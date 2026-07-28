@@ -8,8 +8,8 @@
 - Copyright: Copyright (c) 2026 shanjunjie
 - Adapted concepts: PKCE loopback login, auth generations, atomic credential updates, model-catalog cache invalidation, and redacted operation states.
 
-DeepTutor's Codex OAuth support draws on the design concepts listed above and
-implements them independently against DeepTutor's own settings directory, model
+yFeiSTAI's Codex OAuth support draws on the design concepts listed above and
+implements them independently against yFeiSTAI's own settings directory, model
 catalog, and provider lifecycle. The MIT license text from that source commit
 follows:
 

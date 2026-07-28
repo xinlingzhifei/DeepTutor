@@ -33,7 +33,7 @@ def parse_models_response(payload: Mapping[str, Any]) -> tuple[CodexModel, ...]:
     if len(raw_models) > CODEX_MAX_MODELS:
         raise CodexAuthError(
             "catalog_too_large",
-            "The Codex model catalog exceeded DeepTutor's safety limit.",
+            "The Codex model catalog exceeded yFeiSTAI's safety limit.",
             502,
         )
 
@@ -186,7 +186,7 @@ class CodexModelCatalog:
         ) or len(response.content) > CODEX_MAX_CATALOG_BYTES:
             raise CodexAuthError(
                 "catalog_too_large",
-                "The Codex model catalog exceeded DeepTutor's safety limit.",
+                "The Codex model catalog exceeded yFeiSTAI's safety limit.",
                 502,
             )
         try:

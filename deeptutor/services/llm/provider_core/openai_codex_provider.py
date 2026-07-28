@@ -1,4 +1,4 @@
-"""OpenAI Codex Responses provider backed by DeepTutor's private OAuth service."""
+"""OpenAI Codex Responses provider backed by yFeiSTAI's private OAuth service."""
 
 from __future__ import annotations
 

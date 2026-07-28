@@ -93,7 +93,7 @@ class LoopbackCallback:
         async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
             status = "404 Not Found"
             body = (
-                "<!doctype html><title>DeepTutor Codex</title>"
+                "<!doctype html><title>yFeiSTAI Codex</title>"
                 "<p>This callback path is not available.</p>"
             )
             callback_result: OAuthCallbackResult | None = None
@@ -111,13 +111,13 @@ class LoopbackCallback:
                     )
                     status = "200 OK"
                     body = (
-                        "<!doctype html><title>DeepTutor Codex</title>"
-                        "<p>Authentication received. You can return to DeepTutor.</p>"
+                        "<!doctype html><title>yFeiSTAI Codex</title>"
+                        "<p>Authentication received. You can return to yFeiSTAI.</p>"
                     )
             except (ValueError, UnicodeDecodeError, asyncio.IncompleteReadError, TimeoutError):
                 status = "400 Bad Request"
                 body = (
-                    "<!doctype html><title>DeepTutor Codex</title>"
+                    "<!doctype html><title>yFeiSTAI Codex</title>"
                     "<p>The authentication callback was invalid.</p>"
                 )
 
@@ -162,7 +162,7 @@ class LoopbackCallback:
         if server is None or not server.sockets:
             raise CodexAuthError(
                 "callback_unavailable",
-                "DeepTutor could not start the local Codex sign-in callback.",
+                "yFeiSTAI could not start the local Codex sign-in callback.",
                 503,
             )
         bound_port = int(server.sockets[0].getsockname()[1])

@@ -478,7 +478,7 @@ Settings 是操作控制面板，带有实时状态条（后端、LLM、嵌入�
 
 大多数部分采用草稿-应用流程，因此你可以在提交前测试提供商配置。开箱即提供四种主题 — Default、Cream、Dark 和 Glass。项目根目录的 `.env` 文件被刻意忽略；运行时配置存储在 `data/user/settings/*.json` 下，除非 `DEEPTUTOR_HOME` 或 `deeptutor start --home` 将应用指向其他位置。
 
-**OpenAI Codex OAuth（实验性）。** 在 **模型 → LLM** 下选择 **OpenAI Codex**，会用基于你自己 ChatGPT 订阅运行的浏览器登录取代 API Key 输入框，因此无需 `OPENAI_API_KEY`。令牌仅保存在 `<user-root>/private/openai-codex/` 中，DeepTutor 绝不会读取或修改你的 `~/.codex` CLI 登录状态。模型列表来自该账号的实时目录；登录会发布该配置，但只有在尚未配置任何 LLM 时才会成为活跃模型，因此它不会在你毫不知情的情况下改变已有部署的指向。由于令牌只授权一个人的订阅，该配置无法通过用户授权共享 — 每个账号都需自行登录，且浏览器必须能够访问运行后端的机器（在远程服务器上，请改为在该服务器上运行 `deeptutor provider login openai-codex`）。配额错误和目录获取失败会如实报告，绝不会回退到付费提供商。此兼容路径为实验性功能：上游接口可能发生变化。
+**OpenAI Codex OAuth（实验性）。** 在 **模型 → LLM** 下选择 **OpenAI Codex**，会用基于你自己 ChatGPT 订阅运行的浏览器登录取代 API Key 输入框，因此无需 `OPENAI_API_KEY`。令牌仅保存在 `<user-root>/private/openai-codex/` 中，yFeiSTAI 绝不会读取或修改你的 `~/.codex` CLI 登录状态。模型列表来自该账号的实时目录；登录会发布该配置，但只有在尚未配置任何 LLM 时才会成为活跃模型，因此它不会在你毫不知情的情况下改变已有部署的指向。由于令牌只授权一个人的订阅，该配置无法通过用户授权共享 — 每个账号都需自行登录，且浏览器必须能够访问运行后端的机器（在远程服务器上，请改为在该服务器上运行 `deeptutor provider login openai-codex`）。配额错误和目录获取失败会如实报告，绝不会回退到付费提供商。此兼容路径为实验性功能：上游接口可能发生变化。
 
 </details>
 

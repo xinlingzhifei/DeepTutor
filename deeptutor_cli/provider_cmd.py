@@ -40,7 +40,7 @@ async def _login_openai_codex() -> None:
         authorize_url = str(started["authorize_url"])
         typer.echo(
             "Opening the OpenAI Codex sign-in in your browser; "
-            "credentials are written only to DeepTutor's private directory."
+            "credentials are written only to yFeiSTAI's private directory."
         )
         if not webbrowser.open(authorize_url):
             typer.echo(f"The browser did not open automatically. Visit: {authorize_url}")
