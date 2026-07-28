@@ -63,7 +63,7 @@ DEFAULT_SIDEBAR_NAV_ORDER = {
 DEFAULT_UI_SETTINGS = {
     # "snow" is the pure-white neutral theme, shown as "Default" in the UI.
     "theme": "snow",
-    "language": "en",
+    "language": "zh",
     "sidebar_description": "✨ Data Intelligence Lab @ HKU",
     "sidebar_nav_order": DEFAULT_SIDEBAR_NAV_ORDER,
     # User-toggleable chat tools. Default = all on; the /settings/tools page
@@ -94,7 +94,7 @@ class SidebarNavOrder(BaseModel):
 
 class UISettings(BaseModel):
     theme: Literal["light", "dark", "glass", "snow"] = "snow"
-    language: Literal["zh", "en"] = "en"
+    language: Literal["zh", "en"] = "zh"
     sidebar_description: Optional[str] = None
     sidebar_nav_order: Optional[SidebarNavOrder] = None
     code_block_theme: Optional[str] = None
@@ -275,6 +275,8 @@ def load_ui_settings() -> dict[str, Any]:
             with open(settings_file, encoding="utf-8") as handle:
                 saved = json.load(handle)
                 merged = {**DEFAULT_UI_SETTINGS, **saved}
+                if merged.get("language") not in {"zh", "en"}:
+                    merged["language"] = DEFAULT_UI_SETTINGS["language"]
                 # Filter persisted enabled_optional_tools to current
                 # toggleable set so retired tool names can't leak into
                 # the per-turn payload.
@@ -1202,7 +1204,7 @@ async def complete_tour(payload: TourCompletePayload | None = None):
 
     return {
         "status": "completed",
-        "message": "Configuration saved. DeepTutor will restart shortly.",
+        "message": "Configuration saved. yFeiSTAI will restart shortly.",
         "launch_at": launch_at,
         "redirect_at": redirect_at,
         "runtime": applied,

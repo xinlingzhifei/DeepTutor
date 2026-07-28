@@ -26,7 +26,7 @@ def _resolve_workspace_path(path: str, workspace: str, allowed_dir: str) -> Path
 
 
 class _WorkspaceTool(BaseTool):
-    def get_prompt_hints(self, language: str = "en"):
+    def get_prompt_hints(self, language: str = "zh"):
         return load_prompt_hints(self.name, language=language)
 
     @staticmethod

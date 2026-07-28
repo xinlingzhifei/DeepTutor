@@ -1,7 +1,7 @@
 """API tests for the in-app EduHub skill browser endpoints.
 
 ``GET /api/v1/skills/hub/catalog`` and ``/hub/detail`` proxy a hub's public
-catalog so the web panel can render it in DeepTutor's own UI (no iframe, no
+catalog so the web panel can render it in yFeiSTAI's own UI (no iframe, no
 login). The hub provider is mocked over an ``httpx`` transport.
 """
 
@@ -42,7 +42,7 @@ def _mock_provider() -> ClawHubProvider:
                             "version": "1.0.0",
                             "stats": {"downloads": 8, "stars": 2},
                             "owner": {
-                                "displayName": "DeepTutor",
+                                "displayName": "yFeiSTAI",
                                 "htmlUrl": "https://deeptutor.info",
                             },
                         }
@@ -61,7 +61,7 @@ def _mock_provider() -> ClawHubProvider:
                         "tags": ["tutor"],
                         "stats": {"downloads": 8, "stars": 2},
                     },
-                    "owner": {"displayName": "DeepTutor", "htmlUrl": "https://deeptutor.info"},
+                    "owner": {"displayName": "yFeiSTAI", "htmlUrl": "https://deeptutor.info"},
                     "distTags": {"latest": "1.0.0"},
                 },
             )
@@ -92,7 +92,7 @@ def test_hub_catalog_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
     row = data["skills"][0]
     assert row["slug"] == "socratic-tutor"
     assert row["downloads"] == 8 and row["stars"] == 2
-    assert row["owner"] == "DeepTutor"
+    assert row["owner"] == "yFeiSTAI"
 
 
 def test_hub_detail_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:

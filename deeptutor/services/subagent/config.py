@@ -5,7 +5,7 @@ runtime settings files). Everything has a safe default so the feature works the
 moment a CLI is detected, with no configuration step required.
 
 * ``consult_budget`` — the user-facing "max rounds": the maximum number of times
-  DeepTutor may put a question to the subagent in one turn. Enforced
+  yFeiSTAI may put a question to the subagent in one turn. Enforced
   authoritatively inside the consult tool; the chat loop's own round budget is
   only a safety ceiling.
 * per-backend ``permission_mode`` / ``sandbox`` / ``approval`` — how the local

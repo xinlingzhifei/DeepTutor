@@ -18,7 +18,7 @@ _setup_logger = None
 DEFAULT_INTERFACE_SETTINGS = {
     # "snow" is the pure-white neutral theme, shown as "Default" in the UI.
     "theme": "snow",
-    "language": "en",
+    "language": "zh",
     "sidebar_description": "✨ Data Intelligence Lab @ HKU",
     "sidebar_nav_order": {
         "start": ["/", "/history", "/knowledge", "/notebook"],
@@ -28,7 +28,7 @@ DEFAULT_INTERFACE_SETTINGS = {
 
 DEFAULT_MAIN_SETTINGS = {
     "system": {
-        "language": "en",
+        "language": "zh",
     },
     "logging": {
         "level": "WARNING",

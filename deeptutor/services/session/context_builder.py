@@ -90,7 +90,7 @@ class ContextBuildResult:
 class _ContextSummaryAgent(BaseAgent):
     """Small helper agent for compressing older conversation turns."""
 
-    def __init__(self, language: str = "en") -> None:
+    def __init__(self, language: str = "zh") -> None:
         super().__init__(
             module_name="chat",
             agent_name="context_summary_agent",
@@ -350,7 +350,7 @@ class ContextBuilder:
         *,
         session_id: str,
         llm_config: LLMConfig,
-        language: str = "en",
+        language: str = "zh",
         on_event: Callable[[StreamEvent], Awaitable[None]] | None = None,
         leaf_message_id: int | None = None,
     ) -> ContextBuildResult:

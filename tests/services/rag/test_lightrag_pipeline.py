@@ -237,7 +237,7 @@ def test_build_rag_skips_raganything_parser_install_check(monkeypatch) -> None:
     """Regression for issue #594.
 
     RAG-Anything validates its *default* parser (``mineru``) at LightRAG-init
-    time, even though DeepTutor only ever inserts a pre-parsed ``content_list``
+    time, even though yFeiSTAI only ever inserts a pre-parsed ``content_list``
     and never uses RAG-Anything's parser. ``build_rag`` must pre-satisfy that
     check so indexing with a different parse engine (e.g. pymupdf4llm) doesn't
     hard-fail when MinerU is absent.

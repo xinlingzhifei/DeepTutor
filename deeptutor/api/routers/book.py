@@ -43,7 +43,7 @@ class CreateBookRequest(BaseModel):
     knowledge_bases: list[str] = Field(default_factory=list)
     question_categories: list[int] = Field(default_factory=list)
     question_entries: list[int] = Field(default_factory=list)
-    language: str = Field(default="en")
+    language: str = Field(default="zh")
 
 
 class ConfirmProposalRequest(BaseModel):
@@ -564,7 +564,7 @@ async def book_websocket(ws: WebSocket) -> None:
                             int(c) for c in (data.get("question_categories") or [])
                         ],
                         question_entries=[int(e) for e in (data.get("question_entries") or [])],
-                        language=str(data.get("language") or "en"),
+                        language=str(data.get("language") or "zh"),
                         stream=bus,
                     )
                     await send(

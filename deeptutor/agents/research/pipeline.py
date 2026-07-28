@@ -276,7 +276,7 @@ class ResearchPipeline:
     def __init__(
         self,
         *,
-        language: str = "en",
+        language: str = "zh",
         runtime_config: dict[str, Any] | None = None,
         kb_name: str | None = None,
         enabled_tools: list[str] | None = None,

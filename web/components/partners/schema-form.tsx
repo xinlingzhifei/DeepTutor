@@ -8,6 +8,7 @@
 
 import { useState } from "react";
 import { Eye, EyeOff } from "lucide-react";
+import { useTranslation } from "react-i18next";
 
 export type JsonSchema = {
   type?: string | string[];
@@ -92,6 +93,7 @@ function JsonObjectField({
   value: unknown;
   onChange: (next: unknown) => void;
 }) {
+  const { t } = useTranslation();
   const [draft, setDraft] = useState(() => {
     const obj =
       value && typeof value === "object"
@@ -137,7 +139,7 @@ function JsonObjectField({
       />
       {invalid && (
         <p className="mt-1 text-[11px] text-amber-600 dark:text-amber-400">
-          Invalid JSON — value not applied.
+          {t("Invalid JSON — value not applied.")}
         </p>
       )}
     </div>

@@ -78,11 +78,11 @@ export default function AppearanceSettingsPage() {
         <SettingRow
           title={t("Interface language")}
           description={t(
-            "Affects the UI only. Model output language is controlled by your prompt.",
+            "Controls the interface, system messages, and AI response language.",
           )}
           control={
             <div className="flex gap-0.5 rounded-lg bg-[var(--muted)] p-0.5">
-              {(["en", "zh"] as const).map((v) => (
+              {(["zh", "en"] as const).map((v) => (
                 <button
                   key={v}
                   onClick={() => updateLanguage(v)}

@@ -1,7 +1,7 @@
 """LightRAG / RAG-Anything knowledge-base engine.
 
 A graph-based RAG provider built on HKUDS/LightRAG (multimodal via
-HKUDS/RAG-Anything). It consumes DeepTutor's shared parse layer for document
+HKUDS/RAG-Anything). It consumes yFeiSTAI's shared parse layer for document
 parsing and exposes LightRAG's native query modes (naive/local/global/hybrid/mix)
 through the per-KB ``search_mode``.
 

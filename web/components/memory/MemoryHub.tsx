@@ -98,7 +98,7 @@ export default function MemoryHub() {
         </div>
         <p className="max-w-2xl text-[14px] text-[var(--muted-foreground)] md:text-[15px]">
           {t(
-            "Everything DeepTutor remembers about you, organised across three layers. Click into any layer to inspect or curate it.",
+            "Everything yFeiSTAI remembers about you, organised across three layers. Click into any layer to inspect or curate it.",
           )}
         </p>
         <div className="flex items-center gap-3 text-[12px] text-[var(--muted-foreground)]">

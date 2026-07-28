@@ -205,7 +205,7 @@ class BaseTool(ABC):
         """Run the tool with the given keyword arguments."""
         ...
 
-    def get_prompt_hints(self, language: str = "en") -> ToolPromptHints:
+    def get_prompt_hints(self, language: str = "zh") -> ToolPromptHints:
         """Return prompt-level metadata for dynamic prompt assembly."""
         definition = self.get_definition()
         return ToolPromptHints(

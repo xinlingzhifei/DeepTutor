@@ -25,6 +25,7 @@ import {
 import { useTranslation } from "react-i18next";
 import { apiFetch, apiUrl } from "@/lib/api";
 import SpaceSectionHeader from "@/components/space/SpaceSectionHeader";
+import { DEFAULT_APP_LANGUAGE } from "@/i18n/language";
 
 const MarkdownRenderer = dynamic(
   () => import("@/components/common/MarkdownRenderer"),
@@ -375,7 +376,9 @@ export default function MemorySection({
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ language: i18n.language || "en" }),
+          body: JSON.stringify({
+            language: i18n.language || DEFAULT_APP_LANGUAGE,
+          }),
         },
       );
       const reader = res.body?.getReader();
@@ -467,7 +470,7 @@ export default function MemorySection({
             </p>
             <p className="mt-0.5 text-[var(--muted-foreground)]">
               {t(
-                "Stored at memory/backup/{{name}}. v2 starts fresh — interact with DeepTutor and click Update on each doc to build memory.",
+                "Stored at memory/backup/{{name}}. v2 starts fresh — interact with yFeiSTAI and click Update on each doc to build memory.",
                 { name: latestBackup },
               )}
             </p>

@@ -117,7 +117,7 @@ async def build_inventory(
     fresh_book_references: Sequence[dict[str, Any]],
     fresh_history_session_ids: Sequence[Any],
     fresh_question_entry_ids: Sequence[Any],
-    language: str = "en",
+    language: str = "zh",
 ) -> SourceInventory:
     """Compose the session-cumulative inventory for one chat turn.
 
@@ -306,7 +306,7 @@ async def _add_fresh_history(
     store: SessionStoreProtocol,
     history_session_ids: Sequence[Any],
     current_turn_ordinal: int,
-    language: str = "en",
+    language: str = "zh",
 ) -> None:
     for raw in history_session_ids:
         hs_id = str(raw or "").strip()
@@ -366,7 +366,7 @@ async def _add_historical(
     store: SessionStoreProtocol,
     session_id: str,
     leaf_message_id: int | None,
-    language: str = "en",
+    language: str = "zh",
 ) -> None:
     """Walk the active branch's ancestor user messages and pull in
     references they carried. Sources already in ``inv`` (i.e. fresh
@@ -388,7 +388,7 @@ async def _collect_from_user_message(
     store: SessionStoreProtocol,
     msg: dict[str, Any],
     turn_ordinal: int,
-    language: str = "en",
+    language: str = "zh",
 ) -> None:
     """Drain one prior user message into the inventory as historical
     entries. Attachments are pulled from the persisted ``attachments``
@@ -645,7 +645,7 @@ def serialize_referenced_transcript(
     meta: dict[str, Any],
     messages: Sequence[dict[str, Any]],
     *,
-    language: str = "en",
+    language: str = "zh",
 ) -> str:
     """Serialize a *referenced* conversation into a clearly-framed transcript.
 
@@ -665,7 +665,7 @@ def serialize_referenced_transcript(
     be confused with the model's own ``assistant`` role. Returns ``""`` when
     there is no content to serialize.
     """
-    lang = "zh" if str(language or "en").lower().startswith("zh") else "en"
+    lang = "en" if str(language or "zh").lower().startswith("en") else "zh"
     agent = _imported_agent_label(meta, lang)
     if agent is not None:
         assistant_label = agent
@@ -719,7 +719,7 @@ def serialize_referenced_transcript(
 _PARTNER_REF_PREFIX = "partner:"
 
 
-def _load_partner_session(ref: str, *, language: str = "en") -> tuple[str, str]:
+def _load_partner_session(ref: str, *, language: str = "zh") -> tuple[str, str]:
     """Resolve a ``partner:{pid}:{session_key}`` reference into transcript + title.
 
     Partner conversations live in the admin-scoped ``PartnerSessionStore`` (one
@@ -767,7 +767,7 @@ async def _load_history_session(
     store: SessionStoreProtocol,
     history_session_id: str,
     *,
-    language: str = "en",
+    language: str = "zh",
 ) -> tuple[str, str]:
     """Fetch and serialize a referenced history session into transcript +
     title. Returns ``("", "")`` when the session is empty or missing.

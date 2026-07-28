@@ -9,7 +9,7 @@ This module provides:
 Usage:
     from deeptutor.agents.chat import ChatAgent, SessionManager
 
-    agent = ChatAgent(language="en")
+    agent = ChatAgent(language="zh")
     response = await agent.process(
         message="What is machine learning?",
         history=[],

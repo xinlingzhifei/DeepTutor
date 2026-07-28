@@ -1,5 +1,5 @@
 """
-Default configuration values for DeepTutor.
+Default configuration values for yFeiSTAI.
 """
 
 from deeptutor.runtime.home import get_runtime_home

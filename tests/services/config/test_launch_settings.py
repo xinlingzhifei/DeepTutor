@@ -58,7 +58,7 @@ def test_launch_settings_creates_default_system_json_without_dotenv_migration(
     assert settings.backend_port == 8001
     assert settings.frontend_port == 3782
     assert settings.system_json_path.exists()
-    assert settings.language == "en"
+    assert settings.language == "zh"
 
 
 def test_launch_settings_allows_process_env_as_deployment_override(

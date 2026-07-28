@@ -74,7 +74,7 @@ class UpdateRecordRequest(BaseModel):
 async def _build_record_summary(request: AddRecordRequest) -> str:
     if request.summary.strip():
         return clean_thinking_tags(request.summary).strip()
-    agent = NotebookSummarizeAgent(language=str(request.metadata.get("ui_language", "en")))
+    agent = NotebookSummarizeAgent(language=str(request.metadata.get("ui_language", "zh")))
     return clean_thinking_tags(
         await agent.summarize(
             title=request.title,
@@ -90,7 +90,7 @@ async def _stream_add_record_with_summary(
     request: AddRecordRequest,
 ) -> AsyncGenerator[str, None]:
     try:
-        agent = NotebookSummarizeAgent(language=str(request.metadata.get("ui_language", "en")))
+        agent = NotebookSummarizeAgent(language=str(request.metadata.get("ui_language", "zh")))
         summary_parts: list[str] = []
         if request.summary.strip():
             summary = clean_thinking_tags(request.summary).strip()

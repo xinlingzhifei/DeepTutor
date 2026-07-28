@@ -1,4 +1,4 @@
-"""Runtime home resolution for installed and source DeepTutor runs."""
+"""Runtime home resolution for installed and source yFeiSTAI runs."""
 
 from __future__ import annotations
 

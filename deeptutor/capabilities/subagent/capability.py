@@ -86,7 +86,7 @@ class SubagentCapability(KnowledgeCapability):
         )
         # Persistent continuity: on the first consult of a turn, seed the session
         # id from the cross-turn registry so we resume the SAME local agent
-        # session the user/DeepTutor built up earlier (and the sidebar shares).
+        # session the user/yFeiSTAI built up earlier (and the sidebar shares).
         chat_sid = str(getattr(context, "session_id", "") or "")
         skey = session_key(chat_sid, conn["name"]) if chat_sid else ""
         if skey and not state.get("_seeded"):
@@ -125,7 +125,7 @@ class SubagentCapability(KnowledgeCapability):
 # behaves like a delegate, not an interactive session, when the user hasn't set
 # their own in /settings.
 _DEFAULT_CONSULT_INSTRUCTION = (
-    "You are being consulted programmatically by DeepTutor on the user's behalf, "
+    "You are being consulted programmatically by yFeiSTAI on the user's behalf, "
     "not in an interactive terminal. Answer the question directly, concisely, and "
     "self-contained. Do not ask the user follow-up questions or wait for input; "
     "if something is ambiguous, state your assumption and proceed."
@@ -166,7 +166,7 @@ def _system_text(language: str, name: str, budget: int, kind: str = "") -> str:
     from deeptutor.services.subagent import PARTNER_BACKEND_KIND
 
     is_partner = kind == PARTNER_BACKEND_KIND
-    zh = str(language or "en").lower().startswith("zh")
+    zh = not str(language or "zh").lower().startswith("en")
     if zh:
         if is_partner:
             framing = (

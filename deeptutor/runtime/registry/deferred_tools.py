@@ -26,11 +26,11 @@ from deeptutor.runtime.registry.tool_registry import ToolRegistry
 logger = logging.getLogger(__name__)
 
 
-def render_deferred_tools_manifest(tools: list[BaseTool], *, language: str = "en") -> str:
+def render_deferred_tools_manifest(tools: list[BaseTool], *, language: str = "zh") -> str:
     """System-prompt block listing deferred tools, grouped by MCP server."""
     if not tools:
         return ""
-    zh = (language or "en").lower().startswith("zh")
+    zh = not (language or "zh").lower().startswith("en")
     groups: dict[str, list[tuple[str, str]]] = {}
     for tool in tools:
         definition = tool.get_definition()

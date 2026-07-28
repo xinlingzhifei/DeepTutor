@@ -18,6 +18,16 @@ function readAppearancePage() {
   return fs.readFileSync(appearancePagePath, "utf8");
 }
 
+test("appearance settings exposes Chinese first and describes unified language behavior", () => {
+  const source = readAppearancePage();
+
+  assert.match(source, /\(\["zh", "en"\] as const\)/);
+  assert.match(
+    source,
+    /Controls the interface, system messages, and AI response language\./,
+  );
+});
+
 test("appearance settings page: adds the code blocks section after the theme section", () => {
   const source = readAppearancePage();
 

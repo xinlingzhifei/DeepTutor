@@ -25,7 +25,7 @@ import {
  * past transcripts, these drive the live agent now. CLI detection is
  * machine-global (is the CLI installed here); partners come from the user's
  * partner list. Consulting a partner opens a fresh session on it — every
- * consult within one DeepTutor chat is archived as one partner session.
+ * consult within one yFeiSTAI chat is archived as one partner session.
  */
 
 const PARTNER_KIND = "partner";

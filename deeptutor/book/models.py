@@ -153,7 +153,7 @@ class BookInputs(BaseModel):
     knowledge_bases: list[str] = Field(default_factory=list)
     question_categories: list[int] = Field(default_factory=list)
     question_entries: list[int] = Field(default_factory=list)
-    language: str = "en"
+    language: str = "zh"
     captured_at: float = Field(default_factory=_now)
 
 
@@ -434,7 +434,7 @@ class Book(BaseModel):
     status: BookStatus = BookStatus.DRAFT
     proposal: BookProposal | None = None
     knowledge_bases: list[str] = Field(default_factory=list)
-    language: str = "en"
+    language: str = "zh"
     page_count: int = 0
     chapter_count: int = 0
     created_at: float = Field(default_factory=_now)

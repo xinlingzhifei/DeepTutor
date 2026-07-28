@@ -1,4 +1,4 @@
-"""Bridge DeepTutor's runtime config into LightRAG / RAG-Anything.
+"""Bridge yFeiSTAI's runtime config into LightRAG / RAG-Anything.
 
 LightRAG (HKUDS/LightRAG) is a text knowledge-graph RAG engine; its multimodal
 story is RAG-Anything (HKUDS/RAG-Anything), built on top of LightRAG. The
@@ -7,16 +7,16 @@ story is RAG-Anything (HKUDS/RAG-Anything), built on top of LightRAG. The
 a plain text insert.
 
 This module is the decoupling seam: it exposes availability + mode helpers and
-builds the three adapters LightRAG needs from DeepTutor's already-resolved LLM /
+builds the three adapters LightRAG needs from yFeiSTAI's already-resolved LLM /
 embedding clients. It imports neither RAG-Anything nor LightRAG at module load —
 the adapter builders import ``lightrag.utils`` lazily (only the embedding wrapper
 needs it), and engine construction lives in ``engine.py``.
 
 Decoupling notes:
-* ``llm_model_func`` / ``vision_model_func`` wrap DeepTutor's unified model
+* ``llm_model_func`` / ``vision_model_func`` wrap yFeiSTAI's unified model
   callables and DROP LightRAG's internal kwargs (``hashing_kv``,
   ``keyword_extraction``, …) so they never leak into ``factory.complete``.
-* ``embedding_func`` reuses DeepTutor's embedding client, wrapped in LightRAG's
+* ``embedding_func`` reuses yFeiSTAI's embedding client, wrapped in LightRAG's
   ``EmbeddingFunc`` with the active model's dimension.
 """
 
@@ -41,7 +41,7 @@ class LightRagNotAvailableError(RuntimeError):
 
 
 class LightRagNotConfiguredError(RuntimeError):
-    """Raised when DeepTutor's LLM / embedding config can't back LightRAG."""
+    """Raised when yFeiSTAI's LLM / embedding config can't back LightRAG."""
 
 
 def is_lightrag_available() -> bool:
@@ -83,7 +83,7 @@ def query_kwargs_from_settings() -> dict:
 
 
 def build_llm_model_func():
-    """Wrap DeepTutor's unified LLM callable for LightRAG.
+    """Wrap yFeiSTAI's unified LLM callable for LightRAG.
 
     Drops LightRAG's internal kwargs while preserving explicit ``messages``.
     """
@@ -109,7 +109,7 @@ def build_llm_model_func():
 
 
 def build_vision_model_func():
-    """Wrap DeepTutor's vision-capable callable for RAG-Anything's image step."""
+    """Wrap yFeiSTAI's vision-capable callable for RAG-Anything's image step."""
     from deeptutor.services.llm import get_llm_client
 
     base = get_llm_client().get_vision_model_func()
@@ -134,7 +134,7 @@ def build_vision_model_func():
 
 
 def build_embedding_func():
-    """Wrap DeepTutor's embedding client in LightRAG's ``EmbeddingFunc``."""
+    """Wrap yFeiSTAI's embedding client in LightRAG's ``EmbeddingFunc``."""
     from lightrag.utils import EmbeddingFunc
 
     from deeptutor.services.embedding import get_embedding_client, get_embedding_config

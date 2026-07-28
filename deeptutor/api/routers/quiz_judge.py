@@ -277,10 +277,10 @@ async def websocket_quiz_judge(websocket: WebSocket):
     requested_language = (data.get("language") or "").strip().lower()
     if requested_language not in ("zh", "en"):
         requested_language = get_ui_language(
-            default=_config.get("system", {}).get("language", "en")
+            default=_config.get("system", {}).get("language", "zh")
         )
         if requested_language not in ("zh", "en"):
-            requested_language = "en"
+            requested_language = "zh"
 
     user_answer = data.get("user_answer") or ""
 
@@ -335,7 +335,7 @@ async def websocket_quiz_judge(websocket: WebSocket):
     has_image = bool(image_records)
 
     options_value = data.get("options") if isinstance(data.get("options"), dict) else None
-    system_prompt = _JUDGE_SYSTEM_PROMPTS.get(requested_language, _JUDGE_SYSTEM_PROMPTS["en"])
+    system_prompt = _JUDGE_SYSTEM_PROMPTS.get(requested_language, _JUDGE_SYSTEM_PROMPTS["zh"])
     user_prompt = _build_judge_user_prompt(
         language=requested_language,
         question=question_text,

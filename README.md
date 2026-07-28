@@ -1,17 +1,17 @@
 <div align="center">
 
-<p align="center"><img src="assets/figs/logo/logo.png" alt="DeepTutor logo" height="56" style="vertical-align: middle;">&nbsp;<img src="assets/figs/logo/banner.png" alt="DeepTutor" height="48" style="vertical-align: middle;"></p>
+<p align="center"><img src="assets/figs/logo/logo.png" alt="yFeiSTAI logo" height="56" style="vertical-align: middle;">&nbsp;<img src="assets/figs/logo/banner.png" alt="yFeiSTAI" height="48" style="vertical-align: middle;"></p>
 
-# DeepTutor: Lifelong Personalized Tutoring
+# yFeiSTAI: Lifelong Personalized Tutoring
 
 <p align="center">
   <a href="https://deeptutor.info" target="_blank"><img alt="Docs — deeptutor.info" src="https://img.shields.io/badge/Docs-deeptutor.info%20%E2%86%97-0A0A0A?style=for-the-badge&labelColor=F5F5F4" height="36"></a>
 </p>
 
 <p align="center">
-  <a href="https://trendshift.io/repositories/17099?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-17099" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/17099" alt="HKUDS%2FDeepTutor | Trendshift" width="250" height="55"/></a>&nbsp;
-  <a href="https://trendshift.io/repositories/17099?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-17099" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/17099/daily" alt="HKUDS%2FDeepTutor | Trendshift" width="250" height="55"/></a>&nbsp;
-  <a href="https://trendshift.io/repositories/17099?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-17099" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/17099/weekly?language=Python" alt="HKUDS%2FDeepTutor | Trendshift" width="250" height="55"/></a>
+  <a href="https://trendshift.io/repositories/17099?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-17099" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/17099" alt="yFeiSTAI | Trendshift" width="250" height="55"/></a>&nbsp;
+  <a href="https://trendshift.io/repositories/17099?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-17099" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/17099/daily" alt="yFeiSTAI | Trendshift" width="250" height="55"/></a>&nbsp;
+  <a href="https://trendshift.io/repositories/17099?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-17099" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/17099/weekly?language=Python" alt="yFeiSTAI | Trendshift" width="250" height="55"/></a>
 </p>
 
 <p align="center">
@@ -167,14 +167,14 @@
 
 - **2026-05-22** 🌐 Official docs site live at [**deeptutor.info**](https://deeptutor.info/) — guides, references, and capability tours in one place.
 - **2026-04-19** 🎉 20k stars in 111 days! Thank you for the support toward truly personalized, intelligent tutoring.
-- **2026-04-10** 📄 Our paper is live on arXiv — read the [preprint](https://arxiv.org/abs/2604.26962) for the design and ideas behind DeepTutor.
+- **2026-04-10** 📄 Our paper is live on arXiv — read the [preprint](https://arxiv.org/abs/2604.26962) for the design and ideas behind yFeiSTAI.
 - **2026-02-06** 🚀 10k stars in just 39 days! A huge thank you to our incredible community.
-- **2026-01-01** 🎊 Happy New Year! Join our [Discord](https://discord.gg/eRsjPgMU4t), [WeChat](https://github.com/HKUDS/DeepTutor/issues/78), or [Discussions](https://github.com/HKUDS/DeepTutor/discussions) — let's shape DeepTutor together.
-- **2025-12-29** 🎓 DeepTutor is officially released!
+- **2026-01-01** 🎊 Happy New Year! Join our [Discord](https://discord.gg/eRsjPgMU4t), [WeChat](https://github.com/HKUDS/DeepTutor/issues/78), or [Discussions](https://github.com/HKUDS/DeepTutor/discussions) — let's shape yFeiSTAI together.
+- **2025-12-29** 🎓 yFeiSTAI is officially released!
 
 ## ✨ Key Features
 
-DeepTutor is an agent-native learning workspace that connects tutoring, problem solving, quiz generation, research, visualization, and mastery practice in one extensible system.
+yFeiSTAI is an agent-native learning workspace that connects tutoring, problem solving, quiz generation, research, visualization, and mastery practice in one extensible system.
 
 - **One runtime for every mode** — Chat, Quiz, Research, Visualize, Solve, and Mastery Path run on the same agent loop, so you switch the objective, not the engine, and context moves with the learner.
 - **Connected learning context** — Knowledge bases, books, Co-Writer drafts, notebooks, question banks, personas, and Memory stay available across every workflow instead of living in isolated tools.
@@ -187,7 +187,7 @@ DeepTutor is an agent-native learning workspace that connects tutoring, problem 
 
 ## 🚀 Get Started
 
-DeepTutor ships four installation paths. They all share one workspace layout: settings live in `data/user/settings/` under the directory you launch from (or under `DEEPTUTOR_HOME` / `deeptutor start --home` if you set one explicitly). For the full app, the recommended flow is **pick a workspace directory → install → `deeptutor init` → `deeptutor start`**.
+yFeiSTAI ships four installation paths. They all share one workspace layout: settings live in `data/user/settings/` under the directory you launch from (or under `DEEPTUTOR_HOME` / `deeptutor start --home` if you set one explicitly). For the full app, the recommended flow is **pick a workspace directory → install → `deeptutor init` → `deeptutor start`**.
 
 <details>
 <summary><b>Option 1 — Install From PyPI</b> · full local Web app + CLI, no clone required</summary>
@@ -213,8 +213,8 @@ After `deeptutor start`, open the frontend URL printed in the terminal — by de
 For development against a checkout. Use **Python 3.11–3.13** and **Node.js 22 LTS** to match CI and Docker.
 
 ```bash
-git clone https://github.com/HKUDS/DeepTutor.git
-cd DeepTutor
+git clone https://github.com/HKUDS/DeepTutor.git yFeiSTAI
+cd yFeiSTAI
 
 # Create a venv (macOS/Linux). Windows PowerShell:
 #   py -3.11 -m venv .venv ; .\.venv\Scripts\Activate.ps1
@@ -312,7 +312,7 @@ uses to reach the backend (it's read server-side, never sent to the browser).
 
 `next_public_api_base_external` (and its alias `public_api_base`) are accepted as
 lower-precedence fallbacks. CORS uses frontend **origins**, not API URLs. With
-auth disabled, DeepTutor permits normal HTTP/HTTPS browser origins by default.
+auth disabled, yFeiSTAI permits normal HTTP/HTTPS browser origins by default.
 With auth enabled, add exact frontend origins:
 
 ```json
@@ -356,8 +356,8 @@ Docker Desktop (macOS/Windows) usually resolves `host.docker.internal` without `
 When you don't need the Web UI. The CLI-only package is installed from a source checkout, not from PyPI.
 
 ```bash
-git clone https://github.com/HKUDS/DeepTutor.git
-cd DeepTutor
+git clone https://github.com/HKUDS/DeepTutor.git yFeiSTAI
+cd yFeiSTAI
 
 # Create a venv (macOS/Linux). Windows PowerShell:
 #   py -3.11 -m venv .venv-cli ; .\.venv-cli\Scripts\Activate.ps1
@@ -433,19 +433,19 @@ Project-root `.env` is **not** read as an application config file. For a minimal
 
 </details>
 
-## 📖 Explore DeepTutor
+## 📖 Explore yFeiSTAI
 
 Start with the main surfaces you will use day to day: Chat, Partners, My Agents, Co-Writer, Book, Knowledge Center, Learning Space, Memory, and Settings. The tour then covers Multi-User deployments for shared, isolated workspaces.
 
 <div align="center">
-<img src="assets/figs/web-1.4.6+/OVERVIEW.png" alt="DeepTutor home — the Chat workspace with every surface in the sidebar" width="900">
+<img src="assets/figs/web-1.4.6+/OVERVIEW.png" alt="yFeiSTAI home — the Chat workspace with every surface in the sidebar" width="900">
 </div>
 
 <details>
 <summary><b>🏗️ System architecture</b></summary>
 
 <div align="center">
-<img src="assets/figs/system/system%20architecture.png" alt="DeepTutor system architecture" width="900">
+<img src="assets/figs/system/system%20architecture.png" alt="yFeiSTAI system architecture" width="900">
 </div>
 
 </details>
@@ -456,13 +456,13 @@ Start with the main surfaces you will use day to day: Chat, Partners, My Agents,
 Chat is the default capability and where most work begins. A single thread can talk normally, call tools, ground itself in selected knowledge bases, read attachments, generate images, consult subagents, write notebook records, and continue with the same context across turns.
 
 <div align="center">
-<img src="assets/figs/web-1.4.6+/home/00-overview.png" alt="DeepTutor chat workspace" width="900">
+<img src="assets/figs/web-1.4.6+/home/00-overview.png" alt="yFeiSTAI chat workspace" width="900">
 </div>
 
 The loop is deliberately simple: the model thinks in rounds, calls tools when useful, observes the results, and finishes with a tool-free message. `ask_user` is special — instead of guessing, the agent can pause the turn, ask a structured clarifying question, and resume once you answer.
 
 <div align="center">
-<img src="assets/figs/system/chat-agent-loop.png" alt="DeepTutor chat agent loop" width="900">
+<img src="assets/figs/system/chat-agent-loop.png" alt="yFeiSTAI chat agent loop" width="900">
 </div>
 
 User-toggleable tools are `brainstorm`, `web_search`, `paper_search`, `reason`, and `geogebra_analysis` — plus `imagegen` and `videogen` once you configure the matching generation model. Contextual tools such as `rag`, `read_source`, `read_memory`, `write_memory`, `read_skill`, `load_tools`, `exec`, `web_fetch`, `ask_user`, `list_notebook`, `write_note`, `github`, and `consult_subagent` mount automatically when the turn has the right context.
@@ -477,13 +477,13 @@ Chat is also the launch point for deeper capabilities: **Quiz** for question gen
 <summary><b>🤝 Partner — Persistent Companions on the Same Brain</b></summary>
 
 <div align="center">
-<img src="assets/figs/web-1.4.6+/partners/00-partners%20overview.png" alt="DeepTutor partners workspace" width="900">
+<img src="assets/figs/web-1.4.6+/partners/00-partners%20overview.png" alt="yFeiSTAI partners workspace" width="900">
 </div>
 
 Partners are persistent companions with their own soul, model policy, library, memory, and channels. They are not a separate bot engine: every inbound web or IM message becomes a normal `ChatOrchestrator` turn inside a partner-scoped workspace. A partner is "a chat that has a personality and a phone number."
 
 <div align="center">
-<img src="assets/figs/system/partners-architecture.png" alt="DeepTutor partners architecture" width="900">
+<img src="assets/figs/system/partners-architecture.png" alt="yFeiSTAI partners architecture" width="900">
 </div>
 
 Each partner has a `SOUL.md`, model selection, channels, tool policy, and assigned library. Knowledge bases, skills, and notebooks are copied into `data/partners/<id>/workspace/`, so the same RAG, skill, notebook, and memory tools work without special cases. A partner reads its owner's memory but writes only its own.
@@ -500,16 +500,16 @@ The channel layer is schema-driven and can connect to IM platforms such as Feish
 <summary><b>🧑‍🚀 My Agents — Consult & Import Other Agents</b></summary>
 
 <div align="center">
-<img src="assets/figs/web-1.4.6+/myagents/00-overview.png" alt="DeepTutor My Agents workspace" width="900">
+<img src="assets/figs/web-1.4.6+/myagents/00-overview.png" alt="yFeiSTAI My Agents workspace" width="900">
 </div>
 
-My Agents turns other agents into context for DeepTutor, and does two distinct things. **Connect a live agent** — a Claude Code, Codex, Gemini, Kimi, opencode, or MiMo Code CLI on your machine, or one of your Partners — and consult it from inside a chat turn: DeepTutor actually *runs* the other agent and streams its work into the Activity panel via the `consult_subagent` tool. Select it with the Agent chip (or type `@`), and set how many rounds the consult may take.
+My Agents turns other agents into context for yFeiSTAI, and does two distinct things. **Connect a live agent** — a Claude Code, Codex, Gemini, Kimi, opencode, or MiMo Code CLI on your machine, or one of your Partners — and consult it from inside a chat turn: yFeiSTAI actually *runs* the other agent and streams its work into the Activity panel via the `consult_subagent` tool. Select it with the Agent chip (or type `@`), and set how many rounds the consult may take.
 
 <div align="center">
 <img src="assets/figs/web-1.4.6+/home/08-subagent%20demo%20with%20claude%20code.png" alt="Consulting a Claude Code subagent live" width="900">
 </div>
 
-**Import past conversations** — bring in your existing Claude Code and Codex history as named, searchable, resumable agents. Pick which days to import; refreshing re-syncs them. Reference an imported conversation from any chat turn via `+` → My Agents, and DeepTutor reads it as a third-party transcript — it stays *their* conversation, not DeepTutor's own voice.
+**Import past conversations** — bring in your existing Claude Code and Codex history as named, searchable, resumable agents. Pick which days to import; refreshing re-syncs them. Reference an imported conversation from any chat turn via `+` → My Agents, and yFeiSTAI reads it as a third-party transcript — it stays *their* conversation, not yFeiSTAI's own voice.
 
 </details>
 
@@ -517,7 +517,7 @@ My Agents turns other agents into context for DeepTutor, and does two distinct t
 <summary><b>✍️ Co-Writer — Selection-Aware Markdown Drafting</b></summary>
 
 <div align="center">
-<img src="assets/figs/web-1.4.6+/co-writer/00-overview.png" alt="DeepTutor Co-Writer workspace" width="900">
+<img src="assets/figs/web-1.4.6+/co-writer/00-overview.png" alt="yFeiSTAI Co-Writer workspace" width="900">
 </div>
 
 Co-Writer is a split-view Markdown workspace for reports, tutorials, notes, and long-form learning artifacts. Documents autosave and render a live preview (KaTeX math, diagram fences), and can be saved back into notebooks when a draft becomes reusable context.
@@ -526,7 +526,7 @@ Co-Writer is a split-view Markdown workspace for reports, tutorials, notes, and 
 <img src="assets/figs/web-1.4.6+/co-writer/01-edit%20panel.png" alt="Co-Writer editor with live preview" width="900">
 </div>
 
-Its defining idea is **surgical editing**: select a span and ask DeepTutor to rewrite, expand, or shorten it. The edit agent can ground the change in a knowledge base or web evidence, keeps a trace of its tool calls, and shows every change as an accept/reject diff — so nothing lands until you approve it.
+Its defining idea is **surgical editing**: select a span and ask yFeiSTAI to rewrite, expand, or shorten it. The edit agent can ground the change in a knowledge base or web evidence, keeps a trace of its tool calls, and shows every change as an accept/reject diff — so nothing lands until you approve it.
 
 </details>
 
@@ -534,7 +534,7 @@ Its defining idea is **surgical editing**: select a span and ask DeepTutor to re
 <summary><b>📖 Book — Living Books from Your Materials</b></summary>
 
 <div align="center">
-<img src="assets/figs/web-1.4.6+/book/00-book_overview.png" alt="DeepTutor book library" width="900">
+<img src="assets/figs/web-1.4.6+/book/00-book_overview.png" alt="yFeiSTAI book library" width="900">
 </div>
 
 Book turns selected sources into an interactive **living book** — not a static PDF, but a reading environment built from typed blocks. A book can start from knowledge bases, notebooks, question banks, or chat history; the creation flow proposes a chapter outline before content is generated, so you review the shape instead of accepting a blind one-shot output.
@@ -555,7 +555,7 @@ Each chapter compiles into typed blocks — text, callouts, quizzes, flash cards
 <summary><b>📚 Knowledge Center — Multi-Engine RAG Libraries</b></summary>
 
 <div align="center">
-<img src="assets/figs/web-1.4.6+/knowledge/00-overview.png" alt="DeepTutor Knowledge Center" width="900">
+<img src="assets/figs/web-1.4.6+/knowledge/00-overview.png" alt="yFeiSTAI Knowledge Center" width="900">
 </div>
 
 Knowledge bases are the document collections behind RAG — they ground Chat turns, Co-Writer edits, Book generation, and Partner conversations. What's distinctive is a **choice of retrieval engines**: **LlamaIndex** (the default, local vector + BM25), **PageIndex** (hosted, reasoning retrieval with page-level citations), **GraphRAG** and **LightRAG** (knowledge-graph retrieval), **LightRAG Server** (retrieval offloaded to an external LightRAG instance you connect over HTTP), or a linked **Obsidian** vault the tutor reads and writes in place. Each KB is bound to one engine.
@@ -572,7 +572,7 @@ Creating a KB, you either **create new** (upload documents and build a fresh ind
 <summary><b>🌐 Learning Space — Skills, Personas, and Reusable Context</b></summary>
 
 <div align="center">
-<img src="assets/figs/web-1.4.6+/learning-space/00-overview.png" alt="DeepTutor Learning Space hub" width="900">
+<img src="assets/figs/web-1.4.6+/learning-space/00-overview.png" alt="yFeiSTAI Learning Space hub" width="900">
 </div>
 
 Learning Space is the library and personalization layer — where the things that persist live. **Conversations & Materials** holds your chat history, notebooks, and a question bank (each saved question keeps your answer, the reference answer, and an explanation). **Personalization** holds mastery paths, personas (behavior presets such as *peer*, *research-assistant*, *teacher*), and skills (`SKILL.md` playbooks the model reads on demand). Everything here can be reused from Chat, Partners, Co-Writer, and Book.
@@ -589,13 +589,13 @@ You don't have to write every skill yourself — **Import from EduHub** browses 
 <summary><b>🧠 Memory — Inspectable Personalization</b></summary>
 
 <div align="center">
-<img src="assets/figs/web-1.4.6+/memory/00-overview.png" alt="DeepTutor memory overview" width="900">
+<img src="assets/figs/web-1.4.6+/memory/00-overview.png" alt="yFeiSTAI memory overview" width="900">
 </div>
 
 Memory is a file-backed, three-layer system you can read, curate, and audit — deliberately *not* a hidden vector store. **L1** is the workspace mirror plus an append-only event trace (`trace/<surface>/<date>.jsonl`); **L2** is per-surface curated facts (`L2/<surface>.md`); **L3** is cross-surface synthesis (`L3/<profile|recent|scope|preferences>.md`). Because L2 cites L1 and L3 cites L2, nothing in your profile is unaccountable.
 
 <div align="center">
-<img src="assets/figs/web-1.4.6+/memory/01-3%20layer%20memory%20graph.png" alt="DeepTutor memory graph" width="900">
+<img src="assets/figs/web-1.4.6+/memory/01-3%20layer%20memory%20graph.png" alt="yFeiSTAI memory graph" width="900">
 </div>
 
 The Memory Graph shows the whole pyramid — L3 synthesis at the centre, L2 in the middle ring, L1 traces on the outside — so you can trace any synthesized claim back to the exact raw event behind it. Memory is tracked across `chat`, `notebook`, `quiz`, `kb`, `book`, partner, and `cowriter` surfaces; the consolidator's Update / Audit / Dedup budgets are tuned in **Settings → Memory**.
@@ -606,13 +606,13 @@ The Memory Graph shows the whole pyramid — L3 synthesis at the centre, L2 in t
 <summary><b>⚙️ Settings — One Control Plane</b></summary>
 
 <div align="center">
-<img src="assets/figs/web-1.4.6+/settings/00-setting%20overview.png" alt="DeepTutor settings hub" width="900">
+<img src="assets/figs/web-1.4.6+/settings/00-setting%20overview.png" alt="yFeiSTAI settings hub" width="900">
 </div>
 
 Settings is the operational control plane, with a live status strip (Backend, LLM, Embedding, Search) and one card per area: **Appearance** (theme, UI language, code-block styling), **Network** (API base, ports, CORS), **Models** (LLM, Embedding, Search, Text-to-Speech, Speech-to-Text, Image Generation, Video Generation), **Knowledge Base** (document parsing engine), **Chat** (tools, MCP servers, per-capability parameters, attachment caps), **Partners & Agents** (the subagents you can consult from a turn), and **Memory** (the consolidator's budgets).
 
 <div align="center">
-<img src="assets/figs/web-1.4.6+/settings/01-appearance%20settings.png" alt="DeepTutor appearance settings and themes" width="900">
+<img src="assets/figs/web-1.4.6+/settings/01-appearance%20settings.png" alt="yFeiSTAI appearance settings and themes" width="900">
 </div>
 
 Most sections use a draft-and-apply flow, so you can test a provider before committing it. Four themes ship in the box — Default, Cream, Dark, and Glass. Project-root `.env` files are intentionally ignored; runtime configuration lives under `data/user/settings/*.json` unless `DEEPTUTOR_HOME` or `deeptutor start --home` points the app elsewhere.
@@ -622,7 +622,7 @@ Most sections use a draft-and-apply flow, so you can test a provider before comm
 <details>
 <summary><b>👥 Multi-User — Shared Deployments</b> · optional auth, isolated per-user workspaces</summary>
 
-Authentication is **off by default** — DeepTutor runs single-user. Turn it on and one `data/` tree hosts an admin workspace, isolated per-user workspaces, and partner workspaces side by side:
+Authentication is **off by default** — yFeiSTAI runs single-user. Turn it on and one `data/` tree hosts an admin workspace, isolated per-user workspaces, and partner workspaces side by side:
 
 ```text
 data/
@@ -640,9 +640,9 @@ The **first registered user becomes admin** and owns model catalogs, provider cr
 
 </details>
 
-## ⌨️ DeepTutor CLI — Agent-Native Interface
+## ⌨️ yFeiSTAI CLI — Agent-Native Interface
 
-One `deeptutor` binary, two ways in: an interactive **REPL** for people who live in the terminal, and structured **JSON** for other agents that drive DeepTutor as a tool. Same capabilities, tools, and knowledge bases either way.
+One `deeptutor` binary, two ways in: an interactive **REPL** for people who live in the terminal, and structured **JSON** for other agents that drive yFeiSTAI as a tool. Same capabilities, tools, and knowledge bases either way.
 
 <details>
 <summary><b>Drive it yourself</b></summary>
@@ -664,7 +664,7 @@ Everything the Web app does is here too — knowledge bases (`kb`), sessions (`s
 <details>
 <summary><b>Let an agent drive it</b></summary>
 
-DeepTutor is built to be *operated by another agent*. Add `--format json` to any `run` and each turn streams **NDJSON — one event per line** (`content`, `tool_call`, `tool_result`, `done`, …), every line tagged with its `session_id`. Runs are headless-safe: an `ask_user` pause with no TTY auto-resolves with an empty reply instead of hanging.
+yFeiSTAI is built to be *operated by another agent*. Add `--format json` to any `run` and each turn streams **NDJSON — one event per line** (`content`, `tool_call`, `tool_result`, `done`, …), every line tagged with its `session_id`. Runs are headless-safe: an `ask_user` pause with no TTY auto-resolves with an empty reply instead of hanging.
 
 ```bash
 # One shot, machine-readable
@@ -719,12 +719,12 @@ It isn't published to PyPI yet, so the main [Get Started](#-get-started) section
 
 ## 🧩 Ecosystem — EduHub & the Skills Community
 
-DeepTutor skills use the open **Agent-Skills** format — a folder with a `SKILL.md` playbook (YAML frontmatter + Markdown) and optional reference files. Nothing about it is DeepTutor-specific, so any registry that speaks the format becomes a source for your library. DeepTutor ships with **[EduHub](https://eduhub.deeptutor.info/)** — our own education-focused skill registry — wired in as the default hub.
+yFeiSTAI skills use the open **Agent-Skills** format — a folder with a `SKILL.md` playbook (YAML frontmatter + Markdown) and optional reference files. Nothing about it is yFeiSTAI-specific, so any registry that speaks the format becomes a source for your library. yFeiSTAI ships with **[EduHub](https://eduhub.deeptutor.info/)** — our own education-focused skill registry — wired in as the default hub.
 
 <details>
-<summary><b>EduHub — DeepTutor's skill ecosystem</b></summary>
+<summary><b>EduHub — yFeiSTAI's skill ecosystem</b></summary>
 
-[**EduHub**](https://eduhub.deeptutor.info/) is the community hub DeepTutor launched for sharing teaching-oriented agent skills — Socratic tutors, flashcard builders, essay feedback, exam blueprints, concept explainers, and more. It is built into DeepTutor, so there's nothing to configure: a bare slug or an `eduhub:` prefix resolves to it.
+[**EduHub**](https://eduhub.deeptutor.info/) is the community hub yFeiSTAI launched for sharing teaching-oriented agent skills — Socratic tutors, flashcard builders, essay feedback, exam blueprints, concept explainers, and more. It is built into yFeiSTAI, so there's nothing to configure: a bare slug or an `eduhub:` prefix resolves to it.
 
 **Find and install** — in the browser, open **Learning Space → Skills → Import from EduHub** to browse the catalog and download a skill straight into your library. From the terminal:
 
@@ -743,7 +743,7 @@ deeptutor skill publish ./my-skill                    # interactive: pick a trac
 deeptutor skill update                                # roll back or release a new version
 ```
 
-EduHub is also a standalone, ClawHub-compatible registry, so agents that aren't DeepTutor (Claude Code, Codex, …) can use it directly through the `eduhub` CLI — `npx eduhub install socratic-tutor`.
+EduHub is also a standalone, ClawHub-compatible registry, so agents that aren't yFeiSTAI (Claude Code, Codex, …) can use it directly through the `eduhub` CLI — `npx eduhub install socratic-tutor`.
 
 </details>
 
@@ -754,7 +754,7 @@ Whatever the source, every import passes the **same safety gate** before anythin
 
 - the registry's **security verdict** is checked first — flagged packages are refused unless you pass `--allow-unverified`;
 - archives are extracted defensively (zip-slip / zip-bomb guards) behind a text/script **suffix whitelist**, so binaries never land in the workspace;
-- frontmatter is normalized to DeepTutor's schema and `always:` is **stripped**, so a downloaded skill can never force itself into every system prompt;
+- frontmatter is normalized to yFeiSTAI's schema and `always:` is **stripped**, so a downloaded skill can never force itself into every system prompt;
 - provenance — hub, version, verdict, and install time — is written to `.hub-lock.json` for audits and updates.
 
 In multi-user deployments, installing is admin-only: a new skill lands in the admin catalog and stays invisible to other users until a grant assigns it, so an admin can vet it before rolling it out.
@@ -764,7 +764,7 @@ In multi-user deployments, installing is admin-only: a new skill lands in the ad
 <details>
 <summary><b>Also compatible with ClawHub</b></summary>
 
-Because DeepTutor speaks the open Agent-Skills format, **[ClawHub](https://clawhub.ai/)** works as a first-class source too — it's built in alongside EduHub. Pick it with the hub prefix:
+Because yFeiSTAI speaks the open Agent-Skills format, **[ClawHub](https://clawhub.ai/)** works as a first-class source too — it's built in alongside EduHub. Pick it with the hub prefix:
 
 ```bash
 deeptutor skill search "git release notes" --hub clawhub
@@ -779,13 +779,13 @@ Add more registries in `settings/skill_hubs.json`: a `type: "clawhub"` entry poi
 
 ### 📮 Contact
 
-DeepTutor is an open-source project led by [Bingxi Zhao](https://github.com/pancacake) within the [HKUDS](https://github.com/HKUDS) Group, and it iterates in a **fully open-source form**, built together with the community. So far, we **DO NOT** have paid online products of any form. Feel free to reach out at **bingxizhao39@gmail.com** for discussions, ideas, or collaboration.
+yFeiSTAI is an open-source project led by [Bingxi Zhao](https://github.com/pancacake) within the [HKUDS](https://github.com/HKUDS) Group, and it iterates in a **fully open-source form**, built together with the community. So far, we **DO NOT** have paid online products of any form. Feel free to reach out at **bingxizhao39@gmail.com** for discussions, ideas, or collaboration.
 
 ### 🙏 Appreciation
 
-Heartfelt thanks to [**Chao Huang**](https://sites.google.com/view/chaoh), director of the Data Intelligence Lab @ HKU, and to our HKUDS labmates for their warm support — especially [**Jiahao Zhang**](https://github.com/zzhtx258), [**Zirui Guo**](https://github.com/LarFii), and [**Xubin Ren**](https://github.com/Re-bin). We're also deeply grateful to the **open-source community**: your stars, issues, pull requests, and discussions shape DeepTutor every single day.
+Heartfelt thanks to [**Chao Huang**](https://sites.google.com/view/chaoh), director of the Data Intelligence Lab @ HKU, and to our HKUDS labmates for their warm support — especially [**Jiahao Zhang**](https://github.com/zzhtx258), [**Zirui Guo**](https://github.com/LarFii), and [**Xubin Ren**](https://github.com/Re-bin). We're also deeply grateful to the **open-source community**: your stars, issues, pull requests, and discussions shape yFeiSTAI every single day.
 
-DeepTutor also stands on the shoulders of outstanding open-source projects that gave us both tools and inspiration:
+yFeiSTAI also stands on the shoulders of outstanding open-source projects that gave us both tools and inspiration:
 
 | Project | Role / Inspiration |
 |:---|:---|
@@ -796,16 +796,16 @@ DeepTutor also stands on the shoulders of outstanding open-source projects that 
 | [**AI-Researcher**](https://github.com/HKUDS/AI-Researcher) | Automated research pipeline *(HKUDS)* |
 | [**OpenClaw**](https://github.com/openclaw/openclaw) | Open agent gateway and skill ecosystem behind ClawHub |
 | [**Codex**](https://github.com/openai/codex) | Agent-native coding CLI that inspired our CLI workflow |
-| [**Claude Code**](https://github.com/anthropics/claude-code) | Agentic coding CLI that inspired the DeepTutor agent loop |
+| [**Claude Code**](https://github.com/anthropics/claude-code) | Agentic coding CLI that inspired the yFeiSTAI agent loop |
 | [**ManimCat**](https://github.com/Wing900/ManimCat) | AI-driven math animation generation for Math Animator |
 
 ### 🗺️ Roadmap & Contribute
 
-We want DeepTutor to keep iterating and improving — and ultimately to become a gift we give back to the open-source community. Our [**roadmap**](https://github.com/HKUDS/DeepTutor/issues/498) is updated continuously; vote on items there or propose new ones. If you'd like to contribute, see the [**Contributing Guide**](CONTRIBUTING.md) for branching strategy, coding standards, and how to get started.
+We want yFeiSTAI to keep iterating and improving — and ultimately to become a gift we give back to the open-source community. Our [**roadmap**](https://github.com/HKUDS/DeepTutor/issues/498) is updated continuously; vote on items there or propose new ones. If you'd like to contribute, see the [**Contributing Guide**](CONTRIBUTING.md) for branching strategy, coding standards, and how to get started.
 
 <div align="center">
 
-We hope DeepTutor becomes a gift for the community. 🎁
+We hope yFeiSTAI becomes a gift for the community. 🎁
 
 <a href="https://github.com/HKUDS/DeepTutor/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=HKUDS/DeepTutor&max=999" alt="Contributors" />

@@ -1420,7 +1420,7 @@ export default function ChatPage() {
     () => state.knowledgeBases.find((name) => agentNameSet.has(name)) ?? null,
     [state.knowledgeBases, agentNameSet],
   );
-  // How many times DeepTutor may consult the selected agent this turn. Seeded
+  // How many times yFeiSTAI may consult the selected agent this turn. Seeded
   // from the configured default; the composer's stepper overrides it per turn.
   const [subagentBudget, setSubagentBudget] = useState<number | null>(null);
   useEffect(() => {
@@ -1474,7 +1474,7 @@ export default function ChatPage() {
         config = buildResearchWSConfig(researchConfig);
       }
       // When a connected agent is selected, carry the per-turn consult budget
-      // (how many times DeepTutor may ask it) so the subagent capability uses it.
+      // (how many times yFeiSTAI may ask it) so the subagent capability uses it.
       if (selectedAgent && subagentBudget) {
         config = { ...(config ?? {}), subagent_consult_budget: subagentBudget };
       }
@@ -1865,10 +1865,10 @@ export default function ChatPage() {
                 <div className="w-full max-w-[960px] flex items-center justify-center gap-4">
                   <img
                     src="/logo_black.png"
-                    alt="DeepTutor"
-                    width={40}
-                    height={40}
-                    className="h-10 w-10 select-none"
+                    alt="yFeiSTAI"
+                    width={752}
+                    height={460}
+                    className="h-10 w-auto select-none"
                     draggable={false}
                   />
                   <h1 className="font-serif text-[40px] font-medium leading-[1.1] tracking-[-0.015em] text-[var(--foreground)]">
@@ -2129,7 +2129,7 @@ function SubagentTabWatcher({
   viewerPanelRef: React.MutableRefObject<SessionViewerPanelHandle | null>;
 }) {
   useEffect(() => {
-    // Group by turn so all of one turn's consults (DeepTutor may ask the agent
+    // Group by turn so all of one turn's consults (yFeiSTAI may ask the agent
     // several questions in a row, each its own tool call) land in one tab as a
     // single running dialogue; fall back to the call id when no turn is set.
     const groups = new Map<string, { label: string; events: StreamEvent[] }>();

@@ -22,6 +22,7 @@ import {
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
+import { DEFAULT_APP_LANGUAGE } from "@/i18n/language";
 import {
   listLLMOptions,
   llmSelectionKey,
@@ -149,14 +150,14 @@ export default function MemoryRunPanel({
         mode,
         iterations: typeof iterations === "number" ? iterations : undefined,
         llmSelection,
-        language: i18n.language || "en",
+        language: i18n.language || DEFAULT_APP_LANGUAGE,
       });
     } else {
       void start({
         mode,
         budget: typeof budget === "number" ? budget : undefined,
         llmSelection,
-        language: i18n.language || "en",
+        language: i18n.language || DEFAULT_APP_LANGUAGE,
       });
     }
   }, [

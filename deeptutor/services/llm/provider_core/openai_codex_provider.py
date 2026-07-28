@@ -20,7 +20,7 @@ from deeptutor.services.llm.provider_core.openai_responses import (
 )
 
 DEFAULT_CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
-DEFAULT_ORIGINATOR = "DeepTutor"
+DEFAULT_ORIGINATOR = "yFeiSTAI"
 
 
 class OpenAICodexProvider(LLMProvider):
@@ -151,7 +151,7 @@ def _build_headers(account_id: Any, token: Any) -> dict[str, str]:
         "Authorization": f"Bearer {token}",
         "OpenAI-Beta": "responses=experimental",
         "originator": DEFAULT_ORIGINATOR,
-        "User-Agent": "DeepTutor (python)",
+        "User-Agent": "yFeiSTAI (python)",
         "accept": "text/event-stream",
         "content-type": "application/json",
     }

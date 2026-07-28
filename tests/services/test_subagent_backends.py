@@ -58,11 +58,11 @@ def test_codex_command_build_sandbox_and_resume() -> None:
 
 def test_claude_command_applies_model_effort_system_prompt() -> None:
     backend = ClaudeCodeBackend()
-    cfg = BackendConfig(model="opus", effort="high", system_prompt="consulted by DeepTutor")
+    cfg = BackendConfig(model="opus", effort="high", system_prompt="consulted by yFeiSTAI")
     cmd = backend._build_command("hi", session_id=None, config=cfg)
     assert "--model" in cmd and "opus" in cmd
     assert "--effort" in cmd and "high" in cmd
-    assert "--append-system-prompt" in cmd and "consulted by DeepTutor" in cmd
+    assert "--append-system-prompt" in cmd and "consulted by yFeiSTAI" in cmd
 
 
 def test_codex_command_applies_model_effort_network_ephemeral() -> None:

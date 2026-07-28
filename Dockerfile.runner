@@ -1,5 +1,5 @@
 # ============================================
-# DeepTutor Sandbox Runner Sidecar Image
+# yFeiSTAI Sandbox Runner Sidecar Image
 # ============================================
 # A deliberately small, least-privileged image whose *only* job is to execute
 # untrusted shell commands on behalf of the main app, isolated in its own
@@ -12,7 +12,7 @@
 #   docker run --rm -p 8900:8900 deeptutor-sandbox-runner:local
 #
 # Why no app code beyond server.py: the runner ships ONLY the stdlib HTTP server
-# plus a set of common CLI tools. It must not depend on the DeepTutor package or
+# plus a set of common CLI tools. It must not depend on the yFeiSTAI package or
 # any heavy framework — keeping the attack surface and image size minimal.
 # ============================================
 

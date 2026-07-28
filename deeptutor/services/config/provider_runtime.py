@@ -1,4 +1,4 @@
-"""Nanobot-style normalized runtime configuration for DeepTutor."""
+"""Nanobot-style normalized runtime configuration for yFeiSTAI."""
 
 from __future__ import annotations
 

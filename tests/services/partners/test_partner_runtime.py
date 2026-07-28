@@ -661,7 +661,7 @@ class TestPartnerCommands:
         runner = _runner(partners_root)
         await runner.process_message(_msg("first question"))
 
-        reply = await runner.process_message(_msg("/new@DeepTutorBot"))
+        reply = await runner.process_message(_msg("/new@yFeiSTAIBot"))
 
         assert "Started a new conversation" in reply
         assert len(fake_orchestrator.seen_contexts) == 1

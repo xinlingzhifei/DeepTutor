@@ -314,7 +314,7 @@ async def build_book_inputs(
     knowledge_bases: list[str] | None = None,
     question_categories: list[int] | None = None,
     question_entries: list[int] | None = None,
-    language: str = "en",
+    language: str = "zh",
     chat_history_limit: int = 60,
 ) -> tuple[BookInputs, IdeationContext]:
     """Capture the four-source snapshot and produce the IdeationContext."""

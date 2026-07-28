@@ -1,4 +1,4 @@
-# DeepTutor CLI
+# yFeiSTAI CLI
 
 Agent-first 的命令行界面。两条核心路径：
 
@@ -9,8 +9,8 @@ Agent-first 的命令行界面。两条核心路径：
 
 ```bash
 # 仅 CLI（本地源码安装，含 RAG / 文档解析 / 各家 LLM provider SDK）
-git clone https://github.com/HKUDS/DeepTutor.git
-cd DeepTutor
+git clone https://github.com/HKUDS/DeepTutor.git yFeiSTAI
+cd yFeiSTAI
 python3 -m venv .venv-cli
 source .venv-cli/bin/activate
 python -m pip install --upgrade pip

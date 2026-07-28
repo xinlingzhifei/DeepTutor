@@ -61,7 +61,7 @@ class TestUnifiedContext:
         assert ctx.knowledge_bases == []
         assert ctx.attachments == []
         assert ctx.config_overrides == {}
-        assert ctx.language == "en"
+        assert ctx.language == "zh"
         assert ctx.memory_context == ""
         assert ctx.source_manifest == ""
         assert ctx.metadata == {}
@@ -100,6 +100,11 @@ class TestUnifiedContext:
         ctx_empty = UnifiedContext(enabled_tools=[])
         assert ctx_none.enabled_tools is None
         assert ctx_empty.enabled_tools == []
+
+    def test_language_is_limited_to_supported_values(self) -> None:
+        assert UnifiedContext(language="en-US").language == "en"
+        assert UnifiedContext(language="invalid").language == "zh"
+        assert UnifiedContext(language="").language == "zh"
 
 
 # ---------------------------------------------------------------------------

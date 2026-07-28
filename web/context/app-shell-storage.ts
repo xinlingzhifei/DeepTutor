@@ -1,6 +1,13 @@
 "use client";
 
-export type AppLanguage = "en" | "zh";
+import {
+  DEFAULT_APP_LANGUAGE,
+  normalizeLanguage,
+  type AppLanguage,
+} from "@/i18n/language";
+
+export { DEFAULT_APP_LANGUAGE, normalizeLanguage };
+export type { AppLanguage };
 
 export const ACTIVE_SESSION_STORAGE_KEY = "deeptutor.activeSessionId.tab";
 export const LANGUAGE_STORAGE_KEY = "deeptutor-language";
@@ -59,18 +66,12 @@ export const LANGUAGE_EVENT = "deeptutor:language";
 export const SIDEBAR_COLLAPSED_EVENT = "deeptutor:sidebar-collapsed";
 export const CODE_BLOCK_SETTINGS_EVENT = "deeptutor:code-block-settings";
 
-export function normalizeLanguage(
-  value: string | null | undefined,
-): AppLanguage {
-  return value === "zh" ? "zh" : "en";
-}
-
 export function readStoredLanguage(): AppLanguage {
-  if (typeof window === "undefined") return "en";
+  if (typeof window === "undefined") return DEFAULT_APP_LANGUAGE;
   try {
     return normalizeLanguage(window.localStorage.getItem(LANGUAGE_STORAGE_KEY));
   } catch {
-    return "en";
+    return DEFAULT_APP_LANGUAGE;
   }
 }
 

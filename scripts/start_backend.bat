@@ -1,5 +1,5 @@
 @echo off
-REM DeepTutor Backend Startup Script
+REM yFeiSTAI Backend Startup Script
 REM Activates virtual environment and starts the backend API server
 
 REM Move to the project root (this script lives in scripts/)
@@ -17,7 +17,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo Starting DeepTutor Backend Server...
+echo Starting yFeiSTAI Backend Server...
 echo Backend will be available at: http://localhost:8001
 echo Press Ctrl+C to stop the server.
 python -m deeptutor.api.run_server

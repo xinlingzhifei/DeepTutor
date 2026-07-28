@@ -3,7 +3,7 @@
 A trimmed-down take on nanobot's CronService (docs/ref/nanobot): same job
 semantics (``at`` / ``every`` / ``cron`` schedules, JSON persistence, run
 bookkeeping) without the multi-process file-lock/action-log machinery —
-DeepTutor runs one server process, so a single in-process scheduler owns
+yFeiSTAI runs one server process, so a single in-process scheduler owns
 the store.
 
 Jobs carry an *owner*: a chat session (the reply is appended to that
@@ -55,7 +55,7 @@ class CronOwner:
     user_id: str = ""  # chat: owning user
     is_admin: bool = True  # chat: scope restore
     session_id: str = ""  # chat: reply lands in this session
-    language: str = "en"
+    language: str = "zh"
     partner_id: str = ""  # partner: owning partner
     channel: str = ""  # partner: originating channel
     chat_id: str = ""  # partner: originating chat

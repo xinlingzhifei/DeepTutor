@@ -53,7 +53,7 @@ async def run_dedup(
     layer: str,
     key: str,
     *,
-    language: str = "en",
+    language: str = "zh",
     user_label: str = "anonymous",
     iterations: int | None = None,
     llm_selection: dict | None = None,

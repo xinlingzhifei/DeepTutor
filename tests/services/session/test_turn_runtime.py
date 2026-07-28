@@ -13,8 +13,18 @@ from deeptutor.services.session.turn_runtime import (
     _extract_persist_user_message,
     _format_followup_question_context,
     _narration_marker_call_id,
+    _normalize_response_language,
     _should_capture_assistant_content,
 )
+
+
+def test_response_language_defaults_to_chinese_and_preserves_english() -> None:
+    assert _normalize_response_language(None) == "zh"
+    assert _normalize_response_language("") == "zh"
+    assert _normalize_response_language("unsupported") == "zh"
+    assert _normalize_response_language("zh-CN") == "zh"
+    assert _normalize_response_language("en-US") == "en"
+
 
 # ---------------------------------------------------------------------------
 # _should_capture_assistant_content

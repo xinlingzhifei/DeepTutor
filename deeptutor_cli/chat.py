@@ -32,7 +32,7 @@ class ChatState:
     capability: str = "chat"
     tools: list[str] = field(default_factory=list)
     knowledge_bases: list[str] = field(default_factory=list)
-    language: str = "en"
+    language: str = "zh"
     notebook_references: list[dict[str, Any]] = field(default_factory=list)
     history_references: list[str] = field(default_factory=list)
     config: dict[str, Any] = field(default_factory=dict)
@@ -48,7 +48,7 @@ def register(app: typer.Typer) -> None:
         kb: list[str] = typer.Option([], "--kb", help="Pre-attach knowledge base(s)."),
         notebook_ref: list[str] = typer.Option([], "--notebook-ref", help="Notebook references."),
         history_ref: list[str] = typer.Option([], "--history-ref", help="Referenced session ids."),
-        language: str = typer.Option("en", "--language", "-l", help="Response language."),
+        language: str = typer.Option("zh", "--language", "-l", help="Response language."),
         config: list[str] = typer.Option([], "--config", help="Initial config key=value."),
         config_json: str | None = typer.Option(
             None, "--config-json", help="Initial config as JSON."
@@ -107,7 +107,7 @@ async def _chat_repl(state: ChatState) -> None:
 
     console.print(
         Panel(
-            "[bold]DeepTutor CLI[/]\n"
+            "[bold]yFeiSTAI CLI[/]\n"
             "Type a message to chat. Ctrl-C interrupts a running turn. Commands:\n"
             "  /quit  /session  /status  /new  /clear\n"
             "  /regenerate (alias /retry) — re-run the last user message\n"

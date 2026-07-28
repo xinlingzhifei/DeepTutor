@@ -161,7 +161,7 @@ class RunManager:
         mode: RunMode,
         runner: Callable[[Callable[[dict[str, Any]], Awaitable[None]]], Awaitable[None]],
         params: dict[str, Any] | None = None,
-        language: str = "en",
+        language: str = "zh",
         user_label: str = "anonymous",
     ) -> Run:
         """Register and kick off a new run.

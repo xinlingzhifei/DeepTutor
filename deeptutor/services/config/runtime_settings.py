@@ -121,7 +121,7 @@ _DEFAULT_MINERU_ENGINE: dict[str, Any] = {
     "api_token": "",
     # Optional explicit path to a local MinerU executable. Empty = auto-detect
     # from PATH. Lets users install MinerU in an isolated env (uv tool / pipx /
-    # separate conda) so its heavy deps never conflict with DeepTutor's.
+    # separate conda) so its heavy deps never conflict with yFeiSTAI's.
     "local_cli_path": "",
     # Where local-mode model weights download from. ``model_download_endpoint``
     # is a custom HuggingFace mirror (HF_ENDPOINT, e.g. https://hf-mirror.com);
@@ -147,7 +147,7 @@ _DEFAULT_DOCLING_ENGINE: dict[str, Any] = {
 }
 
 # markitdown engine slice. Pure-Python, no model downloads. Optionally uses
-# DeepTutor's VLM to describe images.
+# yFeiSTAI's VLM to describe images.
 _DEFAULT_MARKITDOWN_ENGINE: dict[str, Any] = {
     "enable_llm_image_description": False,
 }
@@ -163,7 +163,7 @@ _DEFAULT_PYMUPDF4LLM_ENGINE: dict[str, Any] = {
 }
 
 # Built-in text-only engine slice. It deliberately has no knobs: it reuses
-# DeepTutor's legacy text extractors for PDF / Office / text-like files.
+# yFeiSTAI's legacy text extractors for PDF / Office / text-like files.
 _DEFAULT_TEXT_ONLY_ENGINE: dict[str, Any] = {}
 
 # Legacy flat keys that mark a v1 ``mineru.json`` (these live only at the top

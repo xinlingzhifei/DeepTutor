@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { ShieldCheck } from "lucide-react";
+import { useTranslation } from "react-i18next";
 import { useAuthStatus } from "@/hooks/useAuthStatus";
 
 interface AdminLinkProps {
@@ -10,6 +11,7 @@ interface AdminLinkProps {
 }
 
 export function AdminLink({ collapsed = false }: AdminLinkProps) {
+  const { t } = useTranslation();
   const pathname = usePathname();
   const { enabled, isAdmin } = useAuthStatus();
 
@@ -27,8 +29,8 @@ export function AdminLink({ collapsed = false }: AdminLinkProps) {
               ? "bg-[var(--primary)]/10 text-[var(--primary)]"
               : "text-[var(--muted-foreground)] hover:bg-[var(--background)]/50 hover:text-[var(--foreground)]"
           }`}
-        aria-label="Admin"
-        title="Admin — User Management"
+        aria-label={t("Admin")}
+        title={t("Admin — User Management")}
       >
         <ShieldCheck size={16} strokeWidth={1.5} />
       </Link>
@@ -46,7 +48,7 @@ export function AdminLink({ collapsed = false }: AdminLinkProps) {
         }`}
     >
       <ShieldCheck size={16} strokeWidth={1.5} />
-      <span>Admin</span>
+      <span>{t("Admin")}</span>
     </Link>
   );
 }

@@ -21,7 +21,7 @@ const fontSerif = Lora({
 });
 
 export const metadata: Metadata = {
-  title: "DeepTutor",
+  title: "yFeiSTAI",
   description: "Agent-native intelligent learning companion",
   icons: {
     icon: [
@@ -39,7 +39,7 @@ export default function RootLayout({
 }>) {
   return (
     <html
-      lang="en"
+      lang="zh"
       suppressHydrationWarning
       data-scroll-behavior="smooth"
       className={`${fontSans.variable} ${fontSerif.variable}`}

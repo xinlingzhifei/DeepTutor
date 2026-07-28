@@ -51,7 +51,7 @@ class ConsolidateResult:
 async def consolidate_l2(
     surface: Surface,
     *,
-    language: str = "en",
+    language: str = "zh",
     user_label: str = "anonymous",
     on_event: OnEvent | None = None,
     apply_ops: bool = True,
@@ -71,7 +71,7 @@ async def consolidate_l2(
 async def consolidate_l3(
     slot: L3Slot,
     *,
-    language: str = "en",
+    language: str = "zh",
     user_label: str = "anonymous",
     on_event: OnEvent | None = None,
     apply_ops: bool = True,

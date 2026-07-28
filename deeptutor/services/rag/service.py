@@ -25,7 +25,7 @@ class RAGService:
 
     The provider is resolved per knowledge base: an explicit ``provider`` passed
     to the constructor wins (used at create time); otherwise it is read from
-    DeepTutor's authoritative KB config, with metadata as a legacy fallback.
+    yFeiSTAI's authoritative KB config, with metadata as a legacy fallback.
     """
 
     def __init__(
@@ -55,7 +55,7 @@ class RAGService:
         self._pipelines: dict[str, Any] = {}
 
     def _resolve_provider(self, kb_name: Optional[str]) -> str:
-        """Pick the provider for ``kb_name`` from DeepTutor's binding."""
+        """Pick the provider for ``kb_name`` from yFeiSTAI's binding."""
         if self._provider_override:
             return self._provider_override
         return resolve_bound_provider(self.kb_base_dir, kb_name)

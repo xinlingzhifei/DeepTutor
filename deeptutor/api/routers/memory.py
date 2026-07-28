@@ -231,7 +231,7 @@ class RunStartRequest(BaseModel):
     layer: str
     key: str
     mode: Literal["update", "audit", "dedup", "merge"]
-    language: str = "en"
+    language: str = "zh"
     budget: int | None = None
     iterations: int | None = None
     llm_selection: LLMSelectionPayload | None = None
@@ -509,19 +509,19 @@ def _legacy_run_stream(req: RunStartRequest) -> StreamingResponse:
 
 
 class UpdateRequest(BaseModel):
-    language: str = "en"
+    language: str = "zh"
     budget: int | None = None
     llm_selection: LLMSelectionPayload | None = None
 
 
 class AuditRequest(BaseModel):
-    language: str = "en"
+    language: str = "zh"
     budget: int | None = None
     llm_selection: LLMSelectionPayload | None = None
 
 
 class DedupRequest(BaseModel):
-    language: str = "en"
+    language: str = "zh"
     iterations: int | None = None
     llm_selection: LLMSelectionPayload | None = None
 
@@ -534,7 +534,7 @@ async def update_doc(layer: str, key: str, payload: UpdateRequest | None = None)
         layer=lyr,
         key=key,
         mode="update",
-        language=(payload.language if payload else "en") or "en",
+        language=(payload.language if payload else "zh") or "zh",
         budget=payload.budget if payload else None,
         llm_selection=payload.llm_selection if payload else None,
     )
@@ -549,7 +549,7 @@ async def audit_doc(layer: str, key: str, payload: AuditRequest | None = None):
         layer=lyr,
         key=key,
         mode="audit",
-        language=(payload.language if payload else "en") or "en",
+        language=(payload.language if payload else "zh") or "zh",
         budget=payload.budget if payload else None,
         llm_selection=payload.llm_selection if payload else None,
     )
@@ -564,7 +564,7 @@ async def dedup_doc(layer: str, key: str, payload: DedupRequest | None = None):
         layer=lyr,
         key=key,
         mode="dedup",
-        language=(payload.language if payload else "en") or "en",
+        language=(payload.language if payload else "zh") or "zh",
         iterations=payload.iterations if payload else None,
         llm_selection=payload.llm_selection if payload else None,
     )

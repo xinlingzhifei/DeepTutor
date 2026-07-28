@@ -88,7 +88,7 @@ class ContextExplorer:
     """Investigate the turn's attached sources and return an objective briefing."""
 
     def __init__(self, *, language: str, prompts: dict[str, Any]) -> None:
-        self.language = "zh" if str(language or "en").lower().startswith("zh") else "en"
+        self.language = "en" if str(language or "zh").lower().startswith("en") else "zh"
         self._prompts = prompts or {}
         cfg = get_llm_config()
         self.model = getattr(cfg, "model", None)

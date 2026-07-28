@@ -427,7 +427,7 @@ function MarkItDownPanel({
       <SettingRow
         title={t("Describe images with the vision model")}
         description={t(
-          "Reserved — uses DeepTutor's vision model to caption images during conversion.",
+          "Reserved — uses yFeiSTAI's vision model to caption images during conversion.",
         )}
         control={
           <Toggle

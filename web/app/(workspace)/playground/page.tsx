@@ -1807,7 +1807,7 @@ export default function PlaygroundPage() {
           </h1>
           <p className="mt-1 text-[13px] text-[var(--muted-foreground)]">
             {t(
-              "Explore the building blocks of DeepTutor: reusable tools and higher-level capabilities.",
+              "Explore the building blocks of yFeiSTAI: reusable tools and higher-level capabilities.",
             )}
           </p>
         </div>

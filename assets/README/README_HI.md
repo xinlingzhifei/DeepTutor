@@ -1,17 +1,17 @@
 <div align="center">
 
-<p align="center"><img src="../../assets/figs/logo/logo.png" alt="DeepTutor logo" height="56" style="vertical-align: middle;">&nbsp;<img src="../../assets/figs/logo/banner.png" alt="DeepTutor" height="48" style="vertical-align: middle;"></p>
+<p align="center"><img src="../../assets/figs/logo/logo.png" alt="yFeiSTAI logo" height="56" style="vertical-align: middle;">&nbsp;<img src="../../assets/figs/logo/banner.png" alt="yFeiSTAI" height="48" style="vertical-align: middle;"></p>
 
-# DeepTutor: लाइफलॉन्ग व्यक्तिगत ट्यूटरिंग
+# yFeiSTAI: लाइफलॉन्ग व्यक्तिगत ट्यूटरिंग
 
 <p align="center">
   <a href="https://deeptutor.info" target="_blank"><img alt="Docs — deeptutor.info" src="https://img.shields.io/badge/Docs-deeptutor.info%20%E2%86%97-0A0A0A?style=for-the-badge&labelColor=F5F5F4" height="36"></a>
 </p>
 
 <p align="center">
-  <a href="https://trendshift.io/repositories/17099?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-17099" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/17099" alt="HKUDS%2FDeepTutor | Trendshift" width="250" height="55"/></a>&nbsp;
-  <a href="https://trendshift.io/repositories/17099?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-17099" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/17099/daily" alt="HKUDS%2FDeepTutor | Trendshift" width="250" height="55"/></a>&nbsp;
-  <a href="https://trendshift.io/repositories/17099?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-17099" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/17099/weekly?language=Python" alt="HKUDS%2FDeepTutor | Trendshift" width="250" height="55"/></a>
+  <a href="https://trendshift.io/repositories/17099?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-17099" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/17099" alt="yFeiSTAI | Trendshift" width="250" height="55"/></a>&nbsp;
+  <a href="https://trendshift.io/repositories/17099?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-17099" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/17099/daily" alt="yFeiSTAI | Trendshift" width="250" height="55"/></a>&nbsp;
+  <a href="https://trendshift.io/repositories/17099?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-17099" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/17099/weekly?language=Python" alt="yFeiSTAI | Trendshift" width="250" height="55"/></a>
 </p>
 
 <p align="center">
@@ -50,14 +50,14 @@
 
 - **2026-05-22** 🌐 आधिकारिक डॉक्स साइट [**deeptutor.info**](https://deeptutor.info/) पर live — guides, references, और capability tours एक ही जगह।
 - **2026-04-19** 🎉 111 दिनों में 20k स्टार्स! सच्ची व्यक्तिगत, बुद्धिमान ट्यूटरिंग की दिशा में आपके अविश्वसनीय समर्थन के लिए धन्यवाद।
-- **2026-04-10** 📄 हमारा paper अब arXiv पर live है — DeepTutor के design और विचारों के लिए [preprint](https://arxiv.org/abs/2604.26962) पढ़ें।
+- **2026-04-10** 📄 हमारा paper अब arXiv पर live है — yFeiSTAI के design और विचारों के लिए [preprint](https://arxiv.org/abs/2604.26962) पढ़ें।
 - **2026-02-06** 🚀 39 दिनों में 10k स्टार्स! हमारे अविश्वसनीय community के समर्थन के लिए बहुत धन्यवाद।
-- **2026-01-01** 🎊 नया साल मुबारक! हमारे [Discord](https://discord.gg/eRsjPgMU4t), [WeChat](https://github.com/HKUDS/DeepTutor/issues/78), या [Discussions](https://github.com/HKUDS/DeepTutor/discussions) से जुड़ें — आइए मिलकर DeepTutor को आकार दें।
-- **2025-12-29** 🎓 DeepTutor आधिकारिक रूप से जारी हुआ!
+- **2026-01-01** 🎊 नया साल मुबारक! हमारे [Discord](https://discord.gg/eRsjPgMU4t), [WeChat](https://github.com/HKUDS/DeepTutor/issues/78), या [Discussions](https://github.com/HKUDS/DeepTutor/discussions) से जुड़ें — आइए मिलकर yFeiSTAI को आकार दें।
+- **2025-12-29** 🎓 yFeiSTAI आधिकारिक रूप से जारी हुआ!
 
 ## ✨ मुख्य विशेषताएं
 
-DeepTutor एक agent-native learning workspace है जो tutoring, problem solving, quiz generation, research, visualization, और mastery practice को एक extensible system में जोड़ता है।
+yFeiSTAI एक agent-native learning workspace है जो tutoring, problem solving, quiz generation, research, visualization, और mastery practice को एक extensible system में जोड़ता है।
 
 - **हर मोड के लिए एक रनटाइम** — Chat, Quiz, Research, Visualize, Solve और Mastery Path एक ही agent loop पर चलते हैं, इसलिए आप objective बदलते हैं, engine नहीं, और context learner के साथ बना रहता है।
 - **जुड़ा हुआ लर्निंग कॉन्टेक्स्ट** — Knowledge bases, books, Co-Writer drafts, notebooks, question banks, personas, और Memory सभी workflows में उपलब्ध रहते हैं, isolated tools में बंद रहने की बजाय।
@@ -70,7 +70,7 @@ DeepTutor एक agent-native learning workspace है जो tutoring, problem
 
 ## 🚀 शुरू करें
 
-DeepTutor चार installation paths के साथ आता है। वे सभी एक workspace layout साझा करते हैं: settings उस directory के नीचे `data/user/settings/` में रहती हैं जहां से आप launch करते हैं (या `DEEPTUTOR_HOME` / `deeptutor start --home` के नीचे अगर आप explicitly set करते हैं)। पूरे app के लिए, recommended flow है **workspace directory चुनें → install करें → `deeptutor init` → `deeptutor start`**।
+yFeiSTAI चार installation paths के साथ आता है। वे सभी एक workspace layout साझा करते हैं: settings उस directory के नीचे `data/user/settings/` में रहती हैं जहां से आप launch करते हैं (या `DEEPTUTOR_HOME` / `deeptutor start --home` के नीचे अगर आप explicitly set करते हैं)। पूरे app के लिए, recommended flow है **workspace directory चुनें → install करें → `deeptutor init` → `deeptutor start`**।
 
 <details>
 <summary><b>Option 1 — PyPI से Install करें</b> · पूरा local Web app + CLI, clone की जरूरत नहीं</summary>
@@ -96,8 +96,8 @@ deeptutor start    # backend + frontend शुरू करता है; termin
 Checkout के विरुद्ध development के लिए। CI और Docker से match करने के लिए **Python 3.11–3.13** और **Node.js 22 LTS** उपयोग करें।
 
 ```bash
-git clone https://github.com/HKUDS/DeepTutor.git
-cd DeepTutor
+git clone https://github.com/HKUDS/DeepTutor.git yFeiSTAI
+cd yFeiSTAI
 
 # एक venv बनाएं (macOS/Linux). Windows PowerShell:
 #   py -3.11 -m venv .venv ; .\.venv\Scripts\Activate.ps1
@@ -186,7 +186,7 @@ docker run --rm --name deeptutor \
 }
 ```
 
-`next_public_api_base_external` (और इसका alias `public_api_base`) lower-precedence fallbacks के रूप में accept किए जाते हैं। CORS frontend **origins** उपयोग करता है, API URLs नहीं। Auth disabled होने पर, DeepTutor default रूप से normal HTTP/HTTPS browser origins permit करता है। Auth enabled होने पर, exact frontend origins add करें:
+`next_public_api_base_external` (और इसका alias `public_api_base`) lower-precedence fallbacks के रूप में accept किए जाते हैं। CORS frontend **origins** उपयोग करता है, API URLs नहीं। Auth disabled होने पर, yFeiSTAI default रूप से normal HTTP/HTTPS browser origins permit करता है। Auth enabled होने पर, exact frontend origins add करें:
 
 ```json
 {
@@ -229,8 +229,8 @@ Docker Desktop (macOS/Windows) आमतौर पर `--add-host` के बि
 जब आपको Web UI की जरूरत न हो। CLI-only package PyPI से नहीं, source checkout से install होता है।
 
 ```bash
-git clone https://github.com/HKUDS/DeepTutor.git
-cd DeepTutor
+git clone https://github.com/HKUDS/DeepTutor.git yFeiSTAI
+cd yFeiSTAI
 
 # एक venv बनाएं (macOS/Linux). Windows PowerShell:
 #   py -3.11 -m venv .venv-cli ; .\.venv-cli\Scripts\Activate.ps1
@@ -294,19 +294,19 @@ Project-root `.env` application config file के रूप में **नह�
 
 </details>
 
-## 📖 DeepTutor को एक्सप्लोर करें
+## 📖 yFeiSTAI को एक्सप्लोर करें
 
 दैनिक उपयोग की मुख्य surfaces से शुरू करें: Chat, Partners, My Agents, Co-Writer, Book, Knowledge Center, Learning Space, Memory, और Settings। फिर tour साझा, isolated workspaces के लिए Multi-User deployments को cover करता है।
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/OVERVIEW.png" alt="DeepTutor home — sidebar में हर surface के साथ Chat workspace" width="900">
+<img src="../../assets/figs/web-1.4.6+/OVERVIEW.png" alt="yFeiSTAI home — sidebar में हर surface के साथ Chat workspace" width="900">
 </div>
 
 <details>
 <summary><b>🏗️ System architecture</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/system/system%20architecture.png" alt="DeepTutor system architecture" width="900">
+<img src="../../assets/figs/system/system%20architecture.png" alt="yFeiSTAI system architecture" width="900">
 </div>
 
 </details>
@@ -317,13 +317,13 @@ Project-root `.env` application config file के रूप में **नह�
 Chat default capability है और जहां से अधिकांश काम शुरू होता है। एक single thread normally बात कर सकता है, tools call कर सकता है, selected knowledge bases में खुद को ground कर सकता है, attachments पढ़ सकता है, images generate कर सकता है, subagents से consult कर सकता है, notebook records लिख सकता है, और turns के पार same context के साथ जारी रह सकता है।
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/home/00-overview.png" alt="DeepTutor chat workspace" width="900">
+<img src="../../assets/figs/web-1.4.6+/home/00-overview.png" alt="yFeiSTAI chat workspace" width="900">
 </div>
 
 Loop जानबूझकर simple है: model rounds में सोचता है, जब उपयोगी हो tools call करता है, results observe करता है, और tool-free message के साथ finish करता है। `ask_user` special है — guess करने की बजाय, agent turn pause कर सकता है, एक structured clarifying question पूछ सकता है, और आपके जवाब देने के बाद resume कर सकता है।
 
 <div align="center">
-<img src="../../assets/figs/system/chat-agent-loop.png" alt="DeepTutor chat agent loop" width="900">
+<img src="../../assets/figs/system/chat-agent-loop.png" alt="yFeiSTAI chat agent loop" width="900">
 </div>
 
 User-toggleable tools हैं `brainstorm`, `web_search`, `paper_search`, `reason`, और `geogebra_analysis` — साथ ही `imagegen` और `videogen` जब आप matching generation model configure करें। Contextual tools जैसे `rag`, `read_source`, `read_memory`, `write_memory`, `read_skill`, `load_tools`, `exec`, `web_fetch`, `ask_user`, `list_notebook`, `write_note`, `github`, और `consult_subagent` तब automatically mount होते हैं जब turn के पास सही context हो।
@@ -338,13 +338,13 @@ Chat deeper capabilities के लिए launch point भी है: **Quiz** q
 <summary><b>🤝 Partner — Same Brain पर Persistent Companions</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/partners/00-partners%20overview.png" alt="DeepTutor partners workspace" width="900">
+<img src="../../assets/figs/web-1.4.6+/partners/00-partners%20overview.png" alt="yFeiSTAI partners workspace" width="900">
 </div>
 
 Partners अपनी soul, model policy, library, memory, और channels वाले persistent companions हैं। वे एक अलग bot engine नहीं हैं: हर inbound web या IM message partner-scoped workspace के अंदर एक normal `ChatOrchestrator` turn बन जाता है। एक partner "एक chat है जिसकी personality और phone number है।"
 
 <div align="center">
-<img src="../../assets/figs/system/partners-architecture.png" alt="DeepTutor partners architecture" width="900">
+<img src="../../assets/figs/system/partners-architecture.png" alt="yFeiSTAI partners architecture" width="900">
 </div>
 
 हर partner के पास एक `SOUL.md`, model selection, channels, tool policy, और assigned library है। Knowledge bases, skills, और notebooks `data/partners/<id>/workspace/` में copy होते हैं, इसलिए same RAG, skill, notebook, और memory tools special cases के बिना काम करते हैं। एक partner अपने owner की memory पढ़ता है लेकिन केवल अपनी memory में लिखता है।
@@ -361,16 +361,16 @@ Channel layer schema-driven है और installed extras और configured cre
 <summary><b>🧑‍🚀 My Agents — दूसरे Agents को Consult और Import करें</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/myagents/00-overview.png" alt="DeepTutor My Agents workspace" width="900">
+<img src="../../assets/figs/web-1.4.6+/myagents/00-overview.png" alt="yFeiSTAI My Agents workspace" width="900">
 </div>
 
-My Agents दूसरे agents को DeepTutor के लिए context बनाता है, और दो अलग काम करता है। **लाइव एजेंट connect करें** — आपकी machine पर एक Claude Code, Codex, Gemini, Kimi, opencode, या MiMo Code CLI, या आपके Partners में से एक — और इसे chat turn के अंदर से consult करें: DeepTutor actually दूसरे agent को *run* करता है और इसके काम को `consult_subagent` tool के जरिए Activity panel में stream करता है। इसे Agent chip से select करें (या `@` type करें), और set करें कि consult कितने rounds ले सकता है।
+My Agents दूसरे agents को yFeiSTAI के लिए context बनाता है, और दो अलग काम करता है। **लाइव एजेंट connect करें** — आपकी machine पर एक Claude Code, Codex, Gemini, Kimi, opencode, या MiMo Code CLI, या आपके Partners में से एक — और इसे chat turn के अंदर से consult करें: yFeiSTAI actually दूसरे agent को *run* करता है और इसके काम को `consult_subagent` tool के जरिए Activity panel में stream करता है। इसे Agent chip से select करें (या `@` type करें), और set करें कि consult कितने rounds ले सकता है।
 
 <div align="center">
 <img src="../../assets/figs/web-1.4.6+/home/08-subagent%20demo%20with%20claude%20code.png" alt="Claude Code subagent को live consult करना" width="900">
 </div>
 
-**पिछली conversations import करें** — अपनी existing Claude Code और Codex history को named, searchable, resumable agents के रूप में bring in करें। Import करने के लिए कौन से days लेने हैं चुनें; refreshing उन्हें re-sync करता है। किसी भी chat turn से imported conversation को `+` → My Agents के जरिए reference करें, और DeepTutor इसे एक third-party transcript के रूप में पढ़ता है — यह उनकी conversation रहती है, DeepTutor की अपनी आवाज नहीं।
+**पिछली conversations import करें** — अपनी existing Claude Code और Codex history को named, searchable, resumable agents के रूप में bring in करें। Import करने के लिए कौन से days लेने हैं चुनें; refreshing उन्हें re-sync करता है। किसी भी chat turn से imported conversation को `+` → My Agents के जरिए reference करें, और yFeiSTAI इसे एक third-party transcript के रूप में पढ़ता है — यह उनकी conversation रहती है, yFeiSTAI की अपनी आवाज नहीं।
 
 </details>
 
@@ -378,7 +378,7 @@ My Agents दूसरे agents को DeepTutor के लिए context ब�
 <summary><b>✍️ Co-Writer — Selection-Aware Markdown Drafting</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/co-writer/00-overview.png" alt="DeepTutor Co-Writer workspace" width="900">
+<img src="../../assets/figs/web-1.4.6+/co-writer/00-overview.png" alt="yFeiSTAI Co-Writer workspace" width="900">
 </div>
 
 Co-Writer reports, tutorials, notes, और long-form learning artifacts के लिए एक split-view Markdown workspace है। Documents autosave होते हैं और live preview render करते हैं (KaTeX math, diagram fences), और जब draft reusable context बन जाए तो notebooks में save किए जा सकते हैं।
@@ -387,7 +387,7 @@ Co-Writer reports, tutorials, notes, और long-form learning artifacts के 
 <img src="../../assets/figs/web-1.4.6+/co-writer/01-edit%20panel.png" alt="Co-Writer editor with live preview" width="900">
 </div>
 
-इसका defining idea **surgical editing** है: एक span select करें और DeepTutor से rewrite, expand, या shorten करने के लिए कहें। Edit agent change को एक knowledge base या web evidence में ground कर सकता है, अपने tool calls का trace रखता है, और हर change को accept/reject diff के रूप में दिखाता है — इसलिए कुछ भी land नहीं होता जब तक आप approve नहीं करते।
+इसका defining idea **surgical editing** है: एक span select करें और yFeiSTAI से rewrite, expand, या shorten करने के लिए कहें। Edit agent change को एक knowledge base या web evidence में ground कर सकता है, अपने tool calls का trace रखता है, और हर change को accept/reject diff के रूप में दिखाता है — इसलिए कुछ भी land नहीं होता जब तक आप approve नहीं करते।
 
 </details>
 
@@ -395,7 +395,7 @@ Co-Writer reports, tutorials, notes, और long-form learning artifacts के 
 <summary><b>📖 Book — आपकी सामग्री से Living Books</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/book/00-book_overview.png" alt="DeepTutor book library" width="900">
+<img src="../../assets/figs/web-1.4.6+/book/00-book_overview.png" alt="yFeiSTAI book library" width="900">
 </div>
 
 Book selected sources को एक interactive **living book** में बदलता है — एक static PDF नहीं, बल्कि typed blocks से बना एक reading environment। एक book knowledge bases, notebooks, question banks, या chat history से शुरू हो सकती है; creation flow content generate होने से पहले एक chapter outline propose करता है, इसलिए आप blind one-shot output accept करने की बजाय shape review करते हैं।
@@ -416,7 +416,7 @@ Book selected sources को एक interactive **living book** में बद
 <summary><b>📚 Knowledge Center — Multi-Engine RAG Libraries</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/knowledge/00-overview.png" alt="DeepTutor Knowledge Center" width="900">
+<img src="../../assets/figs/web-1.4.6+/knowledge/00-overview.png" alt="yFeiSTAI Knowledge Center" width="900">
 </div>
 
 Knowledge bases RAG के पीछे document collections हैं — वे Chat turns, Co-Writer edits, Book generation, और Partner conversations को ground करते हैं। जो distinctive है वह है **retrieval engines का choice**: **LlamaIndex** (default, local vector + BM25), **PageIndex** (hosted, reasoning retrieval with page-level citations), **GraphRAG** और **LightRAG** (knowledge-graph retrieval), **LightRAG Server** (retrieval एक external LightRAG instance पर offload किया जाता है जिसे आप HTTP पर connect करते हैं), या एक linked **Obsidian** vault जिसे tutor in-place पढ़ता और लिखता है। हर KB एक engine से bound होती है।
@@ -433,7 +433,7 @@ KB बनाते समय, आप either **नया create** करते �
 <summary><b>🌐 Learning Space — Skills, Personas, और Reusable Context</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/learning-space/00-overview.png" alt="DeepTutor Learning Space hub" width="900">
+<img src="../../assets/figs/web-1.4.6+/learning-space/00-overview.png" alt="yFeiSTAI Learning Space hub" width="900">
 </div>
 
 Learning Space library और personalization layer है — वह जगह जहां persist होने वाली चीजें रहती हैं। **Conversations & Materials** में आपका chat history, notebooks, और एक question bank है (हर saved question आपका जवाब, reference answer, और एक explanation रखता है)। **Personalization** में mastery paths, personas (behavior presets जैसे *peer*, *research-assistant*, *teacher*), और skills (`SKILL.md` playbooks जिन्हें model on-demand पढ़ता है) हैं। यहां सब कुछ Chat, Partners, Co-Writer, और Book से reuse किया जा सकता है।
@@ -450,13 +450,13 @@ Learning Space library और personalization layer है — वह जगह 
 <summary><b>🧠 Memory — Inspectable Personalization</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/memory/00-overview.png" alt="DeepTutor memory overview" width="900">
+<img src="../../assets/figs/web-1.4.6+/memory/00-overview.png" alt="yFeiSTAI memory overview" width="900">
 </div>
 
 Memory एक file-backed, three-layer system है जिसे आप पढ़, curate, और audit कर सकते हैं — जानबूझकर एक hidden vector store नहीं। **L1** workspace mirror plus एक append-only event trace (`trace/<surface>/<date>.jsonl`) है; **L2** per-surface curated facts (`L2/<surface>.md`) है; **L3** cross-surface synthesis (`L3/<profile|recent|scope|preferences>.md`) है। क्योंकि L2 L1 cite करता है और L3 L2 cite करता है, आपके profile में कुछ भी unaccountable नहीं है।
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/memory/01-3%20layer%20memory%20graph.png" alt="DeepTutor memory graph" width="900">
+<img src="../../assets/figs/web-1.4.6+/memory/01-3%20layer%20memory%20graph.png" alt="yFeiSTAI memory graph" width="900">
 </div>
 
 Memory Graph पूरा pyramid दिखाता है — L3 synthesis centre में, L2 middle ring में, L1 traces outside में — इसलिए आप किसी भी synthesized claim को उसके पीछे exact raw event तक trace कर सकते हैं। Memory `chat`, `notebook`, `quiz`, `kb`, `book`, partner, और `cowriter` surfaces पर track किया जाता है; consolidator के Update / Audit / Dedup budgets **Settings → Memory** में tune किए जाते हैं।
@@ -467,13 +467,13 @@ Memory Graph पूरा pyramid दिखाता है — L3 synthesis cen
 <summary><b>⚙️ Settings — एक Control Plane</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/settings/00-setting%20overview.png" alt="DeepTutor settings hub" width="900">
+<img src="../../assets/figs/web-1.4.6+/settings/00-setting%20overview.png" alt="yFeiSTAI settings hub" width="900">
 </div>
 
 Settings operational control plane है, एक live status strip (Backend, LLM, Embedding, Search) और प्रत्येक area के लिए एक card के साथ: **Appearance** (theme, UI language, code-block styling), **Network** (API base, ports, CORS), **Models** (LLM, Embedding, Search, Text-to-Speech, Speech-to-Text, Image Generation, Video Generation), **Knowledge Base** (document parsing engine), **Chat** (tools, MCP servers, per-capability parameters, attachment caps), **Partners & Agents** (वे subagents जिन्हें आप turn से consult कर सकते हैं), और **Memory** (consolidator के budgets)।
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/settings/01-appearance%20settings.png" alt="DeepTutor appearance settings and themes" width="900">
+<img src="../../assets/figs/web-1.4.6+/settings/01-appearance%20settings.png" alt="yFeiSTAI appearance settings and themes" width="900">
 </div>
 
 अधिकांश sections एक draft-and-apply flow उपयोग करते हैं, इसलिए आप provider को commit करने से पहले test कर सकते हैं। चार themes box में आते हैं — Default, Cream, Dark, और Glass। Project-root `.env` files जानबूझकर ignored हैं; runtime configuration `data/user/settings/*.json` के नीचे रहती है जब तक कि `DEEPTUTOR_HOME` या `deeptutor start --home` app को कहीं और point न करे।
@@ -483,7 +483,7 @@ Settings operational control plane है, एक live status strip (Backend, LL
 <details>
 <summary><b>👥 Multi-User — Shared Deployments</b> · optional auth, isolated per-user workspaces</summary>
 
-Authentication **default रूप से बंद** है — DeepTutor single-user चलता है। इसे on करें और एक `data/` tree एक admin workspace, isolated per-user workspaces, और partner workspaces को side by side host करती है:
+Authentication **default रूप से बंद** है — yFeiSTAI single-user चलता है। इसे on करें और एक `data/` tree एक admin workspace, isolated per-user workspaces, और partner workspaces को side by side host करती है:
 
 ```text
 data/
@@ -501,9 +501,9 @@ data/
 
 </details>
 
-## ⌨️ DeepTutor CLI — एजेंट-नेटिव इंटरफेस
+## ⌨️ yFeiSTAI CLI — एजेंट-नेटिव इंटरफेस
 
-एक `deeptutor` binary, दो तरीके से: terminal में रहने वालों के लिए interactive **REPL**, और DeepTutor को tool के रूप में drive करने वाले दूसरे agents के लिए structured **JSON**। दोनों तरफ same capabilities, tools, और knowledge bases।
+एक `deeptutor` binary, दो तरीके से: terminal में रहने वालों के लिए interactive **REPL**, और yFeiSTAI को tool के रूप में drive करने वाले दूसरे agents के लिए structured **JSON**। दोनों तरफ same capabilities, tools, और knowledge bases।
 
 <details>
 <summary><b>खुद drive करें</b></summary>
@@ -525,7 +525,7 @@ Web app जो कुछ भी करता है वह यहां भी �
 <details>
 <summary><b>किसी agent को drive करने दें</b></summary>
 
-DeepTutor *दूसरे agent द्वारा operated* होने के लिए built है। किसी भी `run` में `--format json` add करें और हर turn **NDJSON — एक event per line** stream करता है (`content`, `tool_call`, `tool_result`, `done`, …), हर line `session_id` के साथ tagged। Runs headless-safe हैं: बिना TTY के `ask_user` pause automatically empty reply से resolve होता है बजाय hang करने के।
+yFeiSTAI *दूसरे agent द्वारा operated* होने के लिए built है। किसी भी `run` में `--format json` add करें और हर turn **NDJSON — एक event per line** stream करता है (`content`, `tool_call`, `tool_result`, `done`, …), हर line `session_id` के साथ tagged। Runs headless-safe हैं: बिना TTY के `ask_user` pause automatically empty reply से resolve होता है बजाय hang करने के।
 
 ```bash
 # One shot, machine-readable
@@ -580,12 +580,12 @@ python -m pip install -e ./packaging/deeptutor-cli
 
 ## 🧩 इकोसिस्टम — EduHub और Skills Community
 
-DeepTutor skills open **Agent-Skills** format उपयोग करती हैं — एक `SKILL.md` playbook (YAML frontmatter + Markdown) और optional reference files के साथ एक folder। इसमें DeepTutor-specific कुछ नहीं है, इसलिए format बोलने वाली कोई भी registry आपकी library के लिए एक source बन जाती है। DeepTutor **[EduHub](https://eduhub.deeptutor.info/)** के साथ ship होता है — हमारी अपनी education-focused skill registry — default hub के रूप में built in।
+yFeiSTAI skills open **Agent-Skills** format उपयोग करती हैं — एक `SKILL.md` playbook (YAML frontmatter + Markdown) और optional reference files के साथ एक folder। इसमें yFeiSTAI-specific कुछ नहीं है, इसलिए format बोलने वाली कोई भी registry आपकी library के लिए एक source बन जाती है। yFeiSTAI **[EduHub](https://eduhub.deeptutor.info/)** के साथ ship होता है — हमारी अपनी education-focused skill registry — default hub के रूप में built in।
 
 <details>
-<summary><b>EduHub — DeepTutor का skill ecosystem</b></summary>
+<summary><b>EduHub — yFeiSTAI का skill ecosystem</b></summary>
 
-[**EduHub**](https://eduhub.deeptutor.info/) वह community hub है जिसे DeepTutor ने teaching-oriented agent skills share करने के लिए launch किया — Socratic tutors, flashcard builders, essay feedback, exam blueprints, concept explainers, और बहुत कुछ। यह DeepTutor में built in है, इसलिए configure करने की कोई जरूरत नहीं: एक bare slug या `eduhub:` prefix इसे resolve करता है।
+[**EduHub**](https://eduhub.deeptutor.info/) वह community hub है जिसे yFeiSTAI ने teaching-oriented agent skills share करने के लिए launch किया — Socratic tutors, flashcard builders, essay feedback, exam blueprints, concept explainers, और बहुत कुछ। यह yFeiSTAI में built in है, इसलिए configure करने की कोई जरूरत नहीं: एक bare slug या `eduhub:` prefix इसे resolve करता है।
 
 **ढूंढें और install करें** — browser में, catalog browse करने और directly आपकी library में skill download करने के लिए **Learning Space → Skills → Import from EduHub** खोलें। Terminal से:
 
@@ -604,7 +604,7 @@ deeptutor skill publish ./my-skill                    # interactive: track + tag
 deeptutor skill update                                # roll back या नया version release करें
 ```
 
-EduHub एक standalone, ClawHub-compatible registry भी है, इसलिए DeepTutor नहीं होने वाले agents (Claude Code, Codex, …) इसे `eduhub` CLI के जरिए directly use कर सकते हैं — `npx eduhub install socratic-tutor`।
+EduHub एक standalone, ClawHub-compatible registry भी है, इसलिए yFeiSTAI नहीं होने वाले agents (Claude Code, Codex, …) इसे `eduhub` CLI के जरिए directly use कर सकते हैं — `npx eduhub install socratic-tutor`।
 
 </details>
 
@@ -615,7 +615,7 @@ Source चाहे जो भी हो, हर import आपके workspace �
 
 - registry का **security verdict** पहले check होता है — flagged packages refuse किए जाते हैं जब तक आप `--allow-unverified` pass नहीं करते;
 - archives defensively extract होते हैं (zip-slip / zip-bomb guards) text/script **suffix whitelist** के पीछे, इसलिए binaries workspace में कभी नहीं आते;
-- frontmatter DeepTutor के schema में normalize होता है और `always:` **stripped** होता है, इसलिए एक downloaded skill खुद को हर system prompt में force नहीं कर सकती;
+- frontmatter yFeiSTAI के schema में normalize होता है और `always:` **stripped** होता है, इसलिए एक downloaded skill खुद को हर system prompt में force नहीं कर सकती;
 - provenance — hub, version, verdict, और install time — audits और updates के लिए `.hub-lock.json` में लिखा जाता है।
 
 Multi-user deployments में, installing admin-only है: एक नई skill admin catalog में land करती है और दूसरे users को invisible रहती है जब तक grant assign नहीं करता, इसलिए admin इसे roll out करने से पहले vet कर सकता है।
@@ -625,7 +625,7 @@ Multi-user deployments में, installing admin-only है: एक नई sk
 <details>
 <summary><b>ClawHub के साथ भी compatible</b></summary>
 
-क्योंकि DeepTutor open Agent-Skills format बोलता है, **[ClawHub](https://clawhub.ai/)** भी एक first-class source है — यह EduHub के साथ built in है। इसे hub prefix से चुनें:
+क्योंकि yFeiSTAI open Agent-Skills format बोलता है, **[ClawHub](https://clawhub.ai/)** भी एक first-class source है — यह EduHub के साथ built in है। इसे hub prefix से चुनें:
 
 ```bash
 deeptutor skill search "git release notes" --hub clawhub
@@ -640,13 +640,13 @@ deeptutor skill install clawhub:git-release-notes@1.0.1
 
 ### 📮 संपर्क
 
-DeepTutor [HKUDS](https://github.com/HKUDS) Group के अंदर [Bingxi Zhao](https://github.com/pancacake) द्वारा lead किया जाने वाला एक open-source project है, और यह **पूरी तरह open-source रूप में**, community के साथ मिलकर बनाया जाता है। अब तक, हमारे पास किसी भी प्रकार के **paid online products नहीं** हैं। discussions, ideas, या collaboration के लिए **bingxizhao39@gmail.com** पर contact करें।
+yFeiSTAI [HKUDS](https://github.com/HKUDS) Group के अंदर [Bingxi Zhao](https://github.com/pancacake) द्वारा lead किया जाने वाला एक open-source project है, और यह **पूरी तरह open-source रूप में**, community के साथ मिलकर बनाया जाता है। अब तक, हमारे पास किसी भी प्रकार के **paid online products नहीं** हैं। discussions, ideas, या collaboration के लिए **bingxizhao39@gmail.com** पर contact करें।
 
 ### 🙏 आभार
 
-[**Chao Huang**](https://sites.google.com/view/chaoh), Data Intelligence Lab @ HKU के director, और उनके warm support के लिए हमारे HKUDS labmates — विशेष रूप से [**Jiahao Zhang**](https://github.com/zzhtx258), [**Zirui Guo**](https://github.com/LarFii), और [**Xubin Ren**](https://github.com/Re-bin) — के प्रति हार्दिक आभार। हम **open-source community** के प्रति भी गहराई से आभारी हैं: आपके stars, issues, pull requests, और discussions हर एक दिन DeepTutor को आकार देते हैं।
+[**Chao Huang**](https://sites.google.com/view/chaoh), Data Intelligence Lab @ HKU के director, और उनके warm support के लिए हमारे HKUDS labmates — विशेष रूप से [**Jiahao Zhang**](https://github.com/zzhtx258), [**Zirui Guo**](https://github.com/LarFii), और [**Xubin Ren**](https://github.com/Re-bin) — के प्रति हार्दिक आभार। हम **open-source community** के प्रति भी गहराई से आभारी हैं: आपके stars, issues, pull requests, और discussions हर एक दिन yFeiSTAI को आकार देते हैं।
 
-DeepTutor outstanding open-source projects के कंधों पर खड़ा है जिन्होंने हमें tools और inspiration दोनों दिए:
+yFeiSTAI outstanding open-source projects के कंधों पर खड़ा है जिन्होंने हमें tools और inspiration दोनों दिए:
 
 | Project | भूमिका / Inspiration |
 |:---|:---|
@@ -657,16 +657,16 @@ DeepTutor outstanding open-source projects के कंधों पर खड�
 | [**AI-Researcher**](https://github.com/HKUDS/AI-Researcher) | Automated research pipeline *(HKUDS)* |
 | [**OpenClaw**](https://github.com/openclaw/openclaw) | ClawHub के पीछे open agent gateway और skill ecosystem |
 | [**Codex**](https://github.com/openai/codex) | Agent-native coding CLI जिसने हमारे CLI workflow को inspire किया |
-| [**Claude Code**](https://github.com/anthropics/claude-code) | Agentic coding CLI जिसने DeepTutor agent loop को inspire किया |
+| [**Claude Code**](https://github.com/anthropics/claude-code) | Agentic coding CLI जिसने yFeiSTAI agent loop को inspire किया |
 | [**ManimCat**](https://github.com/Wing900/ManimCat) | Math Animator के लिए AI-driven math animation generation |
 
 ### 🗺️ Roadmap और योगदान
 
-हम चाहते हैं कि DeepTutor iterate और improve करता रहे — और अंततः open-source community को एक gift बने। हमारा [**roadmap**](https://github.com/HKUDS/DeepTutor/issues/498) continuously update होता है; वहां items पर vote करें या नए propose करें। अगर आप contribute करना चाहते हैं, तो branching strategy, coding standards, और शुरू करने के तरीके के लिए [**Contributing Guide**](../../CONTRIBUTING.md) देखें।
+हम चाहते हैं कि yFeiSTAI iterate और improve करता रहे — और अंततः open-source community को एक gift बने। हमारा [**roadmap**](https://github.com/HKUDS/DeepTutor/issues/498) continuously update होता है; वहां items पर vote करें या नए propose करें। अगर आप contribute करना चाहते हैं, तो branching strategy, coding standards, और शुरू करने के तरीके के लिए [**Contributing Guide**](../../CONTRIBUTING.md) देखें।
 
 <div align="center">
 
-हम आशा करते हैं कि DeepTutor community के लिए एक उपहार बने। 🎁
+हम आशा करते हैं कि yFeiSTAI community के लिए एक उपहार बने। 🎁
 
 <a href="https://github.com/HKUDS/DeepTutor/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=HKUDS/DeepTutor&max=999" alt="Contributors" />

@@ -1,4 +1,4 @@
-# Python project configuration for DeepTutor
+# Python project configuration for yFeiSTAI
 # This file configures Black, Ruff, and other Python tools
 
 [build-system]

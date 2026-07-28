@@ -1,17 +1,17 @@
 <div align="center">
 
-<p align="center"><img src="../../assets/figs/logo/logo.png" alt="DeepTutor logo" height="56" style="vertical-align: middle;">&nbsp;<img src="../../assets/figs/logo/banner.png" alt="DeepTutor" height="48" style="vertical-align: middle;"></p>
+<p align="center"><img src="../../assets/figs/logo/logo.png" alt="yFeiSTAI logo" height="56" style="vertical-align: middle;">&nbsp;<img src="../../assets/figs/logo/banner.png" alt="yFeiSTAI" height="48" style="vertical-align: middle;"></p>
 
-# DeepTutor：终身个性化辅导
+# yFeiSTAI：终身个性化辅导
 
 <p align="center">
   <a href="https://deeptutor.info" target="_blank"><img alt="Docs — deeptutor.info" src="https://img.shields.io/badge/Docs-deeptutor.info%20%E2%86%97-0A0A0A?style=for-the-badge&labelColor=F5F5F4" height="36"></a>
 </p>
 
 <p align="center">
-  <a href="https://trendshift.io/repositories/17099?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-17099" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/17099" alt="HKUDS%2FDeepTutor | Trendshift" width="250" height="55"/></a>&nbsp;
-  <a href="https://trendshift.io/repositories/17099?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-17099" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/17099/daily" alt="HKUDS%2FDeepTutor | Trendshift" width="250" height="55"/></a>&nbsp;
-  <a href="https://trendshift.io/repositories/17099?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-17099" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/17099/weekly?language=Python" alt="HKUDS%2FDeepTutor | Trendshift" width="250" height="55"/></a>
+  <a href="https://trendshift.io/repositories/17099?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-17099" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/17099" alt="yFeiSTAI | Trendshift" width="250" height="55"/></a>&nbsp;
+  <a href="https://trendshift.io/repositories/17099?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-17099" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/17099/daily" alt="yFeiSTAI | Trendshift" width="250" height="55"/></a>&nbsp;
+  <a href="https://trendshift.io/repositories/17099?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-17099" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/17099/weekly?language=Python" alt="yFeiSTAI | Trendshift" width="250" height="55"/></a>
 </p>
 
 <p align="center">
@@ -50,14 +50,14 @@
 
 - **2026-05-22** 🌐 官方文档站点上线 [**deeptutor.info**](https://deeptutor.info/) — 指南、参考文档与能力演示一站汇聚。
 - **2026-04-19** 🎉 111 天突破 2 万 Star！感谢大家对真正个性化智能辅导的支持。
-- **2026-04-10** 📄 论文已发布于 arXiv — 阅读 [预印本](https://arxiv.org/abs/2604.26962)，了解 DeepTutor 的设计理念与背后的思考。
+- **2026-04-10** 📄 论文已发布于 arXiv — 阅读 [预印本](https://arxiv.org/abs/2604.26962)，了解 yFeiSTAI 的设计理念与背后的思考。
 - **2026-02-06** 🚀 仅 39 天突破 1 万 Star！衷心感谢我们出色的社区。
-- **2026-01-01** 🎊 新年快乐！加入我们的 [Discord](https://discord.gg/eRsjPgMU4t)、[微信群](https://github.com/HKUDS/DeepTutor/issues/78) 或 [Discussions](https://github.com/HKUDS/DeepTutor/discussions) — 一起塑造 DeepTutor 的未来。
-- **2025-12-29** 🎓 DeepTutor 正式发布！
+- **2026-01-01** 🎊 新年快乐！加入我们的 [Discord](https://discord.gg/eRsjPgMU4t)、[微信群](https://github.com/HKUDS/DeepTutor/issues/78) 或 [Discussions](https://github.com/HKUDS/DeepTutor/discussions) — 一起塑造 yFeiSTAI 的未来。
+- **2025-12-29** 🎓 yFeiSTAI 正式发布！
 
 ## ✨ 核心功能
 
-DeepTutor 是一个智能体原生的学习工作区，将辅导、解题、测验生成、研究、可视化和掌握度练习整合在一个可扩展的系统中。
+yFeiSTAI 是一个智能体原生的学习工作区，将辅导、解题、测验生成、研究、可视化和掌握度练习整合在一个可扩展的系统中。
 
 - **统一的运行时** — Chat、Quiz、Research、Visualize、Solve 和 Mastery Path 运行在同一个智能体循环上，切换的是目标，而非引擎，上下文始终随学习者流转。
 - **互联的学习上下文** — 知识库、书籍、Co-Writer 草稿、笔记本、题库、人格预设和 Memory，在每个工作流中始终可用，而不是各自孤立。
@@ -70,7 +70,7 @@ DeepTutor 是一个智能体原生的学习工作区，将辅导、解题、测�
 
 ## 🚀 快速开始
 
-DeepTutor 提供四种安装方式，共享同一个工作区布局：设置存储在启动目录下的 `data/user/settings/`（或通过 `DEEPTUTOR_HOME` / `deeptutor start --home` 指定的位置）。完整应用的推荐流程为：**选择工作目录 → 安装 → `deeptutor init` → `deeptutor start`**。
+yFeiSTAI 提供四种安装方式，共享同一个工作区布局：设置存储在启动目录下的 `data/user/settings/`（或通过 `DEEPTUTOR_HOME` / `deeptutor start --home` 指定的位置）。完整应用的推荐流程为：**选择工作目录 → 安装 → `deeptutor init` → `deeptutor start`**。
 
 <details>
 <summary><b>方式一 — 从 PyPI 安装</b> · 完整本地 Web 应用 + CLI，无需克隆仓库</summary>
@@ -96,8 +96,8 @@ deeptutor start    # 启动后端 + 前端；保持终端窗口打开
 适用于基于代码仓库的开发。使用 **Python 3.11–3.13** 和 **Node.js 22 LTS** 以匹配 CI 和 Docker 环境。
 
 ```bash
-git clone https://github.com/HKUDS/DeepTutor.git
-cd DeepTutor
+git clone https://github.com/HKUDS/DeepTutor.git yFeiSTAI
+cd yFeiSTAI
 
 # 创建 venv（macOS/Linux）。Windows PowerShell：
 #   py -3.11 -m venv .venv ; .\.venv\Scripts\Activate.ps1
@@ -186,7 +186,7 @@ docker run --rm --name deeptutor \
 }
 ```
 
-`next_public_api_base_external`（及其别名 `public_api_base`）作为低优先级的备用配置被接受。CORS 使用前端**来源**，而非 API URL。禁用认证时，DeepTutor 默认允许普通 HTTP/HTTPS 浏览器来源。启用认证时，需添加精确的前端来源：
+`next_public_api_base_external`（及其别名 `public_api_base`）作为低优先级的备用配置被接受。CORS 使用前端**来源**，而非 API URL。禁用认证时，yFeiSTAI 默认允许普通 HTTP/HTTPS 浏览器来源。启用认证时，需添加精确的前端来源：
 
 ```json
 {
@@ -229,8 +229,8 @@ Docker Desktop（macOS/Windows）通常无需 `--add-host` 即可解析 `host.do
 当不需要 Web UI 时使用。仅 CLI 包从源码安装，不从 PyPI 安装。
 
 ```bash
-git clone https://github.com/HKUDS/DeepTutor.git
-cd DeepTutor
+git clone https://github.com/HKUDS/DeepTutor.git yFeiSTAI
+cd yFeiSTAI
 
 # 创建 venv（macOS/Linux）。Windows PowerShell：
 #   py -3.11 -m venv .venv-cli ; .\.venv-cli\Scripts\Activate.ps1
@@ -294,19 +294,19 @@ deeptutor config show
 
 </details>
 
-## 📖 探索 DeepTutor
+## 📖 探索 yFeiSTAI
 
 从日常使用的主要界面开始：Chat、Partners、My Agents、Co-Writer、Book、知识中心、学习空间、Memory 和 Settings。之后将介绍用于共享隔离工作区的多用户部署。
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/OVERVIEW.png" alt="DeepTutor 主页 — 带有侧边栏所有入口的 Chat 工作区" width="900">
+<img src="../../assets/figs/web-1.4.6+/OVERVIEW.png" alt="yFeiSTAI 主页 — 带有侧边栏所有入口的 Chat 工作区" width="900">
 </div>
 
 <details>
 <summary><b>🏗️ 系统架构</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/system/system%20architecture.png" alt="DeepTutor 系统架构" width="900">
+<img src="../../assets/figs/system/system%20architecture.png" alt="yFeiSTAI 系统架构" width="900">
 </div>
 
 </details>
@@ -317,13 +317,13 @@ deeptutor config show
 Chat 是默认能力，也是大多数工作的起点。单个对话线程可以正常交流、调用工具、基于选定知识库进行检索、读取附件、生成图像、调用子智能体、写入笔记本记录，并在多轮对话中保持相同的上下文。
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/home/00-overview.png" alt="DeepTutor 聊天工作区" width="900">
+<img src="../../assets/figs/web-1.4.6+/home/00-overview.png" alt="yFeiSTAI 聊天工作区" width="900">
 </div>
 
 循环设计刻意保持简单：模型按轮次思考，在有用时调用工具，观察结果，最终以不调用工具的消息结束。`ask_user` 是特殊工具 — 智能体不是凭空猜测，而是可以暂停当前轮次，提出结构化的澄清问题，在你回答后恢复。
 
 <div align="center">
-<img src="../../assets/figs/system/chat-agent-loop.png" alt="DeepTutor 聊天智能体循环" width="900">
+<img src="../../assets/figs/system/chat-agent-loop.png" alt="yFeiSTAI 聊天智能体循环" width="900">
 </div>
 
 用户可切换的工具有 `brainstorm`、`web_search`、`paper_search`、`reason` 和 `geogebra_analysis` — 配置了对应生成模型后还有 `imagegen` 和 `videogen`。上下文工具如 `rag`、`read_source`、`read_memory`、`write_memory`、`read_skill`、`load_tools`、`exec`、`web_fetch`、`ask_user`、`list_notebook`、`write_note`、`github` 和 `consult_subagent` 会在当前轮次具备相应上下文时自动挂载。
@@ -338,13 +338,13 @@ Chat 也是进入更深层能力的入口：**Quiz** 用于题目生成，**Rese
 <summary><b>🤝 Partner — 运行在同一大脑上的持久伴侣</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/partners/00-partners%20overview.png" alt="DeepTutor Partners 工作区" width="900">
+<img src="../../assets/figs/web-1.4.6+/partners/00-partners%20overview.png" alt="yFeiSTAI Partners 工作区" width="900">
 </div>
 
 Partners 是拥有独立灵魂、模型策略、知识库、记忆和渠道的持久伴侣。它们不是独立的机器人引擎：每条入站的 Web 或 IM 消息都会成为在 Partner 作用域工作区内的一次普通 `ChatOrchestrator` 对话轮次。Partner 就是"一个有个性和电话号码的聊天"。
 
 <div align="center">
-<img src="../../assets/figs/system/partners-architecture.png" alt="DeepTutor Partners 架构" width="900">
+<img src="../../assets/figs/system/partners-architecture.png" alt="yFeiSTAI Partners 架构" width="900">
 </div>
 
 每个 Partner 拥有 `SOUL.md`、模型选择、渠道、工具策略和分配的知识库。知识库、技能和笔记本会被复制到 `data/partners/<id>/workspace/`，因此相同的 RAG、技能、笔记本和记忆工具无需特殊处理即可正常工作。Partner 可以读取其拥有者的记忆，但只能写入自己的记忆。
@@ -361,16 +361,16 @@ Partners 是拥有独立灵魂、模型策略、知识库、记忆和渠道的�
 <summary><b>🧑‍🚀 我的智能体 — 调用与导入其他智能体</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/myagents/00-overview.png" alt="DeepTutor 我的智能体工作区" width="900">
+<img src="../../assets/figs/web-1.4.6+/myagents/00-overview.png" alt="yFeiSTAI 我的智能体工作区" width="900">
 </div>
 
-"我的智能体"将其他智能体转化为 DeepTutor 的上下文，具备两种不同的功能。**连接实时智能体** — 连接你机器上的 Claude Code、Codex、Gemini、Kimi、opencode 或 MiMo Code CLI，或你的某个 Partner，在聊天轮次中调用它：DeepTutor 实际上会*运行*另一个智能体，并通过 `consult_subagent` 工具将其工作流式传输到 Activity 面板。通过智能体选项（或输入 `@`）选择它，并设置调用可进行的最大轮数。
+"我的智能体"将其他智能体转化为 yFeiSTAI 的上下文，具备两种不同的功能。**连接实时智能体** — 连接你机器上的 Claude Code、Codex、Gemini、Kimi、opencode 或 MiMo Code CLI，或你的某个 Partner，在聊天轮次中调用它：yFeiSTAI 实际上会*运行*另一个智能体，并通过 `consult_subagent` 工具将其工作流式传输到 Activity 面板。通过智能体选项（或输入 `@`）选择它，并设置调用可进行的最大轮数。
 
 <div align="center">
 <img src="../../assets/figs/web-1.4.6+/home/08-subagent%20demo%20with%20claude%20code.png" alt="实时调用 Claude Code 子智能体" width="900">
 </div>
 
-**导入历史对话** — 将已有的 Claude Code 和 Codex 历史记录作为命名的、可搜索的、可续聊的智能体导入。选择要导入的日期范围；刷新时自动重新同步。通过 `+` → 我的智能体在任意聊天轮次中引用已导入的对话，DeepTutor 会将其作为第三方对话记录读取 — 它始终是*对方的*对话，不会被 DeepTutor 以自己的口吻解读。
+**导入历史对话** — 将已有的 Claude Code 和 Codex 历史记录作为命名的、可搜索的、可续聊的智能体导入。选择要导入的日期范围；刷新时自动重新同步。通过 `+` → 我的智能体在任意聊天轮次中引用已导入的对话，yFeiSTAI 会将其作为第三方对话记录读取 — 它始终是*对方的*对话，不会被 yFeiSTAI 以自己的口吻解读。
 
 </details>
 
@@ -378,7 +378,7 @@ Partners 是拥有独立灵魂、模型策略、知识库、记忆和渠道的�
 <summary><b>✍️ Co-Writer — 感知选区的 Markdown 写作台</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/co-writer/00-overview.png" alt="DeepTutor Co-Writer 工作区" width="900">
+<img src="../../assets/figs/web-1.4.6+/co-writer/00-overview.png" alt="yFeiSTAI Co-Writer 工作区" width="900">
 </div>
 
 Co-Writer 是一个分屏 Markdown 工作区，适用于报告、教程、笔记和长篇学习素材的创作。文档自动保存并实时渲染预览（KaTeX 数学公式、图表围栏），草稿完成后可保存回笔记本成为可复用的上下文。
@@ -387,7 +387,7 @@ Co-Writer 是一个分屏 Markdown 工作区，适用于报告、教程、笔记
 <img src="../../assets/figs/web-1.4.6+/co-writer/01-edit%20panel.png" alt="Co-Writer 编辑器与实时预览" width="900">
 </div>
 
-其核心理念是**精准编辑**：选中一段文字，让 DeepTutor 对其进行改写、扩展或缩短。编辑智能体可以基于知识库或网络证据进行修改，保留工具调用追踪，并以接受/拒绝差异对比的形式展示每处变更 — 直到你批准后才会生效。
+其核心理念是**精准编辑**：选中一段文字，让 yFeiSTAI 对其进行改写、扩展或缩短。编辑智能体可以基于知识库或网络证据进行修改，保留工具调用追踪，并以接受/拒绝差异对比的形式展示每处变更 — 直到你批准后才会生效。
 
 </details>
 
@@ -395,7 +395,7 @@ Co-Writer 是一个分屏 Markdown 工作区，适用于报告、教程、笔记
 <summary><b>📖 Book — 从你的素材生成活书</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/book/00-book_overview.png" alt="DeepTutor 书籍库" width="900">
+<img src="../../assets/figs/web-1.4.6+/book/00-book_overview.png" alt="yFeiSTAI 书籍库" width="900">
 </div>
 
 Book 将选定的来源转化为交互式**活书** — 不是静态 PDF，而是由类型化块构建的阅读环境。书籍可以从知识库、笔记本、题库或聊天历史开始创建；创建流程会在内容生成前提出章节大纲，让你审查结构，而不是被动接受一次性的盲目输出。
@@ -416,7 +416,7 @@ Book 将选定的来源转化为交互式**活书** — 不是静态 PDF，而�
 <summary><b>📚 知识中心 — 多引擎 RAG 知识库</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/knowledge/00-overview.png" alt="DeepTutor 知识中心" width="900">
+<img src="../../assets/figs/web-1.4.6+/knowledge/00-overview.png" alt="yFeiSTAI 知识中心" width="900">
 </div>
 
 知识库是 RAG 背后的文档集合 — 为 Chat 对话、Co-Writer 编辑、Book 生成和 Partner 对话提供依据。其独特之处在于**检索引擎的选择**：**LlamaIndex**（默认，本地向量 + BM25）、**PageIndex**（托管，支持页面级引用的推理检索）、**GraphRAG** 和 **LightRAG**（知识图谱检索）、**LightRAG Server**（将检索卸载至你通过 HTTP 连接的外部 LightRAG 实例），或直接在原位读写的链接 **Obsidian** vault。每个 KB 绑定到单一引擎。
@@ -433,7 +433,7 @@ Book 将选定的来源转化为交互式**活书** — 不是静态 PDF，而�
 <summary><b>🌐 学习空间 — 技能、人格预设与可复用上下文</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/learning-space/00-overview.png" alt="DeepTutor 学习空间中心" width="900">
+<img src="../../assets/figs/web-1.4.6+/learning-space/00-overview.png" alt="yFeiSTAI 学习空间中心" width="900">
 </div>
 
 学习空间是知识库和个性化层 — 持久化内容的存放之处。**对话与素材**保存聊天历史、笔记本和题库（每道保存的题目包含你的答案、参考答案和解析）。**个性化**保存掌握路径、人格预设（如*同伴*、*研究助手*、*教师*等行为预设）和技能（模型按需读取的 `SKILL.md` 剧本）。这里的所有内容均可在 Chat、Partners、Co-Writer 和 Book 中复用。
@@ -450,13 +450,13 @@ Book 将选定的来源转化为交互式**活书** — 不是静态 PDF，而�
 <summary><b>🧠 Memory — 可审计的个性化记忆</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/memory/00-overview.png" alt="DeepTutor 记忆概览" width="900">
+<img src="../../assets/figs/web-1.4.6+/memory/00-overview.png" alt="yFeiSTAI 记忆概览" width="900">
 </div>
 
 Memory 是一个基于文件、三层结构的系统，你可以读取、整理和审计它 — 刻意设计为*非*隐藏的向量库。**L1** 是工作区镜像加仅追加的事件追踪（`trace/<surface>/<date>.jsonl`）；**L2** 是按表面整理的事实（`L2/<surface>.md`）；**L3** 是跨表面的综合（`L3/<profile|recent|scope|preferences>.md`）。由于 L2 引用 L1，L3 引用 L2，你的档案中没有任何不可追溯的内容。
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/memory/01-3%20layer%20memory%20graph.png" alt="DeepTutor 记忆图谱" width="900">
+<img src="../../assets/figs/web-1.4.6+/memory/01-3%20layer%20memory%20graph.png" alt="yFeiSTAI 记忆图谱" width="900">
 </div>
 
 Memory Graph 展示整个金字塔 — L3 综合位于中心，L2 在中间圆环，L1 追踪在外圈 — 你可以将任何综合结论追溯到其背后的精确原始事件。Memory 在 `chat`、`notebook`、`quiz`、`kb`、`book`、partner 和 `cowriter` 表面进行追踪；整合器的更新 / 审计 / 去重预算可在 **Settings → Memory** 中调整。
@@ -467,13 +467,13 @@ Memory Graph 展示整个金字塔 — L3 综合位于中心，L2 在中间圆�
 <summary><b>⚙️ Settings — 统一的控制面板</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/settings/00-setting%20overview.png" alt="DeepTutor 设置中心" width="900">
+<img src="../../assets/figs/web-1.4.6+/settings/00-setting%20overview.png" alt="yFeiSTAI 设置中心" width="900">
 </div>
 
 Settings 是操作控制面板，带有实时状态条（后端、LLM、嵌入、搜索）和每个区域的配置卡：**外观**（主题、UI 语言、代码块样式）、**网络**（API 基础地址、端口、CORS）、**模型**（LLM、嵌入、搜索、文字转语音、语音转文字、图像生成、视频生成）、**知识库**（文档解析引擎）、**聊天**（工具、MCP 服务器、每个能力的参数、附件上限）、**Partners 与智能体**（可在对话轮次中调用的子智能体），以及**记忆**（整合器预算）。
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/settings/01-appearance%20settings.png" alt="DeepTutor 外观设置与主题" width="900">
+<img src="../../assets/figs/web-1.4.6+/settings/01-appearance%20settings.png" alt="yFeiSTAI 外观设置与主题" width="900">
 </div>
 
 大多数部分采用草稿-应用流程，因此你可以在提交前测试提供商配置。开箱即提供四种主题 — Default、Cream、Dark 和 Glass。项目根目录的 `.env` 文件被刻意忽略；运行时配置存储在 `data/user/settings/*.json` 下，除非 `DEEPTUTOR_HOME` 或 `deeptutor start --home` 将应用指向其他位置。
@@ -483,7 +483,7 @@ Settings 是操作控制面板，带有实时状态条（后端、LLM、嵌入�
 <details>
 <summary><b>👥 多用户 — 共享部署</b> · 可选认证，隔离的用户工作区</summary>
 
-认证默认**关闭** — DeepTutor 以单用户模式运行。开启后，单个 `data/` 目录树可同时托管管理员工作区、隔离的用户工作区和 Partner 工作区：
+认证默认**关闭** — yFeiSTAI 以单用户模式运行。开启后，单个 `data/` 目录树可同时托管管理员工作区、隔离的用户工作区和 Partner 工作区：
 
 ```text
 data/
@@ -501,9 +501,9 @@ data/
 
 </details>
 
-## ⌨️ DeepTutor CLI — 智能体原生界面
+## ⌨️ yFeiSTAI CLI — 智能体原生界面
 
-一个 `deeptutor` 可执行文件，两种使用方式：供习惯在终端中工作的人使用的交互式 **REPL**，以及供将 DeepTutor 作为工具来驱动的其他智能体使用的结构化 **JSON** 输出。两种方式共享相同的能力、工具和知识库。
+一个 `deeptutor` 可执行文件，两种使用方式：供习惯在终端中工作的人使用的交互式 **REPL**，以及供将 yFeiSTAI 作为工具来驱动的其他智能体使用的结构化 **JSON** 输出。两种方式共享相同的能力、工具和知识库。
 
 <details>
 <summary><b>自己驱动</b></summary>
@@ -525,7 +525,7 @@ Web 应用的所有功能在这里都有对应 — 知识库（`kb`）、会话�
 <details>
 <summary><b>让智能体驱动</b></summary>
 
-DeepTutor 专为*被其他智能体操作*而设计。在任何 `run` 命令中添加 `--format json`，每个轮次将流式输出 **NDJSON — 每行一个事件**（`content`、`tool_call`、`tool_result`、`done` 等），每行带有其 `session_id` 标记。运行是无头安全的：无 TTY 时，`ask_user` 暂停会以空回复自动解决，而不是挂起。
+yFeiSTAI 专为*被其他智能体操作*而设计。在任何 `run` 命令中添加 `--format json`，每个轮次将流式输出 **NDJSON — 每行一个事件**（`content`、`tool_call`、`tool_result`、`done` 等），每行带有其 `session_id` 标记。运行是无头安全的：无 TTY 时，`ask_user` 暂停会以空回复自动解决，而不是挂起。
 
 ```bash
 # 单次执行，机器可读
@@ -580,12 +580,12 @@ python -m pip install -e ./packaging/deeptutor-cli
 
 ## 🧩 生态系统 — EduHub 与技能社区
 
-DeepTutor 技能使用开放的 **Agent-Skills** 格式 — 一个包含 `SKILL.md` 剧本（YAML frontmatter + Markdown）和可选参考文件的文件夹。该格式与 DeepTutor 无关，因此任何支持该格式的注册表都可以成为你的技能库来源。DeepTutor 内置了 **[EduHub](https://eduhub.deeptutor.info/)** — 我们自己的教育技能注册表 — 作为默认 Hub。
+yFeiSTAI 技能使用开放的 **Agent-Skills** 格式 — 一个包含 `SKILL.md` 剧本（YAML frontmatter + Markdown）和可选参考文件的文件夹。该格式与 yFeiSTAI 无关，因此任何支持该格式的注册表都可以成为你的技能库来源。yFeiSTAI 内置了 **[EduHub](https://eduhub.deeptutor.info/)** — 我们自己的教育技能注册表 — 作为默认 Hub。
 
 <details>
-<summary><b>EduHub — DeepTutor 的技能生态</b></summary>
+<summary><b>EduHub — yFeiSTAI 的技能生态</b></summary>
 
-[**EduHub**](https://eduhub.deeptutor.info/) 是 DeepTutor 为分享教学导向的智能体技能而创建的社区 Hub — 苏格拉底式导师、闪卡生成器、作文反馈、考试蓝图、概念讲解器等。它内置于 DeepTutor，无需任何配置：裸 slug 或 `eduhub:` 前缀均可解析到它。
+[**EduHub**](https://eduhub.deeptutor.info/) 是 yFeiSTAI 为分享教学导向的智能体技能而创建的社区 Hub — 苏格拉底式导师、闪卡生成器、作文反馈、考试蓝图、概念讲解器等。它内置于 yFeiSTAI，无需任何配置：裸 slug 或 `eduhub:` 前缀均可解析到它。
 
 **查找与安装** — 在浏览器中，打开**学习空间 → 技能 → 从 EduHub 导入**，浏览目录并将技能直接下载到你的库中。从终端：
 
@@ -604,7 +604,7 @@ deeptutor skill publish ./my-skill                    # 交互式：选择分类
 deeptutor skill update                                # 回滚或发布新版本
 ```
 
-EduHub 也是一个独立的、ClawHub 兼容的注册表，因此非 DeepTutor 的智能体（Claude Code、Codex 等）可以通过 `eduhub` CLI 直接使用它 — `npx eduhub install socratic-tutor`。
+EduHub 也是一个独立的、ClawHub 兼容的注册表，因此非 yFeiSTAI 的智能体（Claude Code、Codex 等）可以通过 `eduhub` CLI 直接使用它 — `npx eduhub install socratic-tutor`。
 
 </details>
 
@@ -625,7 +625,7 @@ EduHub 也是一个独立的、ClawHub 兼容的注册表，因此非 DeepTutor 
 <details>
 <summary><b>同样兼容 ClawHub</b></summary>
 
-因为 DeepTutor 支持开放的 Agent-Skills 格式，**[ClawHub](https://clawhub.ai/)** 也是一等来源 — 它与 EduHub 并列内置。使用 Hub 前缀选择：
+因为 yFeiSTAI 支持开放的 Agent-Skills 格式，**[ClawHub](https://clawhub.ai/)** 也是一等来源 — 它与 EduHub 并列内置。使用 Hub 前缀选择：
 
 ```bash
 deeptutor skill search "git release notes" --hub clawhub
@@ -640,13 +640,13 @@ deeptutor skill install clawhub:git-release-notes@1.0.1
 
 ### 📮 联系方式
 
-DeepTutor 是一个由 [HKUDS](https://github.com/HKUDS) 团队中的 [Bingxi Zhao](https://github.com/pancacake) 主导的开源项目，以**完全开源的形式**持续迭代，与社区共同构建。迄今为止，我们**没有**任何形式的付费在线产品。欢迎通过 **bingxizhao39@gmail.com** 联系我们，探讨想法或合作。
+yFeiSTAI 是一个由 [HKUDS](https://github.com/HKUDS) 团队中的 [Bingxi Zhao](https://github.com/pancacake) 主导的开源项目，以**完全开源的形式**持续迭代，与社区共同构建。迄今为止，我们**没有**任何形式的付费在线产品。欢迎通过 **bingxizhao39@gmail.com** 联系我们，探讨想法或合作。
 
 ### 🙏 致谢
 
-衷心感谢香港大学数据智能实验室主任 [**Chao Huang**](https://sites.google.com/view/chaoh) 的大力支持，以及 HKUDS 实验室同学们的热心相助 — 特别是 [**Jiahao Zhang**](https://github.com/zzhtx258)、[**Zirui Guo**](https://github.com/LarFii) 和 [**Xubin Ren**](https://github.com/Re-bin)。我们也对**开源社区**深表感激：你们的 Star、Issue、Pull Request 和讨论，每天都在塑造 DeepTutor。
+衷心感谢香港大学数据智能实验室主任 [**Chao Huang**](https://sites.google.com/view/chaoh) 的大力支持，以及 HKUDS 实验室同学们的热心相助 — 特别是 [**Jiahao Zhang**](https://github.com/zzhtx258)、[**Zirui Guo**](https://github.com/LarFii) 和 [**Xubin Ren**](https://github.com/Re-bin)。我们也对**开源社区**深表感激：你们的 Star、Issue、Pull Request 和讨论，每天都在塑造 yFeiSTAI。
 
-DeepTutor 也站在众多优秀开源项目的肩膀上，它们给予了我们工具和灵感：
+yFeiSTAI 也站在众多优秀开源项目的肩膀上，它们给予了我们工具和灵感：
 
 | 项目 | 角色 / 启发 |
 |:---|:---|
@@ -657,16 +657,16 @@ DeepTutor 也站在众多优秀开源项目的肩膀上，它们给予了我们�
 | [**AI-Researcher**](https://github.com/HKUDS/AI-Researcher) | 自动化研究流水线 *(HKUDS)* |
 | [**OpenClaw**](https://github.com/openclaw/openclaw) | 支撑 ClawHub 的开放智能体网关与技能生态 |
 | [**Codex**](https://github.com/openai/codex) | 启发我们 CLI 工作流的智能体原生编程 CLI |
-| [**Claude Code**](https://github.com/anthropics/claude-code) | 启发 DeepTutor 智能体循环的智能体编程 CLI |
+| [**Claude Code**](https://github.com/anthropics/claude-code) | 启发 yFeiSTAI 智能体循环的智能体编程 CLI |
 | [**ManimCat**](https://github.com/Wing900/ManimCat) | Math Animator 的 AI 驱动数学动画生成 |
 
 ### 🗺️ 路线图与贡献
 
-我们希望 DeepTutor 持续迭代与进步 — 并最终成为我们回馈开源社区的礼物。我们的[**路线图**](https://github.com/HKUDS/DeepTutor/issues/498)持续更新；欢迎在那里为议题投票或提出新想法。如果你想贡献，请查看[**贡献指南**](CONTRIBUTING.md)，了解分支策略、编码规范及参与方式。
+我们希望 yFeiSTAI 持续迭代与进步 — 并最终成为我们回馈开源社区的礼物。我们的[**路线图**](https://github.com/HKUDS/DeepTutor/issues/498)持续更新；欢迎在那里为议题投票或提出新想法。如果你想贡献，请查看[**贡献指南**](CONTRIBUTING.md)，了解分支策略、编码规范及参与方式。
 
 <div align="center">
 
-我们希望 DeepTutor 成为送给社区的一份礼物。🎁
+我们希望 yFeiSTAI 成为送给社区的一份礼物。🎁
 
 <a href="https://github.com/HKUDS/DeepTutor/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=HKUDS/DeepTutor&max=999" alt="贡献者" />

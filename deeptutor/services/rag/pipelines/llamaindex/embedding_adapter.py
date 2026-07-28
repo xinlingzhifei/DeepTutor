@@ -1,4 +1,4 @@
-"""LlamaIndex embedding adapter backed by DeepTutor's embedding service."""
+"""LlamaIndex embedding adapter backed by yFeiSTAI's embedding service."""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ def _config_fingerprint(config: EmbeddingConfig) -> tuple[Any, ...]:
 
 
 class CustomEmbedding(BaseEmbedding):
-    """Custom LlamaIndex embedding adapter for DeepTutor embedding providers."""
+    """Custom LlamaIndex embedding adapter for yFeiSTAI embedding providers."""
 
     _client: Any = PrivateAttr()
     _logger: Any = PrivateAttr()
@@ -131,7 +131,7 @@ class CustomEmbedding(BaseEmbedding):
 
 
 def configure_llamaindex_settings(logger=None) -> None:
-    """Configure LlamaIndex globals for DeepTutor's current embedding config."""
+    """Configure LlamaIndex globals for yFeiSTAI's current embedding config."""
     embedding_cfg = get_embedding_config()
 
     current = getattr(Settings, "_embed_model", None)

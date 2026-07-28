@@ -1,17 +1,17 @@
 <div align="center">
 
-<p align="center"><img src="../../assets/figs/logo/logo.png" alt="شعار DeepTutor" height="56" style="vertical-align: middle;">&nbsp;<img src="../../assets/figs/logo/banner.png" alt="DeepTutor" height="48" style="vertical-align: middle;"></p>
+<p align="center"><img src="../../assets/figs/logo/logo.png" alt="شعار yFeiSTAI" height="56" style="vertical-align: middle;">&nbsp;<img src="../../assets/figs/logo/banner.png" alt="yFeiSTAI" height="48" style="vertical-align: middle;"></p>
 
-# DeepTutor: تدريس شخصي مدى الحياة
+# yFeiSTAI: تدريس شخصي مدى الحياة
 
 <p align="center">
   <a href="https://deeptutor.info" target="_blank"><img alt="الوثائق — deeptutor.info" src="https://img.shields.io/badge/Docs-deeptutor.info%20%E2%86%97-0A0A0A?style=for-the-badge&labelColor=F5F5F4" height="36"></a>
 </p>
 
 <p align="center">
-  <a href="https://trendshift.io/repositories/17099?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-17099" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/17099" alt="HKUDS%2FDeepTutor | Trendshift" width="250" height="55"/></a>&nbsp;
-  <a href="https://trendshift.io/repositories/17099?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-17099" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/17099/daily" alt="HKUDS%2FDeepTutor | Trendshift" width="250" height="55"/></a>&nbsp;
-  <a href="https://trendshift.io/repositories/17099?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-17099" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/17099/weekly?language=Python" alt="HKUDS%2FDeepTutor | Trendshift" width="250" height="55"/></a>
+  <a href="https://trendshift.io/repositories/17099?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-17099" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/17099" alt="yFeiSTAI | Trendshift" width="250" height="55"/></a>&nbsp;
+  <a href="https://trendshift.io/repositories/17099?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-17099" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/17099/daily" alt="yFeiSTAI | Trendshift" width="250" height="55"/></a>&nbsp;
+  <a href="https://trendshift.io/repositories/17099?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-17099" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/17099/weekly?language=Python" alt="yFeiSTAI | Trendshift" width="250" height="55"/></a>
 </p>
 
 <p align="center">
@@ -50,14 +50,14 @@
 
 - **2026-05-22** 🌐 موقع الوثائق الرسمي متاح على [**deeptutor.info**](https://deeptutor.info/) — الأدلة والمراجع وجولات القدرات كلها في مكان واحد.
 - **2026-04-19** 🎉 20 ألف نجمة في 111 يومًا! شكراً على الدعم نحو تدريس شخصي وذكي حقيقي.
-- **2026-04-10** 📄 ورقتنا البحثية متاحة على arXiv — اقرأ [النسخة الأولية](https://arxiv.org/abs/2604.26962) للتعرف على التصميم والأفكار وراء DeepTutor.
+- **2026-04-10** 📄 ورقتنا البحثية متاحة على arXiv — اقرأ [النسخة الأولية](https://arxiv.org/abs/2604.26962) للتعرف على التصميم والأفكار وراء yFeiSTAI.
 - **2026-02-06** 🚀 10 آلاف نجمة في 39 يومًا فقط! شكر جزيل لمجتمعنا الرائع.
-- **2026-01-01** 🎊 كل عام وأنتم بخير! انضم إلى [Discord](https://discord.gg/eRsjPgMU4t) أو [WeChat](https://github.com/HKUDS/DeepTutor/issues/78) أو [النقاشات](https://github.com/HKUDS/DeepTutor/discussions) — لنشكّل معاً مستقبل DeepTutor.
-- **2025-12-29** 🎓 تم إطلاق DeepTutor رسميًا!
+- **2026-01-01** 🎊 كل عام وأنتم بخير! انضم إلى [Discord](https://discord.gg/eRsjPgMU4t) أو [WeChat](https://github.com/HKUDS/DeepTutor/issues/78) أو [النقاشات](https://github.com/HKUDS/DeepTutor/discussions) — لنشكّل معاً مستقبل yFeiSTAI.
+- **2025-12-29** 🎓 تم إطلاق yFeiSTAI رسميًا!
 
 ## ✨ الميزات الرئيسية
 
-DeepTutor هو بيئة تعلم أصيلة للوكلاء تربط التدريس وحل المشكلات وتوليد الاختبارات والبحث والتصور وممارسة الإتقان في نظام واحد قابل للتوسيع.
+yFeiSTAI هو بيئة تعلم أصيلة للوكلاء تربط التدريس وحل المشكلات وتوليد الاختبارات والبحث والتصور وممارسة الإتقان في نظام واحد قابل للتوسيع.
 
 - **بيئة تشغيل واحدة لجميع الأوضاع** — Chat وQuiz وResearch وVisualize وSolve وMastery Path تعمل على نفس حلقة الوكيل، لذا تغيّر الهدف لا المحرك، والسياق يتبع المتعلم.
 - **سياق تعلم متصل** — قواعد المعرفة والكتب ومسودات Co-Writer ودفاتر الملاحظات وبنوك الأسئلة والشخصيات والذاكرة متاحة في جميع سير العمل بدلاً من العيش في أدوات معزولة.
@@ -70,7 +70,7 @@ DeepTutor هو بيئة تعلم أصيلة للوكلاء تربط التدري
 
 ## 🚀 البدء
 
-يأتي DeepTutor بأربعة مسارات تثبيت. وكلها تشترك في تخطيط مساحة عمل واحد: تعيش الإعدادات في `data/user/settings/` تحت الدليل الذي تُطلق منه التطبيق (أو تحت `DEEPTUTOR_HOME` / `deeptutor start --home` إذا حددت واحداً صراحةً). للتطبيق الكامل، التدفق الموصى به هو **اختر دليل مساحة عمل → تثبيت → `deeptutor init` → `deeptutor start`**.
+يأتي yFeiSTAI بأربعة مسارات تثبيت. وكلها تشترك في تخطيط مساحة عمل واحد: تعيش الإعدادات في `data/user/settings/` تحت الدليل الذي تُطلق منه التطبيق (أو تحت `DEEPTUTOR_HOME` / `deeptutor start --home` إذا حددت واحداً صراحةً). للتطبيق الكامل، التدفق الموصى به هو **اختر دليل مساحة عمل → تثبيت → `deeptutor init` → `deeptutor start`**.
 
 <details>
 <summary><b>الخيار 1 — التثبيت من PyPI</b> · تطبيق ويب محلي كامل + CLI، لا يلزم الاستنساخ</summary>
@@ -96,8 +96,8 @@ deeptutor start    # يشغّل الخلفية + الواجهة الأمامية
 للتطوير مقابل نسخة مسحوبة. استخدم **Python 3.11–3.13** و**Node.js 22 LTS** لمطابقة CI وDocker.
 
 ```bash
-git clone https://github.com/HKUDS/DeepTutor.git
-cd DeepTutor
+git clone https://github.com/HKUDS/DeepTutor.git yFeiSTAI
+cd yFeiSTAI
 
 # إنشاء venv (macOS/Linux). Windows PowerShell:
 #   py -3.11 -m venv .venv ; .\.venv\Scripts\Activate.ps1
@@ -186,7 +186,7 @@ docker run --rm --name deeptutor \
 }
 ```
 
-يُقبَل `next_public_api_base_external` (واسمه المستعار `public_api_base`) كبدائل ذات أولوية أقل. يستخدم CORS **منشآت** الواجهة الأمامية، وليس عناوين URL لواجهة برمجة التطبيقات. مع تعطيل المصادقة، يسمح DeepTutor بمنشآت متصفح HTTP/HTTPS العادية افتراضياً. مع تفعيل المصادقة، أضف منشآت الواجهة الأمامية الدقيقة:
+يُقبَل `next_public_api_base_external` (واسمه المستعار `public_api_base`) كبدائل ذات أولوية أقل. يستخدم CORS **منشآت** الواجهة الأمامية، وليس عناوين URL لواجهة برمجة التطبيقات. مع تعطيل المصادقة، يسمح yFeiSTAI بمنشآت متصفح HTTP/HTTPS العادية افتراضياً. مع تفعيل المصادقة، أضف منشآت الواجهة الأمامية الدقيقة:
 
 ```json
 {
@@ -229,8 +229,8 @@ docker run --rm --name deeptutor \
 عندما لا تحتاج إلى واجهة مستخدم الويب. يُثبَّت حزمة CLI فقط من نسخة مسحوبة من المصدر، وليس من PyPI.
 
 ```bash
-git clone https://github.com/HKUDS/DeepTutor.git
-cd DeepTutor
+git clone https://github.com/HKUDS/DeepTutor.git yFeiSTAI
+cd yFeiSTAI
 
 # إنشاء venv (macOS/Linux). Windows PowerShell:
 #   py -3.11 -m venv .venv-cli ; .\.venv-cli\Scripts\Activate.ps1
@@ -294,19 +294,19 @@ deeptutor config show
 
 </details>
 
-## 📖 استكشاف DeepTutor
+## 📖 استكشاف yFeiSTAI
 
 ابدأ بالأسطح الرئيسية التي ستستخدمها يومياً: Chat وPartners وMy Agents وCo-Writer وBook ومركز المعرفة وفضاء التعلم والذاكرة والإعدادات. ثم تغطي الجولة عمليات النشر متعددة المستخدمين لمساحات العمل المشتركة المعزولة.
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/OVERVIEW.png" alt="الصفحة الرئيسية لـ DeepTutor — مساحة عمل Chat مع كل الأسطح في الشريط الجانبي" width="900">
+<img src="../../assets/figs/web-1.4.6+/OVERVIEW.png" alt="الصفحة الرئيسية لـ yFeiSTAI — مساحة عمل Chat مع كل الأسطح في الشريط الجانبي" width="900">
 </div>
 
 <details>
 <summary><b>🏗️ معمارية النظام</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/system/system%20architecture.png" alt="معمارية نظام DeepTutor" width="900">
+<img src="../../assets/figs/system/system%20architecture.png" alt="معمارية نظام yFeiSTAI" width="900">
 </div>
 
 </details>
@@ -317,13 +317,13 @@ deeptutor config show
 Chat هي القدرة الافتراضية والمكان الذي يبدأ فيه معظم العمل. يمكن لخيط واحد أن يتحدث عادياً، ويستدعي الأدوات، ويرتكز على قواعد المعرفة المحددة، ويقرأ المرفقات، ويولّد الصور، ويستشير الوكلاء الفرعيين، ويكتب سجلات دفتر الملاحظات، ويستمر بنفس السياق عبر الأدوار.
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/home/00-overview.png" alt="مساحة عمل محادثة DeepTutor" width="900">
+<img src="../../assets/figs/web-1.4.6+/home/00-overview.png" alt="مساحة عمل محادثة yFeiSTAI" width="900">
 </div>
 
 الحلقة بسيطة عمداً: يفكر النموذج في جولات، ويستدعي الأدوات عند الحاجة، ويلاحظ النتائج، وينتهي برسالة خالية من الأدوات. `ask_user` خاص — بدلاً من التخمين، يمكن للوكيل إيقاف الدور مؤقتاً، وطرح سؤال توضيحي منظَّم، والاستئناف بمجرد إجابتك.
 
 <div align="center">
-<img src="../../assets/figs/system/chat-agent-loop.png" alt="حلقة وكيل محادثة DeepTutor" width="900">
+<img src="../../assets/figs/system/chat-agent-loop.png" alt="حلقة وكيل محادثة yFeiSTAI" width="900">
 </div>
 
 الأدوات القابلة للتبديل من قِبَل المستخدم هي `brainstorm` و`web_search` و`paper_search` و`reason` و`geogebra_analysis` — بالإضافة إلى `imagegen` و`videogen` بمجرد تهيئة نموذج التوليد المطابق. الأدوات السياقية مثل `rag` و`read_source` و`read_memory` و`write_memory` و`read_skill` و`load_tools` و`exec` و`web_fetch` و`ask_user` و`list_notebook` و`write_note` و`github` و`consult_subagent` تُثبَّت تلقائياً عندما يكون للدور السياق الصحيح.
@@ -338,13 +338,13 @@ Chat هي أيضاً نقطة انطلاق للقدرات الأعمق: **Quiz**
 <summary><b>🤝 Partner — رفاق دائمون على نفس الدماغ</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/partners/00-partners%20overview.png" alt="مساحة عمل شركاء DeepTutor" width="900">
+<img src="../../assets/figs/web-1.4.6+/partners/00-partners%20overview.png" alt="مساحة عمل شركاء yFeiSTAI" width="900">
 </div>
 
 الشركاء هم رفاق دائمون بروحهم الخاصة وسياسة النموذج ومكتبتهم وذاكرتهم وقنواتهم. إنهم ليسوا محرك بوت منفصلاً: كل رسالة ويب أو IM واردة تصبح دوراً عادياً لـ `ChatOrchestrator` داخل مساحة عمل محدودة بنطاق الشريك. الشريك هو "محادثة لها شخصية ورقم هاتف".
 
 <div align="center">
-<img src="../../assets/figs/system/partners-architecture.png" alt="معمارية شركاء DeepTutor" width="900">
+<img src="../../assets/figs/system/partners-architecture.png" alt="معمارية شركاء yFeiSTAI" width="900">
 </div>
 
 لكل شريك `SOUL.md` واختيار نموذج وقنوات وسياسة أدوات ومكتبة مخصصة. تُنسخ قواعد المعرفة والمهارات ودفاتر الملاحظات إلى `data/partners/<id>/workspace/`، لذا تعمل نفس أدوات RAG والمهارة ودفتر الملاحظات والذاكرة بدون حالات خاصة. يقرأ الشريك ذاكرة مالكه لكنه يكتب فقط في ذاكرته الخاصة.
@@ -361,16 +361,16 @@ Chat هي أيضاً نقطة انطلاق للقدرات الأعمق: **Quiz**
 <summary><b>🧑‍🚀 My Agents — استشارة واستيراد الوكلاء الآخرين</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/myagents/00-overview.png" alt="مساحة عمل My Agents في DeepTutor" width="900">
+<img src="../../assets/figs/web-1.4.6+/myagents/00-overview.png" alt="مساحة عمل My Agents في yFeiSTAI" width="900">
 </div>
 
-يحوّل My Agents الوكلاء الآخرين إلى سياق لـ DeepTutor، ويقوم بشيئين متمايزين. **توصيل وكيل مباشر** — واجهة CLI من Claude Code أو Codex أو Gemini أو Kimi أو opencode أو MiMo Code على جهازك، أو أحد شركائك — واستشارته من داخل دور محادثة: DeepTutor *يشغّل* الوكيل الآخر فعلاً ويبث عمله إلى لوحة Activity عبر أداة `consult_subagent`. اختره بشريحة الوكيل (أو اكتب `@`)، وحدد عدد الجولات التي يمكن للاستشارة أن تأخذها.
+يحوّل My Agents الوكلاء الآخرين إلى سياق لـ yFeiSTAI، ويقوم بشيئين متمايزين. **توصيل وكيل مباشر** — واجهة CLI من Claude Code أو Codex أو Gemini أو Kimi أو opencode أو MiMo Code على جهازك، أو أحد شركائك — واستشارته من داخل دور محادثة: yFeiSTAI *يشغّل* الوكيل الآخر فعلاً ويبث عمله إلى لوحة Activity عبر أداة `consult_subagent`. اختره بشريحة الوكيل (أو اكتب `@`)، وحدد عدد الجولات التي يمكن للاستشارة أن تأخذها.
 
 <div align="center">
 <img src="../../assets/figs/web-1.4.6+/home/08-subagent%20demo%20with%20claude%20code.png" alt="استشارة وكيل Claude Code الفرعي مباشرةً" width="900">
 </div>
 
-**استيراد المحادثات السابقة** — أحضر تاريخ Claude Code وCodex الموجود لديك كوكلاء مسماة قابلة للبحث والاستئناف. اختر الأيام التي تريد استيرادها؛ التحديث يعيد مزامنتها. استشر محادثة مستوردة من أي دور محادثة عبر `+` ← My Agents، وسيقرأها DeepTutor كنصوص محادثة لطرف ثالث — تبقى *محادثتهم*، وليس صوت DeepTutor الخاص.
+**استيراد المحادثات السابقة** — أحضر تاريخ Claude Code وCodex الموجود لديك كوكلاء مسماة قابلة للبحث والاستئناف. اختر الأيام التي تريد استيرادها؛ التحديث يعيد مزامنتها. استشر محادثة مستوردة من أي دور محادثة عبر `+` ← My Agents، وسيقرأها yFeiSTAI كنصوص محادثة لطرف ثالث — تبقى *محادثتهم*، وليس صوت yFeiSTAI الخاص.
 
 </details>
 
@@ -378,7 +378,7 @@ Chat هي أيضاً نقطة انطلاق للقدرات الأعمق: **Quiz**
 <summary><b>✍️ Co-Writer — صياغة Markdown واعية بالتحديد</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/co-writer/00-overview.png" alt="مساحة عمل Co-Writer في DeepTutor" width="900">
+<img src="../../assets/figs/web-1.4.6+/co-writer/00-overview.png" alt="مساحة عمل Co-Writer في yFeiSTAI" width="900">
 </div>
 
 Co-Writer هو مساحة عمل Markdown ذات عرض مقسَّم للتقارير والدروس التعليمية والملاحظات والقطع التعليمية الطويلة. تحفظ المستندات تلقائياً وتُظهر معاينة مباشرة (رياضيات KaTeX وأسوار الرسم البياني)، ويمكن حفظها مرة أخرى في دفاتر الملاحظات عندما تصبح المسودة سياقاً قابلاً لإعادة الاستخدام.
@@ -387,7 +387,7 @@ Co-Writer هو مساحة عمل Markdown ذات عرض مقسَّم للتقا�
 <img src="../../assets/figs/web-1.4.6+/co-writer/01-edit%20panel.png" alt="محرر Co-Writer مع معاينة مباشرة" width="900">
 </div>
 
-الفكرة المحورية هي **التحرير الجراحي**: حدد نطاقاً واطلب من DeepTutor إعادة كتابته أو توسيعه أو تقصيره. يمكن لوكيل التحرير ترسيخ التغيير في قاعدة معرفة أو دليل ويب، ويحتفظ بآثار استدعاءات أدواته، ويعرض كل تغيير كـ diff قبول/رفض — لذا لا شيء يُقبَل حتى توافق عليه.
+الفكرة المحورية هي **التحرير الجراحي**: حدد نطاقاً واطلب من yFeiSTAI إعادة كتابته أو توسيعه أو تقصيره. يمكن لوكيل التحرير ترسيخ التغيير في قاعدة معرفة أو دليل ويب، ويحتفظ بآثار استدعاءات أدواته، ويعرض كل تغيير كـ diff قبول/رفض — لذا لا شيء يُقبَل حتى توافق عليه.
 
 </details>
 
@@ -395,7 +395,7 @@ Co-Writer هو مساحة عمل Markdown ذات عرض مقسَّم للتقا�
 <summary><b>📖 Book — كتب حية من موادك</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/book/00-book_overview.png" alt="مكتبة كتب DeepTutor" width="900">
+<img src="../../assets/figs/web-1.4.6+/book/00-book_overview.png" alt="مكتبة كتب yFeiSTAI" width="900">
 </div>
 
 يحوّل Book المصادر المحددة إلى **كتاب حي** تفاعلي — ليس PDF ثابتاً، بل بيئة قراءة مبنية من كتل مكتوبة. يمكن أن يبدأ الكتاب من قواعد المعرفة أو دفاتر الملاحظات أو بنوك الأسئلة أو تاريخ المحادثة؛ يقترح تدفق الإنشاء هيكل فصل قبل توليد المحتوى، لذا تراجع الشكل بدلاً من قبول مخرجات عشوائية.
@@ -416,7 +416,7 @@ Co-Writer هو مساحة عمل Markdown ذات عرض مقسَّم للتقا�
 <summary><b>📚 مركز المعرفة — مكتبات RAG متعددة المحركات</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/knowledge/00-overview.png" alt="مركز المعرفة في DeepTutor" width="900">
+<img src="../../assets/figs/web-1.4.6+/knowledge/00-overview.png" alt="مركز المعرفة في yFeiSTAI" width="900">
 </div>
 
 قواعد المعرفة هي مجموعات المستندات وراء RAG — إنها ترسّخ أدوار Chat وتحرير Co-Writer وتوليد Book ومحادثات Partner. ما يميزها هو **اختيار محرك الاسترجاع**: **LlamaIndex** (الافتراضي، ناقل محلي + BM25)، **PageIndex** (مستضاف، استرجاع تفكيري مع استشهادات على مستوى الصفحة)، **GraphRAG** و**LightRAG** (استرجاع قائم على الرسم البياني المعرفي)، **LightRAG Server** (استرجاع مُحال إلى نسخة LightRAG خارجية تتصل بها عبر HTTP)، أو مخزن **Obsidian** مرتبط يقرأ المدرس ويكتب فيه في مكانه. كل قاعدة معرفة مرتبطة بمحرك واحد.
@@ -433,7 +433,7 @@ Co-Writer هو مساحة عمل Markdown ذات عرض مقسَّم للتقا�
 <summary><b>🌐 فضاء التعلم — المهارات والشخصيات والسياق القابل لإعادة الاستخدام</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/learning-space/00-overview.png" alt="مركز فضاء التعلم في DeepTutor" width="900">
+<img src="../../assets/figs/web-1.4.6+/learning-space/00-overview.png" alt="مركز فضاء التعلم في yFeiSTAI" width="900">
 </div>
 
 فضاء التعلم هو طبقة المكتبة والتخصيص — حيث تعيش الأشياء التي تستمر. **المحادثات والمواد** تحتفظ بتاريخ المحادثة ودفاتر الملاحظات وبنك الأسئلة (كل سؤال محفوظ يحتفظ بإجابتك والإجابة المرجعية وشرحاً). **التخصيص** يحتفظ بمسارات الإتقان والشخصيات (إعدادات السلوك المسبقة مثل *زميل* و*مساعد بحثي* و*معلم*) والمهارات (دليل `SKILL.md` يقرأه النموذج عند الطلب). كل شيء هنا يمكن إعادة استخدامه من Chat وPartners وCo-Writer وBook.
@@ -450,13 +450,13 @@ Co-Writer هو مساحة عمل Markdown ذات عرض مقسَّم للتقا�
 <summary><b>🧠 Memory — تخصيص قابل للتدقيق</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/memory/00-overview.png" alt="نظرة عامة على ذاكرة DeepTutor" width="900">
+<img src="../../assets/figs/web-1.4.6+/memory/00-overview.png" alt="نظرة عامة على ذاكرة yFeiSTAI" width="900">
 </div>
 
 الذاكرة نظام ثلاثي الطبقات مدعوم بالملفات يمكنك قراءته وتنظيمه ومراجعته — وهو عمداً *ليس* مخزناً ناقلاً مخفياً. **L1** هو مرآة مساحة العمل بالإضافة إلى آثار أحداث تراكمية فقط (`trace/<surface>/<date>.jsonl`)؛ **L2** هو حقائق منظَّمة لكل سطح (`L2/<surface>.md`)؛ **L3** هو تركيب عبر الأسطح (`L3/<profile|recent|scope|preferences>.md`). لأن L2 يستشهد بـ L1 وL3 يستشهد بـ L2، لا شيء في ملفك الشخصي غير مسؤول.
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/memory/01-3%20layer%20memory%20graph.png" alt="رسم بياني لذاكرة DeepTutor" width="900">
+<img src="../../assets/figs/web-1.4.6+/memory/01-3%20layer%20memory%20graph.png" alt="رسم بياني لذاكرة yFeiSTAI" width="900">
 </div>
 
 يُظهر Memory Graph الهرم بأكمله — تركيب L3 في المركز وL2 في الحلقة الوسطى وآثار L1 في الخارج — لذا يمكنك تتبع أي ادعاء مُوليَّف إلى الحدث الخام الدقيق خلفه. يُتتبع الذاكرة عبر أسطح `chat` و`notebook` و`quiz` و`kb` و`book` والشريك و`cowriter`؛ ميزانيات تحديث الموحّد / تدقيقه / إلغاء تكراره تُضبط في **الإعدادات ← الذاكرة**.
@@ -467,13 +467,13 @@ Co-Writer هو مساحة عمل Markdown ذات عرض مقسَّم للتقا�
 <summary><b>⚙️ الإعدادات — لوحة تحكم واحدة</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/settings/00-setting%20overview.png" alt="مركز إعدادات DeepTutor" width="900">
+<img src="../../assets/figs/web-1.4.6+/settings/00-setting%20overview.png" alt="مركز إعدادات yFeiSTAI" width="900">
 </div>
 
 الإعدادات هي لوحة التحكم التشغيلية، مع شريط حالة مباشر (الخلفية وLLM والتضمين والبحث) وبطاقة واحدة لكل منطقة: **المظهر** (الثيمة، ولغة واجهة المستخدم، وتنسيق كتل الرمز)، **الشبكة** (قاعدة API والمنافذ وCORS)، **النماذج** (LLM والتضمين والبحث وتحويل النص إلى كلام وتحويل الكلام إلى نص وتوليد الصور وتوليد الفيديو)، **قاعدة المعرفة** (محرك تحليل المستندات)، **Chat** (الأدوات وخوادم MCP والمعاملات لكل قدرة، وحدود المرفقات)، **الشركاء والوكلاء** (الوكلاء الفرعيون الذين يمكنك استشارتهم من دور)، و**الذاكرة** (ميزانيات الموحّد).
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/settings/01-appearance%20settings.png" alt="إعدادات المظهر والثيمات في DeepTutor" width="900">
+<img src="../../assets/figs/web-1.4.6+/settings/01-appearance%20settings.png" alt="إعدادات المظهر والثيمات في yFeiSTAI" width="900">
 </div>
 
 تستخدم معظم الأقسام تدفق صياغة-وتطبيق، لذا يمكنك اختبار مزود قبل الالتزام به. تشحن أربع ثيمات في الصندوق — Default وCream وDark وGlass. ملفات `.env` في جذر المشروع تُتجاهل عمداً؛ يعيش تهيئة وقت التشغيل تحت `data/user/settings/*.json` إلا إذا وجّه `DEEPTUTOR_HOME` أو `deeptutor start --home` التطبيق في مكان آخر.
@@ -483,7 +483,7 @@ Co-Writer هو مساحة عمل Markdown ذات عرض مقسَّم للتقا�
 <details>
 <summary><b>👥 متعدد المستخدمين — النشر المشترك</b> · مصادقة اختيارية، مساحات عمل معزولة لكل مستخدم</summary>
 
-المصادقة **معطلة افتراضياً** — يعمل DeepTutor لمستخدم واحد. فعّلها وشجرة `data/` واحدة تستضيف مساحة عمل المشرف ومساحات عمل معزولة لكل مستخدم ومساحات عمل الشريك جنباً إلى جنب:
+المصادقة **معطلة افتراضياً** — يعمل yFeiSTAI لمستخدم واحد. فعّلها وشجرة `data/` واحدة تستضيف مساحة عمل المشرف ومساحات عمل معزولة لكل مستخدم ومساحات عمل الشريك جنباً إلى جنب:
 
 ```text
 data/
@@ -501,9 +501,9 @@ data/
 
 </details>
 
-## ⌨️ واجهة سطر أوامر DeepTutor — الواجهة الأصيلة للوكلاء
+## ⌨️ واجهة سطر أوامر yFeiSTAI — الواجهة الأصيلة للوكلاء
 
-ثنائي `deeptutor` واحد، طريقتان للدخول: **REPL** تفاعلي للأشخاص الذين يعيشون في الطرفية، و**JSON** منظَّم للوكلاء الأخرى التي تقود DeepTutor كأداة. نفس القدرات والأدوات وقواعد المعرفة في كلتا الحالتين.
+ثنائي `deeptutor` واحد، طريقتان للدخول: **REPL** تفاعلي للأشخاص الذين يعيشون في الطرفية، و**JSON** منظَّم للوكلاء الأخرى التي تقود yFeiSTAI كأداة. نفس القدرات والأدوات وقواعد المعرفة في كلتا الحالتين.
 
 <details>
 <summary><b>قدّها بنفسك</b></summary>
@@ -525,7 +525,7 @@ deeptutor run deep_research "Survey 2026 papers on RAG" \
 <details>
 <summary><b>دع وكيلاً يقودها</b></summary>
 
-DeepTutor مبنية لتكون *مُشغَّلة بواسطة وكيل آخر*. أضف `--format json` إلى أي `run` وكل دور يبث **NDJSON — حدث واحد في كل سطر** (`content` و`tool_call` و`tool_result` و`done` و...)، وكل سطر مُعنوَن بـ `session_id` الخاص به. التشغيلات آمنة بدون TTY: توقف `ask_user` بدون TTY يحل تلقائياً برد فارغ بدلاً من التعليق.
+yFeiSTAI مبنية لتكون *مُشغَّلة بواسطة وكيل آخر*. أضف `--format json` إلى أي `run` وكل دور يبث **NDJSON — حدث واحد في كل سطر** (`content` و`tool_call` و`tool_result` و`done` و...)، وكل سطر مُعنوَن بـ `session_id` الخاص به. التشغيلات آمنة بدون TTY: توقف `ask_user` بدون TTY يحل تلقائياً برد فارغ بدلاً من التعليق.
 
 ```bash
 # لقطة واحدة، قابلة للقراءة آلياً
@@ -580,12 +580,12 @@ python -m pip install -e ./packaging/deeptutor-cli
 
 ## 🧩 النظام البيئي — EduHub ومجتمع المهارات
 
-تستخدم مهارات DeepTutor تنسيق **Agent-Skills** المفتوح — مجلد يحتوي دليل `SKILL.md` (YAML frontmatter + Markdown) وملفات مرجعية اختيارية. لا شيء في ذلك خاص بـ DeepTutor، لذا أي سجل يتحدث التنسيق يصبح مصدراً لمكتبتك. يشحن DeepTutor مع **[EduHub](https://eduhub.deeptutor.info/)** — سجل المهارات المركّز على التعليم الخاص بنا — مُوصَّلاً كمركز افتراضي.
+تستخدم مهارات yFeiSTAI تنسيق **Agent-Skills** المفتوح — مجلد يحتوي دليل `SKILL.md` (YAML frontmatter + Markdown) وملفات مرجعية اختيارية. لا شيء في ذلك خاص بـ yFeiSTAI، لذا أي سجل يتحدث التنسيق يصبح مصدراً لمكتبتك. يشحن yFeiSTAI مع **[EduHub](https://eduhub.deeptutor.info/)** — سجل المهارات المركّز على التعليم الخاص بنا — مُوصَّلاً كمركز افتراضي.
 
 <details>
-<summary><b>EduHub — النظام البيئي للمهارات في DeepTutor</b></summary>
+<summary><b>EduHub — النظام البيئي للمهارات في yFeiSTAI</b></summary>
 
-[**EduHub**](https://eduhub.deeptutor.info/) هو المركز المجتمعي الذي أطلقه DeepTutor لمشاركة مهارات الوكيل الموجهة نحو التعليم — موجهو سقراط وبناة بطاقات الفلاش وتغذية راجعة للمقالات وخطط الامتحانات وشارحو المفاهيم وغيرها. مُدمَج في DeepTutor، لذا لا شيء يجب تهيئته: slug مجرد أو بادئة `eduhub:` تحل إليه.
+[**EduHub**](https://eduhub.deeptutor.info/) هو المركز المجتمعي الذي أطلقه yFeiSTAI لمشاركة مهارات الوكيل الموجهة نحو التعليم — موجهو سقراط وبناة بطاقات الفلاش وتغذية راجعة للمقالات وخطط الامتحانات وشارحو المفاهيم وغيرها. مُدمَج في yFeiSTAI، لذا لا شيء يجب تهيئته: slug مجرد أو بادئة `eduhub:` تحل إليه.
 
 **البحث والتثبيت** — في المتصفح، افتح **فضاء التعلم ← المهارات ← الاستيراد من EduHub** لتصفح الكتالوج وتنزيل مهارة مباشرةً إلى مكتبتك. من الطرفية:
 
@@ -604,7 +604,7 @@ deeptutor skill publish ./my-skill                    # تفاعلي: اختر t
 deeptutor skill update                                # تراجع أو أصدر إصداراً جديداً
 ```
 
-EduHub هو أيضاً سجل مستقل متوافق مع ClawHub، لذا الوكلاء الذين ليسوا DeepTutor (Claude Code وCodex و...) يمكنهم استخدامه مباشرةً من خلال واجهة `eduhub` — `npx eduhub install socratic-tutor`.
+EduHub هو أيضاً سجل مستقل متوافق مع ClawHub، لذا الوكلاء الذين ليسوا yFeiSTAI (Claude Code وCodex و...) يمكنهم استخدامه مباشرةً من خلال واجهة `eduhub` — `npx eduhub install socratic-tutor`.
 
 </details>
 
@@ -615,7 +615,7 @@ EduHub هو أيضاً سجل مستقل متوافق مع ClawHub، لذا ال
 
 - يُفحَص **حكم الأمان** للسجل أولاً — الحزم الموسومة ترفض إلا إذا مررت `--allow-unverified`؛
 - تُستخرَج الأرشيفات بشكل دفاعي (حراس zip-slip / zip-bomb) خلف **قائمة بيضاء للاحقات** نص/نص، لذا الثنائيات لا تصل أبداً إلى مساحة العمل؛
-- تُعيَّر الـ frontmatter إلى مخطط DeepTutor و`always:` **تُزال**، لذا مهارة محملة لا يمكنها أبداً إجبار نفسها في كل مطالبة نظام؛
+- تُعيَّر الـ frontmatter إلى مخطط yFeiSTAI و`always:` **تُزال**، لذا مهارة محملة لا يمكنها أبداً إجبار نفسها في كل مطالبة نظام؛
 - المصدر — المركز والإصدار والحكم ووقت التثبيت — يُكتب إلى `.hub-lock.json` للمراجعات والتحديثات.
 
 في عمليات النشر متعددة المستخدمين، التثبيت للمشرفين فقط: تهبط مهارة جديدة في كتالوج المشرف وتظل غير مرئية للمستخدمين الآخرين حتى تعيّنها منحة، لذا يمكن للمشرف فحصها قبل طرحها.
@@ -625,7 +625,7 @@ EduHub هو أيضاً سجل مستقل متوافق مع ClawHub، لذا ال
 <details>
 <summary><b>متوافق أيضاً مع ClawHub</b></summary>
 
-لأن DeepTutor يتحدث تنسيق Agent-Skills المفتوح، **[ClawHub](https://clawhub.ai/)** يعمل كمصدر من الدرجة الأولى أيضاً — مُدمَج جنباً إلى جنب مع EduHub. اختره ببادئة المركز:
+لأن yFeiSTAI يتحدث تنسيق Agent-Skills المفتوح، **[ClawHub](https://clawhub.ai/)** يعمل كمصدر من الدرجة الأولى أيضاً — مُدمَج جنباً إلى جنب مع EduHub. اختره ببادئة المركز:
 
 ```bash
 deeptutor skill search "git release notes" --hub clawhub
@@ -640,13 +640,13 @@ deeptutor skill install clawhub:git-release-notes@1.0.1
 
 ### 📮 التواصل
 
-DeepTutor هو مشروع مفتوح المصدر تقوده [Bingxi Zhao](https://github.com/pancacake) ضمن مجموعة [HKUDS](https://github.com/HKUDS)، ويتطور بشكل **مفتوح المصدر بالكامل**، مبني مع المجتمع. حتى الآن، **لا يوجد** لدينا أي منتجات مدفوعة عبر الإنترنت من أي شكل. تفضّل بالتواصل على **bingxizhao39@gmail.com** للنقاشات والأفكار والتعاون.
+yFeiSTAI هو مشروع مفتوح المصدر تقوده [Bingxi Zhao](https://github.com/pancacake) ضمن مجموعة [HKUDS](https://github.com/HKUDS)، ويتطور بشكل **مفتوح المصدر بالكامل**، مبني مع المجتمع. حتى الآن، **لا يوجد** لدينا أي منتجات مدفوعة عبر الإنترنت من أي شكل. تفضّل بالتواصل على **bingxizhao39@gmail.com** للنقاشات والأفكار والتعاون.
 
 ### 🙏 التقدير
 
-خالص الشكر لـ [**Chao Huang**](https://sites.google.com/view/chaoh)، مدير مختبر ذكاء البيانات @ HKU، ولزملائنا في HKUDS على دعمهم الحار — وخاصةً [**Jiahao Zhang**](https://github.com/zzhtx258)، و[**Zirui Guo**](https://github.com/LarFii)، و[**Xubin Ren**](https://github.com/Re-bin). ونحن ممتنون عميقاً أيضاً لـ **مجتمع المصادر المفتوحة**: نجومكم وإصداراتكم وطلبات السحب والنقاشات تشكّل DeepTutor كل يوم.
+خالص الشكر لـ [**Chao Huang**](https://sites.google.com/view/chaoh)، مدير مختبر ذكاء البيانات @ HKU، ولزملائنا في HKUDS على دعمهم الحار — وخاصةً [**Jiahao Zhang**](https://github.com/zzhtx258)، و[**Zirui Guo**](https://github.com/LarFii)، و[**Xubin Ren**](https://github.com/Re-bin). ونحن ممتنون عميقاً أيضاً لـ **مجتمع المصادر المفتوحة**: نجومكم وإصداراتكم وطلبات السحب والنقاشات تشكّل yFeiSTAI كل يوم.
 
-يقف DeepTutor أيضاً على أكتاف مشاريع مفتوحة المصدر متميزة أعطتنا أدوات وإلهاماً:
+يقف yFeiSTAI أيضاً على أكتاف مشاريع مفتوحة المصدر متميزة أعطتنا أدوات وإلهاماً:
 
 | المشروع | الدور / الإلهام |
 |:---|:---|
@@ -657,16 +657,16 @@ DeepTutor هو مشروع مفتوح المصدر تقوده [Bingxi Zhao](https
 | [**AI-Researcher**](https://github.com/HKUDS/AI-Researcher) | خط أنابيب بحث آلي *(HKUDS)* |
 | [**OpenClaw**](https://github.com/openclaw/openclaw) | بوابة وكيل مفتوحة ونظام مهارات وراء ClawHub |
 | [**Codex**](https://github.com/openai/codex) | واجهة برمجة أصيلة للوكلاء ألهمت سير عمل CLI لدينا |
-| [**Claude Code**](https://github.com/anthropics/claude-code) | واجهة برمجة للوكلاء ألهمت حلقة وكيل DeepTutor |
+| [**Claude Code**](https://github.com/anthropics/claude-code) | واجهة برمجة للوكلاء ألهمت حلقة وكيل yFeiSTAI |
 | [**ManimCat**](https://github.com/Wing900/ManimCat) | توليد رسوم متحركة رياضية مدفوع بالذكاء الاصطناعي لـ Math Animator |
 
 ### 🗺️ خارطة الطريق والمساهمة
 
-نريد لـ DeepTutor أن يستمر في التطور والتحسين — وفي نهاية المطاف أن يصبح هدية نقدمها للمجتمع مفتوح المصدر. يُحدَّث [**خارطة طريقنا**](https://github.com/HKUDS/DeepTutor/issues/498) باستمرار؛ صوّت على العناصر هناك أو اقترح عناصر جديدة. إذا كنت ترغب في المساهمة، راجع [**دليل المساهمة**](../../CONTRIBUTING.md) لمعرفة استراتيجية الفروع ومعايير البرمجة وكيفية البدء.
+نريد لـ yFeiSTAI أن يستمر في التطور والتحسين — وفي نهاية المطاف أن يصبح هدية نقدمها للمجتمع مفتوح المصدر. يُحدَّث [**خارطة طريقنا**](https://github.com/HKUDS/DeepTutor/issues/498) باستمرار؛ صوّت على العناصر هناك أو اقترح عناصر جديدة. إذا كنت ترغب في المساهمة، راجع [**دليل المساهمة**](../../CONTRIBUTING.md) لمعرفة استراتيجية الفروع ومعايير البرمجة وكيفية البدء.
 
 <div align="center">
 
-نأمل أن يصبح DeepTutor هدية للمجتمع. 🎁
+نأمل أن يصبح yFeiSTAI هدية للمجتمع. 🎁
 
 <a href="https://github.com/HKUDS/DeepTutor/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=HKUDS/DeepTutor&max=999" alt="المساهمون" />

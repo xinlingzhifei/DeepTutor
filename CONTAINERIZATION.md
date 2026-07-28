@@ -1,6 +1,6 @@
-# DeepTutor Containerization
+# yFeiSTAI Containerization
 
-This document covers deploying DeepTutor from a container image: the
+This document covers deploying yFeiSTAI from a container image: the
 recommended `docker run` path, the hardened rootless-Podman path with a
 read-only root filesystem, runtime configuration, the optional PocketBase
 sidecar, and the security notes that motivate the default posture.
@@ -120,7 +120,7 @@ browser ever sees. `public_api_base` is accepted as a compatibility alias
 and normalized into `next_public_api_base_external` on save.
 
 CORS uses frontend **origins**, not API URLs. With auth disabled,
-DeepTutor permits normal HTTP/HTTPS browser origins by default. With
+yFeiSTAI permits normal HTTP/HTTPS browser origins by default. With
 auth enabled, add exact frontend origins:
 
 ```json

@@ -1,5 +1,5 @@
 # ============================================
-# DeepTutor — Podman Compose (rootless, read-only rootfs)
+# yFeiSTAI — Podman Compose (rootless, read-only rootfs)
 # ============================================
 # Requires:
 #   * podman 4.1+ (rootless)
@@ -110,7 +110,7 @@ services:
       start_period: 10s
 
   # ----------------------------------------------------------
-  # DeepTutor — backend (FastAPI :8001) + frontend (Next.js :3782)
+  # yFeiSTAI — backend (FastAPI :8001) + frontend (Next.js :3782)
   # ----------------------------------------------------------
   # Both run inside the same image, supervised by supervisord under the
   # unprivileged `deeptutor` user (UID 1000). The image's entrypoint loads

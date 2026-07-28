@@ -40,15 +40,13 @@ _PHASE_ORDER = ["exploration", "expansion", "synthesis", "verification", "other"
 
 
 def _normalize_language(language: str) -> str:
-    normalized = language.lower()
-    if normalized.startswith("zh"):
-        return "zh"
+    normalized = str(language or "zh").lower()
     if normalized.startswith("en"):
         return "en"
-    return normalized
+    return "zh"
 
 
-def load_prompt_hints(tool_name: str, language: str = "en") -> ToolPromptHints:
+def load_prompt_hints(tool_name: str, language: str = "zh") -> ToolPromptHints:
     """Load per-tool prompt hints from YAML with zh/en fallback."""
     normalized_language = _normalize_language(language)
     base_dir = Path(__file__).parent / "hints"
@@ -88,7 +86,7 @@ def load_prompt_hints(tool_name: str, language: str = "en") -> ToolPromptHints:
 class ToolPromptComposer:
     """Render prompt metadata into reusable prompt fragments."""
 
-    def __init__(self, language: str = "en") -> None:
+    def __init__(self, language: str = "zh") -> None:
         self.language = _normalize_language(language)
 
     def format_list(self, hints: list[ToolHintEntry]) -> str:

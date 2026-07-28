@@ -1,10 +1,10 @@
-"""Bridge DeepTutor's runtime config into a GraphRAG ``settings.yaml``.
+"""Bridge yFeiSTAI's runtime config into a GraphRAG ``settings.yaml``.
 
 GraphRAG (microsoft/graphrag, 3.x) is a config-file-driven engine: it reads a
 ``settings.[yaml|json]`` from a project root and wires its own LiteLLM-backed
 model clients from it. Rather than hand-build the deeply nested
 ``GraphRagConfig`` pydantic model, we generate a minimal ``settings.yaml`` from
-DeepTutor's already-resolved LLM + embedding runtime config and let
+yFeiSTAI's already-resolved LLM + embedding runtime config and let
 ``graphrag.config.load_config`` validate it.
 
 Decoupling notes:
@@ -15,7 +15,7 @@ Decoupling notes:
 * Built-in prompts are used (every ``prompt`` field defaults to ``None`` in
   GraphRAG), so we never scaffold prompt files.
 * GraphRAG talks to its models via LiteLLM with ``model_provider: openai`` + a
-  custom ``api_base`` — which is exactly how DeepTutor reaches any
+  custom ``api_base`` — which is exactly how yFeiSTAI reaches any
   OpenAI-compatible endpoint.
 
 This is the single spot to touch if GraphRAG's config schema shifts between
@@ -49,7 +49,7 @@ class GraphRagNotAvailableError(RuntimeError):
 
 
 class GraphRagNotConfiguredError(RuntimeError):
-    """Raised when DeepTutor's LLM / embedding config can't back GraphRAG."""
+    """Raised when yFeiSTAI's LLM / embedding config can't back GraphRAG."""
 
 
 def is_graphrag_available() -> bool:
@@ -114,10 +114,10 @@ def _model_entry(*, model: str, api_base: str | None, api_key: str | None) -> di
 
 
 def build_settings(*, llm_cfg: Any = None, embedding_cfg: Any = None) -> dict[str, Any]:
-    """Assemble the GraphRAG ``settings.yaml`` payload from DeepTutor config.
+    """Assemble the GraphRAG ``settings.yaml`` payload from yFeiSTAI config.
 
     ``llm_cfg`` / ``embedding_cfg`` are injectable for tests; in production they
-    are resolved from DeepTutor's catalog. Raises
+    are resolved from yFeiSTAI's catalog. Raises
     :class:`GraphRagNotConfiguredError` if either side has no usable model.
     """
     if llm_cfg is None:
@@ -168,7 +168,7 @@ def build_settings(*, llm_cfg: Any = None, embedding_cfg: Any = None) -> dict[st
                 api_key=getattr(embedding_cfg, "api_key", None),
             ),
         },
-        # Plain-text input: DeepTutor's ingestion writes parsed ``.txt`` files
+        # Plain-text input: yFeiSTAI's ingestion writes parsed ``.txt`` files
         # into ``input/`` (see ``ingestion.py``) so GraphRAG never parses
         # documents itself.
         "input": {"type": "text", "file_pattern": r".*\.txt$"},
@@ -176,7 +176,7 @@ def build_settings(*, llm_cfg: Any = None, embedding_cfg: Any = None) -> dict[st
         "output_storage": {"type": "file", "base_dir": "output"},
         "cache": {"type": "file", "storage": {"type": "file", "base_dir": "cache"}},
         "reporting": {"type": "file", "base_dir": "logs"},
-        # GraphRAG/LanceDB defaults to 3072 dimensions; DeepTutor must stamp the
+        # GraphRAG/LanceDB defaults to 3072 dimensions; yFeiSTAI must stamp the
         # active embedding dimension so Qwen-4096 and other non-default models work.
         "vector_store": {
             "type": "lancedb",

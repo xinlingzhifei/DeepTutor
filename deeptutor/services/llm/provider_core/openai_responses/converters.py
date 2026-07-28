@@ -121,7 +121,7 @@ def adapt_chat_kwargs_to_responses(extra_kwargs: Mapping[str, Any]) -> dict[str,
     or ``max_tokens`` for older chat models. The Responses API does not accept
     either name and uses ``max_output_tokens`` instead, so the OpenAI SDK raises
     ``TypeError`` from ``responses.create`` before any HTTP request leaves the
-    client. See DeepTutor#437.
+    client. See upstream issue #437.
 
     Drops keys with ``None`` values to match the existing merge filter, and
     only applies the alias when the caller did not already set the Responses

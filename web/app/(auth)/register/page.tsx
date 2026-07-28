@@ -56,7 +56,7 @@ export default function RegisterPage() {
       {/* Logo / Title */}
       <div className="text-center mb-8">
         <h1 className="font-serif text-2xl font-semibold text-[var(--foreground)] tracking-tight">
-          DeepTutor
+          yFeiSTAI
         </h1>
         <p className="mt-1 text-sm text-[var(--muted-foreground)]">
           {t("Create your account")}
@@ -96,7 +96,7 @@ export default function RegisterPage() {
                          placeholder:text-[var(--muted-foreground)]
                          focus:outline-none focus:ring-2 focus:ring-[var(--primary)] focus:border-transparent
                          transition-shadow text-sm"
-              placeholder="you@example.com"
+              placeholder={t("you@example.com")}
             />
           </div>
 
@@ -184,7 +184,7 @@ export default function RegisterPage() {
       </p>
 
       <p className="mt-3 text-center text-xs text-[var(--muted-foreground)]">
-        DeepTutor · Agent-Native Learning
+        {t("yFeiSTAI · Agent-Native Learning")}
       </p>
     </div>
   );

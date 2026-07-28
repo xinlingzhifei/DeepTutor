@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import i18n from "i18next";
 
+import { DEFAULT_APP_LANGUAGE } from "@/i18n/language";
 import { apiFetch, apiUrl } from "@/lib/api";
 import type { LLMSelection } from "@/lib/unified-ws";
 
@@ -272,7 +273,7 @@ export function useMemoryRun(layer: "L2" | "L3", key: string) {
             budget: args.budget ?? null,
             iterations: args.iterations ?? null,
             llm_selection: args.llmSelection ?? null,
-            language: args.language ?? "en",
+            language: args.language ?? DEFAULT_APP_LANGUAGE,
           }),
         });
         if (!res.ok) {

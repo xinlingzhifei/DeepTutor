@@ -110,7 +110,7 @@ async def test_explicit_call_inherits_matching_profile_headers_and_reasoning(
     monkeypatch,
 ) -> None:
     cfg = _make_cfg(
-        extra_headers={"User-Agent": "DeepTutor-Test"},
+        extra_headers={"User-Agent": "yFeiSTAI-Test"},
         reasoning_effort="minimal",
     )
     provider = _FakeProvider()
@@ -135,7 +135,7 @@ async def test_explicit_call_inherits_matching_profile_headers_and_reasoning(
     )
 
     assert result == "ok"
-    assert captured_config["config"].extra_headers == {"User-Agent": "DeepTutor-Test"}
+    assert captured_config["config"].extra_headers == {"User-Agent": "yFeiSTAI-Test"}
     assert captured_config["config"].reasoning_effort == "minimal"
     assert provider.complete_kwargs["reasoning_effort"] == "minimal"
 

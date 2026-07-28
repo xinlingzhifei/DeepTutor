@@ -96,7 +96,7 @@ class EditAgent(BaseAgent):
 
     def __init__(
         self,
-        language: str = "en",
+        language: str = "zh",
         enabled_tools: list[str] | None = None,
         **kwargs: Any,
     ):
@@ -104,7 +104,7 @@ class EditAgent(BaseAgent):
         Initialize EditAgent.
 
         Args:
-            language: Language setting ('en' | 'zh'), default 'en'
+            language: Language setting ('en' | 'zh'), default 'zh'
 
         Note: LLM configuration (api_key, base_url, model, etc.) is loaded
         automatically from the unified config service. Use refresh_config()

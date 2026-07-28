@@ -52,7 +52,7 @@ def test_text_only_parser_extracts_docx_text(tmp_path) -> None:
             """
             <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
               <w:body>
-                <w:p><w:r><w:t>Hello DeepTutor</w:t></w:r></w:p>
+                <w:p><w:r><w:t>Hello yFeiSTAI</w:t></w:r></w:p>
               </w:body>
             </w:document>
             """.strip(),
@@ -62,7 +62,7 @@ def test_text_only_parser_extracts_docx_text(tmp_path) -> None:
     workdir.mkdir()
     parser.parse(docx, workdir, config={})
 
-    assert (workdir / "lesson.md").read_text(encoding="utf-8") == "Hello DeepTutor"
+    assert (workdir / "lesson.md").read_text(encoding="utf-8") == "Hello yFeiSTAI"
 
 
 def test_mineru_signature_distinguishes_local_and_cloud() -> None:
@@ -149,7 +149,7 @@ def test_pymupdf4llm_parses_pdf_and_extracts_images(tmp_path) -> None:
     pdf = tmp_path / "doc.pdf"
     doc = pymupdf.open()
     page = doc.new_page()
-    page.insert_text((72, 72), "Hello DeepTutor via PyMuPDF4LLM")
+    page.insert_text((72, 72), "Hello yFeiSTAI via PyMuPDF4LLM")
     pix = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 120, 120))
     pix.clear_with(128)
     page.insert_image(pymupdf.Rect(100, 200, 320, 420), pixmap=pix)
@@ -166,7 +166,7 @@ def test_pymupdf4llm_parses_pdf_and_extracts_images(tmp_path) -> None:
     )
 
     md = (workdir / "doc.md").read_text(encoding="utf-8")
-    assert "DeepTutor" in md
+    assert "yFeiSTAI" in md
     images = workdir / "images"
     assert images.is_dir()
     extracted = list(images.glob("*.png"))

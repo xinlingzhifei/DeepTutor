@@ -1,8 +1,8 @@
-# DeepTutor — Agent-Native Architecture
+# yFeiSTAI — Agent-Native Architecture
 
 ## Overview
 
-DeepTutor is an **agent-native** intelligent learning companion organized
+yFeiSTAI is an **agent-native** intelligent learning companion organized
 around a two-layer plugin model — single-shot **Tools** invoked by the
 LLM, and multi-stage **Capabilities** that take over a turn — exposed
 through three entry points: CLI, WebSocket API, and Python SDK.

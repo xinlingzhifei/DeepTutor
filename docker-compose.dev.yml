@@ -1,5 +1,5 @@
 # ============================================
-# DeepTutor Docker Compose - Development Override
+# yFeiSTAI Docker Compose - Development Override
 # ============================================
 # Use with: python scripts/docker_compose.py -f docker-compose.yml -f docker-compose.dev.yml up
 #

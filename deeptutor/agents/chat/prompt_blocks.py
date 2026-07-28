@@ -14,7 +14,7 @@ class ChatPromptAssembler:
 
     def __init__(self, *, prompts: dict[str, Any], language: str) -> None:
         self.prompts = prompts
-        self.language = "zh" if language.lower().startswith("zh") else "en"
+        self.language = "en" if str(language or "zh").lower().startswith("en") else "zh"
 
     def system_prompt(
         self,
@@ -97,7 +97,7 @@ class ChatPromptAssembler:
 
         Partner turns carry ``metadata["agent_identity"]`` (user-given name +
         description); their identity comes from that and the Soul block, so
-        the "You are DeepTutor" general is swapped for ``general_partner``.
+        the "You are yFeiSTAI" general is swapped for ``general_partner``.
         Chat turns carry no identity and render the general block unchanged.
         """
         identity = context.metadata.get("agent_identity")

@@ -218,19 +218,19 @@ class TestIsMentioned:
         # from the rendered ``@**Bot Name**`` syntax in the message body.
         ch = _make_channel()
         ch._bot_user_id = 100
-        ch._bot_full_name = "DeepTutor Bot"
-        assert ch._is_mentioned({"flags": [], "content": "hi @**DeepTutor Bot** help"}) is True
+        ch._bot_full_name = "yFeiSTAI Bot"
+        assert ch._is_mentioned({"flags": [], "content": "hi @**yFeiSTAI Bot** help"}) is True
 
     def test_content_fallback_requires_full_name(self):
         ch = _make_channel()
         ch._bot_user_id = 100
         ch._bot_full_name = ""
-        assert ch._is_mentioned({"flags": [], "content": "hi @**DeepTutor Bot**"}) is False
+        assert ch._is_mentioned({"flags": [], "content": "hi @**yFeiSTAI Bot**"}) is False
 
     def test_content_fallback_no_match(self):
         ch = _make_channel()
         ch._bot_user_id = 100
-        ch._bot_full_name = "DeepTutor Bot"
+        ch._bot_full_name = "yFeiSTAI Bot"
         assert ch._is_mentioned({"flags": [], "content": "no mention here"}) is False
 
     def test_content_fallback_disambiguated_mention(self):
@@ -238,8 +238,8 @@ class TestIsMentioned:
         # does not contain @**Name** as a substring, so it needs its own pattern.
         ch = _make_channel()
         ch._bot_user_id = 100
-        ch._bot_full_name = "DeepTutor Bot"
-        assert ch._is_mentioned({"flags": [], "content": "hi @**DeepTutor Bot|100** help"}) is True
+        ch._bot_full_name = "yFeiSTAI Bot"
+        assert ch._is_mentioned({"flags": [], "content": "hi @**yFeiSTAI Bot|100** help"}) is True
 
 
 class TestExtractUploadLinks:

@@ -6,10 +6,10 @@ from typing import Any
 
 
 def _parse_language(language: str | None) -> str:
-    raw = (language or "en").strip().lower()
-    if raw.startswith("zh") or raw in {"cn", "chinese"}:
-        return "zh"
-    return "en"
+    raw = (language or "zh").strip().lower()
+    if raw.startswith("en") or raw == "english":
+        return "en"
+    return "zh"
 
 
 _MESSAGES: dict[str, dict[str, str]] = {
@@ -62,7 +62,7 @@ _MESSAGES: dict[str, dict[str, str]] = {
 }
 
 
-def current_language(default: str = "en") -> str:
+def current_language(default: str = "zh") -> str:
     try:
         from deeptutor.services.settings.interface_settings import get_ui_language
 
@@ -73,7 +73,12 @@ def current_language(default: str = "en") -> str:
 
 def t(key: str, default: str = "", *, language: str | None = None, **kwargs: Any) -> str:
     lang = _parse_language(language) if language else current_language()
-    text = _MESSAGES.get(lang, {}).get(key) or _MESSAGES["en"].get(key) or default
+    text = (
+        _MESSAGES.get(lang, {}).get(key)
+        or _MESSAGES["zh"].get(key)
+        or _MESSAGES["en"].get(key)
+        or default
+    )
     if kwargs:
         try:
             return text.format(**kwargs)

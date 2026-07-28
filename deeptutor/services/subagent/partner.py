@@ -8,12 +8,12 @@ streams its native trace back, which we map onto the coarse subagent event
 channels so the sidebar renders it like any other consulted agent.
 
 Session continuity is the whole point of the design. ``session_id`` here IS the
-*partner session key*. The first consult of a DeepTutor chat session has none,
+*partner session key*. The first consult of a yFeiSTAI chat session has none,
 so we mint a fresh ``dt-…`` key and return it; the cross-turn registry
 (:mod:`deeptutor.services.subagent.sessions`) remembers it against
-(chat session, connection), so every later consult in the same DeepTutor chat —
+(chat session, connection), so every later consult in the same yFeiSTAI chat —
 within one turn or across turns — resumes the SAME partner session. The partner
-page then sees one complete history session per DeepTutor chat, titled from the
+page then sees one complete history session per yFeiSTAI chat, titled from the
 first consult's question.
 """
 
@@ -98,7 +98,7 @@ class PartnerBackend(SubagentBackend):
                 return ConsultResult(success=False, error=f"Could not start partner '{pid}': {exc}")
 
         # ``session_id`` is the partner session key. None on the first consult of
-        # a DeepTutor chat → mint a stable, colon-free key; the registry threads
+        # a yFeiSTAI chat → mint a stable, colon-free key; the registry threads
         # it through every later consult so they all land in one partner session.
         session_key = str(session_id or "").strip() or f"dt-{uuid.uuid4().hex[:12]}"
 

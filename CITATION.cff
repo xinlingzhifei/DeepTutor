@@ -1,6 +1,6 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
-title: "DeepTutor: Towards Agentic Personalized Tutoring"
+title: "yFeiSTAI: Towards Agentic Personalized Tutoring"
 authors:
   - family-names: "Zhao"
     given-names: "Bingxi"
@@ -18,7 +18,7 @@ authors:
     given-names: "Chao"
 preferred-citation:
   type: article
-  title: "DeepTutor: Towards Agentic Personalized Tutoring"
+  title: "yFeiSTAI: Towards Agentic Personalized Tutoring"
   authors:
     - family-names: "Zhao"
       given-names: "Bingxi"

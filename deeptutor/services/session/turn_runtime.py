@@ -109,6 +109,11 @@ def _clip_text(value: str, limit: int = 4000) -> str:
     return text[:limit].rstrip() + "\n...[truncated]"
 
 
+def _normalize_response_language(value: Any) -> Literal["zh", "en"]:
+    normalized = str(value or "").strip().lower().replace("_", "-")
+    return "en" if normalized == "english" or normalized.startswith("en") else "zh"
+
+
 _TITLE_QUOTE_PAIRS: tuple[tuple[str, str], ...] = (
     ('"', '"'),
     ("'", "'"),
@@ -216,7 +221,7 @@ def _request_snapshot_metadata(
         "capability": capability,
         "enabledTools": _string_list(payload.get("tools")),
         "knowledgeBases": _string_list(payload.get("knowledge_bases")),
-        "language": str(payload.get("language", "en") or "en"),
+        "language": _normalize_response_language(payload.get("language")),
     }
     if attachments:
         snapshot["attachments"] = attachments
@@ -448,7 +453,7 @@ def _extract_regenerate_flag(config: dict[str, Any] | None) -> bool:
     return bool(raw)
 
 
-def _format_followup_question_context(context: dict[str, Any], language: str = "en") -> str:
+def _format_followup_question_context(context: dict[str, Any], language: str = "zh") -> str:
     options = context.get("options") or {}
     option_lines = []
     if isinstance(options, dict) and options:
@@ -460,7 +465,7 @@ def _format_followup_question_context(context: dict[str, Any], language: str = "
         "correct" if correctness is True else "incorrect" if correctness is False else "unknown"
     )
 
-    if str(language or "en").lower().startswith("zh"):
+    if _normalize_response_language(language) == "zh":
         lines = [
             "你正在处理一道测验题的后续追问。",
             "下面是本题上下文，请在后续回答中优先围绕这道题进行解释、纠错、延展和追问。",
@@ -693,6 +698,7 @@ class TurnRuntimeManager:
             **payload,
             "capability": capability,
             "config": {**validated_public_config, **runtime_only_config},
+            "language": _normalize_response_language(payload.get("language")),
         }
         session = await self.store.ensure_session(payload.get("session_id"))
         preferences = session.get("preferences") or {}
@@ -795,7 +801,7 @@ class TurnRuntimeManager:
             "capability": capability,
             "tools": list(payload.get("tools") or []),
             "knowledge_bases": list(payload.get("knowledge_bases") or []),
-            "language": str(payload.get("language") or "en"),
+            "language": _normalize_response_language(payload.get("language")),
         }
         if llm_selection:
             preference_update["llm_selection"] = llm_selection
@@ -898,7 +904,9 @@ class TurnRuntimeManager:
             if overrides.get("knowledge_bases") is not None
             else preferences.get("knowledge_bases") or []
         )
-        language = str(overrides.get("language") or preferences.get("language") or "en")
+        language = _normalize_response_language(
+            overrides.get("language") or preferences.get("language")
+        )
 
         config: dict[str, Any] = dict(overrides.get("config") or {})
         config.update(
@@ -1340,7 +1348,7 @@ class TurnRuntimeManager:
                         role="system",
                         content=_format_followup_question_context(
                             followup_question_context,
-                            language=str(payload.get("language", "en") or "en"),
+                            language=_normalize_response_language(payload.get("language")),
                         ),
                         capability=capability_name or "chat",
                     )
@@ -1356,7 +1364,7 @@ class TurnRuntimeManager:
             history_result = await builder.build(
                 session_id=session_id,
                 llm_config=llm_config,
-                language=payload.get("language", "en"),
+                language=_normalize_response_language(payload.get("language")),
                 on_event=_emit_context_event,
                 leaf_message_id=branch_parent_id,
             )
@@ -1451,7 +1459,7 @@ class TurnRuntimeManager:
                     fresh_book_references=book_references,
                     fresh_history_session_ids=history_references,
                     fresh_question_entry_ids=question_notebook_references,
-                    language=str(payload.get("language", "en") or "en"),
+                    language=_normalize_response_language(payload.get("language")),
                 )
                 source_manifest_text, source_index = render_manifest(inventory)
                 effective_user_message = raw_user_content
@@ -1462,7 +1470,7 @@ class TurnRuntimeManager:
                     )
                     if referenced_records:
                         analysis_agent = NotebookAnalysisAgent(
-                            language=str(payload.get("language", "en") or "en")
+                            language=_normalize_response_language(payload.get("language"))
                         )
                         notebook_context = await analysis_agent.analyze(
                             user_question=raw_user_content,
@@ -1491,7 +1499,7 @@ class TurnRuntimeManager:
                         transcript = serialize_referenced_transcript(
                             history_session,
                             history_messages,
-                            language=str(payload.get("language", "en") or "en"),
+                            language=_normalize_response_language(payload.get("language")),
                         )
                         if not transcript:
                             continue
@@ -1530,7 +1538,7 @@ class TurnRuntimeManager:
 
                     if history_records:
                         analysis_agent = NotebookAnalysisAgent(
-                            language=str(payload.get("language", "en") or "en")
+                            language=_normalize_response_language(payload.get("language"))
                         )
                         history_context = await analysis_agent.analyze(
                             user_question=raw_user_content,
@@ -1619,7 +1627,7 @@ class TurnRuntimeManager:
                 knowledge_bases=payload.get("knowledge_bases", []),
                 attachments=attachments,
                 config_overrides=request_config,
-                language=payload.get("language", "en"),
+                language=_normalize_response_language(payload.get("language")),
                 memory_context=memory_context,
                 persona_context=persona_context,
                 skills_manifest=skills_manifest,
@@ -1738,7 +1746,7 @@ class TurnRuntimeManager:
                     await self._maybe_generate_session_title(
                         execution=execution,
                         session_id=session_id,
-                        ui_language=str(payload.get("language", "en") or "en"),
+                        ui_language=_normalize_response_language(payload.get("language")),
                     )
                 except Exception:
                     logger.debug("Failed to generate session title", exc_info=True)

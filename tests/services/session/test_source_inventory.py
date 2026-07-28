@@ -470,7 +470,7 @@ async def test_load_history_session_resolves_partner_reference(monkeypatch) -> N
     manager = _FakePartnerManager(
         messages=[
             {"role": "user", "content": "我最近做了什么"},
-            {"role": "assistant", "content": "你最近在配置 DeepTutor。"},
+            {"role": "assistant", "content": "你最近在配置 yFeiSTAI。"},
         ]
     )
     _patch_partner(monkeypatch, manager, is_admin=True)

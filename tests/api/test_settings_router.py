@@ -742,3 +742,14 @@ async def test_update_ui_settings_persists_explicit_theme_and_language_defaults(
     persisted = settings_router.load_ui_settings()
     assert persisted["theme"] == "snow"
     assert persisted["language"] == "en"
+
+
+def test_ui_settings_default_language_is_chinese(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    settings_file = tmp_path / "interface.json"
+    monkeypatch.setattr(settings_router, "_settings_file", lambda: settings_file)
+
+    assert settings_router.DEFAULT_UI_SETTINGS["language"] == "zh"
+    assert settings_router.UISettings().language == "zh"
+    assert settings_router.load_ui_settings()["language"] == "zh"

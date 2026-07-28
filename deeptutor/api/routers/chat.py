@@ -76,7 +76,7 @@ async def websocket_chat(websocket: WebSocket):
                 if requested_language.startswith("zh")
                 else "en"
                 if requested_language.startswith("en")
-                else get_ui_language(default=config.get("system", {}).get("language", "en"))
+                else get_ui_language(default=config.get("system", {}).get("language", "zh"))
             )
             message = data.get("message", "").strip()
             session_id = data.get("session_id")

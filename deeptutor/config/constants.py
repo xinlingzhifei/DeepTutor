@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-Constants for DeepTutor
+Constants for yFeiSTAI
 """
 
 from pathlib import Path

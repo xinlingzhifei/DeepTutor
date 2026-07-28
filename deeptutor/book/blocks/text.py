@@ -24,7 +24,7 @@ def _format_objectives(objectives: list[str]) -> str:
 
 
 def _none_label(language: str) -> str:
-    return _NONE_LABEL.get(language, _NONE_LABEL["en"])
+    return _NONE_LABEL.get(language, _NONE_LABEL["zh"])
 
 
 class TextGenerator(BlockGenerator):

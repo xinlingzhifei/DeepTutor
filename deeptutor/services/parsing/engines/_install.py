@@ -12,7 +12,7 @@ background subprocess with a cursor-based line log the UI starts, polls, and
 cancels. Commands come from fixed allow-lists (pip specs / downloader argv),
 never user input, so the subprocess argv can't be injected. Package installs use
 the bare package specs (the same strings as the ``[parse-*]`` extras) so pip
-never re-resolves DeepTutor itself; after a successful install we invalidate the
+never re-resolves yFeiSTAI itself; after a successful install we invalidate the
 import caches so the engine reports available in the same process (no restart).
 """
 

@@ -412,7 +412,7 @@ async def websocket_question_generate(websocket: WebSocket):
             base_url=base_url,
             api_version=api_version,
             kb_name=kb_name,
-            language=get_ui_language(default=config.get("system", {}).get("language", "en")),
+            language=get_ui_language(default=config.get("system", {}).get("language", "zh")),
             output_dir=str(output_base),
         )
 

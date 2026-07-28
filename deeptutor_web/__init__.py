@@ -1,4 +1,4 @@
-"""Packaged DeepTutor Web standalone assets.
+"""Packaged yFeiSTAI Web standalone assets.
 
 Release builds populate this package with Next.js standalone output:
 ``server.js``, ``.next/static``, ``public``, and the minimal Node runtime files

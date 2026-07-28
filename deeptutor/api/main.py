@@ -217,7 +217,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="DeepTutor API",
+    title="yFeiSTAI API",
     version="1.0.0",
     lifespan=lifespan,
     # Disable automatic trailing slash redirects to prevent protocol downgrade issues
@@ -444,7 +444,7 @@ app.include_router(quiz_judge.router, prefix="/api/v1", tags=["quiz-judge"])
 
 @app.get("/")
 async def root():
-    return {"message": "Welcome to DeepTutor API"}
+    return {"message": "Welcome to yFeiSTAI API"}
 
 
 if __name__ == "__main__":

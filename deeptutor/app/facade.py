@@ -1,4 +1,4 @@
-"""Stable application-layer facade for DeepTutor entry points."""
+"""Stable application-layer facade for yFeiSTAI entry points."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ class TurnRequest:
     session_id: str | None = None
     tools: list[str] = field(default_factory=list)
     knowledge_bases: list[str] = field(default_factory=list)
-    language: str = "en"
+    language: str = "zh"
     config: dict[str, Any] = field(default_factory=dict)
     notebook_references: list[dict[str, Any]] = field(default_factory=list)
     history_references: list[str] = field(default_factory=list)

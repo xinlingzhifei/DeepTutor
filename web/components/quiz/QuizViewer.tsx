@@ -37,6 +37,7 @@ import {
   resolveChoiceAnswerKey,
   resolveConceptAnswer,
 } from "@/lib/quiz-question-type";
+import { DEFAULT_APP_LANGUAGE } from "@/i18n/language";
 import {
   readFileAsBase64,
   startQuizJudge,
@@ -190,7 +191,7 @@ export default function QuizViewer({
   questions,
   sessionId,
   turnId,
-  language = "en",
+  language = DEFAULT_APP_LANGUAGE,
 }: QuizViewerProps) {
   const { t } = useTranslation();
   const followupController = useQuizFollowupController();

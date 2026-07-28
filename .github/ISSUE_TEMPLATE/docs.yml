@@ -51,8 +51,8 @@ body:
     id: environment
     attributes:
       label: Environment (optional)
-      description: Only if relevant to the issue (browser, OS, DeepTutor version).
+      description: Only if relevant to the issue (browser, OS, yFeiSTAI version).
       placeholder: |
         - Browser:
-        - DeepTutor version (if checked locally):
+        - yFeiSTAI version (if checked locally):
         - OS:

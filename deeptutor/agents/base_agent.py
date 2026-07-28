@@ -80,7 +80,8 @@ class BaseAgent(ABC):
         """
         self.module_name = module_name
         self.agent_name = agent_name
-        self.language = language
+        normalized_language = str(language or "").strip().lower().replace("_", "-")
+        self.language = "en" if normalized_language.startswith("en") else "zh"
         self._trace_callback: BaseAgent.TraceCallback | None = None
         # Ensure config is always a dict (not a dataclass like LLMConfig)
         if config is None:

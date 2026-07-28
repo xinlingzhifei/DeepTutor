@@ -2,7 +2,7 @@
 CLI Config Command
 ==================
 
-View and update DeepTutor configuration.
+View and update yFeiSTAI configuration.
 """
 
 from __future__ import annotations
@@ -83,7 +83,7 @@ def register(app: typer.Typer) -> None:
                         "proxy": search_runtime.proxy,
                         "api_key": "***" if search_runtime.api_key else "(not set)",
                     },
-                    "language": main_cfg.get("system", {}).get("language", "en"),
+                    "language": main_cfg.get("system", {}).get("language", "zh"),
                     "tools": list(main_cfg.get("tools", {}).keys()),
                 },
                 indent=2,

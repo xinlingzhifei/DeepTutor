@@ -35,7 +35,7 @@ def _unique_run_token() -> str:
 class _PromptHintsMixin:
     """Shared prompt-hint loader for built-in tools."""
 
-    def get_prompt_hints(self, language: str = "en"):
+    def get_prompt_hints(self, language: str = "zh"):
         return load_prompt_hints(self.name, language=language)
 
 

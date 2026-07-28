@@ -30,7 +30,7 @@ def builtin_pageindex_server() -> MCPServerConfig | None:
         url=cfg.api_base_url.rstrip("/") + "/mcp",
         headers={"Authorization": f"Bearer {cfg.api_key}"},
         tool_timeout=120,
-        # remove_document is the one api-proxy tool DeepTutor blocks: an agent
+        # remove_document is the one api-proxy tool yFeiSTAI blocks: an agent
         # deleting a cloud doc would silently orphan the doc_ids in the local
         # KB manifest. Everything else the server advertises passes through.
         disabled_tools=["remove_document"],

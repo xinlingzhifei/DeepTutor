@@ -11,6 +11,7 @@ import React, {
   useRef,
 } from "react";
 import {
+  DEFAULT_APP_LANGUAGE,
   LANGUAGE_EVENT,
   LANGUAGE_STORAGE_KEY,
   normalizeLanguage,
@@ -252,7 +253,10 @@ function createSessionEntry(
     messages: [],
     isStreaming: false,
     currentStage: "",
-    language: typeof window === "undefined" ? "en" : readStoredLanguage(),
+    language:
+      typeof window === "undefined"
+        ? DEFAULT_APP_LANGUAGE
+        : readStoredLanguage(),
     status: "idle",
     activeTurnId: null,
     lastSeq: 0,
@@ -876,7 +880,10 @@ function hydrateRequestSnapshot(
         : message.capability || "",
     enabledTools: asStringArray(stored.enabledTools),
     knowledgeBases: asStringArray(stored.knowledgeBases),
-    language: typeof stored.language === "string" ? stored.language : "en",
+    language:
+      typeof stored.language === "string"
+        ? normalizeLanguage(stored.language)
+        : DEFAULT_APP_LANGUAGE,
     ...(attachments.length ? { attachments } : {}),
   };
 
@@ -1384,8 +1391,9 @@ export function UnifiedChatProvider({
         replaySnapshot && "llmSelection" in replaySnapshot
           ? (replaySnapshot.llmSelection ?? null)
           : session.llmSelection;
-      const effectiveLanguage =
-        replaySnapshot?.language ?? readStoredLanguage();
+      // Retries and edited branches follow the language selected now, while
+      // retaining the rest of the original request snapshot.
+      const effectiveLanguage = readStoredLanguage();
       // Persona resolution: replay snapshot wins; then an explicit per-call
       // persona (quiz follow-up surface); then the session-level preference.
       // Always a string — "" means Default / no persona.
@@ -1411,42 +1419,44 @@ export function UnifiedChatProvider({
       const effectiveQuestionNotebookReferences =
         replaySnapshot?.questionNotebookReferences ??
         questionNotebookReferences;
-      const requestSnapshot: MessageRequestSnapshot = replaySnapshot ?? {
-        content,
-        capability: effectiveCapability,
-        enabledTools: [...effectiveTools],
-        knowledgeBases: [...effectiveKnowledgeBases],
-        language: effectiveLanguage,
-        ...(effectiveAttachments?.length
-          ? { attachments: effectiveAttachments }
-          : {}),
-        ...(effectiveConfig && Object.keys(effectiveConfig).length > 0
-          ? { config: effectiveConfig }
-          : {}),
-        ...(effectiveNotebookReferences?.length
-          ? { notebookReferences: effectiveNotebookReferences }
-          : {}),
-        ...(effectiveHistoryReferences?.length
-          ? { historyReferences: [...effectiveHistoryReferences] }
-          : {}),
-        ...(effectiveQuestionNotebookReferences?.length
-          ? {
-              questionNotebookReferences: [
-                ...effectiveQuestionNotebookReferences,
-              ],
-            }
-          : {}),
-        ...(effectiveBookReferences?.length
-          ? { bookReferences: effectiveBookReferences }
-          : {}),
-        ...(effectivePersona ? { persona: effectivePersona } : {}),
-        ...(effectiveMemoryReferences?.length
-          ? { memoryReferences: [...effectiveMemoryReferences] }
-          : {}),
-        ...(effectiveLLMSelection
-          ? { llmSelection: effectiveLLMSelection }
-          : {}),
-      };
+      const requestSnapshot: MessageRequestSnapshot = replaySnapshot
+        ? { ...replaySnapshot, language: effectiveLanguage }
+        : {
+            content,
+            capability: effectiveCapability,
+            enabledTools: [...effectiveTools],
+            knowledgeBases: [...effectiveKnowledgeBases],
+            language: effectiveLanguage,
+            ...(effectiveAttachments?.length
+              ? { attachments: effectiveAttachments }
+              : {}),
+            ...(effectiveConfig && Object.keys(effectiveConfig).length > 0
+              ? { config: effectiveConfig }
+              : {}),
+            ...(effectiveNotebookReferences?.length
+              ? { notebookReferences: effectiveNotebookReferences }
+              : {}),
+            ...(effectiveHistoryReferences?.length
+              ? { historyReferences: [...effectiveHistoryReferences] }
+              : {}),
+            ...(effectiveQuestionNotebookReferences?.length
+              ? {
+                  questionNotebookReferences: [
+                    ...effectiveQuestionNotebookReferences,
+                  ],
+                }
+              : {}),
+            ...(effectiveBookReferences?.length
+              ? { bookReferences: effectiveBookReferences }
+              : {}),
+            ...(effectivePersona ? { persona: effectivePersona } : {}),
+            ...(effectiveMemoryReferences?.length
+              ? { memoryReferences: [...effectiveMemoryReferences] }
+              : {}),
+            ...(effectiveLLMSelection
+              ? { llmSelection: effectiveLLMSelection }
+              : {}),
+          };
       // Default the new message's parent to the tip of the currently-
       // visible path so the local chat tree stays connected during
       // streaming. The wire-level ``parent_message_id`` is computed

@@ -279,7 +279,7 @@ class SectionArchitect:
         chapter: Chapter,
         *,
         exploration: ExplorationReport | None = None,
-        language: str = "en",
+        language: str = "zh",
     ) -> list[Block]:
         if not self.llm_enabled:
             return self.plan_blocks(chapter)

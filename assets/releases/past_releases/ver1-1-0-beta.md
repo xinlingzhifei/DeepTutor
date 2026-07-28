@@ -1,4 +1,4 @@
-# DeepTutor v1.1.0-beta Release Notes
+# yFeiSTAI v1.1.0-beta Release Notes
 
 **Release Date:** 2026.04.14
 

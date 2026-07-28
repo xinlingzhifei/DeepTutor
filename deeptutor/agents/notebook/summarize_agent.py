@@ -19,8 +19,8 @@ def _clip_text(value: str, limit: int) -> str:
 class NotebookSummarizeAgent:
     """Generate concise summaries for notebook records."""
 
-    def __init__(self, language: str = "en") -> None:
-        self.language = "zh" if str(language or "en").lower().startswith("zh") else "en"
+    def __init__(self, language: str = "zh") -> None:
+        self.language = "en" if str(language or "zh").lower().startswith("en") else "zh"
         self.llm_config = get_llm_config()
         self.model = getattr(self.llm_config, "model", None)
         self.api_key = getattr(self.llm_config, "api_key", None)

@@ -65,6 +65,7 @@ def test_run_command_json_mode(monkeypatch) -> None:
 
     assert len(captured_requests) == len(capabilities)
     assert captured_requests[0].capability == "chat"
+    assert captured_requests[0].language == "zh"
     assert captured_requests[0].tools == ["rag"]
     assert captured_requests[0].knowledge_bases == ["demo-kb"]
     assert captured_requests[0].history_references == ["session-old"]

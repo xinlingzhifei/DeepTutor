@@ -1,17 +1,17 @@
 <div align="center">
 
-<p align="center"><img src="../../assets/figs/logo/logo.png" alt="DeepTutor logo" height="56" style="vertical-align: middle;">&nbsp;<img src="../../assets/figs/logo/banner.png" alt="DeepTutor" height="48" style="vertical-align: middle;"></p>
+<p align="center"><img src="../../assets/figs/logo/logo.png" alt="yFeiSTAI logo" height="56" style="vertical-align: middle;">&nbsp;<img src="../../assets/figs/logo/banner.png" alt="yFeiSTAI" height="48" style="vertical-align: middle;"></p>
 
-# DeepTutor: Персонализированное Обучение на Базе Агентов
+# yFeiSTAI: Персонализированное Обучение на Базе Агентов
 
 <p align="center">
   <a href="https://deeptutor.info" target="_blank"><img alt="Docs — deeptutor.info" src="https://img.shields.io/badge/Docs-deeptutor.info%20%E2%86%97-0A0A0A?style=for-the-badge&labelColor=F5F5F4" height="36"></a>
 </p>
 
 <p align="center">
-  <a href="https://trendshift.io/repositories/17099?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-17099" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/17099" alt="HKUDS%2FDeepTutor | Trendshift" width="250" height="55"/></a>&nbsp;
-  <a href="https://trendshift.io/repositories/17099?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-17099" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/17099/daily" alt="HKUDS%2FDeepTutor | Trendshift" width="250" height="55"/></a>&nbsp;
-  <a href="https://trendshift.io/repositories/17099?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-17099" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/17099/weekly?language=Python" alt="HKUDS%2FDeepTutor | Trendshift" width="250" height="55"/></a>
+  <a href="https://trendshift.io/repositories/17099?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-17099" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/17099" alt="yFeiSTAI | Trendshift" width="250" height="55"/></a>&nbsp;
+  <a href="https://trendshift.io/repositories/17099?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-17099" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/17099/daily" alt="yFeiSTAI | Trendshift" width="250" height="55"/></a>&nbsp;
+  <a href="https://trendshift.io/repositories/17099?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-17099" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/17099/weekly?language=Python" alt="yFeiSTAI | Trendshift" width="250" height="55"/></a>
 </p>
 
 <p align="center">
@@ -50,14 +50,14 @@
 
 - **2026-05-22** 🌐 Официальный сайт документации запущен на [**deeptutor.info**](https://deeptutor.info/) — руководства, справочники и туры по возможностям в одном месте.
 - **2026-04-19** 🎉 20 тысяч звёзд за 111 дней! Благодарим за поддержку на пути к по-настоящему персонализированному интеллектуальному обучению.
-- **2026-04-10** 📄 Наша статья опубликована на arXiv — прочитайте [препринт](https://arxiv.org/abs/2604.26962) о дизайне и идеях, лежащих в основе DeepTutor.
+- **2026-04-10** 📄 Наша статья опубликована на arXiv — прочитайте [препринт](https://arxiv.org/abs/2604.26962) о дизайне и идеях, лежащих в основе yFeiSTAI.
 - **2026-02-06** 🚀 10 тысяч звёзд всего за 39 дней! Огромная благодарность нашему удивительному сообществу.
-- **2026-01-01** 🎊 С Новым Годом! Присоединяйтесь к нашему [Discord](https://discord.gg/eRsjPgMU4t), [WeChat](https://github.com/HKUDS/DeepTutor/issues/78) или [Обсуждениям](https://github.com/HKUDS/DeepTutor/discussions) — давайте вместе формировать DeepTutor.
-- **2025-12-29** 🎓 DeepTutor официально выпущен!
+- **2026-01-01** 🎊 С Новым Годом! Присоединяйтесь к нашему [Discord](https://discord.gg/eRsjPgMU4t), [WeChat](https://github.com/HKUDS/DeepTutor/issues/78) или [Обсуждениям](https://github.com/HKUDS/DeepTutor/discussions) — давайте вместе формировать yFeiSTAI.
+- **2025-12-29** 🎓 yFeiSTAI официально выпущен!
 
 ## ✨ Ключевые возможности
 
-DeepTutor — это агентная учебная рабочая среда, объединяющая репетиторство, решение задач, генерацию викторин, исследования, визуализацию и практику освоения в одной расширяемой системе.
+yFeiSTAI — это агентная учебная рабочая среда, объединяющая репетиторство, решение задач, генерацию викторин, исследования, визуализацию и практику освоения в одной расширяемой системе.
 
 - **Единая среда выполнения для всех режимов** — Chat, Quiz, Research, Visualize, Solve и Mastery Path работают на одном цикле агента, поэтому вы переключаете цель, а не движок, и контекст перемещается вместе с учащимся.
 - **Связанный контекст обучения** — базы знаний, книги, черновики Co-Writer, блокноты, банки вопросов, персоны и Memory доступны во всех рабочих процессах, а не живут в изолированных инструментах.
@@ -70,7 +70,7 @@ DeepTutor — это агентная учебная рабочая среда, 
 
 ## 🚀 Начало работы
 
-DeepTutor поставляется с четырьмя путями установки. Все они используют одну структуру рабочего пространства: настройки хранятся в `data/user/settings/` в директории запуска (или в `DEEPTUTOR_HOME` / `deeptutor start --home`, если задано явно). Для полного приложения рекомендуемый процесс: **выбрать директорию рабочего пространства → установить → `deeptutor init` → `deeptutor start`**.
+yFeiSTAI поставляется с четырьмя путями установки. Все они используют одну структуру рабочего пространства: настройки хранятся в `data/user/settings/` в директории запуска (или в `DEEPTUTOR_HOME` / `deeptutor start --home`, если задано явно). Для полного приложения рекомендуемый процесс: **выбрать директорию рабочего пространства → установить → `deeptutor init` → `deeptutor start`**.
 
 <details>
 <summary><b>Вариант 1 — Установка из PyPI</b> · полное локальное веб-приложение + CLI, клонирование не требуется</summary>
@@ -96,8 +96,8 @@ deeptutor start    # запускает бэкенд + фронтенд; дер�
 Для разработки на основе чекаута. Используйте **Python 3.11–3.13** и **Node.js 22 LTS** для соответствия CI и Docker.
 
 ```bash
-git clone https://github.com/HKUDS/DeepTutor.git
-cd DeepTutor
+git clone https://github.com/HKUDS/DeepTutor.git yFeiSTAI
+cd yFeiSTAI
 
 # Создание venv (macOS/Linux). Windows PowerShell:
 #   py -3.11 -m venv .venv ; .\.venv\Scripts\Activate.ps1
@@ -186,7 +186,7 @@ docker run --rm --name deeptutor \
 }
 ```
 
-`next_public_api_base_external` (и его псевдоним `public_api_base`) принимаются как запасные варианты с более низким приоритетом. CORS использует **источники** фронтенда, а не URL API. При отключённой аутентификации DeepTutor разрешает обычные HTTP/HTTPS источники браузера по умолчанию. При включённой аутентификации добавьте точные источники фронтенда:
+`next_public_api_base_external` (и его псевдоним `public_api_base`) принимаются как запасные варианты с более низким приоритетом. CORS использует **источники** фронтенда, а не URL API. При отключённой аутентификации yFeiSTAI разрешает обычные HTTP/HTTPS источники браузера по умолчанию. При включённой аутентификации добавьте точные источники фронтенда:
 
 ```json
 {
@@ -229,8 +229,8 @@ Docker Desktop (macOS/Windows) обычно разрешает `host.docker.inte
 Когда веб-интерфейс не нужен. Пакет только для CLI устанавливается из чекаута исходного кода, а не из PyPI.
 
 ```bash
-git clone https://github.com/HKUDS/DeepTutor.git
-cd DeepTutor
+git clone https://github.com/HKUDS/DeepTutor.git yFeiSTAI
+cd yFeiSTAI
 
 # Создание venv (macOS/Linux). Windows PowerShell:
 #   py -3.11 -m venv .venv-cli ; .\.venv-cli\Scripts\Activate.ps1
@@ -294,19 +294,19 @@ deeptutor config show
 
 </details>
 
-## 📖 Обзор DeepTutor
+## 📖 Обзор yFeiSTAI
 
 Начните с основных поверхностей, которые вы будете использовать ежедневно: Chat, Partners, My Agents, Co-Writer, Book, Knowledge Center, Learning Space, Memory и Settings. Затем тур охватывает многопользовательские развёртывания для общих изолированных рабочих пространств.
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/OVERVIEW.png" alt="Главная страница DeepTutor — рабочее пространство чата со всеми поверхностями на боковой панели" width="900">
+<img src="../../assets/figs/web-1.4.6+/OVERVIEW.png" alt="Главная страница yFeiSTAI — рабочее пространство чата со всеми поверхностями на боковой панели" width="900">
 </div>
 
 <details>
 <summary><b>🏗️ Архитектура системы</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/system/system%20architecture.png" alt="Архитектура системы DeepTutor" width="900">
+<img src="../../assets/figs/system/system%20architecture.png" alt="Архитектура системы yFeiSTAI" width="900">
 </div>
 
 </details>
@@ -317,13 +317,13 @@ deeptutor config show
 Чат — это возможность по умолчанию и место, где начинается большинство работ. Один поток может нормально общаться, вызывать инструменты, опираться на выбранные базы знаний, читать вложения, генерировать изображения, обращаться к субагентам, записывать в блокнот и продолжать с тем же контекстом в последующих ходах.
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/home/00-overview.png" alt="Рабочее пространство чата DeepTutor" width="900">
+<img src="../../assets/figs/web-1.4.6+/home/00-overview.png" alt="Рабочее пространство чата yFeiSTAI" width="900">
 </div>
 
 Цикл намеренно прост: модель думает раундами, вызывает инструменты при необходимости, наблюдает результаты и завершает сообщением без инструментов. `ask_user` особенный — вместо угадывания агент может приостановить ход, задать структурированный уточняющий вопрос и возобновить работу, когда вы ответите.
 
 <div align="center">
-<img src="../../assets/figs/system/chat-agent-loop.png" alt="Цикл агента чата DeepTutor" width="900">
+<img src="../../assets/figs/system/chat-agent-loop.png" alt="Цикл агента чата yFeiSTAI" width="900">
 </div>
 
 Переключаемые пользователем инструменты: `brainstorm`, `web_search`, `paper_search`, `reason` и `geogebra_analysis` — плюс `imagegen` и `videogen` после настройки соответствующей генеративной модели. Контекстные инструменты, такие как `rag`, `read_source`, `read_memory`, `write_memory`, `read_skill`, `load_tools`, `exec`, `web_fetch`, `ask_user`, `list_notebook`, `write_note`, `github` и `consult_subagent`, монтируются автоматически, когда ход имеет подходящий контекст.
@@ -338,13 +338,13 @@ deeptutor config show
 <summary><b>🤝 Partner — Постоянные Компаньоны на Том Же Мозге</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/partners/00-partners%20overview.png" alt="Рабочее пространство партнёров DeepTutor" width="900">
+<img src="../../assets/figs/web-1.4.6+/partners/00-partners%20overview.png" alt="Рабочее пространство партнёров yFeiSTAI" width="900">
 </div>
 
 Партнёры — это постоянные компаньоны со своей душой, политикой модели, библиотекой, памятью и каналами. Они не являются отдельным движком бота: каждое входящее веб- или IM-сообщение становится обычным ходом `ChatOrchestrator` внутри рабочего пространства, ограниченного партнёром. Партнёр — это «чат с личностью и номером телефона».
 
 <div align="center">
-<img src="../../assets/figs/system/partners-architecture.png" alt="Архитектура партнёров DeepTutor" width="900">
+<img src="../../assets/figs/system/partners-architecture.png" alt="Архитектура партнёров yFeiSTAI" width="900">
 </div>
 
 Каждый партнёр имеет `SOUL.md`, выбор модели, каналы, политику инструментов и назначенную библиотеку. Базы знаний, навыки и блокноты копируются в `data/partners/<id>/workspace/`, поэтому те же инструменты RAG, навыков, блокнотов и памяти работают без специальных случаев. Партнёр читает память своего владельца, но пишет только в собственную.
@@ -361,16 +361,16 @@ deeptutor config show
 <summary><b>🧑‍🚀 Мои Агенты — Консультация и Импорт Других Агентов</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/myagents/00-overview.png" alt="Рабочее пространство «Мои Агенты» DeepTutor" width="900">
+<img src="../../assets/figs/web-1.4.6+/myagents/00-overview.png" alt="Рабочее пространство «Мои Агенты» yFeiSTAI" width="900">
 </div>
 
-Мои Агенты превращают других агентов в контекст для DeepTutor и делают две разные вещи. **Подключите живого агента** — Claude Code, Codex, Gemini, Kimi, opencode или MiMo Code CLI на вашей машине, или одного из ваших Партнёров — и обращайтесь к нему изнутри хода чата: DeepTutor фактически *запускает* другого агента и транслирует его работу в панель Activity через инструмент `consult_subagent`. Выберите его чипом агента (или введите `@`) и задайте, сколько раундов может занять обращение.
+Мои Агенты превращают других агентов в контекст для yFeiSTAI и делают две разные вещи. **Подключите живого агента** — Claude Code, Codex, Gemini, Kimi, opencode или MiMo Code CLI на вашей машине, или одного из ваших Партнёров — и обращайтесь к нему изнутри хода чата: yFeiSTAI фактически *запускает* другого агента и транслирует его работу в панель Activity через инструмент `consult_subagent`. Выберите его чипом агента (или введите `@`) и задайте, сколько раундов может занять обращение.
 
 <div align="center">
 <img src="../../assets/figs/web-1.4.6+/home/08-subagent%20demo%20with%20claude%20code.png" alt="Обращение к субагенту Claude Code в реальном времени" width="900">
 </div>
 
-**Импортируйте прошлые разговоры** — загрузите существующую историю Claude Code и Codex как именованных, доступных для поиска, возобновляемых агентов. Выберите, за какие дни импортировать; обновление повторно синхронизирует их. Ссылайтесь на импортированный разговор из любого хода чата через `+` → Мои Агенты, и DeepTutor читает его как транскрипт третьей стороны — это *их* разговор, а не собственный голос DeepTutor.
+**Импортируйте прошлые разговоры** — загрузите существующую историю Claude Code и Codex как именованных, доступных для поиска, возобновляемых агентов. Выберите, за какие дни импортировать; обновление повторно синхронизирует их. Ссылайтесь на импортированный разговор из любого хода чата через `+` → Мои Агенты, и yFeiSTAI читает его как транскрипт третьей стороны — это *их* разговор, а не собственный голос yFeiSTAI.
 
 </details>
 
@@ -378,7 +378,7 @@ deeptutor config show
 <summary><b>✍️ Co-Writer — Редактирование Markdown с Учётом Выделения</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/co-writer/00-overview.png" alt="Рабочее пространство Co-Writer DeepTutor" width="900">
+<img src="../../assets/figs/web-1.4.6+/co-writer/00-overview.png" alt="Рабочее пространство Co-Writer yFeiSTAI" width="900">
 </div>
 
 Co-Writer — это разделённое рабочее пространство Markdown для отчётов, руководств, заметок и долгосрочных учебных артефактов. Документы автосохраняются и отображают живой предварительный просмотр (математика KaTeX, ограждения диаграмм), и могут быть сохранены обратно в блокноты, когда черновик становится повторно используемым контекстом.
@@ -387,7 +387,7 @@ Co-Writer — это разделённое рабочее пространст�
 <img src="../../assets/figs/web-1.4.6+/co-writer/01-edit%20panel.png" alt="Редактор Co-Writer с живым предварительным просмотром" width="900">
 </div>
 
-Его определяющая идея — **хирургическое редактирование**: выберите фрагмент и попросите DeepTutor переписать, расширить или сократить его. Агент редактирования может опираться на базу знаний или веб-данные, ведёт след вызовов инструментов и показывает каждое изменение как diff с принятием/отклонением — так ничто не применяется до вашего одобрения.
+Его определяющая идея — **хирургическое редактирование**: выберите фрагмент и попросите yFeiSTAI переписать, расширить или сократить его. Агент редактирования может опираться на базу знаний или веб-данные, ведёт след вызовов инструментов и показывает каждое изменение как diff с принятием/отклонением — так ничто не применяется до вашего одобрения.
 
 </details>
 
@@ -395,7 +395,7 @@ Co-Writer — это разделённое рабочее пространст�
 <summary><b>📖 Книга — Живые Книги из Ваших Материалов</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/book/00-book_overview.png" alt="Библиотека книг DeepTutor" width="900">
+<img src="../../assets/figs/web-1.4.6+/book/00-book_overview.png" alt="Библиотека книг yFeiSTAI" width="900">
 </div>
 
 Книга превращает выбранные источники в интерактивную **живую книгу** — не статический PDF, а среда чтения, построенная из типизированных блоков. Книга может начинаться с баз знаний, блокнотов, банков вопросов или истории чата; процесс создания предлагает план глав перед генерацией содержания, поэтому вы рассматриваете структуру вместо того, чтобы принимать слепой одноразовый вывод.
@@ -416,7 +416,7 @@ Co-Writer — это разделённое рабочее пространст�
 <summary><b>📚 Центр Знаний — Многодвигательные RAG-Библиотеки</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/knowledge/00-overview.png" alt="Центр Знаний DeepTutor" width="900">
+<img src="../../assets/figs/web-1.4.6+/knowledge/00-overview.png" alt="Центр Знаний yFeiSTAI" width="900">
 </div>
 
 Базы знаний — это коллекции документов для RAG, которые обосновывают ходы Chat, редакции Co-Writer, генерацию Book и разговоры с Партнёрами. Отличительной чертой является **выбор движков поиска**: **LlamaIndex** (по умолчанию, локальный вектор + BM25), **PageIndex** (размещённый, поиск с рассуждением с цитатами на уровне страницы), **GraphRAG** и **LightRAG** (поиск на основе графа знаний), **LightRAG Server** (поиск, делегированный внешнему экземпляру LightRAG, подключаемому по HTTP), или связанное хранилище **Obsidian**, которое репетитор читает и записывает на месте. Каждая KB привязана к одному движку.
@@ -433,7 +433,7 @@ Co-Writer — это разделённое рабочее пространст�
 <summary><b>🌐 Пространство Обучения — Навыки, Персоны и Многоразовый Контекст</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/learning-space/00-overview.png" alt="Хаб Пространства Обучения DeepTutor" width="900">
+<img src="../../assets/figs/web-1.4.6+/learning-space/00-overview.png" alt="Хаб Пространства Обучения yFeiSTAI" width="900">
 </div>
 
 Пространство Обучения — это библиотека и уровень персонализации — место, где живут постоянные вещи. **Разговоры и материалы** содержат историю чата, блокноты и банк вопросов (каждый сохранённый вопрос хранит ваш ответ, эталонный ответ и объяснение). **Персонализация** содержит пути мастерства, персонажей (поведенческие пресеты, такие как *коллега*, *исследовательский ассистент*, *учитель*) и навыки (сценарии `SKILL.md`, которые модель читает по требованию). Всё здесь можно повторно использовать из Chat, Partners, Co-Writer и Book.
@@ -450,13 +450,13 @@ Co-Writer — это разделённое рабочее пространст�
 <summary><b>🧠 Память — Проверяемая Персонализация</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/memory/00-overview.png" alt="Обзор Памяти DeepTutor" width="900">
+<img src="../../assets/figs/web-1.4.6+/memory/00-overview.png" alt="Обзор Памяти yFeiSTAI" width="900">
 </div>
 
 Память — это трёхуровневая система на основе файлов, которую можно читать, курировать и проверять — намеренно *не* скрытое векторное хранилище. **L1** — зеркало рабочего пространства плюс трассировка событий только для добавления (`trace/<surface>/<date>.jsonl`); **L2** — курированные факты на уровне поверхности (`L2/<surface>.md`); **L3** — межповерхностный синтез (`L3/<profile|recent|scope|preferences>.md`). Поскольку L2 цитирует L1, а L3 цитирует L2, ничто в вашем профиле не является неотчётным.
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/memory/01-3%20layer%20memory%20graph.png" alt="Граф Памяти DeepTutor" width="900">
+<img src="../../assets/figs/web-1.4.6+/memory/01-3%20layer%20memory%20graph.png" alt="Граф Памяти yFeiSTAI" width="900">
 </div>
 
 Граф памяти показывает всю пирамиду — синтез L3 в центре, L2 в среднем кольце, трассировки L1 снаружи — так что вы можете проследить любое синтезированное утверждение обратно до точного исходного события. Память отслеживается по поверхностям `chat`, `notebook`, `quiz`, `kb`, `book`, partner и `cowriter`; бюджеты обновления / аудита / дедупликации консолидатора настраиваются в **Настройки → Память**.
@@ -467,13 +467,13 @@ Co-Writer — это разделённое рабочее пространст�
 <summary><b>⚙️ Настройки — Единая Панель Управления</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/settings/00-setting%20overview.png" alt="Хаб настроек DeepTutor" width="900">
+<img src="../../assets/figs/web-1.4.6+/settings/00-setting%20overview.png" alt="Хаб настроек yFeiSTAI" width="900">
 </div>
 
 Настройки — это операционная панель управления с живой строкой статуса (Бэкенд, LLM, Встраивание, Поиск) и одной карточкой для каждой области: **Внешний вид** (тема, язык интерфейса, оформление блоков кода), **Сеть** (базовый URL API, порты, CORS), **Модели** (LLM, Встраивание, Поиск, Синтез речи, Распознавание речи, Генерация изображений, Генерация видео), **База знаний** (движок разбора документов), **Чат** (инструменты, MCP-серверы, параметры по возможностям, лимиты вложений), **Партнёры и агенты** (субагенты, к которым можно обратиться из хода) и **Память** (бюджеты консолидатора).
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/settings/01-appearance%20settings.png" alt="Настройки внешнего вида и темы DeepTutor" width="900">
+<img src="../../assets/figs/web-1.4.6+/settings/01-appearance%20settings.png" alt="Настройки внешнего вида и темы yFeiSTAI" width="900">
 </div>
 
 Большинство разделов используют поток черновика и применения, поэтому вы можете протестировать провайдера перед подтверждением. В комплект входят четыре темы — Default, Cream, Dark и Glass. Корневые файлы `.env` проекта намеренно игнорируются; конфигурация среды выполнения хранится в `data/user/settings/*.json`, если только `DEEPTUTOR_HOME` или `deeptutor start --home` не указывает приложению другое место.
@@ -483,7 +483,7 @@ Co-Writer — это разделённое рабочее пространст�
 <details>
 <summary><b>👥 Многопользовательский режим — Общие Развёртывания</b> · необязательная аутентификация, изолированные рабочие пространства</summary>
 
-Аутентификация **отключена по умолчанию** — DeepTutor работает в однопользовательском режиме. Включите её, и одно дерево `data/` содержит рабочее пространство администратора, изолированные пользовательские рабочие пространства и партнёрские рабочие пространства рядом:
+Аутентификация **отключена по умолчанию** — yFeiSTAI работает в однопользовательском режиме. Включите её, и одно дерево `data/` содержит рабочее пространство администратора, изолированные пользовательские рабочие пространства и партнёрские рабочие пространства рядом:
 
 ```text
 data/
@@ -501,9 +501,9 @@ data/
 
 </details>
 
-## ⌨️ DeepTutor CLI — Интерфейс для Агентов
+## ⌨️ yFeiSTAI CLI — Интерфейс для Агентов
 
-Один бинарный файл `deeptutor`, два способа входа: интерактивный **REPL** для тех, кто живёт в терминале, и структурированный **JSON** для других агентов, которые управляют DeepTutor как инструментом. Одни и те же возможности, инструменты и базы знаний в любом случае.
+Один бинарный файл `deeptutor`, два способа входа: интерактивный **REPL** для тех, кто живёт в терминале, и структурированный **JSON** для других агентов, которые управляют yFeiSTAI как инструментом. Одни и те же возможности, инструменты и базы знаний в любом случае.
 
 <details>
 <summary><b>Управляйте им самостоятельно</b></summary>
@@ -525,7 +525,7 @@ deeptutor run deep_research "Survey 2026 papers on RAG" \
 <details>
 <summary><b>Позвольте агенту управлять им</b></summary>
 
-DeepTutor создан для того, чтобы *им управлял другой агент*. Добавьте `--format json` к любой команде `run`, и каждый ход транслирует **NDJSON — одно событие на строку** (`content`, `tool_call`, `tool_result`, `done`, …), каждая строка помечена своим `session_id`. Запуски безопасны без TTY: пауза `ask_user` без TTY автоматически разрешается пустым ответом вместо зависания.
+yFeiSTAI создан для того, чтобы *им управлял другой агент*. Добавьте `--format json` к любой команде `run`, и каждый ход транслирует **NDJSON — одно событие на строку** (`content`, `tool_call`, `tool_result`, `done`, …), каждая строка помечена своим `session_id`. Запуски безопасны без TTY: пауза `ask_user` без TTY автоматически разрешается пустым ответом вместо зависания.
 
 ```bash
 # Один запрос, машиночитаемый
@@ -580,12 +580,12 @@ python -m pip install -e ./packaging/deeptutor-cli
 
 ## 🧩 Экосистема — EduHub и Сообщество Навыков
 
-Навыки DeepTutor используют открытый формат **Agent-Skills** — папку с плейбуком `SKILL.md` (YAML frontmatter + Markdown) и необязательными справочными файлами. В нём нет ничего специфичного для DeepTutor, поэтому любой реестр, говорящий на этом формате, становится источником для вашей библиотеки. DeepTutor поставляется с **[EduHub](https://eduhub.deeptutor.info/)** — нашим собственным образовательным реестром навыков — встроенным в качестве хаба по умолчанию.
+Навыки yFeiSTAI используют открытый формат **Agent-Skills** — папку с плейбуком `SKILL.md` (YAML frontmatter + Markdown) и необязательными справочными файлами. В нём нет ничего специфичного для yFeiSTAI, поэтому любой реестр, говорящий на этом формате, становится источником для вашей библиотеки. yFeiSTAI поставляется с **[EduHub](https://eduhub.deeptutor.info/)** — нашим собственным образовательным реестром навыков — встроенным в качестве хаба по умолчанию.
 
 <details>
-<summary><b>EduHub — экосистема навыков DeepTutor</b></summary>
+<summary><b>EduHub — экосистема навыков yFeiSTAI</b></summary>
 
-[**EduHub**](https://eduhub.deeptutor.info/) — это хаб сообщества, запущенный DeepTutor для обмена обучающими навыками агентов — сократовские репетиторы, создатели флэш-карточек, обратная связь по эссе, планы экзаменов, объяснители концепций и многое другое. Он встроен в DeepTutor, поэтому настраивать ничего не нужно: голый слаг или префикс `eduhub:` разрешается в него.
+[**EduHub**](https://eduhub.deeptutor.info/) — это хаб сообщества, запущенный yFeiSTAI для обмена обучающими навыками агентов — сократовские репетиторы, создатели флэш-карточек, обратная связь по эссе, планы экзаменов, объяснители концепций и многое другое. Он встроен в yFeiSTAI, поэтому настраивать ничего не нужно: голый слаг или префикс `eduhub:` разрешается в него.
 
 **Найти и установить** — в браузере откройте **Пространство Обучения → Навыки → Импорт из EduHub** для просмотра каталога и загрузки навыка прямо в вашу библиотеку. Из терминала:
 
@@ -604,7 +604,7 @@ deeptutor skill publish ./my-skill                    # интерактивно
 deeptutor skill update                                # откатиться или выпустить новую версию
 ```
 
-EduHub также является отдельным, совместимым с ClawHub реестром, поэтому агенты, отличные от DeepTutor (Claude Code, Codex, …), могут использовать его напрямую через CLI `eduhub` — `npx eduhub install socratic-tutor`.
+EduHub также является отдельным, совместимым с ClawHub реестром, поэтому агенты, отличные от yFeiSTAI (Claude Code, Codex, …), могут использовать его напрямую через CLI `eduhub` — `npx eduhub install socratic-tutor`.
 
 </details>
 
@@ -615,7 +615,7 @@ EduHub также является отдельным, совместимым с
 
 - сначала проверяется **вердикт безопасности** реестра — отмеченные пакеты отклоняются, если вы не передали `--allow-unverified`;
 - архивы извлекаются защищённо (защита от zip-slip / zip-bomb) за **белым списком суффиксов** для текста/скриптов, поэтому бинарные файлы никогда не попадают в рабочее пространство;
-- frontmatter нормализуется по схеме DeepTutor, и `always:` **удаляется**, поэтому загруженный навык никогда не может принудить себя в каждый системный промпт;
+- frontmatter нормализуется по схеме yFeiSTAI, и `always:` **удаляется**, поэтому загруженный навык никогда не может принудить себя в каждый системный промпт;
 - происхождение — хаб, версия, вердикт и время установки — записывается в `.hub-lock.json` для аудитов и обновлений.
 
 В многопользовательских развёртываниях установка является исключительно привилегией администратора: новый навык попадает в каталог администратора и остаётся невидимым для других пользователей до тех пор, пока грант не назначит его, поэтому администратор может проверить его перед развёртыванием.
@@ -625,7 +625,7 @@ EduHub также является отдельным, совместимым с
 <details>
 <summary><b>Также совместим с ClawHub</b></summary>
 
-Поскольку DeepTutor использует открытый формат Agent-Skills, **[ClawHub](https://clawhub.ai/)** также работает как первоклассный источник — он встроен рядом с EduHub. Выберите его с префиксом хаба:
+Поскольку yFeiSTAI использует открытый формат Agent-Skills, **[ClawHub](https://clawhub.ai/)** также работает как первоклассный источник — он встроен рядом с EduHub. Выберите его с префиксом хаба:
 
 ```bash
 deeptutor skill search "git release notes" --hub clawhub
@@ -640,13 +640,13 @@ deeptutor skill install clawhub:git-release-notes@1.0.1
 
 ### 📮 Контакты
 
-DeepTutor — это проект с открытым исходным кодом, который ведёт [Bingxi Zhao](https://github.com/pancacake) в составе группы [HKUDS](https://github.com/HKUDS), и он развивается в **полностью открытом формате**, создаваясь вместе с сообществом. До сих пор у нас **НЕТ** платных онлайн-продуктов в каком-либо виде. Не стесняйтесь обращаться по адресу **bingxizhao39@gmail.com** для обсуждений, идей или сотрудничества.
+yFeiSTAI — это проект с открытым исходным кодом, который ведёт [Bingxi Zhao](https://github.com/pancacake) в составе группы [HKUDS](https://github.com/HKUDS), и он развивается в **полностью открытом формате**, создаваясь вместе с сообществом. До сих пор у нас **НЕТ** платных онлайн-продуктов в каком-либо виде. Не стесняйтесь обращаться по адресу **bingxizhao39@gmail.com** для обсуждений, идей или сотрудничества.
 
 ### 🙏 Благодарности
 
-Сердечная благодарность [**Chao Huang**](https://sites.google.com/view/chaoh), директору Лаборатории интеллектуальных данных @ HKU, и нашим коллегам из HKUDS за их тёплую поддержку — особенно [**Jiahao Zhang**](https://github.com/zzhtx258), [**Zirui Guo**](https://github.com/LarFii) и [**Xubin Ren**](https://github.com/Re-bin). Мы также глубоко благодарны **сообществу открытого исходного кода**: ваши звёзды, вопросы, пул-реквесты и обсуждения каждый день формируют DeepTutor.
+Сердечная благодарность [**Chao Huang**](https://sites.google.com/view/chaoh), директору Лаборатории интеллектуальных данных @ HKU, и нашим коллегам из HKUDS за их тёплую поддержку — особенно [**Jiahao Zhang**](https://github.com/zzhtx258), [**Zirui Guo**](https://github.com/LarFii) и [**Xubin Ren**](https://github.com/Re-bin). Мы также глубоко благодарны **сообществу открытого исходного кода**: ваши звёзды, вопросы, пул-реквесты и обсуждения каждый день формируют yFeiSTAI.
 
-DeepTutor также стоит на плечах выдающихся проектов с открытым исходным кодом, которые дали нам инструменты и вдохновение:
+yFeiSTAI также стоит на плечах выдающихся проектов с открытым исходным кодом, которые дали нам инструменты и вдохновение:
 
 | Проект | Роль / Вдохновение |
 |:---|:---|
@@ -657,16 +657,16 @@ DeepTutor также стоит на плечах выдающихся прое�
 | [**AI-Researcher**](https://github.com/HKUDS/AI-Researcher) | Автоматизированный исследовательский конвейер *(HKUDS)* |
 | [**OpenClaw**](https://github.com/openclaw/openclaw) | Открытый шлюз агентов и экосистема навыков за ClawHub |
 | [**Codex**](https://github.com/openai/codex) | Агентный CLI кодирования, вдохновивший наш рабочий процесс CLI |
-| [**Claude Code**](https://github.com/anthropics/claude-code) | Агентный CLI кодирования, вдохновивший цикл агента DeepTutor |
+| [**Claude Code**](https://github.com/anthropics/claude-code) | Агентный CLI кодирования, вдохновивший цикл агента yFeiSTAI |
 | [**ManimCat**](https://github.com/Wing900/ManimCat) | Генерация математической анимации на основе ИИ для Math Animator |
 
 ### 🗺️ Дорожная карта и участие
 
-Мы хотим, чтобы DeepTutor продолжал развиваться и совершенствоваться — и в конечном итоге стал подарком, который мы возвращаем сообществу открытого исходного кода. Наша [**дорожная карта**](https://github.com/HKUDS/DeepTutor/issues/498) обновляется непрерывно; голосуйте там за пункты или предлагайте новые. Если вы хотите участвовать, см. [**Руководство по участию**](CONTRIBUTING.md) с описанием стратегии ветвления, стандартов кодирования и инструкций по началу работы.
+Мы хотим, чтобы yFeiSTAI продолжал развиваться и совершенствоваться — и в конечном итоге стал подарком, который мы возвращаем сообществу открытого исходного кода. Наша [**дорожная карта**](https://github.com/HKUDS/DeepTutor/issues/498) обновляется непрерывно; голосуйте там за пункты или предлагайте новые. Если вы хотите участвовать, см. [**Руководство по участию**](CONTRIBUTING.md) с описанием стратегии ветвления, стандартов кодирования и инструкций по началу работы.
 
 <div align="center">
 
-Мы надеемся, что DeepTutor станет подарком для сообщества. 🎁
+Мы надеемся, что yFeiSTAI станет подарком для сообщества. 🎁
 
 <a href="https://github.com/HKUDS/DeepTutor/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=HKUDS/DeepTutor&max=999" alt="Участники" />

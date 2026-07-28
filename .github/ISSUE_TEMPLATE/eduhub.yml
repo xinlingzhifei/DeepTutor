@@ -1,5 +1,5 @@
 name: EduHub / Skill Registry
-description: Report an issue with EduHub — the DeepTutor skill registry (site, API, CLI, or a published skill)
+description: Report an issue with EduHub — the yFeiSTAI skill registry (site, API, CLI, or a published skill)
 title: "[EduHub]:"
 labels: ["eduhub", "triage"]
 
@@ -7,9 +7,9 @@ body:
   - type: markdown
     attributes:
       value: |
-        EduHub is DeepTutor's skill registry at https://eduhub.deeptutor.info.
+        EduHub is yFeiSTAI's skill registry at https://eduhub.deeptutor.info.
         Use this template for the EduHub web site, the ClawHub-compatible API, the `eduhub` CLI,
-        or a specific published skill. For bugs in the DeepTutor app itself, use the Bug Report template.
+        or a specific published skill. For bugs in the yFeiSTAI app itself, use the Bug Report template.
   - type: checkboxes
     id: existingcheck
     attributes:

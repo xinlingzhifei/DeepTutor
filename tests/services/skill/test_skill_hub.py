@@ -292,7 +292,7 @@ def _browse_client() -> httpx.Client:
                             "stats": {"downloads": 8, "stars": 2},
                             "ownerHandle": "deeptutor",
                             "owner": {
-                                "displayName": "DeepTutor",
+                                "displayName": "yFeiSTAI",
                                 "htmlUrl": "https://deeptutor.info",
                             },
                         },
@@ -320,7 +320,7 @@ def _browse_client() -> httpx.Client:
                         "keywords": ["tutor", "socratic"],
                         "stats": {"downloads": 8, "stars": 2},
                     },
-                    "owner": {"displayName": "DeepTutor", "htmlUrl": "https://deeptutor.info"},
+                    "owner": {"displayName": "yFeiSTAI", "htmlUrl": "https://deeptutor.info"},
                     "distTags": {"latest": "1.0.0"},
                 },
             )
@@ -335,7 +335,7 @@ def test_clawhub_catalog_normalises_rows() -> None:
     row = rows[0]
     assert (row["slug"], row["name"]) == ("socratic-tutor", "Socratic Tutor")
     assert (row["downloads"], row["stars"]) == (8, 2)
-    assert row["owner"] == "DeepTutor"
+    assert row["owner"] == "yFeiSTAI"
     assert row["owner_url"] == "https://deeptutor.info"
 
 
@@ -350,7 +350,7 @@ def test_clawhub_detail_includes_body_version_and_tags() -> None:
     # topical labels come from `keywords`, not EduHub's dist-tags `tags` map
     assert detail["tags"] == ["tutor", "socratic"]
     assert "# Body" in detail["content"]
-    assert detail["owner"] == "DeepTutor"  # lifted from the envelope top level
+    assert detail["owner"] == "yFeiSTAI"  # lifted from the envelope top level
 
 
 def test_clawhub_web_origin_strips_api_suffix() -> None:

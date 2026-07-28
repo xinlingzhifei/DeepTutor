@@ -63,7 +63,7 @@ async def run_merge(
     layer: str,
     key: str,
     *,
-    language: str = "en",
+    language: str = "zh",
     user_label: str = "anonymous",
     on_event: OnEvent | None = None,
 ) -> MergeResult:

@@ -1,5 +1,5 @@
 <!--
-Thank you for contributing to DeepTutor! 🚀
+Thank you for contributing to yFeiSTAI! 🚀
 Please ensure your PR is ready for review and follows our contribution guidelines.
 For more details, see our [CONTRIBUTING.md](https://github.com/HKUDS/DeepTutor/blob/dev/CONTRIBUTING.md).
 -->

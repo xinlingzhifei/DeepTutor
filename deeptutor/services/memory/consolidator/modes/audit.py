@@ -76,7 +76,7 @@ async def run_audit(
     layer: str,
     key: str,
     *,
-    language: str = "en",
+    language: str = "zh",
     user_label: str = "anonymous",
     budget: int | None = None,
     llm_selection: dict | None = None,

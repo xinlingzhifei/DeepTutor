@@ -79,7 +79,7 @@ class BlockContext:
     chapter: Chapter
     page: Page
     block: Block
-    language: str = "en"
+    language: str = "zh"
     knowledge_bases: list[str] = field(default_factory=list)
     rag_enabled: bool = True
     extra: dict[str, Any] = field(default_factory=dict)

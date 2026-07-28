@@ -30,7 +30,7 @@ export default function AgentSelector({
   agents: { name: string; kind?: string }[];
   selected: string | null;
   onSelect: (name: string | null) => void;
-  /** Max times DeepTutor may consult the agent this turn. */
+  /** Max times yFeiSTAI may consult the agent this turn. */
   budget?: number | null;
   onBudgetChange?: (budget: number) => void;
   placement?: "top" | "bottom";
@@ -141,7 +141,7 @@ export default function AgentSelector({
           {onBudgetChange && (
             <div className="flex items-center justify-between gap-2 border-t border-[var(--border)] px-3 py-2">
               <span className="min-w-0 text-[11.5px] text-[var(--muted-foreground)]">
-                {t("Max rounds DeepTutor may ask")}
+                {t("Max rounds yFeiSTAI may ask")}
               </span>
               <div className="flex shrink-0 items-center gap-1">
                 <button

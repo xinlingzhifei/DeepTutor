@@ -76,9 +76,13 @@ class UnifiedContext:
     knowledge_bases: list[str] = field(default_factory=list)
     attachments: list[Attachment] = field(default_factory=list)
     config_overrides: dict[str, Any] = field(default_factory=dict)
-    language: str = "en"
+    language: str = "zh"
     memory_context: str = ""
     persona_context: str = ""
     skills_manifest: str = ""
     source_manifest: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        normalized_language = str(self.language or "").strip().lower().replace("_", "-")
+        self.language = "en" if normalized_language.startswith("en") else "zh"

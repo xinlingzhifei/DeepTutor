@@ -54,7 +54,7 @@ class CapabilityExecuteRequest(BaseModel):
     content: str
     tools: list[str] = Field(default_factory=list, alias="enabledTools")
     knowledge_bases: list[str] = Field(default_factory=list, alias="knowledgeBases")
-    language: str = "en"
+    language: str = "zh"
     config: dict[str, Any] = Field(default_factory=dict)
     attachments: list[dict[str, Any]] = Field(default_factory=list)
     # ``bot_id`` is the legacy TutorBot field name; it now addresses a partner.

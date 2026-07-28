@@ -2,7 +2,7 @@
 Run Mode
 ========
 
-Controls whether DeepTutor is running as a CLI application or an API server.
+Controls whether yFeiSTAI is running as a CLI application or an API server.
 Modules can check the mode to conditionally import server-only dependencies.
 """
 

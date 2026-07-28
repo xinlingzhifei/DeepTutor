@@ -28,7 +28,7 @@ configure_logging()
 
 app = typer.Typer(
     name="deeptutor",
-    help="DeepTutor CLI – agent-first interface for capabilities, tools, and knowledge.",
+    help="yFeiSTAI CLI – agent-first interface for capabilities, tools, and knowledge.",
     no_args_is_help=True,
     add_completion=False,
 )
@@ -87,7 +87,7 @@ def run_capability(
     kb: list[str] = typer.Option([], "--kb", help="Knowledge base name."),
     notebook_ref: list[str] = typer.Option([], "--notebook-ref", help="Notebook references."),
     history_ref: list[str] = typer.Option([], "--history-ref", help="Referenced session ids."),
-    language: str = typer.Option("en", "--language", "-l", help="Response language."),
+    language: str = typer.Option("zh", "--language", "-l", help="Response language."),
     config: list[str] = typer.Option([], "--config", help="Capability config key=value."),
     config_json: str | None = typer.Option(
         None, "--config-json", help="Capability config as JSON."
@@ -130,7 +130,7 @@ def serve(
     port: int | None = typer.Option(None, help="Port number."),
     reload: bool = typer.Option(False, help="Enable auto-reload for development."),
 ) -> None:
-    """Start the DeepTutor API server."""
+    """Start the yFeiSTAI API server."""
     import asyncio
     import sys
 

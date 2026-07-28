@@ -40,7 +40,7 @@ _edit_agent: EditAgent | None = None
 
 def _current_language() -> str:
     # Prefer UI settings, fall back to main.yaml system.language
-    return get_ui_language(default=config.get("system", {}).get("language", "en"))
+    return get_ui_language(default=config.get("system", {}).get("language", "zh"))
 
 
 def get_edit_agent() -> EditAgent:

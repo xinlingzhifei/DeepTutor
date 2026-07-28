@@ -6,7 +6,7 @@ Pinned to the 3.x line (``graphrag>=3,<4``); the indexing/query surface mirrors
 ``graphrag.cli.{index,query}`` for that line.
 
 All imports are lazy so the package only loads when a GraphRAG KB is actually
-used — DeepTutor runs fine without the optional dependency installed.
+used — yFeiSTAI runs fine without the optional dependency installed.
 """
 
 from __future__ import annotations

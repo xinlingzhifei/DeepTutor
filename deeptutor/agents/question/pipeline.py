@@ -360,7 +360,7 @@ class QuestionPipeline:
     def __init__(
         self,
         *,
-        language: str = "en",
+        language: str = "zh",
         kb_name: str | None = None,
         enabled_tools: list[str] | None = None,
         max_explore_iterations: int = DEFAULT_MAX_EXPLORE_ITERATIONS,
@@ -993,7 +993,7 @@ class QuestionPipeline:
         meta = build_trace_metadata(
             call_id=call_id,
             phase=STAGE_EXPLORING,
-            label=self._t("labels.reflecting", default="DeepTutor Reflecting..."),
+            label=self._t("labels.reflecting", default="yFeiSTAI Reflecting..."),
             call_kind="tool_result_reflection",
             trace_id=call_id,
             trace_role="reflection",
@@ -1004,7 +1004,7 @@ class QuestionPipeline:
         # Open the sub-trace card before the LLM stream starts so the panel
         # registers the "Reflecting..." node immediately.
         await stream.progress(
-            self._t("labels.reflecting", default="DeepTutor Reflecting..."),
+            self._t("labels.reflecting", default="yFeiSTAI Reflecting..."),
             source=SOURCE,
             stage=STAGE_EXPLORING,
             metadata=merge_trace_metadata(

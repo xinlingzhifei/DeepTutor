@@ -5,7 +5,7 @@ Implements the same contract as :class:`LlamaIndexPipeline` (see
 LightRAG. Each KB owns a self-contained LightRAG store under its ``version-N``
 directory (see ``storage``).
 
-Documents are turned into a MinerU-style ``content_list`` by DeepTutor's shared
+Documents are turned into a MinerU-style ``content_list`` by yFeiSTAI's shared
 parse layer (``deeptutor/services/parsing``) — the same bridge the question
 extractor uses — so multimodal parsing stays a decoupled, cached, engine-
 pluggable concern and this pipeline only ever feeds LightRAG ready content.

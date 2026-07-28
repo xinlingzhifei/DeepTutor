@@ -1,4 +1,4 @@
-"""DeepTutor logging bootstrap."""
+"""yFeiSTAI logging bootstrap."""
 
 from __future__ import annotations
 

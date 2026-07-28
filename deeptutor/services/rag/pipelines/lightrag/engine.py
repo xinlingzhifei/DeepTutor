@@ -2,10 +2,10 @@
 
 This is the ONLY module that imports ``raganything`` / ``lightrag``. Everything
 version-sensitive lives here, so an API shift between releases is a one-file
-fix. All imports are lazy so DeepTutor runs fine without the optional dependency
+fix. All imports are lazy so yFeiSTAI runs fine without the optional dependency
 installed.
 
-A RAG-Anything instance is built from DeepTutor's LLM/vision/embedding adapters
+A RAG-Anything instance is built from yFeiSTAI's LLM/vision/embedding adapters
 (see ``config.py``) over a per-KB ``working_dir``. Documents are inserted as a
 MinerU-style ``content_list`` (produced upstream by the parse layer), so the
 multimodal step never re-parses anything; retrieval delegates to LightRAG's
@@ -45,8 +45,8 @@ def build_rag(working_dir: Path) -> Any:
         vision_model_func=build_vision_model_func(),
         embedding_func=build_embedding_func(),
     )
-    # DeepTutor always feeds RAG-Anything a pre-parsed ``content_list`` (the
-    # parse layer runs upstream via DeepTutor's own ParseService), so
+    # yFeiSTAI always feeds RAG-Anything a pre-parsed ``content_list`` (the
+    # parse layer runs upstream via yFeiSTAI's own ParseService), so
     # RAG-Anything's bundled document parser is never invoked. Its LightRAG init
     # nevertheless runs a one-time installation check on its *default* parser
     # (``mineru``); when MinerU isn't installed that check hard-fails indexing

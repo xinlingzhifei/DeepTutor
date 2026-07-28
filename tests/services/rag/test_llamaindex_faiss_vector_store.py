@@ -127,7 +127,7 @@ def test_mixed_dimension_nodes_fall_back_to_simple() -> None:
 def _multimodal_nodes() -> list[object]:
     """A text + image node sharing one dimension (single multimodal embedding).
 
-    DeepTutor embeds text and images with the *same* embedding client, so both
+    yFeiSTAI embeds text and images with the *same* embedding client, so both
     modalities produce same-dimension vectors and (in a plain VectorStoreIndex)
     land in the ``default`` store together.
     """

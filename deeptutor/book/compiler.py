@@ -93,7 +93,7 @@ class BookCompiler:
         page: Page,
         stream: BookStream,
         knowledge_bases: list[str] | None = None,
-        language: str = "en",
+        language: str = "zh",
         exploration: ExplorationReport | None = None,
     ) -> Page:
         """Plan (if needed) and generate every block on *page*."""
@@ -309,7 +309,7 @@ class BookCompiler:
         page: Page,
         stream: BookStream,
         *,
-        language: str = "en",
+        language: str = "zh",
         exploration: ExplorationReport | None = None,
     ) -> None:
         if page.blocks:

@@ -51,7 +51,7 @@ def _find_duplicate_preference(doc: Document, section: str, text: str):
 
 
 _NO_MEMORY = (
-    "(No memory available — interact with DeepTutor and update from the Memory page to build one.)"
+    "(No memory available — interact with yFeiSTAI and update from the Memory page to build one.)"
 )
 
 
@@ -126,7 +126,7 @@ class MemoryStore:
         self,
         surface: Surface,
         *,
-        language: str = "en",
+        language: str = "zh",
         user_label: str = "anonymous",
         on_event: OnEvent | None = None,
         apply_ops: bool = True,
@@ -145,7 +145,7 @@ class MemoryStore:
         self,
         slot: L3Slot,
         *,
-        language: str = "en",
+        language: str = "zh",
         user_label: str = "anonymous",
         on_event: OnEvent | None = None,
         apply_ops: bool = True,

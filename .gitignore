@@ -224,7 +224,7 @@ $RECYCLE.BIN/
 *.swo
 
 # Local scripts
-启动 DeepTutor.bat
+启动 yFeiSTAI.bat
 
 # ============================================
 # Testing and Coverage

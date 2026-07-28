@@ -183,13 +183,13 @@ class AgenticChatPipeline:
 
     def __init__(
         self,
-        language: str = "en",
+        language: str = "zh",
         *,
         max_rounds: int | None = None,
         temperature: float | None = None,
         max_tokens: int | None = None,
     ) -> None:
-        self.language = "zh" if language.lower().startswith("zh") else "en"
+        self.language = "en" if str(language or "zh").lower().startswith("en") else "zh"
         self.llm_config = get_llm_config()
         self.binding = getattr(self.llm_config, "binding", None) or "openai"
         self.model = getattr(self.llm_config, "model", None)
@@ -952,7 +952,7 @@ class AgenticChatPipeline:
                     "chat_id": str(meta.get("chat_id") or ""),
                     "session_key": str(meta.get("session_key") or ""),
                     "channel_meta": dict(channel_meta) if isinstance(channel_meta, dict) else {},
-                    "language": context.language or "en",
+                    "language": context.language or "zh",
                 }
             else:
                 from deeptutor.multi_user.context import get_current_user
@@ -963,7 +963,7 @@ class AgenticChatPipeline:
                     "user_id": user.id,
                     "is_admin": user.is_admin,
                     "session_id": context.session_id,
-                    "language": context.language or "en",
+                    "language": context.language or "zh",
                 }
         elif tool_name in {"reason", "brainstorm"}:
             kwargs.setdefault("context", context.user_message)

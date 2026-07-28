@@ -107,7 +107,7 @@ export function removeFromStorage(key: string): void {
 }
 
 /**
- * Clear all DeepTutor data from localStorage
+ * Clear all yFeiSTAI data from localStorage
  */
 export function clearAllStorage(): void {
   if (typeof window === "undefined") {
@@ -125,7 +125,7 @@ export function clearAllStorage(): void {
     }
 
     keysToRemove.forEach((key) => localStorage.removeItem(key));
-    console.info(`Cleared ${keysToRemove.length} DeepTutor storage items`);
+    console.info(`Cleared ${keysToRemove.length} yFeiSTAI storage items`);
   } catch (error) {
     console.warn("Failed to clear localStorage:", error);
   }

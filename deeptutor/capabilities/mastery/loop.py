@@ -65,7 +65,7 @@ def _prompt_text(prompts: dict[str, Any], path: tuple[str, ...]) -> str:
 
 
 def _load_system_prompt(language: str) -> str:
-    lang = "zh" if language.lower().startswith("zh") else "en"
+    lang = "en" if str(language or "zh").lower().startswith("en") else "zh"
     prompt = resources.files(__package__).joinpath("prompts", lang, "system.md")
     return prompt.read_text(encoding="utf-8").strip()
 

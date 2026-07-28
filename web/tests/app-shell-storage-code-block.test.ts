@@ -36,7 +36,10 @@ mockWindow();
 // Import after mocking window
 import {
   CODE_BLOCK_THEME_STORAGE_KEY,
+  DEFAULT_APP_LANGUAGE,
   DEFAULT_CODE_BLOCK_THEME,
+  LANGUAGE_STORAGE_KEY,
+  readStoredLanguage,
   readStoredCodeBlockTheme,
   CODE_BLOCK_SHOW_LINE_NUMBERS_STORAGE_KEY,
   DEFAULT_CODE_BLOCK_SHOW_LINE_NUMBERS,
@@ -49,6 +52,18 @@ import {
   writeStoredCodeBlockWrapLongLines,
   CODE_BLOCK_SETTINGS_EVENT,
 } from "../context/app-shell-storage";
+
+test("app-shell-storage: language defaults to Chinese and preserves English", () => {
+  mockLocalStorage = {};
+  assert.equal(DEFAULT_APP_LANGUAGE, "zh");
+  assert.equal(readStoredLanguage(), "zh");
+
+  mockLocalStorage[LANGUAGE_STORAGE_KEY] = "en";
+  assert.equal(readStoredLanguage(), "en");
+
+  mockLocalStorage[LANGUAGE_STORAGE_KEY] = "unsupported";
+  assert.equal(readStoredLanguage(), "zh");
+});
 
 test("app-shell-storage: code block theme defaults to oneDark", () => {
   assert.equal(DEFAULT_CODE_BLOCK_THEME, "oneDark");

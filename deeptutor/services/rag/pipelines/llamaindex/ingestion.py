@@ -1,6 +1,6 @@
 """LlamaIndex ingestion helpers.
 
-This module keeps DeepTutor's indexing path thin by delegating parsing
+This module keeps yFeiSTAI's indexing path thin by delegating parsing
 transformations and embedding to LlamaIndex's official IngestionPipeline.
 """
 
@@ -18,10 +18,10 @@ from . import vector_store
 
 
 def build_ingestion_pipeline() -> IngestionPipeline:
-    """Create the default DeepTutor ingestion pipeline.
+    """Create the default yFeiSTAI ingestion pipeline.
 
     The embedding step uses ``Settings.embed_model``, which is configured by
-    ``embedding_adapter.configure_llamaindex_settings`` to call DeepTutor's
+    ``embedding_adapter.configure_llamaindex_settings`` to call yFeiSTAI's
     configured embedding service rather than any local model.
     """
 

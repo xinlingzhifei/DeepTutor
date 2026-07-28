@@ -1,4 +1,4 @@
-"""Configuration helpers for DeepTutor's LlamaIndex RAG pipeline."""
+"""Configuration helpers for yFeiSTAI's LlamaIndex RAG pipeline."""
 
 from __future__ import annotations
 

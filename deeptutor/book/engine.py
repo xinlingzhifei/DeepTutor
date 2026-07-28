@@ -207,7 +207,7 @@ class BookEngine:
         knowledge_bases: list[str] | None = None,
         question_categories: list[int] | None = None,
         question_entries: list[int] | None = None,
-        language: str = "en",
+        language: str = "zh",
         stream: StreamBus | None = None,
     ) -> tuple[Book, BookProposal]:
         """Capture inputs, run IdeationAgent, persist DRAFT book + proposal."""

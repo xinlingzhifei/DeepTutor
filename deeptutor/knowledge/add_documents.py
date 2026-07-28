@@ -165,7 +165,7 @@ class DocumentAdder:
         self.legacy_rag_storage_dir = self.kb_dir / "rag_storage"
         self.metadata_file = self.kb_dir / "metadata.json"
 
-        # Incremental adds must use the engine DeepTutor has bound to this KB. An
+        # Incremental adds must use the engine yFeiSTAI has bound to this KB. An
         # explicit rag_provider (from the API, already matched against the KB)
         # wins; otherwise use the shared binding resolver.
         if rag_provider:

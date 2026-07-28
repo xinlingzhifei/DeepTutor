@@ -6,6 +6,11 @@ import path from "node:path";
 // Resolve <web>/locales by walking up from the compiled test location
 // (dist/node-tests/tests/*.js) until we find the locales directory.
 function findLocalesRoot(): string {
+  const workspaceLocales = path.join(process.cwd(), "locales");
+  if (fs.existsSync(path.join(workspaceLocales, "en"))) {
+    return workspaceLocales;
+  }
+
   let dir = __dirname;
   for (let i = 0; i < 8; i++) {
     const candidate = path.join(dir, "locales");

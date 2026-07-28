@@ -49,7 +49,7 @@ _MAX_TIMEOUT = 300
 class ExecTool(BaseTool):
     """Run a shell command inside the execution sandbox."""
 
-    def get_prompt_hints(self, language: str = "en"):
+    def get_prompt_hints(self, language: str = "zh"):
         return load_prompt_hints(self.name, language=language)
 
     def get_definition(self) -> ToolDefinition:

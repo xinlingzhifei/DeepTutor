@@ -15,7 +15,7 @@ from deeptutor.services.path_service import get_path_service
 DEFAULT_UI_SETTINGS: dict[str, Any] = {
     # "snow" is the pure-white neutral theme, shown as "Default" in the UI.
     "theme": "snow",
-    "language": "en",
+    "language": "zh",
 }
 
 
@@ -26,7 +26,7 @@ def _interface_settings_file():
     return get_path_service().get_settings_file("interface")
 
 
-def _normalize_language(language: Any, default: str = "en") -> str:
+def _normalize_language(language: Any, default: str = "zh") -> str:
     """
     Normalize language codes:
     - en/english -> en
@@ -36,16 +36,18 @@ def _normalize_language(language: Any, default: str = "en") -> str:
         language = default
 
     if isinstance(language, str):
-        s = language.lower().strip()
-        if s in {"en", "english"}:
+        s = language.lower().strip().replace("_", "-")
+        if s == "english" or s.startswith("en"):
             return "en"
-        if s in {"zh", "chinese", "cn"}:
+        if s in {"chinese", "cn"} or s.startswith("zh"):
             return "zh"
 
     # Fall back to default
     if isinstance(default, str):
-        return _normalize_language(default, "en")
-    return "en"
+        normalized_default = default.lower().strip().replace("_", "-")
+        if normalized_default == "english" or normalized_default.startswith("en"):
+            return "en"
+    return "zh"
 
 
 def get_ui_settings() -> dict[str, Any]:
@@ -72,14 +74,14 @@ def get_ui_settings() -> dict[str, Any]:
     return DEFAULT_UI_SETTINGS.copy()
 
 
-def get_ui_language(default: str = "en") -> str:
+def get_ui_language(default: str = "zh") -> str:
     """
     Get current UI language.
 
     Priority:
     1) interface.json
     2) provided default
-    3) 'en'
+    3) 'zh'
     """
     settings = get_ui_settings()
     return _normalize_language(settings.get("language"), default)

@@ -2277,7 +2277,7 @@ async def run_reindex_task(kb_name: str, base_dir: str, task_id: str, signature_
 
             from deeptutor.services.rag.service import RAGService
 
-            # provider=None → RAGService resolves the KB's DeepTutor-bound
+            # provider=None → RAGService resolves the KB's yFeiSTAI-bound
             # engine, so re-indexing a PageIndex/LightRAG/GraphRAG KB stays on
             # that provider rather than forcing the default pipeline.
             rag_service = RAGService(kb_base_dir=str(base_path), provider=None)

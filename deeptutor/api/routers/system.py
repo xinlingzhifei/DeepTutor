@@ -296,7 +296,7 @@ async def test_search_connection():
                 message=f"Search provider `{search_config.requested_provider}` missing credentials.",
                 error="Set profile.api_key in Settings > Catalog.",
             )
-        result = web_search("DeepTutor health check", provider=search_config.provider)
+        result = web_search("yFeiSTAI health check", provider=search_config.provider)
         response_time = (time.time() - start_time) * 1000
         answer = result.get("answer") or result.get("search_results")
         if not answer:

@@ -15,7 +15,7 @@ from deeptutor.services.prompt.language import append_language_directive
 class FollowupAgent(BaseAgent):
     """Answer follow-up questions about a single quiz item in one LLM call."""
 
-    def __init__(self, language: str = "en", **kwargs: Any) -> None:
+    def __init__(self, language: str = "zh", **kwargs: Any) -> None:
         super().__init__(
             module_name="question",
             agent_name="followup_agent",

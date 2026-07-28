@@ -1,8 +1,8 @@
-# 🚀 DeepTutor v1.0.0-beta1 Release Notes
+# 🚀 yFeiSTAI v1.0.0-beta1 Release Notes
 
 **Release Date:** 2026.04.04
 
-We're thrilled to announce **DeepTutor v1.0.0-beta1** — the first beta of the **DeepTutor 2.0** architecture. This is a ground-up rewrite that transforms DeepTutor from a monolithic RAG tutor into an **agent-native learning platform** with a two-layer plugin model (Tools + Capabilities), three unified entry points (CLI / WebSocket / Python SDK), and a completely rebuilt web application shell.
+We're thrilled to announce **yFeiSTAI v1.0.0-beta1** — the first beta of the **yFeiSTAI 2.0** architecture. This is a ground-up rewrite that transforms yFeiSTAI from a monolithic RAG tutor into an **agent-native learning platform** with a two-layer plugin model (Tools + Capabilities), three unified entry points (CLI / WebSocket / Python SDK), and a completely rebuilt web application shell.
 
 > ⚠️ **Beta Notice:** This is **beta 1** of v1.0.0. The core architecture is stable, but some **UI interactions and edge-case workflows may still contain bugs**. We appreciate your patience and welcome bug reports via [Issues](https://github.com/HKUDS/DeepTutor/issues).
 
@@ -75,7 +75,7 @@ Seven unified LLM-callable tools with bilingual prompt hints (en/zh):
 
 ### 🤖 TutorBot — Multi-Channel Bot Agent
 
-New autonomous bot system (`deeptutor/tutorbot/`) that brings DeepTutor to messaging platforms:
+New autonomous bot system (`deeptutor/tutorbot/`) that brings yFeiSTAI to messaging platforms:
 
 - **12 Channels:** Telegram, Discord, Slack, WeChat Work (WeCom), Feishu, DingTalk, WhatsApp, Matrix, QQ, Email, MoChat
 - **Agent Loop:** Tool-augmented LLM loop with memory, subagent spawning, and team collaboration
@@ -151,7 +151,7 @@ deeptutor/services/
 
 ## 📦 What's Changed
 
-- Complete codebase rewrite with agent-native architecture (DeepTutor 2.0).
+- Complete codebase rewrite with agent-native architecture (yFeiSTAI 2.0).
 - Two-layer plugin model (Tools + Capabilities) with `ChatOrchestrator` coordinator.
 - Standalone CLI package (`deeptutor_cli/`) with 11 sub-commands via Typer.
 - Unified WebSocket endpoint with turn lifecycle and session streaming.

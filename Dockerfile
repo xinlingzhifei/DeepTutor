@@ -1,7 +1,7 @@
 # ============================================
-# DeepTutor Multi-Stage Dockerfile
+# yFeiSTAI Multi-Stage Dockerfile
 # ============================================
-# This Dockerfile builds a production-ready image for DeepTutor
+# This Dockerfile builds a production-ready image for yFeiSTAI
 # containing both the FastAPI backend and Next.js frontend
 #
 # Build/run:
@@ -104,8 +104,8 @@ RUN pip install --upgrade pip && \
 FROM python:3.11-slim AS production
 
 # Labels
-LABEL maintainer="DeepTutor Team" \
-      description="DeepTutor: AI-Powered Personalized Learning Assistant"
+LABEL maintainer="yFeiSTAI Team" \
+      description="yFeiSTAI: AI-Powered Personalized Learning Assistant"
 
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -306,7 +306,7 @@ RUN cat > /app/entrypoint.sh <<'EOF'
 set -e
 
 echo "============================================"
-echo "🚀 Starting DeepTutor"
+echo "🚀 Starting yFeiSTAI"
 echo "============================================"
 
 export DEEPTUTOR_IGNORE_PROCESS_ENV_OVERRIDES=1

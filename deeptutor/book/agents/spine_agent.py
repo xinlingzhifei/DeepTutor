@@ -32,7 +32,7 @@ class SpineAgent(BaseAgent):
         api_key: str | None = None,
         base_url: str | None = None,
         api_version: str | None = None,
-        language: str = "en",
+        language: str = "zh",
         binding: str = "openai",
     ) -> None:
         super().__init__(

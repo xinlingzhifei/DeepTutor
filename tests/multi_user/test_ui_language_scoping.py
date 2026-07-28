@@ -34,5 +34,24 @@ def test_get_ui_language_reads_per_user_interface_json(mu_isolated_root, as_user
 
 def test_get_ui_language_defaults_when_no_file(mu_isolated_root, as_user):
     with as_user("u_alice", role="user"):
-        # Bob has nothing on disk yet — falls back to the default "en".
-        assert get_ui_language() == "en"
+        # Alice has nothing on disk yet — the product default is Chinese.
+        assert get_ui_language() == "zh"
+
+
+def test_get_ui_language_normalizes_invalid_saved_value_to_chinese(
+    mu_isolated_root, as_user
+):
+    settings_file = (
+        mu_isolated_root
+        / "data"
+        / "users"
+        / "u_alice"
+        / "user"
+        / "settings"
+        / "interface.json"
+    )
+    settings_file.parent.mkdir(parents=True, exist_ok=True)
+    settings_file.write_text(json.dumps({"language": "unsupported"}))
+
+    with as_user("u_alice", role="user"):
+        assert get_ui_language() == "zh"

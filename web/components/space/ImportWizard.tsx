@@ -259,7 +259,7 @@ function IntroView() {
         <div className="min-w-0 space-y-1">
           <p className="text-[13px] leading-relaxed text-[var(--foreground)]">
             {t(
-              "Select your local .claude or .codex folder. DeepTutor reads it right here in your browser — nothing leaves your machine until you choose what to import.",
+              "Select your local .claude or .codex folder. yFeiSTAI reads it right here in your browser — nothing leaves your machine until you choose what to import.",
             )}
           </p>
           <p className="text-[12px] leading-relaxed text-[var(--muted-foreground)]">
