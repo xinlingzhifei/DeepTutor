@@ -1,0 +1,79 @@
+from contextlib import asynccontextmanager
+
+import pytest
+
+
+class FakeEngine:
+    def __init__(self) -> None:
+        self.execution_options_seen = None
+        self.connection_is_open = False
+
+    def execution_options(self, **options):
+        self.execution_options_seen = options
+        return self
+
+    @asynccontextmanager
+    async def connect(self):
+        self.connection_is_open = True
+        try:
+            yield object()
+        finally:
+            self.connection_is_open = False
+
+
+@pytest.fixture
+def fake_engine():
+    return FakeEngine()
+
+
+@pytest.mark.asyncio
+async def test_tenant_session_uses_schema_translate_map(fake_engine):
+    from deeptutor.teaching.database import tenant_connection
+
+    async with tenant_connection(fake_engine, "t_acme"):
+        pass
+
+    assert fake_engine.execution_options_seen == {
+        "schema_translate_map": {"tenant": "tenant_bf4fcb0bb5997635"}
+    }
+    assert fake_engine.connection_is_open is False
+
+
+def test_model_metadata_uses_only_platform_and_logical_tenant_schemas():
+    from deeptutor.teaching.models import PlatformBase, TenantBase
+
+    assert set(PlatformBase.metadata.tables) == {
+        "platform.audit_log",
+        "platform.data_plane_routes",
+        "platform.role_grants",
+        "platform.tenant_memberships",
+        "platform.tenant_provisioning_jobs",
+        "platform.tenant_storage_credentials",
+        "platform.tenants",
+    }
+    assert set(TenantBase.metadata.tables) == {
+        "tenant.classes",
+        "tenant.courses",
+        "tenant.enrollments",
+    }
+
+    for table in TenantBase.metadata.tables.values():
+        for foreign_key in table.foreign_keys:
+            assert foreign_key.target_fullname.startswith("tenant.")
+
+
+def test_tenant_storage_credentials_metadata_excludes_plaintext_secrets():
+    from deeptutor.teaching.models import TenantStorageCredential
+
+    table = TenantStorageCredential.__table__
+    assert table.schema == "platform"
+    assert set(table.columns.keys()) == {
+        "tenant_id",
+        "secret_ref",
+        "access_key_fingerprint",
+        "status",
+        "rotated_at",
+        "created_at",
+        "updated_at",
+    }
+    assert {"access_key", "secret_key"}.isdisjoint(table.columns.keys())
