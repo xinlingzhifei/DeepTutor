@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { fetchAuthStatus } from "@/lib/auth";
+import { fetchAuthStatus, type TenantSummary } from "@/lib/auth";
 
 export interface AuthStatusState {
   /** Whether auth is enabled on the backend. */
@@ -10,6 +10,10 @@ export interface AuthStatusState {
   authenticated: boolean;
   /** Whether the authenticated user is an admin. */
   isAdmin: boolean;
+  /** Currently selected, still-accessible tenant. */
+  activeTenantId: string | null;
+  /** Active tenants available to the current user. */
+  tenants: TenantSummary[];
   /** True until the first status fetch resolves. */
   loading: boolean;
 }
@@ -18,6 +22,8 @@ const INITIAL: AuthStatusState = {
   enabled: false,
   authenticated: false,
   isAdmin: false,
+  activeTenantId: null,
+  tenants: [],
   loading: true,
 };
 
@@ -44,6 +50,8 @@ function loadAuthStatus(): Promise<AuthStatusState> {
         enabled: Boolean(status?.enabled),
         authenticated: Boolean(status?.authenticated),
         isAdmin: status?.role === "admin",
+        activeTenantId: status?.active_tenant_id ?? null,
+        tenants: status?.tenants ?? [],
         loading: false,
       }))
       .finally(() => {

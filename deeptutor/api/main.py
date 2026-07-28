@@ -330,6 +330,7 @@ from deeptutor.api.routers import (
     skills,
     subagents,
     system,
+    tenants,
     unified_ws,
     voice,
 )
@@ -340,6 +341,7 @@ from deeptutor.multi_user.router import router as multi_user_router  # noqa: E40
 
 # Auth router is public — login/logout/register/status require no token
 app.include_router(auth.router, prefix="/api/v1/auth", tags=["auth"])
+app.include_router(tenants.router, prefix="/api/v1/tenants", tags=["tenants"])
 
 # All other routers require a valid session when AUTH_ENABLED=true.
 # require_auth is a no-op when AUTH_ENABLED=false, so this is safe for local use.

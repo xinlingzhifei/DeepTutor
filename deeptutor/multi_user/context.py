@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 from contextvars import ContextVar, Token
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .models import CurrentUser
 from .paths import local_admin_user, scope_for_user
 
+if TYPE_CHECKING:
+    from deeptutor.teaching.tenant_context import TenantContext
+
 _current_user: ContextVar[CurrentUser | None] = ContextVar("deeptutor_current_user", default=None)
+_current_tenant: ContextVar[TenantContext | None] = ContextVar(
+    "deeptutor_current_tenant",
+    default=None,
+)
 
 
 def set_current_user(user: CurrentUser) -> Token[CurrentUser | None]:
@@ -25,6 +32,27 @@ def get_current_user() -> CurrentUser:
 
 def get_current_user_or_none() -> CurrentUser | None:
     return _current_user.get()
+
+
+def set_current_tenant(
+    tenant: TenantContext,
+) -> Token[TenantContext | None]:
+    return _current_tenant.set(tenant)
+
+
+def reset_current_tenant(token: Token[TenantContext | None]) -> None:
+    _current_tenant.reset(token)
+
+
+def get_current_tenant() -> TenantContext:
+    tenant = _current_tenant.get()
+    if tenant is None:
+        raise RuntimeError("tenant context is not installed")
+    return tenant
+
+
+def get_current_tenant_or_none() -> TenantContext | None:
+    return _current_tenant.get()
 
 
 def user_from_token_payload(payload: Any | None) -> CurrentUser:

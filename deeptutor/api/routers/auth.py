@@ -17,9 +17,9 @@ from fastapi import (
     status,
 )
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
-from deeptutor.services.config import load_auth_settings
+from deeptutor.services.config import load_auth_settings, load_platform_settings
 
 # SameSite=None lets the cookie work when the browser accesses the frontend via
 # 127.0.0.1 and the backend via localhost (different origins on the same machine).
@@ -57,7 +57,7 @@ _COOKIE_NAME = "dt_token"
 _COOKIE_MAX_AGE = TOKEN_EXPIRE_HOURS * 3600
 
 
-def _cookie_attrs() -> dict:
+def _cookie_attrs(key: str = _COOKIE_NAME) -> dict:
     """Attribute set shared by ``login``'s ``set_cookie`` and ``logout``'s
     ``delete_cookie``.
 
@@ -68,8 +68,9 @@ def _cookie_attrs() -> dict:
     so tests can monkeypatch ``_SECURE``/``_SAMESITE``.
     """
     return {
-        "key": _COOKIE_NAME,
+        "key": key,
         "httponly": True,
+        "path": "/",
         "samesite": _SAMESITE,
         "secure": _SECURE,
     }
@@ -130,6 +131,14 @@ class SetRoleRequest(BaseModel):
         return v
 
 
+class AuthTenantSummary(BaseModel):
+    """Safe tenant chooser fields returned with auth status."""
+
+    tenant_id: str
+    name: str
+    status: str
+
+
 class AuthStatusResponse(BaseModel):
     """Response body for the GET /status endpoint."""
 
@@ -140,6 +149,8 @@ class AuthStatusResponse(BaseModel):
     role: str | None = None
     is_admin: bool = False
     avatar: str = ""
+    active_tenant_id: str | None = None
+    tenants: list[AuthTenantSummary] = Field(default_factory=list)
 
 
 class UserInfo(BaseModel):
@@ -345,6 +356,94 @@ async def require_admin(
     return payload
 
 
+def authoritative_platform_identity(
+    payload: TokenPayload | None,
+) -> TokenPayload | None:
+    """Resolve a JWT subject against the current authoritative user store."""
+
+    if payload is None:
+        return None
+    if POCKETBASE_ENABLED:
+        if (
+            not payload.username
+            or not payload.username.strip()
+            or not payload.user_id
+            or not payload.user_id.strip()
+            or payload.role not in {"admin", "user"}
+        ):
+            return None
+        return payload
+    info = get_user_info(payload.username)
+    if (
+        info is None
+        or bool(info.get("disabled"))
+        or str(info.get("id") or "") != payload.user_id
+        or str(info.get("username") or "") != payload.username
+    ):
+        return None
+    role = str(info.get("role") or "")
+    if role not in {"admin", "user"}:
+        return None
+    return TokenPayload(
+        username=payload.username,
+        role=role,
+        user_id=payload.user_id,
+    )
+
+
+def require_platform_enabled() -> None:
+    """Reject platform-only control-plane operations before other dependencies."""
+
+    if not load_platform_settings().enabled:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Tenant platform is disabled",
+        )
+
+
+def require_platform_identity_from_payload(
+    payload: TokenPayload | None,
+) -> TokenPayload:
+    """Fail closed and install one current authoritative platform identity."""
+
+    if payload is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Tenant platform requires authentication",
+        )
+    identity = authoritative_platform_identity(payload)
+    if identity is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Account is unavailable",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    _install_current_user(identity)
+    return identity
+
+
+async def require_platform_identity(
+    _platform_enabled: None = Depends(require_platform_enabled),
+    payload: TokenPayload | None = Depends(require_auth),
+) -> TokenPayload:
+    """FastAPI guard for authenticated, authoritative platform identities."""
+
+    return require_platform_identity_from_payload(payload)
+
+
+async def require_platform_admin(
+    payload: TokenPayload = Depends(require_platform_identity),
+) -> TokenPayload:
+    """Require the current authoritative platform role to be admin."""
+
+    if payload.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin access required",
+        )
+    return payload
+
+
 def _local_admin_token_payload() -> TokenPayload:
     """Synthetic admin payload used when AUTH_ENABLED=false.
 
@@ -367,13 +466,64 @@ def _local_admin_token_payload() -> TokenPayload:
 # ---------------------------------------------------------------------------
 
 
+async def _tenant_status_fields(
+    payload: TokenPayload | None,
+    selected_tenant_id: str | None,
+) -> tuple[list[AuthTenantSummary], str | None]:
+    """Load only safe chooser summaries, with no permission or route data."""
+
+    if not load_platform_settings().enabled:
+        if payload is None and AUTH_ENABLED:
+            return [], None
+        return [
+            AuthTenantSummary(
+                tenant_id="local",
+                name="Local",
+                status="active",
+            )
+        ], "local"
+    if payload is None:
+        return [], None
+
+    from deeptutor.teaching.repositories import tenants as tenant_repositories
+
+    repository = tenant_repositories.get_tenant_repository()
+    summaries = await repository.list_tenants(
+        payload.user_id,
+        is_platform_admin=payload.role == "admin",
+    )
+    safe_summaries = [
+        AuthTenantSummary(
+            tenant_id=summary.tenant_id,
+            name=summary.name,
+            status=summary.status,
+        )
+        for summary in summaries
+    ]
+    accessible_ids = {summary.tenant_id for summary in safe_summaries}
+    normalized_selected = selected_tenant_id.strip() if selected_tenant_id else None
+    active_tenant_id = normalized_selected if normalized_selected in accessible_ids else None
+    return safe_summaries, active_tenant_id
+
+
 @router.get("/status", response_model=AuthStatusResponse)
 async def auth_status(
     authorization: str | None = Header(default=None, alias="Authorization"),
     dt_token: str | None = Cookie(default=None),
+    dt_tenant: str | None = Cookie(default=None),
 ) -> AuthStatusResponse:
     """Return whether auth is enabled and whether the current request is authenticated."""
+    platform_enabled = load_platform_settings().enabled
     if not AUTH_ENABLED:
+        if platform_enabled:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Tenant platform requires authentication",
+            )
+        tenants, active_tenant_id = await _tenant_status_fields(
+            _local_admin_token_payload(),
+            dt_tenant,
+        )
         return AuthStatusResponse(
             enabled=False,
             authenticated=True,
@@ -381,12 +531,17 @@ async def auth_status(
             username="local",
             role="admin",
             is_admin=True,
+            active_tenant_id=active_tenant_id,
+            tenants=tenants,
         )
 
     token = _extract_token(authorization, dt_token)
     payload = decode_token(token) if token else None
+    if platform_enabled:
+        payload = authoritative_platform_identity(payload)
+    tenants, active_tenant_id = await _tenant_status_fields(payload, dt_tenant)
     avatar = ""
-    if payload is not None:
+    if payload is not None and not POCKETBASE_ENABLED:
         info = get_user_info(payload.username)
         if info:
             avatar = str(info.get("avatar") or "")
@@ -398,6 +553,8 @@ async def auth_status(
         role=payload.role if payload else None,
         is_admin=payload.role == "admin" if payload else False,
         avatar=avatar,
+        active_tenant_id=active_tenant_id,
+        tenants=tenants,
     )
 
 
@@ -456,6 +613,7 @@ async def logout(response: Response) -> dict:
     (see the rationale there and #623).
     """
     response.delete_cookie(**_cookie_attrs())
+    response.delete_cookie(**_cookie_attrs("dt_tenant"))
     return {"ok": True}
 
 

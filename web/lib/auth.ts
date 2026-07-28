@@ -7,6 +7,12 @@ import { apiFetch, apiUrl, setRuntimeAuthEnabled } from "@/lib/api";
 // `useAuthStatus` hook (web/hooks/useAuthStatus.ts); `apiFetch`'s redirect gate
 // is driven by `setRuntimeAuthEnabled`, which `fetchAuthStatus` calls below.
 
+export interface TenantSummary {
+  tenant_id: string;
+  name: string;
+  status: string;
+}
+
 export interface AuthStatus {
   enabled: boolean;
   authenticated: boolean;
@@ -16,6 +22,8 @@ export interface AuthStatus {
   is_admin?: boolean;
   /** Avatar marker: "", "icon:<name>:<color>", or "img:<version>". */
   avatar?: string;
+  active_tenant_id?: string | null;
+  tenants?: TenantSummary[];
 }
 
 /**

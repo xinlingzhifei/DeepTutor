@@ -9,8 +9,9 @@ not configured.
 Token validation uses PocketBase's auth-refresh endpoint rather than
 local JWT decoding (PocketBase does not expose a static JWT secret).
 Results are cached in memory for 60 seconds so only the first request
-per token per minute incurs a network call (~5–10 ms); all subsequent
-requests within the TTL are resolved in < 1 ms from the local cache.
+per provider and token per minute incurs a network call (~5–10 ms);
+all subsequent requests within the TTL are resolved in < 1 ms from the
+local cache.
 
 Usage:
     from deeptutor.services.pocketbase_client import get_pb_client, is_pocketbase_enabled
@@ -34,8 +35,8 @@ _client = None
 _client_initialised = False
 _client_key = ""
 
-# Token validation cache: token -> (payload_dict, expires_at)
-_TOKEN_CACHE: dict[str, tuple[dict[str, Any], float]] = {}
+# Token validation cache: (PocketBase URL, token) -> (payload_dict, expires_at)
+_TOKEN_CACHE: dict[tuple[str, str], tuple[dict[str, Any], float]] = {}
 _TOKEN_CACHE_TTL: float = 60.0  # seconds
 
 
@@ -114,7 +115,7 @@ def validate_pb_token(token: str) -> dict[str, Any] | None:
 
     Uses PocketBase's /api/collections/users/auth-refresh endpoint.
     Results are cached for ``_TOKEN_CACHE_TTL`` seconds so only the
-    first call per token per minute makes a network round-trip.
+    first call per provider and token per minute makes a network round-trip.
 
     Returns a dict with at least ``username`` and ``role`` keys, or
     None if the token is invalid / expired.
@@ -125,14 +126,15 @@ def validate_pb_token(token: str) -> dict[str, Any] | None:
         return None
 
     now = time.monotonic()
+    cache_key = (pocketbase_url, token)
 
     # Cache hit
-    cached = _TOKEN_CACHE.get(token)
+    cached = _TOKEN_CACHE.get(cache_key)
     if cached is not None:
         payload, expires_at = cached
         if now < expires_at:
             return payload
-        del _TOKEN_CACHE[token]
+        del _TOKEN_CACHE[cache_key]
 
     # Cache miss — call PocketBase
     try:
@@ -152,8 +154,12 @@ def validate_pb_token(token: str) -> dict[str, Any] | None:
         )
         role = str(getattr(record, "role", "user") or "user")
 
-        payload = {"username": str(username), "role": role}
-        _TOKEN_CACHE[token] = (payload, now + _TOKEN_CACHE_TTL)
+        payload = {
+            "id": str(getattr(record, "id", "") or ""),
+            "username": str(username),
+            "role": role,
+        }
+        _TOKEN_CACHE[cache_key] = (payload, now + _TOKEN_CACHE_TTL)
         return payload
 
     except Exception as exc:

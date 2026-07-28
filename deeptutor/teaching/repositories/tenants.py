@@ -1,0 +1,697 @@
+"""Async control-plane repository for tenant selection and provisioning."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import hashlib
+from typing import Any
+
+from sqlalchemy import delete, func, select, update
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.sql import Select
+
+from deeptutor.teaching.database import platform_session
+from deeptutor.teaching.models.platform import (
+    AuditLog,
+    DataPlaneRoute,
+    Tenant,
+    TenantMembership,
+    TenantProvisioningJob,
+    TenantStorageCredential,
+)
+from deeptutor.teaching.models.platform import (
+    RoleGrant as RoleGrantModel,
+)
+from deeptutor.teaching.permissions import DEFAULT_ROLE_PERMISSIONS
+from deeptutor.teaching.schema_names import tenant_schema_name
+
+_POLICY_VERIFIED_ACTION = "tenant.provisioning.policy_verified"
+_PROVISIONING_JOB_RESOURCE = "provisioning_job"
+
+
+class TenantRepositoryError(Exception):
+    """Base class for safe tenant-domain failures."""
+
+
+class TenantNotFoundError(TenantRepositoryError):
+    """The requested tenant or provisioning record does not exist."""
+
+
+class TenantAccessDeniedError(TenantRepositoryError):
+    """The user has no active membership for the requested tenant."""
+
+
+class TenantNotActiveError(TenantRepositoryError):
+    """The tenant exists but is not selectable."""
+
+
+class TenantSelectionRequiredError(TenantRepositoryError):
+    """A request cannot infer one unambiguous active tenant."""
+
+
+class TenantConflictError(TenantRepositoryError):
+    """A tenant write conflicts with existing control-plane state."""
+
+
+class UnknownRoleError(TenantRepositoryError):
+    """At least one requested role is not a fixed role template."""
+
+
+@dataclass(frozen=True, slots=True)
+class TenantSummary:
+    tenant_id: str
+    name: str
+    status: str
+
+
+@dataclass(frozen=True, slots=True)
+class TenantAccess:
+    summary: TenantSummary
+    schema_name: str
+    roles: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
+class ProvisioningSummary:
+    tenant_id: str
+    status: str
+    job_id: str
+    job_status: str
+    attempt_count: int
+
+
+def build_accessible_tenants_statement(
+    user_id: str,
+    *,
+    is_platform_admin: bool,
+) -> Select[Any]:
+    """Build the active-tenant list query with explicit security filters."""
+
+    statement = select(
+        Tenant.id.label("tenant_id"),
+        Tenant.name,
+        Tenant.status,
+    ).where(Tenant.status == "active")
+    if not is_platform_admin:
+        statement = statement.join(
+            TenantMembership,
+            TenantMembership.tenant_id == Tenant.id,
+        ).where(
+            TenantMembership.user_id == user_id,
+            TenantMembership.status == "active",
+        )
+    return statement.order_by(Tenant.name, Tenant.id)
+
+
+def build_tenant_access_statement(
+    tenant_id: str,
+    user_id: str,
+    *,
+    is_platform_admin: bool,
+) -> Select[Any]:
+    """Build one selectable-tenant query without accepting a raw schema."""
+
+    statement = (
+        select(
+            Tenant.id.label("tenant_id"),
+            Tenant.name,
+            Tenant.status,
+            DataPlaneRoute.schema_name,
+        )
+        .outerjoin(
+            DataPlaneRoute,
+            DataPlaneRoute.tenant_id == Tenant.id,
+        )
+        .where(
+            Tenant.id == tenant_id,
+            Tenant.status == "active",
+        )
+    )
+    if not is_platform_admin:
+        statement = statement.join(
+            TenantMembership,
+            TenantMembership.tenant_id == Tenant.id,
+        ).where(
+            TenantMembership.user_id == user_id,
+            TenantMembership.status == "active",
+        )
+    return statement
+
+
+def _summary_from_row(row: Any) -> TenantSummary:
+    return TenantSummary(
+        tenant_id=str(row["tenant_id"]),
+        name=str(row["name"]),
+        status=str(row["status"]),
+    )
+
+
+def _validate_roles(roles: frozenset[str]) -> None:
+    if not roles or not roles.issubset(DEFAULT_ROLE_PERMISSIONS):
+        raise UnknownRoleError("unknown role")
+
+
+def _advisory_lock_key(value: str) -> int:
+    digest = hashlib.sha256(value.encode("utf-8")).digest()[:8]
+    return int.from_bytes(digest, byteorder="big", signed=True)
+
+
+def build_active_tenant_lock_statement(tenant_id: str) -> Select[Any]:
+    return (
+        select(Tenant.id)
+        .where(
+            Tenant.id == tenant_id,
+            Tenant.status == "active",
+        )
+        .with_for_update()
+    )
+
+
+def build_membership_upsert_statement(
+    tenant_id: str,
+    user_id: str,
+) -> Any:
+    return (
+        insert(TenantMembership)
+        .values(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            status="active",
+        )
+        .on_conflict_do_update(
+            index_elements=[
+                TenantMembership.tenant_id,
+                TenantMembership.user_id,
+            ],
+            set_={"status": "active", "updated_at": func.now()},
+        )
+    )
+
+
+def build_role_delete_statement(tenant_id: str, user_id: str) -> Any:
+    return delete(RoleGrantModel).where(
+        RoleGrantModel.tenant_id == tenant_id,
+        RoleGrantModel.user_id == user_id,
+    )
+
+
+def build_role_insert_statement(
+    tenant_id: str,
+    user_id: str,
+    roles: frozenset[str],
+) -> Any:
+    return insert(RoleGrantModel).values(
+        [
+            {
+                "tenant_id": tenant_id,
+                "user_id": user_id,
+                "role": role,
+            }
+            for role in sorted(roles)
+        ]
+    )
+
+
+def build_provisioning_advisory_lock_statement(
+    tenant_id: str,
+) -> Select[Any]:
+    return select(func.pg_advisory_xact_lock(_advisory_lock_key(tenant_id)))
+
+
+def build_failed_tenant_retry_statement(tenant_id: str) -> Any:
+    return (
+        update(Tenant)
+        .where(
+            Tenant.id == tenant_id,
+            Tenant.status == "failed",
+        )
+        .values(
+            status="provisioning",
+            updated_at=func.now(),
+        )
+    )
+
+
+def build_failed_job_retry_statement(
+    tenant_id: str,
+    job_id: str,
+    expected_attempt_count: int,
+) -> Any:
+    return (
+        update(TenantProvisioningJob)
+        .where(
+            TenantProvisioningJob.id == job_id,
+            TenantProvisioningJob.tenant_id == tenant_id,
+            TenantProvisioningJob.operation == "provision",
+            TenantProvisioningJob.status == "failed",
+            TenantProvisioningJob.attempt_count == expected_attempt_count,
+        )
+        .values(
+            status="pending",
+            attempt_count=TenantProvisioningJob.attempt_count + 1,
+            updated_at=func.now(),
+        )
+    )
+
+
+def _policy_resource_id(job_id: str, attempt_count: int) -> str:
+    return f"{job_id}:{attempt_count}"
+
+
+def build_worker_attempt_lock_statement(
+    tenant_id: str,
+    job_id: str,
+    expected_attempt_count: int,
+) -> Select[Any]:
+    return (
+        select(Tenant, TenantProvisioningJob)
+        .join(
+            TenantProvisioningJob,
+            TenantProvisioningJob.tenant_id == Tenant.id,
+        )
+        .where(
+            Tenant.id == tenant_id,
+            Tenant.status == "provisioning",
+            TenantProvisioningJob.id == job_id,
+            TenantProvisioningJob.tenant_id == tenant_id,
+            TenantProvisioningJob.operation == "provision",
+            TenantProvisioningJob.attempt_count == expected_attempt_count,
+            TenantProvisioningJob.status.in_(("pending", "running")),
+        )
+        .with_for_update()
+    )
+
+
+def build_activation_lock_statement(
+    tenant_id: str,
+    job_id: str,
+    expected_attempt_count: int,
+) -> Select[Any]:
+    policy_resource_id = _policy_resource_id(job_id, expected_attempt_count)
+    return (
+        select(Tenant, TenantProvisioningJob)
+        .join(
+            TenantProvisioningJob,
+            TenantProvisioningJob.tenant_id == Tenant.id,
+        )
+        .join(
+            DataPlaneRoute,
+            DataPlaneRoute.tenant_id == Tenant.id,
+        )
+        .join(
+            TenantStorageCredential,
+            TenantStorageCredential.tenant_id == Tenant.id,
+        )
+        .join(
+            AuditLog,
+            AuditLog.tenant_id == Tenant.id,
+        )
+        .where(
+            Tenant.id == tenant_id,
+            Tenant.status == "provisioning",
+            TenantProvisioningJob.id == job_id,
+            TenantProvisioningJob.tenant_id == tenant_id,
+            TenantProvisioningJob.operation == "provision",
+            TenantProvisioningJob.status.in_(("pending", "running")),
+            TenantProvisioningJob.attempt_count == expected_attempt_count,
+            DataPlaneRoute.tenant_id == tenant_id,
+            DataPlaneRoute.status == "active",
+            DataPlaneRoute.schema_name == tenant_schema_name(tenant_id),
+            TenantStorageCredential.tenant_id == tenant_id,
+            TenantStorageCredential.status == "active",
+            AuditLog.tenant_id == tenant_id,
+            AuditLog.action == _POLICY_VERIFIED_ACTION,
+            AuditLog.resource_type == _PROVISIONING_JOB_RESOURCE,
+            AuditLog.resource_id == policy_resource_id,
+        )
+        .limit(1)
+        .with_for_update()
+    )
+
+
+def _expect_single_update(result: Any, operation: str) -> None:
+    if result.rowcount != 1:
+        raise TenantConflictError(f"{operation} state changed concurrently")
+
+
+class TenantRepository:
+    """Small request-stateless repository backed by ``platform_session``."""
+
+    async def list_tenants(
+        self,
+        user_id: str,
+        *,
+        is_platform_admin: bool,
+    ) -> tuple[TenantSummary, ...]:
+        async with platform_session() as session:
+            result = await session.execute(
+                build_accessible_tenants_statement(
+                    user_id,
+                    is_platform_admin=is_platform_admin,
+                )
+            )
+            return tuple(_summary_from_row(row) for row in result.mappings().all())
+
+    async def get_tenant_access(
+        self,
+        tenant_id: str,
+        user_id: str,
+        *,
+        is_platform_admin: bool,
+    ) -> TenantAccess:
+        async with platform_session() as session:
+            result = await session.execute(
+                build_tenant_access_statement(
+                    tenant_id,
+                    user_id,
+                    is_platform_admin=is_platform_admin,
+                )
+            )
+            row = result.mappings().one_or_none()
+            if row is None:
+                inactive_statement = select(Tenant.id).where(
+                    Tenant.id == tenant_id,
+                    Tenant.status != "active",
+                )
+                if not is_platform_admin:
+                    inactive_statement = inactive_statement.join(
+                        TenantMembership,
+                        TenantMembership.tenant_id == Tenant.id,
+                    ).where(
+                        TenantMembership.user_id == user_id,
+                        TenantMembership.status == "active",
+                    )
+                inactive = await session.scalar(inactive_statement)
+                if inactive is not None:
+                    raise TenantNotActiveError(tenant_id)
+                if is_platform_admin:
+                    raise TenantNotFoundError(tenant_id)
+                raise TenantAccessDeniedError(tenant_id)
+
+            role_statement = select(RoleGrantModel.role).where(
+                RoleGrantModel.tenant_id == tenant_id,
+                RoleGrantModel.user_id == user_id,
+            )
+            if not is_platform_admin:
+                role_statement = role_statement.join(
+                    TenantMembership,
+                    (TenantMembership.tenant_id == RoleGrantModel.tenant_id)
+                    & (TenantMembership.user_id == RoleGrantModel.user_id),
+                ).where(TenantMembership.status == "active")
+            roles = frozenset((await session.scalars(role_statement)).all())
+            schema_name = str(row["schema_name"] or tenant_schema_name(tenant_id))
+            return TenantAccess(
+                summary=_summary_from_row(row),
+                schema_name=schema_name,
+                roles=roles,
+            )
+
+    async def create_provisioning(
+        self,
+        *,
+        tenant_id: str,
+        job_id: str,
+        name: str,
+    ) -> ProvisioningSummary:
+        """Create one tenant/job pair, serialized by its opaque tenant ID."""
+
+        async with platform_session() as session:
+            async with session.begin():
+                await session.execute(build_provisioning_advisory_lock_statement(tenant_id))
+                existing_result = await session.execute(
+                    select(
+                        Tenant.id.label("tenant_id"),
+                        Tenant.name,
+                        Tenant.status,
+                        TenantProvisioningJob.id.label("job_id"),
+                        TenantProvisioningJob.status.label("job_status"),
+                        TenantProvisioningJob.attempt_count,
+                    )
+                    .join(
+                        TenantProvisioningJob,
+                        TenantProvisioningJob.tenant_id == Tenant.id,
+                    )
+                    .where(
+                        Tenant.id == tenant_id,
+                        Tenant.status.in_(("provisioning", "active", "failed")),
+                        TenantProvisioningJob.id == job_id,
+                        TenantProvisioningJob.tenant_id == tenant_id,
+                        TenantProvisioningJob.operation == "provision",
+                        TenantProvisioningJob.status.in_(
+                            ("pending", "running", "completed", "failed")
+                        ),
+                    )
+                )
+                existing = existing_result.mappings().one_or_none()
+                if existing is not None:
+                    if str(existing["name"]) != name:
+                        raise TenantConflictError("idempotency payload conflict")
+                    tenant_status = str(existing["status"])
+                    job_status = str(existing["job_status"])
+                    if "failed" in {tenant_status, job_status}:
+                        if (tenant_status, job_status) != ("failed", "failed"):
+                            raise TenantConflictError("provisioning retry state is inconsistent")
+                        tenant_update = await session.execute(
+                            build_failed_tenant_retry_statement(tenant_id)
+                        )
+                        job_update = await session.execute(
+                            build_failed_job_retry_statement(
+                                tenant_id,
+                                job_id,
+                                int(existing["attempt_count"]),
+                            )
+                        )
+                        _expect_single_update(
+                            tenant_update,
+                            "tenant provisioning retry",
+                        )
+                        _expect_single_update(
+                            job_update,
+                            "job provisioning retry",
+                        )
+                        await session.flush()
+                        return ProvisioningSummary(
+                            tenant_id=str(existing["tenant_id"]),
+                            status="provisioning",
+                            job_id=str(existing["job_id"]),
+                            job_status="pending",
+                            attempt_count=int(existing["attempt_count"]) + 1,
+                        )
+                    return ProvisioningSummary(
+                        tenant_id=str(existing["tenant_id"]),
+                        status=tenant_status,
+                        job_id=str(existing["job_id"]),
+                        job_status=job_status,
+                        attempt_count=int(existing["attempt_count"]),
+                    )
+
+                collision = await session.scalar(select(Tenant.id).where(Tenant.id == tenant_id))
+                if collision is not None:
+                    raise TenantConflictError("tenant identifier conflict")
+
+                session.add(
+                    Tenant(
+                        id=tenant_id,
+                        name=name,
+                        status="provisioning",
+                    )
+                )
+                session.add(
+                    TenantProvisioningJob(
+                        id=job_id,
+                        tenant_id=tenant_id,
+                        operation="provision",
+                        status="pending",
+                        attempt_count=0,
+                    )
+                )
+                await session.flush()
+                return ProvisioningSummary(
+                    tenant_id=tenant_id,
+                    status="provisioning",
+                    job_id=job_id,
+                    job_status="pending",
+                    attempt_count=0,
+                )
+
+    async def get_provisioning(self, tenant_id: str) -> ProvisioningSummary:
+        async with platform_session() as session:
+            result = await session.execute(
+                select(
+                    Tenant.id.label("tenant_id"),
+                    Tenant.status,
+                    TenantProvisioningJob.id.label("job_id"),
+                    TenantProvisioningJob.status.label("job_status"),
+                    TenantProvisioningJob.attempt_count,
+                )
+                .join(
+                    TenantProvisioningJob,
+                    TenantProvisioningJob.tenant_id == Tenant.id,
+                )
+                .where(
+                    Tenant.id == tenant_id,
+                    Tenant.status.in_(("provisioning", "active", "failed")),
+                    TenantProvisioningJob.tenant_id == tenant_id,
+                    TenantProvisioningJob.operation == "provision",
+                    TenantProvisioningJob.status.in_(("pending", "running", "completed", "failed")),
+                )
+                .order_by(TenantProvisioningJob.created_at.desc())
+                .limit(1)
+            )
+            row = result.mappings().one_or_none()
+            if row is None:
+                raise TenantNotFoundError(tenant_id)
+            return ProvisioningSummary(
+                tenant_id=str(row["tenant_id"]),
+                status=str(row["status"]),
+                job_id=str(row["job_id"]),
+                job_status=str(row["job_status"]),
+                attempt_count=int(row["attempt_count"]),
+            )
+
+    async def activate_if_ready(
+        self,
+        tenant_id: str,
+        job_id: str,
+        expected_attempt_count: int,
+    ) -> bool:
+        """Activate one exact current attempt with persisted prerequisites."""
+
+        async with platform_session() as session:
+            async with session.begin():
+                result = await session.execute(
+                    build_activation_lock_statement(
+                        tenant_id,
+                        job_id,
+                        expected_attempt_count,
+                    )
+                )
+                row = result.one_or_none()
+                if row is None:
+                    return False
+                tenant, job = row
+                tenant.status = "active"
+                job.status = "completed"
+                await session.flush()
+                return True
+
+    async def mark_provisioning_failed(
+        self,
+        tenant_id: str,
+        job_id: str,
+        expected_attempt_count: int,
+    ) -> bool:
+        """Atomically fail one current attempt without changing its count."""
+
+        async with platform_session() as session:
+            async with session.begin():
+                result = await session.execute(
+                    build_worker_attempt_lock_statement(
+                        tenant_id,
+                        job_id,
+                        expected_attempt_count,
+                    )
+                )
+                row = result.one_or_none()
+                if row is None:
+                    return False
+                tenant, job = row
+                tenant.status = "failed"
+                job.status = "failed"
+                await session.flush()
+                return True
+
+    async def record_policy_verified(
+        self,
+        tenant_id: str,
+        job_id: str,
+        expected_attempt_count: int,
+    ) -> bool:
+        """Persist the fixed policy event for one exact current attempt."""
+
+        async with platform_session() as session:
+            async with session.begin():
+                result = await session.execute(
+                    build_worker_attempt_lock_statement(
+                        tenant_id,
+                        job_id,
+                        expected_attempt_count,
+                    )
+                )
+                if result.one_or_none() is None:
+                    return False
+                session.add(
+                    AuditLog(
+                        tenant_id=tenant_id,
+                        actor_id=None,
+                        action=_POLICY_VERIFIED_ACTION,
+                        resource_type=_PROVISIONING_JOB_RESOURCE,
+                        resource_id=_policy_resource_id(
+                            job_id,
+                            expected_attempt_count,
+                        ),
+                    )
+                )
+                await session.flush()
+                return True
+
+    async def upsert_member(
+        self,
+        tenant_id: str,
+        user_id: str,
+        roles: frozenset[str],
+    ) -> None:
+        """Transactionally upsert an active membership and its initial roles."""
+
+        _validate_roles(roles)
+        async with platform_session() as session:
+            async with session.begin():
+                active_tenant = await session.scalar(build_active_tenant_lock_statement(tenant_id))
+                if active_tenant is None:
+                    raise TenantNotFoundError(tenant_id)
+                await session.execute(build_membership_upsert_statement(tenant_id, user_id))
+                await self._replace_roles(session, tenant_id, user_id, roles)
+
+    async def replace_grants(
+        self,
+        tenant_id: str,
+        user_id: str,
+        roles: frozenset[str],
+    ) -> None:
+        """Replace one active member's role set inside one transaction."""
+
+        _validate_roles(roles)
+        async with platform_session() as session:
+            async with session.begin():
+                membership = await session.scalar(
+                    select(TenantMembership.user_id)
+                    .join(Tenant, Tenant.id == TenantMembership.tenant_id)
+                    .where(
+                        Tenant.id == tenant_id,
+                        Tenant.status == "active",
+                        TenantMembership.tenant_id == tenant_id,
+                        TenantMembership.user_id == user_id,
+                        TenantMembership.status == "active",
+                    )
+                    .with_for_update()
+                )
+                if membership is None:
+                    raise TenantAccessDeniedError(tenant_id)
+                await self._replace_roles(session, tenant_id, user_id, roles)
+
+    @staticmethod
+    async def _replace_roles(
+        session: Any,
+        tenant_id: str,
+        user_id: str,
+        roles: frozenset[str],
+    ) -> None:
+        await session.execute(build_role_delete_statement(tenant_id, user_id))
+        await session.execute(build_role_insert_statement(tenant_id, user_id, roles))
+        await session.flush()
+
+
+def get_tenant_repository() -> TenantRepository:
+    """FastAPI-replaceable repository dependency."""
+
+    return TenantRepository()
