@@ -26,6 +26,7 @@ import {
 import { useTranslation } from "react-i18next";
 import SessionList from "@/components/SessionList";
 import { VersionBadge } from "@/components/sidebar/VersionBadge";
+import { TenantSwitcher } from "@/components/tenant/TenantSwitcher";
 import type { SessionSummary } from "@/lib/session-api";
 import { Tooltip } from "@/components/ui/Tooltip";
 import { useCapabilityAccess } from "@/components/access/CapabilityAccessContext";
@@ -213,6 +214,8 @@ export function SidebarShell({
           </button>
         </div>
 
+        <TenantSwitcher collapsed />
+
         {/* Primary nav */}
         <nav className="mt-1 flex w-full flex-col items-center gap-1 px-1.5">
           {PRIMARY_NAV.map((item) => {
@@ -349,6 +352,8 @@ export function SidebarShell({
           <PanelLeftClose size={15} />
         </button>
       </div>
+
+      <TenantSwitcher />
 
       {/* Primary nav */}
       <nav className="px-2 pt-1">
