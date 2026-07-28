@@ -19,6 +19,7 @@ from .loader import (
     resolve_config_path,
 )
 from .model_catalog import ModelCatalogService, get_model_catalog_service
+from .platform_settings import PlatformSettings, load_platform_settings
 from .runtime_settings import (
     ChatAttachmentLimits,
     RuntimeSettingsService,
@@ -68,6 +69,8 @@ __all__ = [
     "get_kb_config_service",
     "ModelCatalogService",
     "get_model_catalog_service",
+    "PlatformSettings",
+    "load_platform_settings",
     "ConfigTestRunner",
     "TestRun",
     "get_config_test_runner",
