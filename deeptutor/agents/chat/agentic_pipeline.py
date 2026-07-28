@@ -38,6 +38,7 @@ from deeptutor.core.trace import (
     merge_trace_metadata,
     new_call_id,
 )
+from deeptutor.knowledge.manifest import KbManifest, render_manifest_note
 from deeptutor.runtime.registry.deferred_tools import (
     DeferredToolLoader,
     render_deferred_tools_manifest,
@@ -203,6 +204,7 @@ class AgenticChatPipeline:
         self._deferred_loader: DeferredToolLoader | None = None
         self._deferred_pool: list[Any] = []
         self._exec_enabled = False
+        self._kb_manifests: list[KbManifest] = []
 
         try:
             chat_cfg = get_chat_params()
@@ -300,6 +302,7 @@ class AgenticChatPipeline:
 
     async def run(self, context: UnifiedContext, stream: StreamBus) -> None:
         await self._prepare_deferred_tools(context)
+        await self._prepare_kb_manifests(context)
         self._exec_enabled = await self._exec_allowed(context)
         enabled_tools = self._compose_enabled_tools(context)
         use_native_tools = bool(enabled_tools) and self._can_use_native_tool_calling()
@@ -904,6 +907,11 @@ class AgenticChatPipeline:
         exec_dir = task_dir / "exec" if task_dir is not None else None
         if tool_name == "rag":
             kwargs.setdefault("mode", "hybrid")
+        elif tool_name == "kb_files":
+            # The report is read by the user as much as by the model, so it is
+            # written in the turn's language. Injected server-side; the tool
+            # exposes no ``language`` parameter for the model to get wrong.
+            kwargs["language"] = context.language or "en"
         elif tool_name == "load_tools":
             kwargs["_tool_loader"] = self._deferred_loader
         elif tool_name == "exec":
@@ -1326,7 +1334,52 @@ class AgenticChatPipeline:
                     "must be one of these names."
                 )
             )
-        return rag_note + self._pageindex_system_note()
+        return rag_note + self._kb_manifest_system_note() + self._pageindex_system_note()
+
+    async def _prepare_kb_manifests(self, context: UnifiedContext) -> None:
+        """Read the attached KBs' document inventories once per turn.
+
+        Retrieval cannot answer "how many files are in here" — the passages it
+        returns say nothing about the size of the collection they came from. The
+        inventory is a filesystem fact, so it is read here (off the event loop,
+        one directory walk per KB) and rendered into the system prompt, which
+        keeps the prompt byte-stable for the whole turn and makes counts
+        answerable without a tool round-trip.
+
+        PageIndex KBs are excluded: ``_pageindex_system_note`` already lists
+        their documents, with the doc_ids its MCP tools need. Fails soft — a KB
+        whose files cannot be read costs the manifest, not the turn.
+        """
+        self._kb_manifests = []
+        kbs = self._rag_kbs(context)
+        if not kbs:
+            return
+        try:
+            self._kb_manifests = await asyncio.to_thread(self._collect_kb_manifests, kbs)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Failed to build knowledge base manifests: %s", exc)
+
+    @staticmethod
+    def _collect_kb_manifests(kbs: list[str]) -> list[KbManifest]:
+        from deeptutor.multi_user.knowledge_access import resolve_kb_manifest
+
+        manifests: list[KbManifest] = []
+        for kb in kbs:
+            try:
+                manifest = resolve_kb_manifest(kb)
+            except Exception as exc:
+                logger.warning("Failed to read documents of knowledge base '%s': %s", kb, exc)
+                continue
+            if manifest is not None:
+                manifests.append(manifest)
+        return manifests
+
+    def _kb_manifest_system_note(self) -> str:
+        """What the attached KBs contain, from :meth:`_prepare_kb_manifests`."""
+        if not self._kb_manifests:
+            return ""
+        note = render_manifest_note(self._kb_manifests, language=self.language)
+        return f"\n{note}" if note else ""
 
     def _pageindex_system_note(self) -> str:
         """Doc list + retrieval instructions for attached PageIndex KBs.

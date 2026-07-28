@@ -185,3 +185,33 @@ def test_resolve_port_conflicts_change_option_prompts_and_persists(
 
     assert result == (8002, 3785)
     assert saved == {"backend": 8002, "frontend": 3785}
+
+
+class _RecordingStream:
+    """Stand-in for a console stream that records ``reconfigure`` calls."""
+
+    def __init__(self, *, raises: Exception | None = None) -> None:
+        self.calls: list[dict[str, object]] = []
+        self._raises = raises
+
+    def reconfigure(self, **kwargs: object) -> None:
+        self.calls.append(kwargs)
+        if self._raises is not None:
+            raise self._raises
+
+
+def test_relax_console_encoding_replaces_unencodable_output() -> None:
+    """A legacy Windows code page can't encode the frontend's ``✓`` banner; the
+    relay thread used to die on it and the session went silent (issue #702)."""
+    stdout = _RecordingStream()
+    stderr = _RecordingStream()
+
+    launcher._relax_console_encoding((stdout, stderr))
+
+    assert stdout.calls == [{"errors": "replace"}]
+    assert stderr.calls == [{"errors": "replace"}]
+
+
+def test_relax_console_encoding_tolerates_odd_streams() -> None:
+    """Redirected / already-detached streams must not break startup."""
+    launcher._relax_console_encoding((object(), _RecordingStream(raises=ValueError("detached"))))

@@ -326,7 +326,7 @@ Loop जानबूझकर simple है: model rounds में सोचत
 <img src="../../assets/figs/system/chat-agent-loop.png" alt="yFeiSTAI chat agent loop" width="900">
 </div>
 
-User-toggleable tools हैं `brainstorm`, `web_search`, `paper_search`, `reason`, और `geogebra_analysis` — साथ ही `imagegen` और `videogen` जब आप matching generation model configure करें। Contextual tools जैसे `rag`, `read_source`, `read_memory`, `write_memory`, `read_skill`, `load_tools`, `exec`, `web_fetch`, `ask_user`, `list_notebook`, `write_note`, `github`, और `consult_subagent` तब automatically mount होते हैं जब turn के पास सही context हो।
+User-toggleable tools हैं `brainstorm`, `web_search`, `paper_search`, `reason`, और `geogebra_analysis` — साथ ही `imagegen` और `videogen` जब आप matching generation model configure करें। Contextual tools जैसे `rag`, `kb_files`, `read_source`, `read_memory`, `write_memory`, `read_skill`, `load_tools`, `exec`, `web_fetch`, `ask_user`, `list_notebook`, `write_note`, `github`, और `consult_subagent` तब automatically mount होते हैं जब turn के पास सही context हो।
 
 Context दो प्रकार की होती है: **sticky session context** (subagent, knowledge bases, persona, model, voice) composer toolbar पर रहती है और turns के पार persist करती है; **एक-बार references** (files, chat history, books, notebooks, question bank, imported agents) एक single turn के लिए `+` menu से आते हैं।
 
@@ -477,6 +477,8 @@ Settings operational control plane है, एक live status strip (Backend, LL
 </div>
 
 अधिकांश sections एक draft-and-apply flow उपयोग करते हैं, इसलिए आप provider को commit करने से पहले test कर सकते हैं। चार themes box में आते हैं — Default, Cream, Dark, और Glass। Project-root `.env` files जानबूझकर ignored हैं; runtime configuration `data/user/settings/*.json` के नीचे रहती है जब तक कि `DEEPTUTOR_HOME` या `deeptutor start --home` app को कहीं और point न करे।
+
+**OpenAI Codex OAuth (experimental).** **Models → LLM** के तहत **OpenAI Codex** चुनना API-key fields को एक browser sign-in से replace कर देता है जो आपके अपने ChatGPT plan के विरुद्ध चलता है, इसलिए किसी `OPENAI_API_KEY` की जरूरत नहीं। Tokens केवल `<user-root>/private/openai-codex/` में रहते हैं और DeepTutor कभी आपकी `~/.codex` CLI login को न तो पढ़ता है न ही modify करता है। Model list उस account के live catalog से आती है; sign in करना profile को publish करता है लेकिन यह active model तभी बनता है जब अभी तक कोई LLM configure न हो, इसलिए यह कभी भी आपकी जानकारी के बिना किसी deployment को repoint नहीं करता। क्योंकि एक token एक व्यक्ति के plan को authorize करता है, profile user grants के जरिए shareable नहीं है — हर account खुद के लिए sign in करता है, और browser को backend चलाने वाली machine तक पहुंचना होता है (remote server पर इसके बजाय वहां `deeptutor provider login openai-codex` run करें)। Quota errors और catalog failures जैसे हैं वैसे ही report होते हैं और कभी किसी paid provider पर fall back नहीं करते। यह compatibility path experimental है: upstream interface बदल सकता है।
 
 </details>
 

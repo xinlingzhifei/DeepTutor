@@ -44,6 +44,7 @@ import { useVoiceAutoplay } from "@/hooks/useVoiceAutoplay";
 import { extractMathAnimatorResult } from "@/lib/math-animator-types";
 import {
   extractQuizQuestions,
+  extractQuizTurnId,
   extractStreamingQuizQuestions,
 } from "@/lib/quiz-types";
 import { extractVisualizeResult } from "@/lib/visualize-types";
@@ -346,6 +347,15 @@ const AssistantMessage = memo(function AssistantMessage({
     return extractStreamingQuizQuestions(msg.events ?? []);
   }, [msg.capability, msg.events, resultEvent]);
 
+  // Turn identity for the quiz card. Derived from the streamed events, not
+  // just the final result event — during generation the result hasn't landed
+  // yet, and a null turn id would let the QuizViewer fall back to
+  // session-wide notebook state from a previous quiz (issue #677).
+  const quizTurnId = useMemo(() => {
+    if (msg.capability !== "deep_question") return null;
+    return extractQuizTurnId(msg.events);
+  }, [msg.capability, msg.events]);
+
   const mathAnimatorResult = useMemo(() => {
     if (msg.capability !== "math_animator" || !resultEvent) return null;
     return extractMathAnimatorResult(resultEvent.metadata);
@@ -465,7 +475,7 @@ const AssistantMessage = memo(function AssistantMessage({
           <QuizViewer
             questions={quizQuestions}
             sessionId={sessionId}
-            turnId={resultEvent?.turn_id ?? null}
+            turnId={quizTurnId}
             language={language}
           />
         </>

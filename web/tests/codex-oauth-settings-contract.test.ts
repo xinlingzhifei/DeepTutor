@@ -1,0 +1,61 @@
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import test from "node:test";
+
+const EDITOR = path.resolve(
+  process.cwd(),
+  "components/settings/ServiceConfigEditor.tsx",
+);
+const HELPER = path.resolve(
+  process.cwd(),
+  "components/settings/codex-profile.ts",
+);
+const EN = path.resolve(process.cwd(), "locales/en/app.json");
+const ZH = path.resolve(process.cwd(), "locales/zh/app.json");
+
+test("Codex OAuth profile renders the OAuth card from provider metadata", () => {
+  const source = readFileSync(EDITOR, "utf8");
+
+  assert.match(source, /isCodexOAuthProfile\(/);
+  assert.match(source, /<CodexOAuthCard/);
+  assert.match(readFileSync(HELPER, "utf8"), /auth_mode === "oauth"/);
+});
+
+test("the Codex profile predicates live in one place", () => {
+  const source = readFileSync(EDITOR, "utf8");
+
+  // Duplicating the tag comparison per component is how the two copies of this
+  // check drifted before; the editor must go through the shared helper.
+  assert.equal(source.includes('=== "openai_codex_oauth"'), false);
+  assert.match(
+    readFileSync(HELPER, "utf8"),
+    /CODEX_MANAGED_BY = "openai_codex_oauth"/,
+  );
+});
+
+test("managed Codex profiles cannot expose profile or model editing", () => {
+  const source = readFileSync(EDITOR, "utf8");
+
+  assert.match(source, /isManagedCodexProfile\(/);
+  assert.match(source, /disabled=\{isManagedCodex\}/);
+  assert.match(source, /!isCodexOAuth/);
+});
+
+test("Codex OAuth copy stays in sync across locales", () => {
+  const en = JSON.parse(readFileSync(EN, "utf8")) as Record<string, unknown>;
+  const zh = JSON.parse(readFileSync(ZH, "utf8")) as Record<string, unknown>;
+  const codexKeys = (locale: Record<string, unknown>) =>
+    Object.keys(locale)
+      .filter((key) => key.startsWith("codex.oauth."))
+      .sort();
+
+  assert.deepEqual(codexKeys(en), codexKeys(zh));
+  for (const key of ["codex.oauth.signIn", "codex.oauth.ownerBound"]) {
+    assert.ok(codexKeys(en).includes(key));
+  }
+  for (const key of codexKeys(en)) {
+    assert.equal(typeof en[key], "string");
+    assert.equal(typeof zh[key], "string");
+  }
+});

@@ -326,7 +326,7 @@ Chatはデフォルト機能であり、ほとんどの作業が始まる場所�
 <img src="../../assets/figs/system/chat-agent-loop.png" alt="yFeiSTAIチャットエージェントループ" width="900">
 </div>
 
-ユーザーが切り替えられるツールは`brainstorm`、`web_search`、`paper_search`、`reason`、`geogebra_analysis` — 加えて、対応する生成モデルを設定すれば`imagegen`と`videogen`も利用できます。`rag`、`read_source`、`read_memory`、`write_memory`、`read_skill`、`load_tools`、`exec`、`web_fetch`、`ask_user`、`list_notebook`、`write_note`、`github`、`consult_subagent`などのコンテキスト依存ツールは、ターンに適切なコンテキストがある場合に自動的にマウントされます。
+ユーザーが切り替えられるツールは`brainstorm`、`web_search`、`paper_search`、`reason`、`geogebra_analysis` — 加えて、対応する生成モデルを設定すれば`imagegen`と`videogen`も利用できます。`rag`、`kb_files`、`read_source`、`read_memory`、`write_memory`、`read_skill`、`load_tools`、`exec`、`web_fetch`、`ask_user`、`list_notebook`、`write_note`、`github`、`consult_subagent`などのコンテキスト依存ツールは、ターンに適切なコンテキストがある場合に自動的にマウントされます。
 
 コンテキストには2種類あります：**スティッキーセッションコンテキスト**（サブエージェント、知識ベース、ペルソナ、モデル、音声）はコンポーザーツールバーに常駐し、ターンをまたいで持続します。**ワンタイム参照**（ファイル、チャット履歴、本、ノートブック、問題バンク、インポートしたエージェント）は単一のターンのために`+`メニューから追加します。
 
@@ -477,6 +477,8 @@ Settingsはオペレーションコントロールプレーンで、ライブス
 </div>
 
 ほとんどのセクションはドラフトと適用フローを使用するため、コミットする前にプロバイダーをテストできます。4つのテーマが箱に入っています：Default、Cream、Dark、Glass。プロジェクトルートの`.env`ファイルは意図的に無視されます。ランタイム設定は`DEEPTUTOR_HOME`または`deeptutor start --home`でアプリを別の場所に向けない限り、`data/user/settings/*.json`に保存されます。
+
+**OpenAI Codex OAuth（実験的）。** Models → LLMで**OpenAI Codex**を選択すると、APIキー入力欄の代わりに、あなた自身のChatGPTプランに対して実行されるブラウザサインインに置き換わるため、`OPENAI_API_KEY`は不要になります。トークンは`<user-root>/private/openai-codex/`にのみ保存され、DeepTutorがあなたの`~/.codex` CLIログインを読み取ったり変更したりすることは決してありません。モデルリストはそのアカウントのライブカタログから取得されます。サインインするとプロフィールは公開されますが、まだLLMが設定されていない場合にのみアクティブモデルになるため、気づかないうちにデプロイメントの向き先を変えることはありません。トークンは1人のプランを認可するものであるため、このプロフィールはユーザーグラントを通じて共有することはできません — 各アカウントは自分自身でサインインする必要があり、ブラウザはバックエンドを実行しているマシンに到達できなければなりません（リモートサーバーでは、代わりにそこで`deeptutor provider login openai-codex`を実行してください）。クォータエラーとカタログの失敗はそのまま報告され、有料プロバイダーへの自動フォールバックは決して行われません。この互換性パスは実験的です：上流のインターフェースは変更される可能性があります。
 
 </details>
 

@@ -31,6 +31,8 @@ import {
 import { normalizeMarkdownForDisplay } from "@/lib/markdown-display";
 import { normalizeMessageContent } from "@/lib/message-content";
 import { buildVisiblePath, tipMessageId } from "@/lib/message-branches";
+import { nextOptimisticId } from "@/lib/optimistic-id";
+import { reconcileTurnIds } from "@/lib/turn-reconcile";
 import {
   isNarrationMarker,
   recomputeAnswerContent,
@@ -222,6 +224,13 @@ type Action =
       selectedBranches?: Record<string, number>;
     }
   | { type: "SET_SESSION_TITLE"; key: string; title: string }
+  | {
+      type: "RECONCILE_TURN";
+      key: string;
+      turnId?: string | null;
+      userMessageId?: number | null;
+      assistantMessageId?: number | null;
+    }
   | { type: "DELETE_TURN"; key: string; messageId: number }
   | { type: "NEW_SESSION"; key: string }
   | {
@@ -342,7 +351,7 @@ function reducer(state: ProviderState, action: Action): ProviderState {
             messages: [
               ...session.messages,
               {
-                id: -Date.now(),
+                id: nextOptimisticId(),
                 role: "user",
                 content: action.content,
                 capability: action.capability || "",
@@ -428,7 +437,7 @@ function reducer(state: ProviderState, action: Action): ProviderState {
             messages: [
               ...existing,
               {
-                id: -Date.now(),
+                id: nextOptimisticId(),
                 role: "assistant",
                 content: "",
                 events: [],
@@ -453,7 +462,7 @@ function reducer(state: ProviderState, action: Action): ProviderState {
       let last = msgs[msgs.length - 1];
       if (last?.role !== "assistant") {
         msgs.push({
-          id: -Date.now(),
+          id: nextOptimisticId(),
           role: "assistant",
           content: "",
           events: [],
@@ -609,6 +618,37 @@ function reducer(state: ProviderState, action: Action): ProviderState {
           },
         },
         sidebarRefreshToken: state.sidebarRefreshToken + 1,
+      };
+    }
+    case "RECONCILE_TURN": {
+      // Swap the finished turn's optimistic (negative) message ids for the
+      // persisted ids carried on the ``done`` event. This replaces the old
+      // "refetch the whole session after every turn" reconcile, whose
+      // hydrate + normalize + full re-render froze the tab for seconds on
+      // long conversations.
+      const session = state.sessions[action.key];
+      if (!session) return state;
+      const result = reconcileTurnIds(
+        session.messages,
+        session.selectedBranches,
+        {
+          turnId: action.turnId,
+          userMessageId: action.userMessageId,
+          assistantMessageId: action.assistantMessageId,
+        },
+      );
+      if (!result.changed) return state;
+      return {
+        ...state,
+        sessions: {
+          ...state.sessions,
+          [action.key]: {
+            ...session,
+            messages: result.messages,
+            selectedBranches: result.selectedBranches,
+            updatedAt: Date.now(),
+          },
+        },
       };
     }
     case "SET_SELECTED_BRANCH": {
@@ -1078,14 +1118,36 @@ export function UnifiedChatProvider({
         // server's real ids after the turn finishes. Without this the
         // Edit button (which needs a real id to attach the new branch
         // under) and branch navigation (which keys off real ids) would
-        // stay disabled until the user navigates away and back.
+        // stay disabled until the user navigates away and back. The
+        // backend attaches the persisted ids to the ``done`` event, so
+        // this is an in-place swap — refetching the whole session here
+        // (the previous approach) re-downloaded, re-normalized, and
+        // re-rendered the entire transcript after every turn, freezing
+        // the tab for seconds on long conversations.
         if (status === "completed") {
-          const finishedSession = stateRef.current.sessions[effectiveKey];
-          const sessionId = finishedSession?.sessionId;
-          if (sessionId) {
-            loadSessionRef.current?.(sessionId).catch(() => {
-              /* non-fatal — local state remains usable */
+          const doneMeta = event.metadata as {
+            user_message_id?: number;
+            assistant_message_id?: number;
+          } | null;
+          const assistantMessageId = doneMeta?.assistant_message_id ?? null;
+          if (assistantMessageId != null) {
+            dispatch({
+              type: "RECONCILE_TURN",
+              key: effectiveKey,
+              turnId: event.turn_id || null,
+              userMessageId: doneMeta?.user_message_id ?? null,
+              assistantMessageId,
             });
+          } else {
+            // Older backend without ids on ``done`` — fall back to the
+            // full session refetch.
+            const finishedSession = stateRef.current.sessions[effectiveKey];
+            const sessionId = finishedSession?.sessionId;
+            if (sessionId) {
+              loadSessionRef.current?.(sessionId).catch(() => {
+                /* non-fatal — local state remains usable */
+              });
+            }
           }
         }
         return;

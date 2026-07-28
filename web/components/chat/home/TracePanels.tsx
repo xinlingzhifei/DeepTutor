@@ -195,6 +195,13 @@ function describeToolCall(
         chip: clip(str(a.query)) || null,
         mono: false,
       };
+    case "kb_files":
+      return {
+        Icon: KnowledgeMark,
+        verb: t("Listing knowledge base files"),
+        chip: str(a.kb_name) || null,
+        mono: false,
+      };
     case "web_search":
       return {
         Icon: GlobeMark,

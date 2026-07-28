@@ -25,6 +25,7 @@ from deeptutor.knowledge.kb_types import (
     external_root_of,
     is_connected_kb,
 )
+from deeptutor.knowledge.manifest import iter_kb_documents
 from deeptutor.services.file_io import atomic_write_json
 from deeptutor.services.rag.factory import (
     DEFAULT_PROVIDER,
@@ -484,6 +485,18 @@ class KnowledgeBaseManager:
 
         self._save_config()
         self._sync_kb_to_pb(name, kb_config)
+
+    def get_kb_entry(self, name: str) -> dict | None:
+        """The KB's raw ``kb_config.json`` record, or ``None`` if unregistered.
+
+        A cheap read for callers that need the registered facts (provider,
+        status, connected-KB pointers) without paying for :meth:`get_info`,
+        which additionally probes every index version on disk — and parses a
+        provider's docstore to do it.
+        """
+        self.config = self._load_config()
+        entry = self.config.get("knowledge_bases", {}).get(name)
+        return dict(entry) if isinstance(entry, dict) else None
 
     def get_kb_status(self, name: str) -> dict | None:
         """Get status and progress for a knowledge base."""
@@ -1168,11 +1181,10 @@ class KnowledgeBaseManager:
 
         if dir_exists:
             try:
-                raw_count = (
-                    len([f for f in raw_dir.rglob("*") if f.is_file()])
-                    if raw_dir and raw_dir.is_dir()
-                    else 0
-                )
+                # One definition of "a document in a KB", shared with the chat
+                # manifest / ``kb_files`` so a user is never told two different
+                # counts for the same KB (see :mod:`deeptutor.knowledge.manifest`).
+                raw_count = sum(1 for _ in iter_kb_documents(raw_dir)) if raw_dir else 0
             except Exception:
                 pass
 

@@ -228,6 +228,10 @@ deeptutor provider login openai-codex      # 执行 OpenAI Codex OAuth 登录
 deeptutor provider login github-copilot    # 校验现有 GitHub Copilot 认证是否可用
 ```
 
+`openai-codex` 会打开系统浏览器，使用 DeepTutor 自己的独立 OAuth 流程登录。它不需要 `OPENAI_API_KEY`，也不会读取或同步本机 `~/.codex`；凭据保存在 `<user-root>/private/openai-codex/`，与 Web 设置页共用。授权回调监听本机回环地址，因此须在运行后端的机器上完成登录。
+
+Codex 令牌授权的是**你本人**的 ChatGPT 套餐，因此凭据只归当前登录用户，不会通过模型授权共享给部署内的其他用户——每位用户各自登录。登录成功后，模型列表来自该账号的动态目录；仅当此前尚未配置任何 LLM 时，Codex 才会被自动设为活动模型，否则不改动你已选的模型。目录刷新失败、上游 `429` 或其他错误都会如实报告，不会回退到付费 API Provider。这条 Codex backend 兼容路径目前属于实验性能力。
+
 ---
 
 ## 典型工作流
