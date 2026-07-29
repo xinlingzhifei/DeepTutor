@@ -5,6 +5,10 @@ import json
 from pathlib import Path
 import sys
 
+import yaml
+
+from deeptutor.services.config import PlatformSettings
+
 
 def _load_module():
     module_path = Path(__file__).resolve().parents[2] / "scripts" / "docker_compose.py"
@@ -131,3 +135,46 @@ def test_frontend_api_is_url_agnostic_passthrough() -> None:
     proxy_ts = (root / "web" / "proxy.ts").read_text(encoding="utf-8")
     assert "DEEPTUTOR_API_BASE_URL" in proxy_ts
     assert "NextResponse.rewrite" in proxy_ts
+
+
+def test_platform_container_contract_keeps_storage_credentials_tenant_scoped() -> None:
+    root = Path(__file__).resolve().parents[2]
+    forbidden_environment = {
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "MINIO_ROOT_USER",
+        "MINIO_ROOT_PASSWORD",
+        "S3_ACCESS_KEY",
+        "S3_SECRET_KEY",
+    }
+    infrastructure_names = ("postgres", "postgresql", "minio", "s3")
+
+    for name in ("docker-compose.yml", "docker-compose.ghcr.yml"):
+        document = yaml.safe_load((root / name).read_text(encoding="utf-8"))
+        service = document["services"]["deeptutor"]
+        environment = service.get("environment", {})
+        if isinstance(environment, dict):
+            environment_keys = set(environment)
+        else:
+            environment_keys = {str(entry).partition("=")[0] for entry in environment}
+        assert environment_keys.isdisjoint(forbidden_environment)
+
+        depends_on = service.get("depends_on", {})
+        dependency_names = set(depends_on) if isinstance(depends_on, dict) else set(depends_on)
+        assert not any(
+            infrastructure in dependency.lower()
+            for dependency in dependency_names
+            for infrastructure in infrastructure_names
+        )
+
+    dockerfile = (root / "Dockerfile").read_text(encoding="utf-8")
+    assert not any(name in dockerfile for name in forbidden_environment)
+
+    disabled_platform = PlatformSettings(enabled=False, object_store_mode="s3")
+    assert disabled_platform.database_url is None
+    assert {
+        "object_store_access_key",
+        "object_store_secret_key",
+        "object_store_session_token",
+    }.isdisjoint(PlatformSettings.model_fields)
