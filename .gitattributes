@@ -6,6 +6,7 @@ Dockerfile text eol=lf
 docker-compose.yml text eol=lf
 docker-compose.*.yml text eol=lf
 *.sh text eol=lf
+scripts/deeptutor-migrate text eol=lf
 *.py text eol=lf
 *.yaml text eol=lf
 *.yml text eol=lf

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 import hashlib
 import json
@@ -17,6 +18,7 @@ from testcontainers.core.container import DockerContainer
 from testcontainers.core.network import Network
 from testcontainers.core.wait_strategies import HttpWaitStrategy
 
+from deeptutor.multi_user.context import reset_current_tenant, set_current_tenant
 from deeptutor.services.config import PlatformSettings
 from deeptutor.teaching.artifacts import (
     ArtifactManifestEntry,
@@ -30,11 +32,14 @@ from deeptutor.teaching.object_store import (
     ClassroomArtifactStoreFactory,
     ObjectStoreAccessDenied,
     ObjectStoreConflictError,
+    ObjectStoreError,
     ObjectStoreIntegrityError,
     ObjectStoreNotFound,
     S3ClassroomArtifactStore,
 )
+from deeptutor.teaching.schema_names import tenant_schema_name
 from deeptutor.teaching.storage_credentials import TenantStorageCredentialRecord
+from deeptutor.teaching.tenant_context import TenantContext
 
 _MINIO_IMAGE = "minio/minio:RELEASE.2025-04-22T22-12-26Z"
 _MC_IMAGE = "minio/mc:RELEASE.2025-04-16T18-13-26Z"
@@ -49,6 +54,22 @@ async def _body(payload: bytes) -> AsyncIterator[bytes]:
 
 async def _read_all(stream: AsyncIterator[bytes]) -> bytes:
     return b"".join([chunk async for chunk in stream])
+
+
+@contextmanager
+def _current_tenant(tenant_id: str):
+    token = set_current_tenant(
+        TenantContext(
+            tenant_id=tenant_id,
+            schema_name=tenant_schema_name(tenant_id),
+            user_id="minio-test-user",
+            permissions=frozenset(),
+        )
+    )
+    try:
+        yield
+    finally:
+        reset_current_tenant(token)
 
 
 def _s3_client(
@@ -357,8 +378,10 @@ async def test_factory_and_promotion_use_distinct_tenant_clients(
     minio_harness: MinioHarness,
 ) -> None:
     factory = _store_factory(minio_harness)
-    tenant_a = await factory.create("tenant-a")
-    tenant_b = await factory.create("tenant-b")
+    with _current_tenant("tenant-a"):
+        tenant_a = await factory.create("tenant-a")
+    with _current_tenant("tenant-b"):
+        tenant_b = await factory.create("tenant-b")
     assert (
         minio_harness.records["tenant-a"].secret_ref != minio_harness.records["tenant-b"].secret_ref
     )
@@ -567,7 +590,8 @@ async def test_factory_and_promotion_use_distinct_tenant_clients(
 async def test_real_minio_atomic_publish_and_source_integrity(
     minio_harness: MinioHarness,
 ) -> None:
-    store = await _store_factory(minio_harness).create("tenant-a")
+    with _current_tenant("tenant-a"):
+        store = await _store_factory(minio_harness).create("tenant-a")
     first = b'{"winner":"first"}'
     second = b'{"winner":"second"}'
 
@@ -649,10 +673,91 @@ async def test_real_minio_atomic_publish_and_source_integrity(
 
 
 @pytest.mark.asyncio
+async def test_real_minio_ambiguous_staging_failure_preserves_newer_version(
+    minio_harness: MinioHarness,
+) -> None:
+    replacement_payload = b'{"replacement":"newer"}'
+    raw_client = minio_harness.raw_clients["tenant-a"]
+    access_key, secret_key = minio_harness.tenant_credentials["tenant-a"]
+
+    class ReplaceThenRaiseStore(S3ClassroomArtifactStore):
+        staging_key: str | None = None
+
+        async def put_verified(self, key, body, sha256, size, **kwargs):
+            await super().put_verified(key, body, sha256, size, **kwargs)
+            self.staging_key = key
+            await asyncio.to_thread(
+                raw_client.put_object,
+                Bucket=_BUCKET,
+                Key=key,
+                Body=replacement_payload,
+                ContentType="application/json",
+                Metadata={
+                    "owner": "external",
+                    "sha256": hashlib.sha256(replacement_payload).hexdigest(),
+                },
+            )
+            raise ObjectStoreError("simulated ambiguous MinIO staging write")
+
+    store = ReplaceThenRaiseStore(
+        tenant_id="tenant-a",
+        endpoint=minio_harness.endpoint,
+        bucket=_BUCKET,
+        region="us-east-1",
+        access_key=access_key,
+        secret_key=secret_key,
+    )
+    source_payload = b'{"source":"owned"}'
+    manifest = ClassroomArtifactManifest(
+        tenant_id="tenant-a",
+        job_id="minio-ambiguous-write",
+        asset_id="asset-minio-ambiguous-write",
+        version=1,
+        entries=(
+            ArtifactManifestEntry(
+                "classroom.json",
+                "application/json",
+                hashlib.sha256(source_payload).hexdigest(),
+                len(source_payload),
+            ),
+        ),
+    )
+
+    with pytest.raises(ObjectStoreError, match="ambiguous MinIO"):
+        await ClassroomArtifactPromotionService(store).promote(
+            manifest,
+            {"classroom.json": _body(source_payload)},
+        )
+
+    assert store.staging_key is not None
+    key_parts = store.staging_key.split("/")
+    assert key_parts[:4] == [
+        "tenants",
+        "tenant-a",
+        "temporary",
+        "minio-ambiguous-write",
+    ]
+    response = raw_client.get_object(Bucket=_BUCKET, Key=store.staging_key)
+    try:
+        assert response["Body"].read() == replacement_payload
+    finally:
+        response["Body"].close()
+    versions = raw_client.list_object_versions(
+        Bucket=_BUCKET,
+        Prefix=store.staging_key,
+    )
+    assert not [
+        marker for marker in versions.get("DeleteMarkers", []) if marker["Key"] == store.staging_key
+    ]
+    assert len(key_parts[4]) == 32
+
+
+@pytest.mark.asyncio
 async def test_real_minio_hides_and_preserves_legacy_formal_object(
     minio_harness: MinioHarness,
 ) -> None:
-    store = await _store_factory(minio_harness).create("tenant-a")
+    with _current_tenant("tenant-a"):
+        store = await _store_factory(minio_harness).create("tenant-a")
     raw_client = minio_harness.raw_clients["tenant-a"]
     legacy_key = classroom_artifact_key(
         "tenant-a",

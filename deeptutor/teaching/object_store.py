@@ -17,6 +17,7 @@ import boto3
 from botocore.client import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
+from deeptutor.multi_user.context import get_current_tenant
 from deeptutor.services.config import PlatformSettings
 from deeptutor.teaching.artifacts import (
     ArtifactManifestEntry,
@@ -1906,14 +1907,6 @@ class ClassroomArtifactPromotionService:
         if set(bodies) != declared_names:
             raise ArtifactManifestError("uploaded files must exactly match the manifest")
 
-        temporary_keys = [
-            temporary_artifact_key(
-                manifest.tenant_id,
-                manifest.job_id,
-                entry.relative_name,
-            )
-            for entry in manifest.entries
-        ]
         destination_keys = [
             classroom_artifact_key(
                 manifest.tenant_id,
@@ -1924,15 +1917,25 @@ class ClassroomArtifactPromotionService:
             for entry in manifest.entries
         ]
         claim: StoredArtifact | None = None
+        temporary_keys: list[str] = []
         temporary: list[StoredArtifact] = []
         promoted: list[StoredArtifact] = []
-        staging_started = False
-        staging_complete = False
         copy_attempted = False
         commit_attempted = False
         committed = False
         try:
             claim = await self._store.acquire_publish_claim(manifest)
+            attempt = claim.ownership_token
+            if not _is_owner_token(attempt):
+                raise ObjectStoreConflictError("publication claim is not current")
+            temporary_keys = [
+                temporary_artifact_key(
+                    manifest.tenant_id,
+                    manifest.job_id,
+                    f"{attempt}/{entry.relative_name}",
+                )
+                for entry in manifest.entries
+            ]
             for destination_key in destination_keys:
                 if await self._store.exists(destination_key):
                     raise ObjectStoreConflictError("classroom artifact version already exists")
@@ -1942,7 +1945,6 @@ class ClassroomArtifactPromotionService:
                 temporary_keys,
                 strict=True,
             ):
-                staging_started = True
                 temporary.append(
                     await self._store.put_verified(
                         temporary_key,
@@ -1952,7 +1954,6 @@ class ClassroomArtifactPromotionService:
                         content_type=entry.content_type,
                     )
                 )
-            staging_complete = True
 
             for entry, temporary_key, destination_key in zip(
                 manifest.entries,
@@ -2018,26 +2019,13 @@ class ClassroomArtifactPromotionService:
                 cleanup_groups,
                 protected=True,
             )
-            if staging_started and not staging_complete:
-                cleanup_failures.extend(
-                    await _finish_exception_cleanup(
-                        (
-                            (
-                                "temporary object",
-                                lambda key=key: self._store.delete(key),
-                            )
-                            for key in temporary_keys
-                        )
-                    )
+            cleanup_failures.extend(
+                await _cleanup_owned(
+                    self._store,
+                    [("temporary object", temporary)],
+                    protected=True,
                 )
-            else:
-                cleanup_failures.extend(
-                    await _cleanup_owned(
-                        self._store,
-                        [("temporary object", temporary)],
-                        protected=True,
-                    )
-                )
+            )
             ambiguous_write = copy_attempted or commit_attempted
             if claim is not None and not cleanup_failures and (committed or not ambiguous_write):
                 cleanup_failures.extend(
@@ -2068,6 +2056,17 @@ class ClassroomArtifactStoreFactory:
         self._allow_local = allow_local
 
     async def create(self, tenant_id: str) -> ClassroomArtifactStore:
+        try:
+            current_tenant = get_current_tenant()
+        except RuntimeError:
+            raise ObjectStoreConfigurationError(
+                "tenant context is required for object storage"
+            ) from None
+        if tenant_id != current_tenant.tenant_id:
+            raise ObjectStoreConfigurationError(
+                "object storage tenant must match the current tenant"
+            )
+        tenant_id = current_tenant.tenant_id
         tenant_artifact_prefix(tenant_id)
         if self._settings.object_store_mode == "local":
             if not self._allow_local:

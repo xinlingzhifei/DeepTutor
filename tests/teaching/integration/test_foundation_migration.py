@@ -5,8 +5,10 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
+import zipfile
 
 import pytest
 from sqlalchemy import make_url, text
@@ -25,6 +27,135 @@ class MigrationDatabase:
     url: str
     password: str
     environment: dict[str, str]
+
+
+@dataclass(frozen=True)
+class InstalledMigration:
+    command: Path
+    wheel: Path
+    cli_wheel: Path
+
+
+def _clean_python_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    environment.pop("PYTHONHOME", None)
+    environment.pop("PYTHONPATH", None)
+    return environment
+
+
+def _assert_subprocess_succeeded(completed: subprocess.CompletedProcess[str]) -> None:
+    assert completed.returncode == 0, f"{completed.stdout}\n{completed.stderr}"
+
+
+@pytest.fixture(scope="module")
+def installed_migration(tmp_path_factory) -> InstalledMigration:
+    build_root = tmp_path_factory.mktemp("installed-migration")
+    source_root = build_root / "source"
+    source_root.mkdir()
+    for filename in ("LICENSE", "MANIFEST.in", "README.md", "pyproject.toml"):
+        shutil.copy2(PROJECT_ROOT / filename, source_root / filename)
+    for package_directory in ("deeptutor", "deeptutor_cli", "deeptutor_web"):
+        shutil.copytree(
+            PROJECT_ROOT / package_directory,
+            source_root / package_directory,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
+    cli_project = source_root / "packaging" / "deeptutor-cli"
+    cli_project.mkdir(parents=True)
+    for filename in ("README.md", "pyproject.toml"):
+        shutil.copy2(
+            PROJECT_ROOT / "packaging" / "deeptutor-cli" / filename,
+            cli_project / filename,
+        )
+
+    full_wheelhouse = build_root / "full-wheel"
+    full_wheelhouse.mkdir()
+    full_build = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "wheel",
+            "--no-deps",
+            "--no-build-isolation",
+            "--wheel-dir",
+            str(full_wheelhouse),
+            str(source_root),
+        ],
+        cwd=build_root,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=180,
+    )
+    _assert_subprocess_succeeded(full_build)
+    wheels = tuple(full_wheelhouse.glob("deeptutor-*.whl"))
+    assert len(wheels) == 1
+
+    cli_wheelhouse = build_root / "cli-wheel"
+    cli_wheelhouse.mkdir()
+    cli_build = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "wheel",
+            "--no-deps",
+            "--no-build-isolation",
+            "--wheel-dir",
+            str(cli_wheelhouse),
+            str(source_root / "packaging" / "deeptutor-cli"),
+        ],
+        cwd=build_root,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=180,
+    )
+    _assert_subprocess_succeeded(cli_build)
+    cli_wheels = tuple(cli_wheelhouse.glob("deeptutor_cli-*.whl"))
+    assert len(cli_wheels) == 1
+
+    environment_root = build_root / "venv"
+    create_environment = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "venv",
+            "--system-site-packages",
+            str(environment_root),
+        ],
+        cwd=build_root,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+    _assert_subprocess_succeeded(create_environment)
+    scripts_directory = environment_root / ("Scripts" if os.name == "nt" else "bin")
+    python_name = "python.exe" if os.name == "nt" else "python"
+    install = subprocess.run(
+        [
+            str(scripts_directory / python_name),
+            "-m",
+            "pip",
+            "install",
+            "--no-deps",
+            str(wheels[0]),
+        ],
+        cwd=build_root,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+    _assert_subprocess_succeeded(install)
+    command_name = "deeptutor-migrate.exe" if os.name == "nt" else "deeptutor-migrate"
+    return InstalledMigration(
+        command=scripts_directory / command_name,
+        wheel=wheels[0],
+        cli_wheel=cli_wheels[0],
+    )
 
 
 @pytest.fixture(scope="module")
@@ -49,7 +180,7 @@ def migration_database(tmp_path_factory):
             encoding="utf-8",
         )
 
-        environment = os.environ.copy()
+        environment = _clean_python_environment()
         environment["DEEPTUTOR_HOME"] = str(runtime_home)
         environment["DEEPTUTOR_PLATFORM_DATABASE_URL"] = async_url
         yield MigrationDatabase(
@@ -89,6 +220,39 @@ def _run_alembic(
         )
     except subprocess.TimeoutExpired:
         pytest.fail("Alembic subprocess timed out after 120 seconds")
+
+
+def _run_packaged_migration(
+    installed: InstalledMigration,
+    database: MigrationDatabase,
+    *,
+    action: str,
+    scope: str,
+    tenant_schema: str | None = None,
+    cwd: Path,
+) -> subprocess.CompletedProcess[str]:
+    command = [str(installed.command), action, "--scope", scope]
+    if tenant_schema is not None:
+        command.extend(("--tenant-schema", tenant_schema))
+    if not installed.command.is_file():
+        return subprocess.CompletedProcess(
+            command,
+            returncode=127,
+            stdout="",
+            stderr="installed migration entry point is missing",
+        )
+    try:
+        return subprocess.run(
+            command,
+            cwd=cwd,
+            env=database.environment,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail("Packaged migration subprocess timed out after 120 seconds")
 
 
 def _assert_secret_safe_output(
@@ -189,10 +353,7 @@ async def _inspect_database(
 
 
 def _expected_columns(metadata, schema: str) -> dict[tuple[str, str], set[str]]:
-    return {
-        (schema, table.name): set(table.columns.keys())
-        for table in metadata.tables.values()
-    }
+    return {(schema, table.name): set(table.columns.keys()) for table in metadata.tables.values()}
 
 
 async def _table_names(database_url: str, schema: str) -> set[str]:
@@ -256,6 +417,7 @@ def test_platform_engine_survives_independent_event_loops(
 
 
 def test_migration_runs_from_outside_repository(
+    installed_migration,
     migration_database,
     tmp_path,
 ):
@@ -263,12 +425,13 @@ def test_migration_runs_from_outside_repository(
     assert PROJECT_ROOT not in tmp_path.resolve().parents
     assert asyncio.run(_table_names(migration_database.url, tenant_schema)) == set()
 
-    completed = _run_alembic(
+    completed = _run_packaged_migration(
+        installed_migration,
         migration_database,
-        "scope=tenant",
-        f"tenant_schema={tenant_schema}",
+        action="upgrade",
+        scope="tenant",
+        tenant_schema=tenant_schema,
         cwd=tmp_path,
-        config_file=PROJECT_ROOT / "alembic.ini",
     )
 
     _assert_migration_succeeded(migration_database, completed)
@@ -278,6 +441,179 @@ def test_migration_runs_from_outside_repository(
         "courses",
         "enrollments",
     }
+
+
+def test_wheel_packages_migrations_and_full_app_entrypoint(
+    installed_migration,
+    tmp_path,
+) -> None:
+    with zipfile.ZipFile(installed_migration.wheel) as archive:
+        names = set(archive.namelist())
+        entry_points_name = next(
+            name for name in names if name.endswith(".dist-info/entry_points.txt")
+        )
+        entry_points = archive.read(entry_points_name).decode("utf-8")
+    assert {
+        "deeptutor/teaching/migrations/__init__.py",
+        "deeptutor/teaching/migrations/env.py",
+        "deeptutor/teaching/migrations/script.py.mako",
+        "deeptutor/teaching/migrations/versions/__init__.py",
+        "deeptutor/teaching/migrations/versions/20260728_0001_foundation.py",
+    }.issubset(names)
+    assert "deeptutor-migrate = deeptutor.teaching.migrations.cli:main" in entry_points
+
+    with zipfile.ZipFile(installed_migration.cli_wheel) as archive:
+        cli_entry_points_name = next(
+            name for name in archive.namelist() if name.endswith(".dist-info/entry_points.txt")
+        )
+        cli_entry_points = archive.read(cli_entry_points_name).decode("utf-8")
+    assert "deeptutor-migrate" not in cli_entry_points
+
+    assert PROJECT_ROOT not in tmp_path.resolve().parents
+    assert installed_migration.command.is_file()
+    completed = subprocess.run(
+        [str(installed_migration.command), "--help"],
+        cwd=tmp_path,
+        env=_clean_python_environment(),
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    _assert_subprocess_succeeded(completed)
+    assert "upgrade" in completed.stdout
+    assert "downgrade" in completed.stdout
+
+
+def test_packaged_entrypoint_runs_platform_and_tenant_scopes(
+    installed_migration,
+    migration_database,
+    tmp_path,
+) -> None:
+    tenant_schema = tenant_schema_name("packaged/platform-and-tenant")
+
+    for scope, schema in (("platform", None), ("tenant", tenant_schema)):
+        completed = _run_packaged_migration(
+            installed_migration,
+            migration_database,
+            action="upgrade",
+            scope=scope,
+            tenant_schema=schema,
+            cwd=tmp_path,
+        )
+        _assert_migration_succeeded(migration_database, completed)
+
+    assert asyncio.run(_table_names(migration_database.url, "platform")) == {
+        "alembic_version",
+        "audit_log",
+        "data_plane_routes",
+        "role_grants",
+        "tenant_memberships",
+        "tenant_provisioning_jobs",
+        "tenant_storage_credentials",
+        "tenants",
+    }
+    assert asyncio.run(_table_names(migration_database.url, tenant_schema)) == {
+        "alembic_version",
+        "classes",
+        "courses",
+        "enrollments",
+    }
+
+
+@pytest.mark.parametrize(
+    ("arguments", "expected_message"),
+    [
+        (
+            ("upgrade", "--scope", "platform", "--tenant-schema", "tenant_0123456789abcdef"),
+            "scope must be exactly platform or tenant",
+        ),
+        (
+            ("upgrade", "--scope", "tenant"),
+            "scope must be exactly platform or tenant",
+        ),
+        (
+            ("upgrade", "--scope", "tenant", "--tenant-schema", "platform"),
+            "tenant_schema must match tenant_[0-9a-f]{16}",
+        ),
+    ],
+)
+def test_packaged_entrypoint_rejects_invalid_scope_exactly(
+    installed_migration,
+    migration_database,
+    tmp_path,
+    arguments,
+    expected_message,
+) -> None:
+    command = [str(installed_migration.command), *arguments]
+    if installed_migration.command.is_file():
+        completed = subprocess.run(
+            command,
+            cwd=tmp_path,
+            env=migration_database.environment,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    else:
+        completed = subprocess.CompletedProcess(
+            command,
+            returncode=127,
+            stdout="",
+            stderr="installed migration entry point is missing",
+        )
+
+    safe_output = _assert_secret_safe_output(migration_database, completed)
+    assert completed.returncode != 0
+    assert expected_message in safe_output
+
+
+@pytest.mark.parametrize(
+    ("platform_document", "expected_message"),
+    [
+        ('{"enabled":false}', "platform database is disabled"),
+        ("not-json", "platform database settings are invalid"),
+    ],
+)
+def test_packaged_entrypoint_fails_closed_on_unavailable_platform_settings(
+    installed_migration,
+    tmp_path,
+    platform_document,
+    expected_message,
+) -> None:
+    runtime_home = tmp_path / expected_message.replace(" ", "-")
+    settings_dir = runtime_home / "data" / "user" / "settings"
+    settings_dir.mkdir(parents=True)
+    (settings_dir / "platform.json").write_text(
+        platform_document,
+        encoding="utf-8",
+    )
+    environment = _clean_python_environment()
+    environment["DEEPTUTOR_HOME"] = str(runtime_home)
+    environment.pop("DEEPTUTOR_PLATFORM_DATABASE_URL", None)
+    command = [str(installed_migration.command), "upgrade", "--scope", "platform"]
+    if installed_migration.command.is_file():
+        completed = subprocess.run(
+            command,
+            cwd=tmp_path,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    else:
+        completed = subprocess.CompletedProcess(
+            command,
+            returncode=127,
+            stdout="",
+            stderr="installed migration entry point is missing",
+        )
+
+    output = f"{completed.stdout}\n{completed.stderr}"
+    assert completed.returncode != 0
+    assert expected_message in output
 
 
 @pytest.mark.parametrize(
@@ -303,18 +639,13 @@ def test_alembic_check_is_explicitly_unsupported(
 
     safe_output = _assert_secret_safe_output(migration_database, completed)
     assert completed.returncode != 0, safe_output
-    assert (
-        "teaching migrations support only upgrade and downgrade"
-        in safe_output
-    )
+    assert "teaching migrations support only upgrade and downgrade" in safe_output
 
 
 def test_revision_autogenerate_is_unsupported_without_writing_a_file(
     migration_database,
 ):
-    versions_dir = (
-        PROJECT_ROOT / "deeptutor" / "teaching" / "migrations" / "versions"
-    )
+    versions_dir = PROJECT_ROOT / "deeptutor" / "teaching" / "migrations" / "versions"
     files_before = {path.name for path in versions_dir.iterdir()}
 
     completed = _run_alembic(
@@ -327,10 +658,7 @@ def test_revision_autogenerate_is_unsupported_without_writing_a_file(
 
     safe_output = _assert_secret_safe_output(migration_database, completed)
     assert completed.returncode != 0, safe_output
-    assert (
-        "teaching migrations support only upgrade and downgrade"
-        in safe_output
-    )
+    assert "teaching migrations support only upgrade and downgrade" in safe_output
     assert {path.name for path in versions_dir.iterdir()} == files_before
 
 

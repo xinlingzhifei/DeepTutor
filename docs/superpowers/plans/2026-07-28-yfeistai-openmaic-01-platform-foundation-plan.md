@@ -235,8 +235,8 @@ tenant.enrollments
 `env.py` 接受以下两种明确命令：
 
 ```powershell
-python -m alembic -x scope=platform upgrade head
-python -m alembic -x scope=tenant -x tenant_schema=tenant_bf4fcb0bb5997635 upgrade head
+deeptutor-migrate upgrade --scope platform
+deeptutor-migrate upgrade --scope tenant --tenant-schema tenant_bf4fcb0bb5997635
 ```
 
 平台范围的版本表位于 `platform.alembic_version`；每个租户的版本表位于自己的 Schema。`scope=tenant` 时必须校验 Schema 名只匹配 `^tenant_[0-9a-f]{16}$`。

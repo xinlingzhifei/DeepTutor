@@ -160,9 +160,12 @@ COPY --from=frontend-builder /app/web/public/ ./web/public/
 COPY deeptutor/ ./deeptutor/
 COPY deeptutor_cli/ ./deeptutor_cli/
 COPY scripts/ ./scripts/
+COPY scripts/deeptutor-migrate /usr/local/bin/deeptutor-migrate
 COPY pyproject.toml ./
 COPY requirements/ ./requirements/
 COPY requirements.txt ./
+RUN chmod 0755 /usr/local/bin/deeptutor-migrate \
+    && deeptutor-migrate --help >/dev/null
 
 # Create necessary directories (these will be overwritten by volume mounts)
 RUN mkdir -p \

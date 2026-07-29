@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import re
-from typing import Literal, NamedTuple
 
 from alembic import context
 from alembic.util import CommandError
@@ -13,29 +11,23 @@ from sqlalchemy.pool import NullPool
 from sqlalchemy.schema import CreateSchema
 
 from deeptutor.services.config import load_platform_settings
+from deeptutor.teaching.migrations.runner import (
+    MigrationScope,
+    validate_migration_scope,
+)
 
-_TENANT_SCHEMA_PATTERN = re.compile(r"tenant_[0-9a-f]{16}")
 _SUPPORTED_COMMANDS = {"upgrade", "downgrade"}
-
-
-class MigrationScope(NamedTuple):
-    name: Literal["platform", "tenant"]
-    schema: str
 
 
 def _validate_cli_command() -> None:
     command_options = context.config.cmd_opts
     command_tuple = getattr(command_options, "cmd", None)
     command_function = (
-        command_tuple[0]
-        if isinstance(command_tuple, tuple) and command_tuple
-        else None
+        command_tuple[0] if isinstance(command_tuple, tuple) and command_tuple else None
     )
     command_name = getattr(command_function, "__name__", None)
     if command_name not in _SUPPORTED_COMMANDS:
-        raise CommandError(
-            "teaching migrations support only upgrade and downgrade"
-        )
+        raise CommandError("teaching migrations support only upgrade and downgrade")
 
 
 def _parse_x_arguments() -> MigrationScope:
@@ -48,13 +40,10 @@ def _parse_x_arguments() -> MigrationScope:
 
     scope = parsed.get("scope")
     if scope == "platform" and set(parsed) == {"scope"}:
-        return MigrationScope("platform", "platform")
+        return validate_migration_scope(scope, None)
 
     if scope == "tenant" and set(parsed) == {"scope", "tenant_schema"}:
-        tenant_schema = parsed["tenant_schema"]
-        if _TENANT_SCHEMA_PATTERN.fullmatch(tenant_schema):
-            return MigrationScope("tenant", tenant_schema)
-        raise CommandError("tenant_schema must match tenant_[0-9a-f]{16}")
+        return validate_migration_scope(scope, parsed["tenant_schema"])
 
     raise CommandError("scope must be exactly platform or tenant")
 
@@ -91,9 +80,7 @@ async def _run_online_migrations(migration_scope: MigrationScope) -> None:
     )
     try:
         async with engine.connect() as connection:
-            await connection.execute(
-                CreateSchema(migration_scope.schema, if_not_exists=True)
-            )
+            await connection.execute(CreateSchema(migration_scope.schema, if_not_exists=True))
             await connection.commit()
 
             migration_connection: AsyncConnection = connection
@@ -120,6 +107,4 @@ try:
 except CommandError:
     raise
 except Exception as exc:
-    raise CommandError(
-        f"database migration failed ({type(exc).__name__})"
-    ) from None
+    raise CommandError(f"database migration failed ({type(exc).__name__})") from None

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Callable
+from contextlib import contextmanager
 import hashlib
 import io
 import os
@@ -13,6 +14,11 @@ from botocore.exceptions import ClientError, EndpointConnectionError
 from pydantic import SecretStr
 import pytest
 
+from deeptutor.multi_user.context import (
+    get_current_tenant_or_none,
+    reset_current_tenant,
+    set_current_tenant,
+)
 from deeptutor.services.config import PlatformSettings
 from deeptutor.teaching import object_store as object_store_module
 from deeptutor.teaching.artifacts import (
@@ -34,11 +40,13 @@ from deeptutor.teaching.object_store import (
     ObjectStoreNotFound,
     S3ClassroomArtifactStore,
 )
+from deeptutor.teaching.schema_names import tenant_schema_name
 from deeptutor.teaching.storage_credentials import (
     StorageCredentialError,
     TenantStorageCredentialRecord,
     TenantStorageCredentialResolver,
 )
+from deeptutor.teaching.tenant_context import TenantContext
 
 
 async def _body(*chunks: bytes) -> AsyncIterator[bytes]:
@@ -48,6 +56,22 @@ async def _body(*chunks: bytes) -> AsyncIterator[bytes]:
 
 async def _read_all(stream: AsyncIterator[bytes]) -> bytes:
     return b"".join([chunk async for chunk in stream])
+
+
+@contextmanager
+def _current_tenant(tenant_id: str):
+    token = set_current_tenant(
+        TenantContext(
+            tenant_id=tenant_id,
+            schema_name=tenant_schema_name(tenant_id),
+            user_id="object-store-test-user",
+            permissions=frozenset(),
+        )
+    )
+    try:
+        yield
+    finally:
+        reset_current_tenant(token)
 
 
 _FORMAL_ROOT = "tenants/tenant-a/classrooms/asset-1/versions"
@@ -402,17 +426,18 @@ async def test_enabled_platform_local_store_fails_closed_without_opt_in(
         object_store_mode="local",
     )
 
-    with pytest.raises(ObjectStoreConfigurationError):
-        await ClassroomArtifactStoreFactory(
+    with _current_tenant("tenant-a"):
+        with pytest.raises(ObjectStoreConfigurationError):
+            await ClassroomArtifactStoreFactory(
+                settings,
+                local_root=tmp_path,
+            ).create("tenant-a")
+
+        store = await ClassroomArtifactStoreFactory(
             settings,
             local_root=tmp_path,
+            allow_local=True,
         ).create("tenant-a")
-
-    store = await ClassroomArtifactStoreFactory(
-        settings,
-        local_root=tmp_path,
-        allow_local=True,
-    ).create("tenant-a")
     assert isinstance(store, LocalClassroomArtifactStore)
 
 
@@ -427,19 +452,78 @@ async def test_disabled_platform_s3_fails_before_credential_lookup(
             calls.append(tenant_id)
             return None
 
-    with pytest.raises(ObjectStoreConfigurationError):
+    with _current_tenant("tenant-a"):
+        with pytest.raises(ObjectStoreConfigurationError):
+            await ClassroomArtifactStoreFactory(
+                PlatformSettings(enabled=False, object_store_mode="s3"),
+                credential_repository=Repository(),
+            ).create("tenant-a")
+
+        local_store = await ClassroomArtifactStoreFactory(
+            PlatformSettings(enabled=False, object_store_mode="local"),
+            local_root=tmp_path,
+            allow_local=True,
+        ).create("tenant-a")
+
+    assert get_current_tenant_or_none() is None
+    assert calls == []
+    assert isinstance(local_store, LocalClassroomArtifactStore)
+
+
+@pytest.mark.asyncio
+async def test_factory_rejects_tenant_mismatch_before_credential_lookup(
+    tmp_path,
+) -> None:
+    calls: list[str] = []
+
+    class Repository:
+        async def get_active(self, tenant_id: str):
+            calls.append(tenant_id)
+            return None
+
+    factory = ClassroomArtifactStoreFactory(
+        PlatformSettings(
+            enabled=True,
+            database_url=SecretStr("postgresql+asyncpg://user:pass@db/platform"),
+            object_store_mode="s3",
+            object_store_endpoint="http://minio:9000",
+            object_store_tenant_credentials_dir=tmp_path,
+        ),
+        credential_repository=Repository(),
+    )
+
+    with _current_tenant("tenant-a"):
+        with pytest.raises(ObjectStoreConfigurationError, match="current tenant"):
+            await factory.create("tenant-b")
+
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_factory_requires_tenant_context_before_credential_lookup(
+    tmp_path,
+) -> None:
+    calls: list[str] = []
+
+    class Repository:
+        async def get_active(self, tenant_id: str):
+            calls.append(tenant_id)
+            return None
+
+    assert get_current_tenant_or_none() is None
+    with pytest.raises(ObjectStoreConfigurationError, match="tenant context"):
         await ClassroomArtifactStoreFactory(
-            PlatformSettings(enabled=False, object_store_mode="s3"),
+            PlatformSettings(
+                enabled=True,
+                database_url=SecretStr("postgresql+asyncpg://user:pass@db/platform"),
+                object_store_mode="s3",
+                object_store_endpoint="http://minio:9000",
+                object_store_tenant_credentials_dir=tmp_path,
+            ),
             credential_repository=Repository(),
         ).create("tenant-a")
 
     assert calls == []
-    local_store = await ClassroomArtifactStoreFactory(
-        PlatformSettings(enabled=False, object_store_mode="local"),
-        local_root=tmp_path,
-        allow_local=True,
-    ).create("tenant-a")
-    assert isinstance(local_store, LocalClassroomArtifactStore)
 
 
 @pytest.mark.asyncio
@@ -788,8 +872,10 @@ async def test_factory_builds_distinct_explicit_s3_clients_from_secret_refs(
         credential_repository=Repository(),
     )
 
-    store_a = await factory.create("tenant-a")
-    store_b = await factory.create("tenant-b")
+    with _current_tenant("tenant-a"):
+        store_a = await factory.create("tenant-a")
+    with _current_tenant("tenant-b"):
+        store_b = await factory.create("tenant-b")
 
     assert store_a.tenant_id == "tenant-a"
     assert store_b.tenant_id == "tenant-b"
@@ -845,11 +931,12 @@ async def test_factory_rejects_an_unversioned_s3_bucket(tmp_path, monkeypatch) -
         object_store_tenant_credentials_dir=tmp_path,
     )
 
-    with pytest.raises(ObjectStoreConfigurationError, match="versioning"):
-        await ClassroomArtifactStoreFactory(
-            settings,
-            credential_repository=Repository(),
-        ).create("tenant-a")
+    with _current_tenant("tenant-a"):
+        with pytest.raises(ObjectStoreConfigurationError, match="versioning"):
+            await ClassroomArtifactStoreFactory(
+                settings,
+                credential_repository=Repository(),
+            ).create("tenant-a")
 
 
 @pytest.mark.asyncio
@@ -979,14 +1066,17 @@ async def test_multi_file_staging_failure_cleans_temp_and_never_promotes(
 
 
 @pytest.mark.asyncio
-async def test_promotion_cleans_unconfirmed_temporary_write(
+async def test_promotion_leaves_unconfirmed_temporary_write_for_gc(
     tmp_path,
 ) -> None:
     payload = b"{}"
 
     class WriteThenRaiseStore(LocalClassroomArtifactStore):
+        staging_key: str | None = None
+
         async def put_verified(self, key, body, sha256, size, **kwargs):
             await super().put_verified(key, body, sha256, size, **kwargs)
+            self.staging_key = key
             raise ObjectStoreError("simulated uncertain remote write")
 
     store = WriteThenRaiseStore(tmp_path, "tenant-a")
@@ -998,7 +1088,52 @@ async def test_promotion_cleans_unconfirmed_temporary_write(
             {"classroom.json": _body(payload)},
         )
 
-    assert await store.list_prefix("tenants/tenant-a/temporary/uncertain-write/") == ()
+    assert store.staging_key is not None
+    assert await store.list_prefix("tenants/tenant-a/temporary/uncertain-write/") == (
+        store.staging_key,
+    )
+    assert await _read_all(await store.open(store.staging_key)) == payload
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_staging_failure_preserves_newer_local_replacements(
+    tmp_path,
+) -> None:
+    payload = b"{}"
+    replacements = (b'{"replacement":1}', b'{"replacement":2}')
+
+    class ReplaceThenRaiseStore(LocalClassroomArtifactStore):
+        def __init__(self) -> None:
+            super().__init__(tmp_path, "tenant-a")
+            self.staging_keys: list[str] = []
+
+        async def put_verified(self, key, body, sha256, size, **kwargs):
+            await super().put_verified(key, body, sha256, size, **kwargs)
+            self.staging_keys.append(key)
+            target = tmp_path.joinpath(*key.split("/"))
+            replacement = tmp_path / f"replacement-{len(self.staging_keys)}"
+            replacement.write_bytes(replacements[len(self.staging_keys) - 1])
+            replacement.replace(target)
+            raise ObjectStoreError("simulated ambiguous staging write")
+
+    store = ReplaceThenRaiseStore()
+    manifest = _manifest(payload, "ambiguous-write")
+
+    for _ in replacements:
+        with pytest.raises(ObjectStoreError, match="ambiguous staging"):
+            await ClassroomArtifactPromotionService(store).promote(
+                manifest,
+                {"classroom.json": _body(payload)},
+            )
+
+    assert len(set(store.staging_keys)) == len(replacements)
+    for key, replacement_payload in zip(store.staging_keys, replacements, strict=True):
+        parts = key.split("/")
+        assert parts[:4] == ["tenants", "tenant-a", "temporary", "ambiguous-write"]
+        assert len(parts[4]) == 32
+        assert all(character in "0123456789abcdef" for character in parts[4])
+        assert parts[5:] == ["classroom.json"]
+        assert tmp_path.joinpath(*parts).read_bytes() == replacement_payload
 
 
 @pytest.mark.asyncio
@@ -1639,11 +1774,11 @@ async def test_cleanup_is_independent_and_preserves_primary_error(tmp_path) -> N
     deleted: list[str] = []
 
     class CleanupFailureStore(LocalClassroomArtifactStore):
-        async def delete(self, key):
-            deleted.append(key)
-            if key.endswith("classroom.json"):
+        async def delete_owned(self, artifact):
+            deleted.append(artifact.key)
+            if artifact.key.endswith("classroom.json"):
                 raise ObjectStoreError(sentinel)
-            await super().delete(key)
+            await super().delete_owned(artifact)
 
     first = b"{}"
     second = b"<main>bad</main>"
@@ -1668,10 +1803,9 @@ async def test_cleanup_is_independent_and_preserves_primary_error(tmp_path) -> N
             },
         )
 
-    assert deleted == [
-        temporary_artifact_key("tenant-a", "cleanup-errors", "classroom.json"),
-        temporary_artifact_key("tenant-a", "cleanup-errors", "index.html"),
-    ]
+    assert len(deleted) == 1
+    assert deleted[0].startswith("tenants/tenant-a/temporary/cleanup-errors/")
+    assert deleted[0].endswith("/classroom.json")
     rendered = "".join(traceback.format_exception(caught.value))
     assert "object body sha256 does not match" in rendered
     assert "cleanup failed: temporary object (ObjectStoreError)" in rendered
@@ -1918,11 +2052,12 @@ async def test_factory_suppresses_secret_bearing_credential_exception(
         object_store_tenant_credentials_dir=tmp_path,
     )
 
-    with pytest.raises(ObjectStoreConfigurationError) as caught:
-        await ClassroomArtifactStoreFactory(
-            settings,
-            credential_repository=Repository(),
-        ).create("tenant-a")
+    with _current_tenant("tenant-a"):
+        with pytest.raises(ObjectStoreConfigurationError) as caught:
+            await ClassroomArtifactStoreFactory(
+                settings,
+                credential_repository=Repository(),
+            ).create("tenant-a")
 
     rendered = "".join(traceback.format_exception(caught.value))
     assert secret not in str(caught.value)

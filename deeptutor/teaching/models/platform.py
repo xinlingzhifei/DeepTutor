@@ -163,9 +163,7 @@ class TenantProvisioningJob(PlatformBase):
         server_default=func.now(),
     )
 
-    __table_args__ = (
-        Index("ix_tenant_provisioning_jobs_tenant_status", "tenant_id", "status"),
-    )
+    __table_args__ = (Index("ix_tenant_provisioning_jobs_tenant_status", "tenant_id", "status"),)
 
 
 class AuditLog(PlatformBase):

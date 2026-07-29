@@ -178,3 +178,18 @@ def test_platform_container_contract_keeps_storage_credentials_tenant_scoped() -
         "object_store_secret_key",
         "object_store_session_token",
     }.isdisjoint(PlatformSettings.model_fields)
+
+
+def test_production_image_installs_supported_migration_entrypoint() -> None:
+    root = Path(__file__).resolve().parents[2]
+    wrapper = root / "scripts" / "deeptutor-migrate"
+    dockerfile = (root / "Dockerfile").read_text(encoding="utf-8")
+    attributes = (root / ".gitattributes").read_text(encoding="utf-8")
+
+    assert wrapper.is_file()
+    wrapper_content = wrapper.read_text(encoding="utf-8")
+    assert "cd /app" in wrapper_content
+    assert "python -m deeptutor.teaching.migrations.cli" in wrapper_content
+    assert "scripts/deeptutor-migrate text eol=lf" in attributes
+    assert "COPY scripts/deeptutor-migrate /usr/local/bin/deeptutor-migrate" in dockerfile
+    assert "deeptutor-migrate --help" in dockerfile

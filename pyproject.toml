@@ -76,6 +76,7 @@ dependencies = [
 
 [project.scripts]
 deeptutor = "deeptutor_cli.main:main"
+deeptutor-migrate = "deeptutor.teaching.migrations.cli:main"
 
 [project.optional-dependencies]
 # Compatibility extra for source installs and older docs. These packages are
@@ -267,6 +268,7 @@ deeptutor = [
     "**/*.sh",
     "**/*.j2",
     "**/*.jinja",
+    "**/*.mako",
 ]
 deeptutor_cli = ["**/*.md"]
 deeptutor_web = ["**/*", ".next/**/*"]
