@@ -14,6 +14,7 @@ from sqlalchemy import (
     Integer,
     MetaData,
     String,
+    Text,
     func,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -135,6 +136,26 @@ class DataPlaneRoute(PlatformBase):
     __table_args__ = (Index("ix_data_plane_routes_status", "status"),)
 
 
+class TenantSchemaState(PlatformBase):
+    __tablename__ = "tenant_schema_states"
+
+    tenant_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("platform.tenants.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    schema_name: Mapped[str] = mapped_column(String(64), unique=True)
+    revision: Mapped[str | None] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(32), server_default="pending")
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+
+    __table_args__ = (Index("ix_tenant_schema_states_status", "status"),)
+
+
 class TenantStorageCredential(PlatformBase):
     __tablename__ = "tenant_storage_credentials"
 
@@ -157,6 +178,51 @@ class TenantStorageCredential(PlatformBase):
     )
 
 
+class TenantStorageState(PlatformBase):
+    __tablename__ = "tenant_storage_states"
+
+    tenant_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("platform.tenants.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    mode: Mapped[str] = mapped_column(String(16))
+    policy_version: Mapped[str] = mapped_column(String(64))
+    policy_payload: Mapped[str] = mapped_column(Text)
+    policy_hash: Mapped[str] = mapped_column(String(64))
+    credential_secret_ref: Mapped[str | None] = mapped_column(String(512))
+    credential_fingerprint: Mapped[str | None] = mapped_column(String(128))
+    status: Mapped[str] = mapped_column(String(32), server_default="pending")
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+
+    __table_args__ = (Index("ix_tenant_storage_states_status", "status"),)
+
+
+class TenantDefaultPolicyState(PlatformBase):
+    __tablename__ = "tenant_default_policy_states"
+
+    tenant_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("platform.tenants.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    policy_version: Mapped[str] = mapped_column(String(64))
+    policy_payload: Mapped[str] = mapped_column(Text)
+    policy_hash: Mapped[str] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(32), server_default="pending")
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+
+    __table_args__ = (Index("ix_tenant_default_policy_states_status", "status"),)
+
+
 class TenantProvisioningJob(PlatformBase):
     __tablename__ = "tenant_provisioning_jobs"
 
@@ -168,6 +234,18 @@ class TenantProvisioningJob(PlatformBase):
     operation: Mapped[str] = mapped_column(String(32), server_default="provision")
     status: Mapped[str] = mapped_column(String(32), server_default="pending")
     attempt_count: Mapped[int] = mapped_column(Integer, server_default="0")
+    max_attempts: Mapped[int] = mapped_column(Integer, server_default="5")
+    next_attempt_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+    lease_owner: Mapped[str | None] = mapped_column(String(128))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error_category: Mapped[str | None] = mapped_column(String(64))
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
@@ -177,7 +255,15 @@ class TenantProvisioningJob(PlatformBase):
         server_default=func.now(),
     )
 
-    __table_args__ = (Index("ix_tenant_provisioning_jobs_tenant_status", "tenant_id", "status"),)
+    __table_args__ = (
+        Index("ix_tenant_provisioning_jobs_tenant_status", "tenant_id", "status"),
+        Index(
+            "ix_tenant_provisioning_jobs_claim",
+            "status",
+            "next_attempt_at",
+            "lease_expires_at",
+        ),
+    )
 
 
 class AuditLog(PlatformBase):

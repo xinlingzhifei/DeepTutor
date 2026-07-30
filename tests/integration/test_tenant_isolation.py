@@ -34,6 +34,7 @@ from deeptutor.teaching.models import (
     TenantBase,
     TenantMembership,
     TenantProvisioningJob,
+    TenantSchemaState,
     TenantStorageCredential,
 )
 from deeptutor.teaching.object_store import (
@@ -210,6 +211,18 @@ async def _initialize_database(database_url: str) -> None:
                         DataPlaneRoute(
                             tenant_id=TENANT_A,
                             schema_name=tenant_schema_name(TENANT_A),
+                            status="active",
+                        ),
+                        TenantSchemaState(
+                            tenant_id=TENANT_A,
+                            schema_name=tenant_schema_name(TENANT_A),
+                            revision="20260730_0003",
+                            status="active",
+                        ),
+                        TenantSchemaState(
+                            tenant_id=TENANT_B,
+                            schema_name=tenant_schema_name(TENANT_B),
+                            revision="20260730_0003",
                             status="active",
                         ),
                         DataPlaneRoute(

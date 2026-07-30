@@ -6,9 +6,12 @@ from .platform import (
     PlatformBase,
     RoleGrant,
     Tenant,
+    TenantDefaultPolicyState,
     TenantMembership,
     TenantProvisioningJob,
+    TenantSchemaState,
     TenantStorageCredential,
+    TenantStorageState,
 )
 from .tenant import Course, Enrollment, TeachingClass, TenantBase
 
@@ -22,7 +25,10 @@ __all__ = [
     "TeachingClass",
     "Tenant",
     "TenantBase",
+    "TenantDefaultPolicyState",
     "TenantMembership",
     "TenantProvisioningJob",
+    "TenantSchemaState",
     "TenantStorageCredential",
+    "TenantStorageState",
 ]

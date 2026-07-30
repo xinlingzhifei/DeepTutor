@@ -1407,6 +1407,8 @@ def test_repository_selection_statements_pin_tenant_user_and_status_filters() ->
         assert "tenant_memberships.user_id = 'u-alice'" in sql
     assert "tenants.id = 'tenant-a'" in access_sql
     for fragment in (
+        "join platform.tenant_schema_states",
+        "tenant_schema_states.status = 'active'",
         "left outer join platform.role_grants",
         "role_grants.tenant_id = platform.tenant_memberships.tenant_id",
         "role_grants.user_id = platform.tenant_memberships.user_id",
@@ -1492,6 +1494,14 @@ def test_write_statements_bind_scope_state_and_conflict_keys() -> None:
         "tenant_provisioning_jobs.status = 'failed'",
         "tenant_provisioning_jobs.attempt_count = 2",
         "attempt_count + 1",
+        "next_attempt_at=now()",
+        "lease_owner=null",
+        "lease_expires_at=null",
+        "heartbeat_at=null",
+        "error_category=null",
+        "error_code=null",
+        "started_at=null",
+        "completed_at=null",
     )
     worker_builder = getattr(
         tenant_repositories,
@@ -1512,14 +1522,14 @@ def test_write_statements_bind_scope_state_and_conflict_keys() -> None:
     )
     _assert_sql(
         build_activation_lock_statement("tenant-a", "job-a", 2),
-        "data_plane_routes.tenant_id = 'tenant-a'",
-        "data_plane_routes.status = 'active'",
-        f"data_plane_routes.schema_name = '{tenant_schema_name('tenant-a')}'",
-        "tenant_storage_credentials.tenant_id = 'tenant-a'",
-        "tenant_storage_credentials.status = 'active'",
-        "audit_log.action = 'tenant.provisioning.policy_verified'",
-        "audit_log.resource_type = 'provisioning_job'",
-        "audit_log.resource_id = 'job-a:2'",
+        "tenant_schema_states.tenant_id = 'tenant-a'",
+        "tenant_schema_states.status = 'active'",
+        "tenant_schema_states.revision = '20260730_0003'",
+        f"tenant_schema_states.schema_name = '{tenant_schema_name('tenant-a')}'",
+        "tenant_storage_states.tenant_id = 'tenant-a'",
+        "tenant_storage_states.status = 'active'",
+        "tenant_default_policy_states.tenant_id = 'tenant-a'",
+        "tenant_default_policy_states.status = 'active'",
         "for update",
     )
 

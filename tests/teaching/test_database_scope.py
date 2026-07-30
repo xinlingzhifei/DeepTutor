@@ -46,9 +46,12 @@ def test_model_metadata_uses_only_platform_and_logical_tenant_schemas():
         "platform.audit_log",
         "platform.data_plane_routes",
         "platform.role_grants",
+        "platform.tenant_default_policy_states",
         "platform.tenant_memberships",
         "platform.tenant_provisioning_jobs",
+        "platform.tenant_schema_states",
         "platform.tenant_storage_credentials",
+        "platform.tenant_storage_states",
         "platform.tenants",
     }
     assert set(TenantBase.metadata.tables) == {

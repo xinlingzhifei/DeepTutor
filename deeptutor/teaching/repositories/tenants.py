@@ -6,18 +6,20 @@ from dataclasses import dataclass
 import hashlib
 from typing import Any
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.sql import Select
 
 from deeptutor.teaching.database import platform_session, tenant_session
 from deeptutor.teaching.models.platform import (
     AuditLog,
-    DataPlaneRoute,
     Tenant,
+    TenantDefaultPolicyState,
     TenantMembership,
     TenantProvisioningJob,
+    TenantSchemaState,
     TenantStorageCredential,
+    TenantStorageState,
 )
 from deeptutor.teaching.models.platform import (
     RoleGrant as RoleGrantModel,
@@ -27,6 +29,14 @@ from deeptutor.teaching.permissions import (
     DEFAULT_ROLE_PERMISSIONS,
     KNOWN_SCOPE_TYPES,
     RoleGrant,
+)
+from deeptutor.teaching.provisioning_worker import (
+    DEFAULT_POLICY_HASH,
+    DEFAULT_POLICY_PAYLOAD,
+    DEFAULT_POLICY_VERSION,
+    OBJECT_STORAGE_POLICY_VERSION,
+    TENANT_SCHEMA_REVISION,
+    StorageProvisioningResult,
 )
 from deeptutor.teaching.schema_names import tenant_schema_name
 
@@ -151,14 +161,15 @@ def build_tenant_access_statement(
             Tenant.id.label("tenant_id"),
             Tenant.name,
             Tenant.status,
-            DataPlaneRoute.schema_name,
+            TenantSchemaState.schema_name,
             RoleGrantModel.role.label("grant_role"),
             RoleGrantModel.scope_type.label("grant_scope_type"),
             RoleGrantModel.scope_id.label("grant_scope_id"),
         )
-        .outerjoin(
-            DataPlaneRoute,
-            DataPlaneRoute.tenant_id == Tenant.id,
+        .join(
+            TenantSchemaState,
+            (TenantSchemaState.tenant_id == Tenant.id)
+            & (TenantSchemaState.status == "active"),
         )
         .where(
             Tenant.id == tenant_id,
@@ -384,6 +395,14 @@ def build_failed_job_retry_statement(
         .values(
             status="pending",
             attempt_count=TenantProvisioningJob.attempt_count + 1,
+            next_attempt_at=func.now(),
+            lease_owner=None,
+            lease_expires_at=None,
+            heartbeat_at=None,
+            error_category=None,
+            error_code=None,
+            started_at=None,
+            completed_at=None,
             updated_at=func.now(),
         )
     )
@@ -422,7 +441,7 @@ def build_activation_lock_statement(
     job_id: str,
     expected_attempt_count: int,
 ) -> Select[Any]:
-    policy_resource_id = _policy_resource_id(job_id, expected_attempt_count)
+    expected_storage = StorageProvisioningResult.local(tenant_id)
     return (
         select(Tenant, TenantProvisioningJob)
         .join(
@@ -430,16 +449,20 @@ def build_activation_lock_statement(
             TenantProvisioningJob.tenant_id == Tenant.id,
         )
         .join(
-            DataPlaneRoute,
-            DataPlaneRoute.tenant_id == Tenant.id,
+            TenantSchemaState,
+            TenantSchemaState.tenant_id == Tenant.id,
         )
         .join(
+            TenantStorageState,
+            TenantStorageState.tenant_id == Tenant.id,
+        )
+        .outerjoin(
             TenantStorageCredential,
             TenantStorageCredential.tenant_id == Tenant.id,
         )
         .join(
-            AuditLog,
-            AuditLog.tenant_id == Tenant.id,
+            TenantDefaultPolicyState,
+            TenantDefaultPolicyState.tenant_id == Tenant.id,
         )
         .where(
             Tenant.id == tenant_id,
@@ -449,18 +472,40 @@ def build_activation_lock_statement(
             TenantProvisioningJob.operation == "provision",
             TenantProvisioningJob.status.in_(("pending", "running")),
             TenantProvisioningJob.attempt_count == expected_attempt_count,
-            DataPlaneRoute.tenant_id == tenant_id,
-            DataPlaneRoute.status == "active",
-            DataPlaneRoute.schema_name == tenant_schema_name(tenant_id),
-            TenantStorageCredential.tenant_id == tenant_id,
-            TenantStorageCredential.status == "active",
-            AuditLog.tenant_id == tenant_id,
-            AuditLog.action == _POLICY_VERIFIED_ACTION,
-            AuditLog.resource_type == _PROVISIONING_JOB_RESOURCE,
-            AuditLog.resource_id == policy_resource_id,
+            TenantSchemaState.tenant_id == tenant_id,
+            TenantSchemaState.status == "active",
+            TenantSchemaState.revision == TENANT_SCHEMA_REVISION,
+            TenantSchemaState.schema_name == tenant_schema_name(tenant_id),
+            TenantStorageState.tenant_id == tenant_id,
+            TenantStorageState.status == "active",
+            TenantStorageState.policy_version == OBJECT_STORAGE_POLICY_VERSION,
+            TenantStorageState.policy_payload == expected_storage.policy_payload,
+            TenantStorageState.policy_hash == expected_storage.policy_hash,
+            or_(
+                and_(
+                    TenantStorageState.mode == "local",
+                    TenantStorageState.credential_secret_ref.is_(None),
+                    TenantStorageState.credential_fingerprint.is_(None),
+                ),
+                and_(
+                    TenantStorageState.mode == "s3",
+                    TenantStorageCredential.status == "active",
+                    TenantStorageCredential.secret_ref != "",
+                    TenantStorageCredential.access_key_fingerprint != "",
+                    TenantStorageState.credential_secret_ref
+                    == TenantStorageCredential.secret_ref,
+                    TenantStorageState.credential_fingerprint
+                    == TenantStorageCredential.access_key_fingerprint,
+                ),
+            ),
+            TenantDefaultPolicyState.tenant_id == tenant_id,
+            TenantDefaultPolicyState.status == "active",
+            TenantDefaultPolicyState.policy_version == DEFAULT_POLICY_VERSION,
+            TenantDefaultPolicyState.policy_payload == DEFAULT_POLICY_PAYLOAD,
+            TenantDefaultPolicyState.policy_hash == DEFAULT_POLICY_HASH,
         )
         .limit(1)
-        .with_for_update()
+        .with_for_update(of=(Tenant, TenantProvisioningJob))
     )
 
 
@@ -504,9 +549,20 @@ class TenantRepository:
             )
             rows = result.mappings().all()
             if not rows:
-                inactive_statement = select(Tenant.id).where(
-                    Tenant.id == tenant_id,
-                    Tenant.status != "active",
+                inactive_statement = (
+                    select(Tenant.id)
+                    .outerjoin(
+                        TenantSchemaState,
+                        TenantSchemaState.tenant_id == Tenant.id,
+                    )
+                    .where(
+                        Tenant.id == tenant_id,
+                        or_(
+                            Tenant.status != "active",
+                            TenantSchemaState.tenant_id.is_(None),
+                            TenantSchemaState.status != "active",
+                        ),
+                    )
                 )
                 if not is_platform_admin:
                     inactive_statement = inactive_statement.join(
@@ -533,7 +589,7 @@ class TenantRepository:
                 if row["grant_role"] is not None
             )
             row = rows[0]
-            schema_name = str(row["schema_name"] or tenant_schema_name(tenant_id))
+            schema_name = str(row["schema_name"])
             return TenantAccess(
                 summary=_summary_from_row(row),
                 schema_name=schema_name,
