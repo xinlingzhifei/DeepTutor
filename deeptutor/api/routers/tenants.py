@@ -100,26 +100,6 @@ class ProvisioningStatusResponse(BaseModel):
     attempt_count: int
 
 
-class AddMemberRequest(BaseModel):
-    user_id: str = Field(min_length=1, max_length=128)
-    role: str = "student"
-
-    @field_validator("user_id", "role")
-    @classmethod
-    def normalize_fields(cls, value: str) -> str:
-        normalized = value.strip()
-        if not normalized:
-            raise ValueError("value is required")
-        return normalized
-
-    @field_validator("role")
-    @classmethod
-    def validate_role(cls, value: str) -> str:
-        if value not in DEFAULT_ROLE_PERMISSIONS:
-            raise ValueError("unknown role")
-        return value
-
-
 class MemberRoleGrant(BaseModel):
     role: str = Field(min_length=1, max_length=64)
     scope_type: Literal["tenant", "course", "class"]
@@ -139,6 +119,38 @@ class MemberRoleGrant(BaseModel):
         if value not in DEFAULT_ROLE_PERMISSIONS:
             raise ValueError("unknown role")
         return value
+
+
+class AddMemberRequest(BaseModel):
+    user_id: str = Field(min_length=1, max_length=128)
+    role: str | None = None
+    grants: list[MemberRoleGrant] | None = Field(default=None, min_length=1)
+
+    @field_validator("user_id")
+    @classmethod
+    def normalize_user_id(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("value is required")
+        return normalized
+
+    @field_validator("role")
+    @classmethod
+    def normalize_role(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if normalized not in DEFAULT_ROLE_PERMISSIONS:
+            raise ValueError("unknown role")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_grant_shape(self) -> AddMemberRequest:
+        if self.grants is not None and self.role is not None:
+            raise ValueError("provide exactly one of role or grants")
+        if self.grants is None and self.role is None:
+            self.role = "student"
+        return self
 
 
 class ReplaceGrantsRequest(BaseModel):
@@ -393,19 +405,35 @@ async def add_member(
     repository: TenantRepository = Depends(get_tenant_repository),
 ) -> MemberGrantsResponse:
     _require_tenant_management(context, tenant_id)
-    roles = frozenset({body.role})
-    grants = frozenset(
-        {
+    if body.grants is not None:
+        grants = frozenset(
             RoleGrant(
-                role=body.role,
-                scope_type="tenant",
-                scope_id=tenant_id,
+                role=grant.role,
+                scope_type=grant.scope_type,
+                scope_id=grant.scope_id,
             )
-        }
-    )
+            for grant in body.grants
+        )
+    else:
+        assert body.role is not None
+        grants = frozenset(
+            {
+                RoleGrant(
+                    role=body.role,
+                    scope_type="tenant",
+                    scope_id=tenant_id,
+                )
+            }
+        )
     try:
-        await repository.upsert_member(tenant_id, body.user_id, roles)
+        await repository.upsert_member_with_scoped_grants(
+            tenant_id,
+            body.user_id,
+            grants,
+        )
     except (
+        GrantResourceNotFoundError,
+        InvalidGrantScopeError,
         TenantAccessDeniedError,
         TenantConflictError,
         TenantNotFoundError,

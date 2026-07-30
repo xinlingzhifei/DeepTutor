@@ -152,6 +152,9 @@ def build_tenant_access_statement(
             Tenant.name,
             Tenant.status,
             DataPlaneRoute.schema_name,
+            RoleGrantModel.role.label("grant_role"),
+            RoleGrantModel.scope_type.label("grant_scope_type"),
+            RoleGrantModel.scope_id.label("grant_scope_id"),
         )
         .outerjoin(
             DataPlaneRoute,
@@ -162,7 +165,14 @@ def build_tenant_access_statement(
             Tenant.status == "active",
         )
     )
-    if not is_platform_admin:
+    if is_platform_admin:
+        statement = statement.outerjoin(
+            TenantMembership,
+            (TenantMembership.tenant_id == Tenant.id)
+            & (TenantMembership.user_id == user_id)
+            & (TenantMembership.status == "active"),
+        )
+    else:
         statement = statement.join(
             TenantMembership,
             TenantMembership.tenant_id == Tenant.id,
@@ -170,7 +180,11 @@ def build_tenant_access_statement(
             TenantMembership.user_id == user_id,
             TenantMembership.status == "active",
         )
-    return statement
+    return statement.outerjoin(
+        RoleGrantModel,
+        (RoleGrantModel.tenant_id == TenantMembership.tenant_id)
+        & (RoleGrantModel.user_id == TenantMembership.user_id),
+    )
 
 
 def _summary_from_row(row: Any) -> TenantSummary:
@@ -307,29 +321,6 @@ def build_active_membership_lock_statement(
             TenantMembership.status == "active",
         )
         .with_for_update()
-    )
-
-
-def build_role_grants_statement(
-    tenant_id: str,
-    user_id: str,
-) -> Select[Any]:
-    return (
-        select(
-            RoleGrantModel.role,
-            RoleGrantModel.scope_type,
-            RoleGrantModel.scope_id,
-        )
-        .join(
-            TenantMembership,
-            (TenantMembership.tenant_id == RoleGrantModel.tenant_id)
-            & (TenantMembership.user_id == RoleGrantModel.user_id),
-        )
-        .where(
-            RoleGrantModel.tenant_id == tenant_id,
-            RoleGrantModel.user_id == user_id,
-            TenantMembership.status == "active",
-        )
     )
 
 
@@ -511,8 +502,8 @@ class TenantRepository:
                     is_platform_admin=is_platform_admin,
                 )
             )
-            row = result.mappings().one_or_none()
-            if row is None:
+            rows = result.mappings().all()
+            if not rows:
                 inactive_statement = select(Tenant.id).where(
                     Tenant.id == tenant_id,
                     Tenant.status != "active",
@@ -532,16 +523,16 @@ class TenantRepository:
                     raise TenantNotFoundError(tenant_id)
                 raise TenantAccessDeniedError(tenant_id)
 
-            role_statement = build_role_grants_statement(tenant_id, user_id)
-            role_rows = (await session.execute(role_statement)).all()
             grants = frozenset(
                 RoleGrant(
-                    role=str(role),
-                    scope_type=str(scope_type),
-                    scope_id=str(scope_id),
+                    role=str(row["grant_role"]),
+                    scope_type=str(row["grant_scope_type"]),
+                    scope_id=str(row["grant_scope_id"]),
                 )
-                for role, scope_type, scope_id in role_rows
+                for row in rows
+                if row["grant_role"] is not None
             )
+            row = rows[0]
             schema_name = str(row["schema_name"] or tenant_schema_name(tenant_id))
             return TenantAccess(
                 summary=_summary_from_row(row),
@@ -787,17 +778,33 @@ class TenantRepository:
         """Transactionally upsert an active membership and its initial roles."""
 
         _validate_roles(roles)
-        async with platform_session() as session:
+        await self.upsert_member_with_scoped_grants(
+            tenant_id,
+            user_id,
+            _tenant_role_grants(tenant_id, roles),
+        )
+
+    async def upsert_member_with_scoped_grants(
+        self,
+        tenant_id: str,
+        user_id: str,
+        grants: frozenset[RoleGrant],
+    ) -> None:
+        """Validate resources before atomically activating membership and grants."""
+
+        _validate_scoped_grants(tenant_id, grants)
+        async with tenant_session(tenant_id) as session:
             async with session.begin():
                 active_tenant = await session.scalar(build_active_tenant_lock_statement(tenant_id))
                 if active_tenant is None:
                     raise TenantNotFoundError(tenant_id)
+                await self._validate_grant_resources(session, grants)
                 await session.execute(build_membership_upsert_statement(tenant_id, user_id))
                 await self._replace_scoped_roles(
                     session,
                     tenant_id,
                     user_id,
-                    _tenant_role_grants(tenant_id, roles),
+                    grants,
                 )
 
     async def replace_grants(

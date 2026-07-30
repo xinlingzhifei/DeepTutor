@@ -943,8 +943,71 @@ def test_scoped_role_grant_migration_backfills_and_refuses_lossy_downgrade(
     asyncio.run(set_scope("tenant", "migration-tenant"))
     _assert_migration_succeeded(
         migration_database,
+        _run_alembic(
+            migration_database,
+            "scope=platform",
+            action="downgrade",
+            revision=FOUNDATION_REVISION,
+        ),
+    )
+
+    async def inspect_legacy_grant() -> tuple:
+        engine = create_async_engine(migration_database.url)
+        try:
+            async with engine.connect() as connection:
+                legacy_grant = (
+                    await connection.execute(
+                        text(
+                            """
+                            SELECT tenant_id, user_id, role, granted_at IS NOT NULL
+                            FROM platform.role_grants
+                            WHERE tenant_id = 'migration-tenant'
+                            """
+                        )
+                    )
+                ).one()
+                scope_columns = (
+                    (
+                        await connection.execute(
+                            text(
+                                """
+                            SELECT column_name
+                            FROM information_schema.columns
+                            WHERE table_schema = 'platform'
+                              AND table_name = 'role_grants'
+                              AND column_name IN ('scope_type', 'scope_id')
+                            ORDER BY column_name
+                            """
+                            )
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                legacy_version = await connection.scalar(
+                    text("SELECT version_num FROM platform.alembic_version")
+                )
+                return legacy_grant, tuple(scope_columns), legacy_version
+        finally:
+            await engine.dispose()
+
+    legacy_grant, scope_columns, legacy_version = asyncio.run(inspect_legacy_grant())
+    assert tuple(legacy_grant) == (
+        "migration-tenant",
+        "migration-user",
+        "teacher",
+        True,
+    )
+    assert scope_columns == ()
+    assert legacy_version == FOUNDATION_REVISION
+
+    _assert_migration_succeeded(
+        migration_database,
         _run_alembic(migration_database, "scope=platform"),
     )
+    restored_grant, _, _, _, restored_version = asyncio.run(inspect_grant_schema())
+    assert tuple(restored_grant) == ("tenant", "migration-tenant")
+    assert restored_version == HEAD_REVISION
 
 
 @pytest.mark.parametrize(
