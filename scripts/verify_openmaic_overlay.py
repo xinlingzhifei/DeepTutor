@@ -25,23 +25,26 @@ REQUIRED_OVERLAY_FILES = {
     Path("lib/yfeistai/service-auth.ts"),
     Path("tests/yfeistai/service-auth.test.ts"),
 }
-FORBIDDEN_PATH_SEGMENTS = {"account", "accounts", "login"}
+JAVASCRIPT_SUFFIXES = {".cjs", ".cts", ".js", ".jsx", ".mjs", ".mts", ".ts", ".tsx"}
 FORBIDDEN_CLIENT_PARAMETER_PATTERNS = (
-    re.compile(r"\bapiKey\b", re.IGNORECASE),
-    re.compile(r"\bapi_key\b", re.IGNORECASE),
-    re.compile(r"\bapi-key\b", re.IGNORECASE),
-    re.compile(r"\bbaseUrl\b", re.IGNORECASE),
-    re.compile(r"\bbase_url\b", re.IGNORECASE),
-    re.compile(r"\bbase-url\b", re.IGNORECASE),
-    re.compile(r"\bproviderApiKey\b", re.IGNORECASE),
-    re.compile(r"\bprovider_api_key\b", re.IGNORECASE),
-    re.compile(r"\bproviderId\b", re.IGNORECASE),
-    re.compile(r"\bprovider_id\b", re.IGNORECASE),
-    re.compile(r"\bproviderBaseUrl\b", re.IGNORECASE),
-    re.compile(r"\bprovider_base_url\b", re.IGNORECASE),
+    re.compile(r"\bapi[-_\s]*key\b", re.IGNORECASE),
+    re.compile(r"\bbase[-_\s]*url\b", re.IGNORECASE),
+    re.compile(r"\bprovider[-_\s]*id\b", re.IGNORECASE),
+    re.compile(r"\bprovider[-_\s]*key\b", re.IGNORECASE),
+    re.compile(r"\bprovider[-_\s]*api[-_\s]*key\b", re.IGNORECASE),
+    re.compile(r"\bprovider[-_\s]*base[-_\s]*url\b", re.IGNORECASE),
 )
-FORBIDDEN_IDENTITY_SURFACE_PATTERN = re.compile(
-    r"\b(?:LoginPage|LoginForm|AccountTable|AccountModel|AccountEntity)\b",
+FORBIDDEN_IDENTITY_SURFACE_PATTERNS = (
+    re.compile(r"\bsign[-_\s]*in(?:[-_\s]*(?:page|form))?\b", re.IGNORECASE),
+    re.compile(r"\blogin(?:[-_\s]*(?:page|form))?\b", re.IGNORECASE),
+    re.compile(
+        r"\baccount(?:s|[-_\s]*(?:store|table|model|entity|record))?\b",
+        re.IGNORECASE,
+    ),
+)
+PRODUCTION_TEST_IMPORT_PATTERN = re.compile(
+    r"""(?:(?:\bimport\b|\bfrom\b)[^;\n]*|\brequire\s*\(\s*)["']"""
+    r"""(?:tests[/\\][^"']*|[^"']*[/\\]tests(?:[/\\][^"']*)?)["']""",
     re.IGNORECASE,
 )
 VITEST_PACKAGE = "vitest@4.1.8"
@@ -56,6 +59,45 @@ def _read_text(path: Path) -> str:
         return path.read_text(encoding="utf-8")
     except FileNotFoundError as exc:
         raise OverlayVerificationError(f"required file is missing: {path}") from exc
+
+
+def _strip_javascript_comments(source: str) -> str:
+    result: list[str] = []
+    index = 0
+    quote: str | None = None
+    while index < len(source):
+        char = source[index]
+        next_char = source[index + 1] if index + 1 < len(source) else ""
+        if quote is not None:
+            result.append(char)
+            if char == "\\" and index + 1 < len(source):
+                index += 1
+                result.append(source[index])
+            elif char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in {'"', "'", "`"}:
+            quote = char
+            result.append(char)
+            index += 1
+            continue
+        if char == "/" and next_char == "/":
+            index += 2
+            while index < len(source) and source[index] not in "\r\n":
+                index += 1
+            continue
+        if char == "/" and next_char == "*":
+            index += 2
+            while index + 1 < len(source) and source[index : index + 2] != "*/":
+                if source[index] in "\r\n":
+                    result.append(source[index])
+                index += 1
+            index = min(index + 2, len(source))
+            continue
+        result.append(char)
+        index += 1
+    return "".join(result)
 
 
 def _verify_upstream_manifest(integration_root: Path) -> None:
@@ -74,23 +116,31 @@ def _verify_dockerfile(integration_root: Path) -> None:
     path = integration_root / "Dockerfile"
     source = _read_text(path)
     overlay_copy = "COPY integrations/openmaic/overlay/"
+    commit = EXPECTED_UPSTREAM["commit"]
+    short_commit = commit[:12]
     required_tokens = (
-        EXPECTED_UPSTREAM["repository"],
-        EXPECTED_UPSTREAM["commit"],
-        EXPECTED_UPSTREAM["appVersion"],
-        "git clone",
-        "git rev-parse HEAD",
-        "require('./package.json').version",
+        (f'git clone --filter=blob:none --no-checkout "{EXPECTED_UPSTREAM["repository"]}" /src'),
+        f'git fetch --depth=1 origin "{commit}"',
+        f'git checkout --detach "{commit}"',
+        f'test "$(git rev-parse HEAD)" = "{commit}"',
+        (
+            'test "$(node -p "require(\'./package.json\').version")" = '
+            f'"{EXPECTED_UPSTREAM["appVersion"]}"'
+        ),
         overlay_copy,
-        "org.opencontainers.image.revision",
-        "org.opencontainers.image.revision-short",
-        "org.opencontainers.image.version",
+        f'org.opencontainers.image.revision="{commit}"',
+        f'org.opencontainers.image.revision-short="{short_commit}"',
+        f'org.opencontainers.image.version="{EXPECTED_UPSTREAM["appVersion"]}"',
     )
     missing = [token for token in required_tokens if token not in source]
     if missing:
         raise OverlayVerificationError(
             f"{path} is missing required pin/build tokens: {', '.join(missing)}"
         )
+    if re.search(r"^\s*ARG\s+OPENMAIC_", source, re.MULTILINE):
+        raise OverlayVerificationError("OpenMAIC release pins cannot be Docker build arguments")
+    if "$OPENMAIC_" in source or "${OPENMAIC_" in source:
+        raise OverlayVerificationError("OpenMAIC release pins cannot be variable substitutions")
     if source.index("git rev-parse HEAD") > source.index(overlay_copy):
         raise OverlayVerificationError(
             "Dockerfile must verify the checkout before applying overlay"
@@ -111,44 +161,92 @@ def find_forbidden_overlay_surface(overlay_root: Path) -> list[str]:
         if not path.is_file():
             continue
         relative = path.relative_to(overlay_root)
-        if relative.parts and relative.parts[0] == "tests":
+        relative_text = relative.as_posix()
+        for pattern in FORBIDDEN_IDENTITY_SURFACE_PATTERNS:
+            match = pattern.search(relative_text)
+            if match:
+                violations.append(f"{relative}: forbidden {match.group(0)} surface")
+        if path.suffix.lower() not in JAVASCRIPT_SUFFIXES:
             continue
-        path_tokens = set(re.findall(r"[a-z0-9]+", relative.as_posix().lower()))
-        forbidden_parts = path_tokens & FORBIDDEN_PATH_SEGMENTS
-        for part in sorted(forbidden_parts):
-            violations.append(f"{relative}: forbidden {part} surface")
-        if path.suffix.lower() not in {".js", ".jsx", ".ts", ".tsx"}:
-            continue
-        source = path.read_text(encoding="utf-8")
-        identity_match = FORBIDDEN_IDENTITY_SURFACE_PATTERN.search(source)
-        if identity_match:
-            violations.append(f"{relative}: forbidden {identity_match.group(0)} surface")
+        source = _strip_javascript_comments(path.read_text(encoding="utf-8"))
+        for pattern in FORBIDDEN_IDENTITY_SURFACE_PATTERNS:
+            match = pattern.search(source)
+            if match:
+                violations.append(f"{relative}: forbidden {match.group(0)} surface")
         for pattern in FORBIDDEN_CLIENT_PARAMETER_PATTERNS:
             match = pattern.search(source)
             if match:
                 violations.append(f"{relative}: forbidden client parameter {match.group(0)}")
+        if (
+            not relative.parts or relative.parts[0].lower() != "tests"
+        ) and PRODUCTION_TEST_IMPORT_PATTERN.search(source):
+            violations.append(f"{relative}: production source imports overlay tests")
     return violations
 
 
 def verify_service_auth_source(source: str) -> None:
-    required_tokens = (
-        'createHash("sha256")',
-        'createHmac("sha256"',
-        "timingSafeEqual",
-        "MAX_CLOCK_SKEW_SECONDS = 60",
-        "/run/secrets/openmaic_service_secret",
-        "readFileSync(SERVICE_SECRET_PATH",
-        "idempotencyKey",
-        "canonicalParts",
-    )
-    missing = [token for token in required_tokens if token not in source]
+    source = _strip_javascript_comments(source)
+    required_patterns = {
+        "Node crypto imports": (
+            r"import\s*\{(?=[^}]*\bcreateHash\b)(?=[^}]*\bcreateHmac\b)"
+            r'(?=[^}]*\btimingSafeEqual\b)[^}]*\}\s*from\s*["\']node:crypto["\']'
+        ),
+        "SHA-256 body digest": (
+            r'createHash\(["\']sha256["\']\)\s*\.update\(body\)'
+            r'\s*\.digest\(["\']hex["\']\)'
+        ),
+        "HMAC-SHA256 signer": (
+            r'createHmac\(["\']sha256["\'],\s*secret\)\s*'
+            r'\.update\(canonicalServiceRequest\(input\),\s*["\']utf8["\']\)'
+            r'\s*\.digest\(["\']hex["\']\)'
+        ),
+        "60-second clock window": (
+            r"export\s+const\s+MAX_CLOCK_SKEW_SECONDS\s*=\s*60"
+            r"(?:\s+as\s+const)?\s*;"
+        ),
+        "clock-skew enforcement": (
+            r"Math\.abs\(options\.nowSeconds\s*-\s*normalized\.timestamp\)"
+            r"\s*>\s*MAX_CLOCK_SKEW_SECONDS"
+        ),
+        "fixed secret mount": (
+            r"export\s+const\s+SERVICE_SECRET_PATH\s*=\s*"
+            r'["\']/run/secrets/openmaic_service_secret["\']'
+        ),
+        "secret file read": (
+            r"readFileSync\(SERVICE_SECRET_PATH,\s*"
+            r'["\']utf8["\']\)'
+        ),
+        "write idempotency enforcement": (r"allowEmpty:\s*!requiresIdempotencyKey\(method\)"),
+        "canonical field order": (
+            r"const\s+canonicalParts\s*=\s*\[\s*"
+            r"normalized\.method,\s*"
+            r"normalized\.path,\s*"
+            r"normalized\.tenantId,\s*"
+            r"normalized\.jobId,\s*"
+            r"String\(normalized\.timestamp\),\s*"
+            r"normalized\.idempotencyKey,\s*"
+            r"sha256Body\(input\.body\),?\s*\]"
+        ),
+        "canonical newline join": (r'return\s+canonicalParts\.join\(["\']\\n["\']\)'),
+        "signature shape validation": (r"!SHA256_HEX\.test\(signed\.signature\)"),
+        "constant-time signature comparison": (r"timingSafeEqual\(expected,\s*received\)"),
+    }
+    missing = [
+        label
+        for label, pattern in required_patterns.items()
+        if re.search(pattern, source, re.DOTALL) is None
+    ]
     if missing:
         raise OverlayVerificationError(
-            "service-auth.ts is missing security-critical primitives: " + ", ".join(missing)
+            "service-auth.ts is missing security-critical structures: " + ", ".join(missing)
         )
     if "process.env" in source:
         raise OverlayVerificationError(
             "service-auth.ts must not read its service secret from process.env"
+        )
+    if len(re.findall(r"\breadFileSync\s*\(", source)) != 1:
+        raise OverlayVerificationError(
+            "service-auth.ts must read exactly one fixed service-secret file"
         )
 
 
