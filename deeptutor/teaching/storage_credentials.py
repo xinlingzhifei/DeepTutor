@@ -152,6 +152,11 @@ class TenantStorageCredentialResolver:
             raise StorageCredentialError(
                 "tenant storage credential is not active for the current tenant"
             )
+        secret_parts = _safe_secret_ref(record.secret_ref)
+        if secret_parts[0] != tenant_id:
+            raise StorageCredentialError(
+                "tenant storage secret reference is not bound to the current tenant"
+            )
         directory = self._secret_directory(record.secret_ref)
         access_path = directory / _ACCESS_KEY_FILE
         secret_path = directory / _SECRET_KEY_FILE
