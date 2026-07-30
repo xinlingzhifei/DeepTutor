@@ -467,10 +467,7 @@ def test_wheel_packages_migrations_and_full_app_entrypoint(
         "deeptutor/teaching/migrations/versions/20260730_0004_data_plane_routing.py",
     }.issubset(names)
     assert "deeptutor-migrate = deeptutor.teaching.migrations.cli:main" in entry_points
-    assert (
-        "deeptutor-provisioner = deeptutor.teaching.provisioning_cli:main"
-        in entry_points
-    )
+    assert "deeptutor-provisioner = deeptutor.teaching.provisioning_cli:main" in entry_points
 
     with zipfile.ZipFile(installed_migration.cli_wheel) as archive:
         cli_entry_points_name = next(
@@ -1117,9 +1114,7 @@ def test_data_plane_routing_migration_preserves_legacy_schema_fact_and_roundtrip
         finally:
             await engine.dispose()
 
-    state, tenant_mode, route_columns, profile_columns, revision = asyncio.run(
-        inspect_head()
-    )
+    state, tenant_mode, route_columns, profile_columns, revision = asyncio.run(inspect_head())
     assert state == (schema_name, PROVISIONING_REVISION, "active")
     assert tenant_mode == "shared"
     assert route_columns == {
@@ -1553,10 +1548,7 @@ def test_postgres_data_plane_routing_is_fail_closed_and_owner_bound(
                                 provider_type="openai-compatible",
                                 model_name="shared-model",
                                 api_base_url=None,
-                                secret_ref=(
-                                    "shared/providers/"
-                                    f"{shared_profile_id}"
-                                ),
+                                secret_ref=(f"shared/providers/{shared_profile_id}"),
                                 status="active",
                             ),
                             ProviderProfile(
@@ -1568,8 +1560,7 @@ def test_postgres_data_plane_routing_is_fail_closed_and_owner_bound(
                                 model_name="private-model",
                                 api_base_url=None,
                                 secret_ref=(
-                                    f"tenants/{private_tenant}/providers/"
-                                    f"{private_profile_id}"
+                                    f"tenants/{private_tenant}/providers/{private_profile_id}"
                                 ),
                                 status="active",
                             ),
@@ -1582,8 +1573,7 @@ def test_postgres_data_plane_routing_is_fail_closed_and_owner_bound(
                                 model_name="foreign-model",
                                 api_base_url=None,
                                 secret_ref=(
-                                    f"tenants/{foreign_tenant}/providers/"
-                                    f"{foreign_profile_id}"
+                                    f"tenants/{foreign_tenant}/providers/{foreign_profile_id}"
                                 ),
                                 status="active",
                             ),
@@ -1644,15 +1634,17 @@ def test_postgres_data_plane_routing_is_fail_closed_and_owner_bound(
             assert (
                 await repository.resolve_bound_profile(private_selection)
             ).profile_id == private_profile_id
+            bound_route = await repository.resolve_bound_route(private_selection)
+            assert bound_route is not None
+            assert bound_route.route_id == private_route_id
+            assert bound_route.base_url == "http://openmaic-private:3000"
 
             assert await repository.set_health(
                 private_route_id,
                 "unhealthy",
             )
-            assert (
-                await repository.resolve_bound_profile(private_selection)
-                is None
-            )
+            assert await repository.resolve_bound_profile(private_selection) is None
+            assert await repository.resolve_bound_route(private_selection) is None
             with pytest.raises(DataPlaneUnavailable):
                 await selector.resolve(private_tenant)
             with pytest.raises(DataPlaneUnavailable):
@@ -1734,9 +1726,7 @@ def test_postgres_data_plane_routing_is_fail_closed_and_owner_bound(
                                     missing_tenant,
                                 )
                             ),
-                            AuditLog.action.like(
-                                "teaching.data_plane.%"
-                            ),
+                            AuditLog.action.like("teaching.data_plane.%"),
                         )
                         .order_by(AuditLog.id)
                     )
@@ -2040,10 +2030,7 @@ def test_postgres_activation_requires_all_states_and_s3_credential_binding(
                 )
             assert await repository.activate(claim) is False
             async with database_module.platform_session() as session:
-                assert (
-                    await session.get(TenantStorageCredential, claim.tenant_id)
-                    is None
-                )
+                assert await session.get(TenantStorageCredential, claim.tenant_id) is None
                 assert await session.get(TenantStorageState, claim.tenant_id) is None
 
             storage_result = replace(
@@ -2056,10 +2043,7 @@ def test_postgres_activation_requires_all_states_and_s3_credential_binding(
             assert await repository.activate(claim) is False
 
             policy_result = build_default_policy_result()
-            assert (
-                await repository.record_default_policy_ready(claim, policy_result)
-                is True
-            )
+            assert await repository.record_default_policy_ready(claim, policy_result) is True
             async with database_module.platform_session() as session:
                 async with session.begin():
                     credential = await session.get(
@@ -2397,12 +2381,16 @@ def test_create_intent_runs_to_active_with_real_schema_revision_and_local_storag
                     intent.tenant_id,
                 )
                 audits = (
-                    await session.execute(
-                        select(AuditLog.action)
-                        .where(AuditLog.tenant_id == intent.tenant_id)
-                        .order_by(AuditLog.id)
+                    (
+                        await session.execute(
+                            select(AuditLog.action)
+                            .where(AuditLog.tenant_id == intent.tenant_id)
+                            .order_by(AuditLog.id)
+                        )
                     )
-                ).scalars().all()
+                    .scalars()
+                    .all()
+                )
                 assert tenant is not None and tenant.status == "active"
                 assert job is not None and job.status == "completed"
                 assert schema_state is not None
@@ -2434,19 +2422,12 @@ def test_create_intent_runs_to_active_with_real_schema_revision_and_local_storag
             try:
                 async with engine.connect() as connection:
                     revision = await connection.scalar(
-                        text(
-                            f'SELECT version_num FROM "{schema_name}".alembic_version'
-                        )
+                        text(f'SELECT version_num FROM "{schema_name}".alembic_version')
                     )
                     assert revision == TENANT_SCHEMA_REVISION
             finally:
                 await engine.dispose()
-            assert (
-                tmp_path
-                / "objects"
-                / "tenants"
-                / intent.tenant_id
-            ).is_dir()
+            assert (tmp_path / "objects" / "tenants" / intent.tenant_id).is_dir()
         finally:
             await database_module.dispose_platform_engine()
 
