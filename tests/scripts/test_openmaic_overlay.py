@@ -242,6 +242,44 @@ def test_service_auth_verifier_requires_canonical_field_order() -> None:
         verifier.verify_service_auth_source(reordered)
 
 
+def test_outline_contract_hash_matches_the_frozen_json_schema() -> None:
+    verifier = _load_verifier()
+    source = (
+        INTEGRATION_ROOT / "overlay" / "lib" / "yfeistai" / "outline-generation.ts"
+    ).read_text(encoding="utf-8")
+
+    verifier.verify_outline_contract_hash(source)
+
+
+def test_outline_contract_hash_verifier_rejects_a_handwritten_mismatch() -> None:
+    verifier = _load_verifier()
+    source = (
+        INTEGRATION_ROOT / "overlay" / "lib" / "yfeistai" / "outline-generation.ts"
+    ).read_text(encoding="utf-8")
+    forged = source.replace(
+        "f8ddb7c11138f402ed048c4af2010714b2bfd456e5c38122920c689e4a2b3ddf",
+        "0" * 64,
+    )
+    assert forged != source
+
+    with pytest.raises(verifier.OverlayVerificationError):
+        verifier.verify_outline_contract_hash(forged)
+
+
+def test_cli_dispatches_the_outline_generation_suite(monkeypatch: pytest.MonkeyPatch) -> None:
+    verifier = _load_verifier()
+    called: list[Path] = []
+    monkeypatch.setattr(verifier, "verify_overlay", lambda: None)
+    monkeypatch.setattr(
+        verifier,
+        "_run_outline_generation_tests",
+        lambda root: called.append(root) or 0,
+    )
+
+    assert verifier.main(["--test", "outline-generation"]) == 0
+    assert called == [verifier.DEFAULT_INTEGRATION_ROOT]
+
+
 def test_verifier_resolves_an_executable_package_runner() -> None:
     verifier = _load_verifier()
 

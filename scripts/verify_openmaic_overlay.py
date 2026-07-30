@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -20,9 +21,14 @@ EXPECTED_UPSTREAM = {
     "appVersion": "0.3.1",
 }
 REQUIRED_OVERLAY_FILES = {
+    Path("app/api/yfeistai/v1/outlines/[jobId]/route.ts"),
+    Path("app/api/yfeistai/v1/outlines/route.ts"),
     Path("app/api/yfeistai/v1/health/route.ts"),
     Path("lib/yfeistai/contracts.ts"),
+    Path("lib/yfeistai/job-store.ts"),
+    Path("lib/yfeistai/outline-generation.ts"),
     Path("lib/yfeistai/service-auth.ts"),
+    Path("tests/yfeistai/outline-generation.test.ts"),
     Path("tests/yfeistai/service-auth.test.ts"),
 }
 JAVASCRIPT_SUFFIXES = {".cjs", ".cts", ".js", ".jsx", ".mjs", ".mts", ".ts", ".tsx"}
@@ -181,6 +187,14 @@ def find_forbidden_overlay_surface(overlay_root: Path) -> list[str]:
             not relative.parts or relative.parts[0].lower() != "tests"
         ) and PRODUCTION_TEST_IMPORT_PATTERN.search(source):
             violations.append(f"{relative}: production source imports overlay tests")
+        if (
+            relative.parts
+            and relative.parts[0].lower() != "tests"
+            and re.search(r"\bgenerateClassroom\s*\(", source)
+        ):
+            violations.append(
+                f"{relative}: outline overlay must not invoke full classroom generation"
+            )
     return violations
 
 
@@ -278,6 +292,110 @@ def _verify_health_contract(overlay_root: Path) -> None:
         )
 
 
+def verify_outline_contract_hash(
+    source: str,
+    schema_path: Path | None = None,
+) -> None:
+    schema_path = (
+        schema_path
+        if schema_path is not None
+        else ROOT / "contracts" / "classroom" / "outline-bundle.schema.json"
+    )
+    expected = hashlib.sha256(schema_path.read_bytes()).hexdigest()
+    match = re.search(
+        r"export\s+const\s+OUTLINE_BUNDLE_CONTRACT_SHA256\s*=\s*"
+        r'["\']([0-9a-f]{64})["\']',
+        _strip_javascript_comments(source),
+    )
+    if match is None:
+        raise OverlayVerificationError(
+            "outline-generation.ts must export the frozen outline schema hash"
+        )
+    if match.group(1) != expected:
+        raise OverlayVerificationError(
+            "outline contract hash does not match outline-bundle.schema.json"
+        )
+
+
+def _verify_outline_generation(overlay_root: Path) -> None:
+    source = _strip_javascript_comments(
+        _read_text(overlay_root / "lib/yfeistai/outline-generation.ts")
+    )
+    post_route = _strip_javascript_comments(
+        _read_text(overlay_root / "app/api/yfeistai/v1/outlines/route.ts")
+    )
+    get_route = _strip_javascript_comments(
+        _read_text(overlay_root / "app/api/yfeistai/v1/outlines/[jobId]/route.ts")
+    )
+    store = _strip_javascript_comments(_read_text(overlay_root / "lib/yfeistai/job-store.ts"))
+
+    required_source_tokens = (
+        "verifyServiceRequest(",
+        "JSON.parse(body)",
+        "validateGenerationRequest(",
+        "validateOutlineBundle(",
+        "canonicalJson(generationRequest)",
+        'action: "outline"',
+        "generationRequest.tenantId !== signed.tenantId",
+        "generationRequest.jobId !== signed.jobId",
+        "generationRequest.idempotencyKey !== signed.idempotencyKey",
+        "dependencies.store.read(signed.tenantId, jobId)",
+        "IdempotencyConflictError",
+    )
+    missing = [token for token in required_source_tokens if token not in source]
+    if missing:
+        raise OverlayVerificationError(
+            "outline-generation.ts is missing boundary controls: " + ", ".join(missing)
+        )
+    if source.index("verifyServiceRequest(") > source.index("JSON.parse(body)"):
+        raise OverlayVerificationError(
+            "outline POST must authenticate before parsing its request body"
+        )
+
+    required_post_tokens = (
+        "@/lib/generation/outline-generator",
+        "@/lib/server/resolve-model",
+        "@/lib/web-search",
+        "generateSceneOutlinesFromRequirements(",
+        'resolveModel({ stage: "generate-classroom" })',
+        "resolveClassroomWebSearchConfig({})",
+        'answer: ""',
+        "createOutlinePostHandler(",
+        "return postOutline(request)",
+    )
+    missing = [token for token in required_post_tokens if token not in post_route]
+    if missing:
+        raise OverlayVerificationError(
+            "outline POST route is missing pinned upstream adapters: " + ", ".join(missing)
+        )
+    required_get_tokens = (
+        "createOutlineGetHandler(",
+        "params: Promise<{ jobId: string }>",
+        "return getOutline(request, context)",
+    )
+    missing = [token for token in required_get_tokens if token not in get_route]
+    if missing:
+        raise OverlayVerificationError(
+            "outline GET route is missing authenticated polling: " + ", ".join(missing)
+        )
+    required_store_tokens = (
+        "idempotencyBindings",
+        "submission.tenantId",
+        "submission.jobId",
+        "submission.idempotencyKey",
+        "submission.action",
+        "bodySha256(submission.canonicalBody)",
+        "Symbol.for(",
+        "globalThis",
+    )
+    missing = [token for token in required_store_tokens if token not in store]
+    if missing:
+        raise OverlayVerificationError(
+            "job-store.ts is missing idempotency bindings: " + ", ".join(missing)
+        )
+    verify_outline_contract_hash(source)
+
+
 def verify_overlay(integration_root: Path = DEFAULT_INTEGRATION_ROOT) -> None:
     integration_root = integration_root.resolve()
     overlay_root = integration_root / "overlay"
@@ -291,6 +409,7 @@ def verify_overlay(integration_root: Path = DEFAULT_INTEGRATION_ROOT) -> None:
         raise OverlayVerificationError("\n".join(violations))
     verify_service_auth_source(_read_text(overlay_root / "lib/yfeistai/service-auth.ts"))
     _verify_health_contract(overlay_root)
+    _verify_outline_generation(overlay_root)
 
 
 def resolve_package_runner() -> list[str]:
@@ -324,11 +443,30 @@ def _run_service_auth_tests(integration_root: Path) -> int:
     return completed.returncode
 
 
+def _run_outline_generation_tests(integration_root: Path) -> int:
+    try:
+        runner = resolve_package_runner()
+    except OverlayVerificationError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    command = [
+        *runner,
+        "dlx",
+        VITEST_PACKAGE,
+        "run",
+        "tests/yfeistai/outline-generation.test.ts",
+        "--environment",
+        "node",
+    ]
+    completed = subprocess.run(command, cwd=integration_root / "overlay", check=False)
+    return completed.returncode
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--test",
-        choices=("service-auth", "static"),
+        choices=("service-auth", "outline-generation", "static"),
         default="static",
         help="verification surface to run",
     )
@@ -340,6 +478,10 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     if args.test == "service-auth":
         result = _run_service_auth_tests(DEFAULT_INTEGRATION_ROOT)
+        if result:
+            return result
+    if args.test == "outline-generation":
+        result = _run_outline_generation_tests(DEFAULT_INTEGRATION_ROOT)
         if result:
             return result
     print("OpenMAIC overlay verified.")
