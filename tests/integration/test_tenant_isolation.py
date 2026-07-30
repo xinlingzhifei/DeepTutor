@@ -28,7 +28,6 @@ from deeptutor.teaching.artifacts import temporary_artifact_key, tenant_artifact
 from deeptutor.teaching.models import (
     AuditLog,
     Course,
-    DataPlaneRoute,
     PlatformBase,
     Tenant,
     TenantBase,
@@ -208,26 +207,16 @@ async def _initialize_database(database_url: str) -> None:
                             user_id=USER_B,
                             status="active",
                         ),
-                        DataPlaneRoute(
-                            tenant_id=TENANT_A,
-                            schema_name=tenant_schema_name(TENANT_A),
-                            status="active",
-                        ),
                         TenantSchemaState(
                             tenant_id=TENANT_A,
                             schema_name=tenant_schema_name(TENANT_A),
-                            revision="20260730_0003",
+                            revision="20260730_0004",
                             status="active",
                         ),
                         TenantSchemaState(
                             tenant_id=TENANT_B,
                             schema_name=tenant_schema_name(TENANT_B),
-                            revision="20260730_0003",
-                            status="active",
-                        ),
-                        DataPlaneRoute(
-                            tenant_id=TENANT_B,
-                            schema_name=tenant_schema_name(TENANT_B),
+                            revision="20260730_0004",
                             status="active",
                         ),
                         TenantStorageCredential(

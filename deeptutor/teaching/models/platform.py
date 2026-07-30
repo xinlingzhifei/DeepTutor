@@ -15,7 +15,9 @@ from sqlalchemy import (
     MetaData,
     String,
     Text,
+    UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -51,8 +53,18 @@ class Tenant(PlatformBase):
         DateTime(timezone=True),
         server_default=func.now(),
     )
+    data_plane_mode: Mapped[str] = mapped_column(
+        String(16),
+        server_default="shared",
+    )
 
-    __table_args__ = (Index("ix_tenants_status", "status"),)
+    __table_args__ = (
+        CheckConstraint(
+            "data_plane_mode IN ('shared', 'dedicated')",
+            name="data_plane_mode",
+        ),
+        Index("ix_tenants_status", "status"),
+    )
 
 
 class TenantMembership(PlatformBase):
@@ -114,16 +126,21 @@ class RoleGrant(PlatformBase):
     )
 
 
-class DataPlaneRoute(PlatformBase):
-    __tablename__ = "data_plane_routes"
+class ProviderProfile(PlatformBase):
+    __tablename__ = "provider_profiles"
 
-    tenant_id: Mapped[str] = mapped_column(
+    id: Mapped[str] = mapped_column(String(63), primary_key=True)
+    scope: Mapped[str] = mapped_column(String(16))
+    tenant_id: Mapped[str | None] = mapped_column(
         String(64),
         ForeignKey("platform.tenants.id", ondelete="CASCADE"),
-        primary_key=True,
     )
-    schema_name: Mapped[str] = mapped_column(String(64), unique=True)
-    status: Mapped[str] = mapped_column(String(32), server_default="pending")
+    owner_key: Mapped[str] = mapped_column(String(64))
+    provider_type: Mapped[str] = mapped_column(String(64))
+    model_name: Mapped[str] = mapped_column(String(128))
+    api_base_url: Mapped[str | None] = mapped_column(String(512))
+    secret_ref: Mapped[str] = mapped_column(String(512), unique=True)
+    status: Mapped[str] = mapped_column(String(32), server_default="active")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
@@ -133,7 +150,115 @@ class DataPlaneRoute(PlatformBase):
         server_default=func.now(),
     )
 
-    __table_args__ = (Index("ix_data_plane_routes_status", "status"),)
+    __table_args__ = (
+        CheckConstraint(
+            "scope IN ('shared', 'dedicated')",
+            name="scope",
+        ),
+        CheckConstraint(
+            "("
+            "scope = 'shared' AND tenant_id IS NULL AND owner_key = 'shared'"
+            ") OR ("
+            "scope = 'dedicated' AND tenant_id IS NOT NULL "
+            "AND owner_key = tenant_id"
+            ")",
+            name="owner_scope",
+        ),
+        CheckConstraint(
+            "status IN ('active', 'disabled')",
+            name="status",
+        ),
+        UniqueConstraint(
+            "id",
+            "scope",
+            "owner_key",
+            name="uq_provider_profiles_route_binding",
+        ),
+        Index(
+            "ix_provider_profiles_tenant_status",
+            "tenant_id",
+            "status",
+        ),
+    )
+
+
+class DataPlaneRoute(PlatformBase):
+    __tablename__ = "data_plane_routes"
+
+    id: Mapped[str] = mapped_column(String(63), primary_key=True)
+    tenant_id: Mapped[str | None] = mapped_column(
+        String(64),
+        ForeignKey("platform.tenants.id", ondelete="CASCADE"),
+    )
+    owner_key: Mapped[str] = mapped_column(String(64))
+    mode: Mapped[str] = mapped_column(String(16))
+    base_url: Mapped[str] = mapped_column(String(512))
+    worker_pool: Mapped[str] = mapped_column(String(128), unique=True)
+    queue_name: Mapped[str] = mapped_column(String(128), unique=True)
+    provider_profile_id: Mapped[str] = mapped_column(String(63))
+    status: Mapped[str] = mapped_column(String(32), server_default="active")
+    health_status: Mapped[str] = mapped_column(
+        String(32),
+        server_default="unknown",
+    )
+    health_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["provider_profile_id", "mode", "owner_key"],
+            [
+                "platform.provider_profiles.id",
+                "platform.provider_profiles.scope",
+                "platform.provider_profiles.owner_key",
+            ],
+            name="fk_data_plane_routes_provider_binding",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint(
+            "mode IN ('shared', 'dedicated')",
+            name="mode",
+        ),
+        CheckConstraint(
+            "("
+            "mode = 'shared' AND tenant_id IS NULL AND owner_key = 'shared'"
+            ") OR ("
+            "mode = 'dedicated' AND tenant_id IS NOT NULL "
+            "AND owner_key = tenant_id"
+            ")",
+            name="owner_mode",
+        ),
+        CheckConstraint(
+            "status IN ('active', 'disabled')",
+            name="status",
+        ),
+        CheckConstraint(
+            "health_status IN ('unknown', 'healthy', 'unhealthy')",
+            name="health_status",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            name="uq_data_plane_routes_tenant_id",
+        ),
+        Index(
+            "uq_data_plane_routes_global_shared",
+            "mode",
+            unique=True,
+            postgresql_where=text("mode = 'shared'"),
+        ),
+        Index(
+            "ix_data_plane_routes_status_health",
+            "status",
+            "health_status",
+        ),
+    )
 
 
 class TenantSchemaState(PlatformBase):

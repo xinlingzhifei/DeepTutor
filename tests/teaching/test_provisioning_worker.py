@@ -109,7 +109,7 @@ class FakeSchemaProvisioner:
             raise self.failure
         return SchemaProvisioningResult(
             schema_name="tenant_9e4714402f06d0f7",
-            revision="20260730_0003",
+            revision="20260730_0004",
         )
 
 
@@ -166,7 +166,7 @@ def test_run_once_executes_and_persists_steps_in_fixed_order() -> None:
     assert trace == [
         "claim",
         "schema",
-        "persist:schema:20260730_0003",
+        "persist:schema:20260730_0004",
         "storage",
         "persist:storage:local",
         "policy",
@@ -190,7 +190,7 @@ def test_run_once_executes_and_persists_steps_in_fixed_order() -> None:
             [
                 "claim",
                 "schema",
-                "persist:schema:20260730_0003",
+                "persist:schema:20260730_0004",
                 "storage",
                 "failure",
             ],
@@ -202,7 +202,7 @@ def test_run_once_executes_and_persists_steps_in_fixed_order() -> None:
             [
                 "claim",
                 "schema",
-                "persist:schema:20260730_0003",
+                "persist:schema:20260730_0004",
                 "storage",
                 "persist:storage:local",
                 "policy",
@@ -672,7 +672,7 @@ def test_blocked_step_is_heartbeated_before_another_worker_can_reclaim() -> None
                 await release.wait()
                 return SchemaProvisioningResult(
                     schema_name="tenant_9e4714402f06d0f7",
-                    revision="20260730_0003",
+                    revision="20260730_0004",
                 )
 
         repository = LeaseRepository()
@@ -834,7 +834,7 @@ def test_worker_activation_requires_schema_policy_and_mode_specific_storage() ->
 
     for fragment in (
         "tenant_schema_states.status = 'active'",
-        "tenant_schema_states.revision = '20260730_0003'",
+        "tenant_schema_states.revision = '20260730_0004'",
         "tenant_storage_states.status = 'active'",
         "tenant_storage_states.mode = 'local'",
         "tenant_storage_states.mode = 's3'",

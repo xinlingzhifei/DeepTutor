@@ -45,6 +45,7 @@ def test_model_metadata_uses_only_platform_and_logical_tenant_schemas():
     assert set(PlatformBase.metadata.tables) == {
         "platform.audit_log",
         "platform.data_plane_routes",
+        "platform.provider_profiles",
         "platform.role_grants",
         "platform.tenant_default_policy_states",
         "platform.tenant_memberships",
@@ -80,3 +81,44 @@ def test_tenant_storage_credentials_metadata_excludes_plaintext_secrets():
         "updated_at",
     }
     assert {"access_key", "secret_key"}.isdisjoint(table.columns.keys())
+
+
+def test_data_plane_metadata_separates_routes_from_provider_secret_references():
+    from deeptutor.teaching.models import DataPlaneRoute, ProviderProfile
+
+    assert set(DataPlaneRoute.__table__.columns.keys()) == {
+        "id",
+        "tenant_id",
+        "owner_key",
+        "mode",
+        "base_url",
+        "worker_pool",
+        "queue_name",
+        "provider_profile_id",
+        "status",
+        "health_status",
+        "health_checked_at",
+        "created_at",
+        "updated_at",
+    }
+    assert "schema_name" not in DataPlaneRoute.__table__.columns
+    assert set(ProviderProfile.__table__.columns.keys()) == {
+        "id",
+        "scope",
+        "tenant_id",
+        "owner_key",
+        "provider_type",
+        "model_name",
+        "api_base_url",
+        "secret_ref",
+        "status",
+        "created_at",
+        "updated_at",
+    }
+    assert {
+        "api_key",
+        "access_key",
+        "secret_key",
+        "token",
+        "password",
+    }.isdisjoint(ProviderProfile.__table__.columns.keys())

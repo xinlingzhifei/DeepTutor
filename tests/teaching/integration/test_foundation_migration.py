@@ -21,7 +21,8 @@ from deeptutor.teaching.schema_names import tenant_schema_name
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 FOUNDATION_REVISION = "20260728_0001"
 SCOPED_GRANTS_REVISION = "20260730_0002"
-HEAD_REVISION = "20260730_0003"
+PROVISIONING_REVISION = "20260730_0003"
+HEAD_REVISION = "20260730_0004"
 
 
 @dataclass(frozen=True)
@@ -463,6 +464,7 @@ def test_wheel_packages_migrations_and_full_app_entrypoint(
         "deeptutor/teaching/migrations/versions/20260728_0001_foundation.py",
         "deeptutor/teaching/migrations/versions/20260730_0002_scoped_role_grants.py",
         "deeptutor/teaching/migrations/versions/20260730_0003_tenant_provisioning_worker.py",
+        "deeptutor/teaching/migrations/versions/20260730_0004_data_plane_routing.py",
     }.issubset(names)
     assert "deeptutor-migrate = deeptutor.teaching.migrations.cli:main" in entry_points
     assert (
@@ -515,6 +517,7 @@ def test_packaged_entrypoint_runs_platform_and_tenant_scopes(
         "alembic_version",
         "audit_log",
         "data_plane_routes",
+        "provider_profiles",
         "role_grants",
         "tenant_default_policy_states",
         "tenant_memberships",
@@ -698,6 +701,7 @@ def test_foundation_migration_is_isolated_and_repeatable(migration_database):
         "alembic_version",
         "audit_log",
         "data_plane_routes",
+        "provider_profiles",
         "role_grants",
         "tenant_default_policy_states",
         "tenant_memberships",
@@ -966,6 +970,225 @@ def test_provisioning_worker_migration_roundtrips_0002_and_backfills_routes(
     )
 
 
+def test_data_plane_routing_migration_preserves_legacy_schema_fact_and_roundtrips(
+    migration_database,
+) -> None:
+    tenant_id = "migration-data-plane-tenant"
+    schema_name = tenant_schema_name(tenant_id)
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(migration_database, "scope=platform"),
+    )
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(
+            migration_database,
+            "scope=platform",
+            action="downgrade",
+            revision=PROVISIONING_REVISION,
+        ),
+    )
+
+    async def seed_legacy_route() -> None:
+        engine = create_async_engine(migration_database.url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO platform.tenants (id, name, status)
+                        VALUES (
+                            :tenant_id,
+                            'Migration Data Plane Tenant',
+                            'active'
+                        )
+                        ON CONFLICT (id) DO NOTHING
+                        """
+                    ),
+                    {"tenant_id": tenant_id},
+                )
+                await connection.execute(
+                    text(
+                        """
+                        DELETE FROM platform.tenant_schema_states
+                        WHERE tenant_id = :tenant_id
+                        """
+                    ),
+                    {"tenant_id": tenant_id},
+                )
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO platform.data_plane_routes (
+                            tenant_id,
+                            schema_name,
+                            status
+                        )
+                        VALUES (:tenant_id, :schema_name, 'active')
+                        ON CONFLICT (tenant_id) DO UPDATE
+                        SET schema_name = EXCLUDED.schema_name,
+                            status = EXCLUDED.status
+                        """
+                    ),
+                    {
+                        "tenant_id": tenant_id,
+                        "schema_name": schema_name,
+                    },
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(seed_legacy_route())
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(migration_database, "scope=platform"),
+    )
+
+    async def inspect_head() -> tuple[
+        tuple[str, str, str],
+        str,
+        set[str],
+        set[str],
+        str,
+    ]:
+        engine = create_async_engine(migration_database.url)
+        try:
+            async with engine.connect() as connection:
+                schema_state = (
+                    await connection.execute(
+                        text(
+                            """
+                            SELECT schema_name, revision, status
+                            FROM platform.tenant_schema_states
+                            WHERE tenant_id = :tenant_id
+                            """
+                        ),
+                        {"tenant_id": tenant_id},
+                    )
+                ).one()
+                tenant_mode = await connection.scalar(
+                    text(
+                        """
+                        SELECT data_plane_mode
+                        FROM platform.tenants
+                        WHERE id = :tenant_id
+                        """
+                    ),
+                    {"tenant_id": tenant_id},
+                )
+                route_columns = set(
+                    (
+                        await connection.execute(
+                            text(
+                                """
+                                SELECT column_name
+                                FROM information_schema.columns
+                                WHERE table_schema = 'platform'
+                                  AND table_name = 'data_plane_routes'
+                                """
+                            )
+                        )
+                    ).scalars()
+                )
+                profile_columns = set(
+                    (
+                        await connection.execute(
+                            text(
+                                """
+                                SELECT column_name
+                                FROM information_schema.columns
+                                WHERE table_schema = 'platform'
+                                  AND table_name = 'provider_profiles'
+                                """
+                            )
+                        )
+                    ).scalars()
+                )
+                revision = await connection.scalar(
+                    text("SELECT version_num FROM platform.alembic_version")
+                )
+                return (
+                    tuple(schema_state),
+                    str(tenant_mode),
+                    route_columns,
+                    profile_columns,
+                    str(revision),
+                )
+        finally:
+            await engine.dispose()
+
+    state, tenant_mode, route_columns, profile_columns, revision = asyncio.run(
+        inspect_head()
+    )
+    assert state == (schema_name, PROVISIONING_REVISION, "active")
+    assert tenant_mode == "shared"
+    assert route_columns == {
+        "id",
+        "tenant_id",
+        "owner_key",
+        "mode",
+        "base_url",
+        "worker_pool",
+        "queue_name",
+        "provider_profile_id",
+        "status",
+        "health_status",
+        "health_checked_at",
+        "created_at",
+        "updated_at",
+    }
+    assert profile_columns == {
+        "id",
+        "scope",
+        "tenant_id",
+        "owner_key",
+        "provider_type",
+        "model_name",
+        "api_base_url",
+        "secret_ref",
+        "status",
+        "created_at",
+        "updated_at",
+    }
+    assert revision == HEAD_REVISION
+
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(
+            migration_database,
+            "scope=platform",
+            action="downgrade",
+            revision=PROVISIONING_REVISION,
+        ),
+    )
+
+    async def inspect_legacy_route() -> tuple[str, str]:
+        engine = create_async_engine(migration_database.url)
+        try:
+            async with engine.connect() as connection:
+                row = (
+                    await connection.execute(
+                        text(
+                            """
+                            SELECT schema_name, status
+                            FROM platform.data_plane_routes
+                            WHERE tenant_id = :tenant_id
+                            """
+                        ),
+                        {"tenant_id": tenant_id},
+                    )
+                ).one()
+                return tuple(row)
+        finally:
+            await engine.dispose()
+
+    assert asyncio.run(inspect_legacy_route()) == (schema_name, "active")
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(migration_database, "scope=platform"),
+    )
+
+
 def test_scoped_role_grant_migration_backfills_and_refuses_lossy_downgrade(
     migration_database,
 ) -> None:
@@ -1228,6 +1451,338 @@ def _install_source_runtime_database(
         lambda: settings,
     )
     return settings, database_module
+
+
+def test_postgres_data_plane_routing_is_fail_closed_and_owner_bound(
+    migration_database,
+    monkeypatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from sqlalchemy.exc import IntegrityError
+
+    from deeptutor.teaching.models import (
+        AuditLog,
+        DataPlaneRoute,
+        ProviderProfile,
+        Tenant,
+    )
+    from deeptutor.teaching.openmaic.data_planes import (
+        DataPlaneSelection,
+        DataPlaneSelector,
+        DataPlaneUnavailable,
+    )
+    from deeptutor.teaching.repositories.data_planes import (
+        SqlAlchemyDataPlaneRepository,
+    )
+
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(migration_database, "scope=platform"),
+    )
+    _settings, database_module = _install_source_runtime_database(
+        monkeypatch,
+        migration_database,
+    )
+
+    async def exercise() -> None:
+        await database_module.dispose_platform_engine()
+        repository = SqlAlchemyDataPlaneRepository()
+        standard_tenant = "routing-standard"
+        private_tenant = "routing-private"
+        missing_tenant = "routing-missing"
+        wrong_owner_tenant = "routing-wrong-owner"
+        binding_tenant = "routing-wrong-binding"
+        foreign_tenant = "routing-foreign"
+        shared_profile_id = "routing-shared-profile"
+        private_profile_id = "routing-private-profile"
+        foreign_profile_id = "routing-foreign-profile"
+        shared_route_id = "routing-shared-route"
+        private_route_id = "routing-private-route"
+        try:
+            async with database_module.platform_session() as session:
+                async with session.begin():
+                    session.add_all(
+                        [
+                            Tenant(
+                                id=standard_tenant,
+                                name="Routing standard",
+                                status="active",
+                                data_plane_mode="shared",
+                            ),
+                            Tenant(
+                                id=private_tenant,
+                                name="Routing private",
+                                status="active",
+                                data_plane_mode="dedicated",
+                            ),
+                            Tenant(
+                                id=missing_tenant,
+                                name="Routing missing",
+                                status="active",
+                                data_plane_mode="dedicated",
+                            ),
+                            Tenant(
+                                id=wrong_owner_tenant,
+                                name="Routing wrong owner",
+                                status="active",
+                                data_plane_mode="dedicated",
+                            ),
+                            Tenant(
+                                id=binding_tenant,
+                                name="Routing wrong binding",
+                                status="active",
+                                data_plane_mode="dedicated",
+                            ),
+                            Tenant(
+                                id=foreign_tenant,
+                                name="Routing foreign",
+                                status="active",
+                                data_plane_mode="dedicated",
+                            ),
+                        ]
+                    )
+                async with session.begin():
+                    session.add_all(
+                        [
+                            ProviderProfile(
+                                id=shared_profile_id,
+                                scope="shared",
+                                tenant_id=None,
+                                owner_key="shared",
+                                provider_type="openai-compatible",
+                                model_name="shared-model",
+                                api_base_url=None,
+                                secret_ref=(
+                                    "shared/providers/"
+                                    f"{shared_profile_id}"
+                                ),
+                                status="active",
+                            ),
+                            ProviderProfile(
+                                id=private_profile_id,
+                                scope="dedicated",
+                                tenant_id=private_tenant,
+                                owner_key=private_tenant,
+                                provider_type="openai-compatible",
+                                model_name="private-model",
+                                api_base_url=None,
+                                secret_ref=(
+                                    f"tenants/{private_tenant}/providers/"
+                                    f"{private_profile_id}"
+                                ),
+                                status="active",
+                            ),
+                            ProviderProfile(
+                                id=foreign_profile_id,
+                                scope="dedicated",
+                                tenant_id=foreign_tenant,
+                                owner_key=foreign_tenant,
+                                provider_type="openai-compatible",
+                                model_name="foreign-model",
+                                api_base_url=None,
+                                secret_ref=(
+                                    f"tenants/{foreign_tenant}/providers/"
+                                    f"{foreign_profile_id}"
+                                ),
+                                status="active",
+                            ),
+                        ]
+                    )
+                async with session.begin():
+                    session.add_all(
+                        [
+                            DataPlaneRoute(
+                                id=shared_route_id,
+                                tenant_id=None,
+                                owner_key="shared",
+                                mode="shared",
+                                base_url="http://openmaic-shared:3000",
+                                worker_pool="routing-shared-pool",
+                                queue_name="routing.shared",
+                                provider_profile_id=shared_profile_id,
+                                status="active",
+                                health_status="healthy",
+                            ),
+                            DataPlaneRoute(
+                                id=private_route_id,
+                                tenant_id=private_tenant,
+                                owner_key=private_tenant,
+                                mode="dedicated",
+                                base_url="http://openmaic-private:3000",
+                                worker_pool="routing-private-pool",
+                                queue_name="routing.private",
+                                provider_profile_id=private_profile_id,
+                                status="active",
+                                health_status="healthy",
+                            ),
+                        ]
+                    )
+
+            selector = DataPlaneSelector(
+                settings=SimpleNamespace(enabled=True),
+                repository=repository,
+            )
+            standard_selection = await selector.resolve(standard_tenant)
+            assert standard_selection == DataPlaneSelection(
+                tenant_id=standard_tenant,
+                route_ref=shared_route_id,
+                provider_profile_ref=shared_profile_id,
+                mode="shared",
+                worker_pool_ref="routing-shared-pool",
+                queue_ref="routing.shared",
+            )
+            private_selection = await selector.resolve(private_tenant)
+            assert private_selection == DataPlaneSelection(
+                tenant_id=private_tenant,
+                route_ref=private_route_id,
+                provider_profile_ref=private_profile_id,
+                mode="dedicated",
+                worker_pool_ref="routing-private-pool",
+                queue_ref="routing.private",
+            )
+            assert (
+                await repository.resolve_bound_profile(private_selection)
+            ).profile_id == private_profile_id
+
+            assert await repository.set_health(
+                private_route_id,
+                "unhealthy",
+            )
+            assert (
+                await repository.resolve_bound_profile(private_selection)
+                is None
+            )
+            with pytest.raises(DataPlaneUnavailable):
+                await selector.resolve(private_tenant)
+            with pytest.raises(DataPlaneUnavailable):
+                await selector.resolve(missing_tenant)
+
+            async def assert_insert_rejected(instance) -> None:
+                async with database_module.platform_session() as session:
+                    with pytest.raises(IntegrityError):
+                        async with session.begin():
+                            session.add(instance)
+                            await session.flush()
+
+            await assert_insert_rejected(
+                DataPlaneRoute(
+                    id="routing-second-shared",
+                    tenant_id=None,
+                    owner_key="shared",
+                    mode="shared",
+                    base_url="http://openmaic-shared-2:3000",
+                    worker_pool="routing-shared-pool-2",
+                    queue_name="routing.shared.2",
+                    provider_profile_id=shared_profile_id,
+                    status="active",
+                    health_status="healthy",
+                )
+            )
+            await assert_insert_rejected(
+                DataPlaneRoute(
+                    id="routing-missing-dedicated-owner",
+                    tenant_id=None,
+                    owner_key=private_tenant,
+                    mode="dedicated",
+                    base_url="http://openmaic-invalid:3000",
+                    worker_pool="routing-invalid-pool",
+                    queue_name="routing.invalid",
+                    provider_profile_id=private_profile_id,
+                    status="active",
+                    health_status="healthy",
+                )
+            )
+            await assert_insert_rejected(
+                DataPlaneRoute(
+                    id="routing-wrong-owner-route",
+                    tenant_id=wrong_owner_tenant,
+                    owner_key=foreign_tenant,
+                    mode="dedicated",
+                    base_url="http://openmaic-wrong-owner:3000",
+                    worker_pool="routing-wrong-owner-pool",
+                    queue_name="routing.wrong-owner",
+                    provider_profile_id=foreign_profile_id,
+                    status="active",
+                    health_status="healthy",
+                )
+            )
+            await assert_insert_rejected(
+                DataPlaneRoute(
+                    id="routing-wrong-profile-binding",
+                    tenant_id=binding_tenant,
+                    owner_key=binding_tenant,
+                    mode="dedicated",
+                    base_url="http://openmaic-wrong-binding:3000",
+                    worker_pool="routing-wrong-binding-pool",
+                    queue_name="routing.wrong-binding",
+                    provider_profile_id=foreign_profile_id,
+                    status="active",
+                    health_status="healthy",
+                )
+            )
+
+            async with database_module.platform_session() as session:
+                audits = (
+                    await session.scalars(
+                        select(AuditLog)
+                        .where(
+                            AuditLog.tenant_id.in_(
+                                (
+                                    standard_tenant,
+                                    private_tenant,
+                                    missing_tenant,
+                                )
+                            ),
+                            AuditLog.action.like(
+                                "teaching.data_plane.%"
+                            ),
+                        )
+                        .order_by(AuditLog.id)
+                    )
+                ).all()
+            assert [
+                (
+                    audit.tenant_id,
+                    audit.action,
+                    audit.resource_type,
+                    audit.resource_id,
+                )
+                for audit in audits
+            ] == [
+                (
+                    standard_tenant,
+                    "teaching.data_plane.selected",
+                    "data_plane_route:shared",
+                    f"{shared_route_id}/{shared_profile_id}",
+                ),
+                (
+                    private_tenant,
+                    "teaching.data_plane.selected",
+                    "data_plane_route:dedicated",
+                    f"{private_route_id}/{private_profile_id}",
+                ),
+                (
+                    private_tenant,
+                    "teaching.data_plane.unavailable",
+                    "data_plane_route:dedicated",
+                    f"{private_route_id}/{private_profile_id}",
+                ),
+                (
+                    missing_tenant,
+                    "teaching.data_plane.unavailable",
+                    "data_plane_route:dedicated",
+                    None,
+                ),
+            ]
+            audit_repr = repr(audits)
+            assert "openmaic-shared" not in audit_repr
+            assert "shared/providers" not in audit_repr
+            assert "private/providers" not in audit_repr
+        finally:
+            await database_module.dispose_platform_engine()
+
+    asyncio.run(exercise())
 
 
 def test_postgres_claims_are_unique_and_stale_same_owner_token_is_fenced(
@@ -1737,7 +2292,6 @@ def test_create_intent_runs_to_active_with_real_schema_revision_and_local_storag
     from deeptutor.services import config as config_module
     from deeptutor.teaching.models import (
         AuditLog,
-        DataPlaneRoute,
         Tenant,
         TenantDefaultPolicyState,
         TenantProvisioningJob,
@@ -1842,7 +2396,6 @@ def test_create_intent_runs_to_active_with_real_schema_revision_and_local_storag
                     TenantDefaultPolicyState,
                     intent.tenant_id,
                 )
-                route = await session.get(DataPlaneRoute, intent.tenant_id)
                 audits = (
                     await session.execute(
                         select(AuditLog.action)
@@ -1869,7 +2422,6 @@ def test_create_intent_runs_to_active_with_real_schema_revision_and_local_storag
                     "network_access_enabled": False,
                     "open_creation_enabled": False,
                 }
-                assert route is None
                 assert audits == [
                     "tenant.provisioning.attempt_started",
                     "tenant.provisioning.schema_ready",
