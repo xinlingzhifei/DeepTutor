@@ -13,18 +13,18 @@
     "ExportPolicy": {
       "additionalProperties": false,
       "properties": {
-        "allow_external_links": {
-          "title": "Allow External Links",
+        "allowExternalLinks": {
+          "title": "Allowexternallinks",
           "type": "boolean"
         },
-        "include_source_attribution": {
-          "title": "Include Source Attribution",
+        "includeSourceAttribution": {
+          "title": "Includesourceattribution",
           "type": "boolean"
         }
       },
       "required": [
-        "include_source_attribution",
-        "allow_external_links"
+        "includeSourceAttribution",
+        "allowExternalLinks"
       ],
       "title": "ExportPolicy",
       "type": "object"
@@ -32,25 +32,25 @@
   },
   "additionalProperties": false,
   "properties": {
-    "classroom_document_sha256": {
+    "classroomDocumentSha256": {
       "pattern": "^[0-9a-f]{64}$",
-      "title": "Classroom Document Sha256",
+      "title": "Classroomdocumentsha256",
       "type": "string"
     },
-    "export_policy": {
+    "exportPolicy": {
       "$ref": "#/$defs/ExportPolicy"
     },
     "format": {
       "$ref": "#/$defs/ExportFormat"
     },
-    "idempotency_key": {
+    "idempotencyKey": {
       "minLength": 1,
-      "title": "Idempotency Key",
+      "title": "Idempotencykey",
       "type": "string"
     },
-    "job_id": {
+    "jobId": {
       "minLength": 1,
-      "title": "Job Id",
+      "title": "Jobid",
       "type": "string"
     },
     "language": {
@@ -58,32 +58,32 @@
       "title": "Language",
       "type": "string"
     },
-    "media_manifest_sha256": {
+    "mediaManifestSha256": {
       "pattern": "^[0-9a-f]{64}$",
-      "title": "Media Manifest Sha256",
+      "title": "Mediamanifestsha256",
       "type": "string"
     },
-    "schema_version": {
+    "schemaVersion": {
       "const": "1.0",
-      "title": "Schema Version",
+      "title": "Schemaversion",
       "type": "string"
     },
-    "tenant_id": {
+    "tenantId": {
       "minLength": 1,
-      "title": "Tenant Id",
+      "title": "Tenantid",
       "type": "string"
     }
   },
   "required": [
-    "schema_version",
-    "tenant_id",
-    "job_id",
-    "idempotency_key",
-    "classroom_document_sha256",
-    "media_manifest_sha256",
+    "schemaVersion",
+    "tenantId",
+    "jobId",
+    "idempotencyKey",
+    "classroomDocumentSha256",
+    "mediaManifestSha256",
     "format",
     "language",
-    "export_policy"
+    "exportPolicy"
   ],
   "title": "ExportRequest",
   "type": "object"

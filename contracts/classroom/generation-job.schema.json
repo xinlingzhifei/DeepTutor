@@ -1,5 +1,72 @@
 {
   "$defs": {
+    "ArtifactState": {
+      "additionalProperties": false,
+      "properties": {
+        "artifactId": {
+          "minLength": 1,
+          "title": "Artifactid",
+          "type": "string"
+        },
+        "sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sha256"
+        },
+        "status": {
+          "enum": [
+            "pending",
+            "materializing",
+            "ready",
+            "failed",
+            "discarded"
+          ],
+          "title": "Status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "artifactId",
+        "status"
+      ],
+      "title": "ArtifactState",
+      "type": "object"
+    },
+    "CostSummary": {
+      "additionalProperties": false,
+      "properties": {
+        "actualAmount": {
+          "minimum": 0,
+          "title": "Actualamount",
+          "type": "number"
+        },
+        "currency": {
+          "pattern": "^[A-Z]{3}$",
+          "title": "Currency",
+          "type": "string"
+        },
+        "estimatedAmount": {
+          "minimum": 0,
+          "title": "Estimatedamount",
+          "type": "number"
+        }
+      },
+      "required": [
+        "currency",
+        "estimatedAmount",
+        "actualAmount"
+      ],
+      "title": "CostSummary",
+      "type": "object"
+    },
     "GenerationJobStatus": {
       "enum": [
         "created",
@@ -20,9 +87,27 @@
     "JobError": {
       "additionalProperties": false,
       "properties": {
+        "category": {
+          "enum": [
+            "validation",
+            "quota",
+            "provider",
+            "timeout",
+            "canceled",
+            "internal",
+            "artifact"
+          ],
+          "title": "Category",
+          "type": "string"
+        },
         "code": {
           "minLength": 1,
           "title": "Code",
+          "type": "string"
+        },
+        "diagnosticSummary": {
+          "minLength": 1,
+          "title": "Diagnosticsummary",
           "type": "string"
         },
         "message": {
@@ -36,22 +121,174 @@
         }
       },
       "required": [
+        "category",
         "code",
         "message",
-        "retryable"
+        "retryable",
+        "diagnosticSummary"
       ],
       "title": "JobError",
+      "type": "object"
+    },
+    "QuotaReservation": {
+      "additionalProperties": false,
+      "properties": {
+        "actualUnits": {
+          "minimum": 0,
+          "title": "Actualunits",
+          "type": "integer"
+        },
+        "reservationId": {
+          "minLength": 1,
+          "title": "Reservationid",
+          "type": "string"
+        },
+        "reservedUnits": {
+          "minimum": 0,
+          "title": "Reservedunits",
+          "type": "integer"
+        },
+        "unit": {
+          "enum": [
+            "credits",
+            "tokens",
+            "seconds"
+          ],
+          "title": "Unit",
+          "type": "string"
+        }
+      },
+      "required": [
+        "reservationId",
+        "reservedUnits",
+        "actualUnits",
+        "unit"
+      ],
+      "title": "QuotaReservation",
       "type": "object"
     }
   },
   "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "succeeded"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "completedAt": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "error": {
+            "type": "null"
+          },
+          "finalArtifact": {
+            "properties": {
+              "status": {
+                "const": "ready"
+              }
+            },
+            "required": [
+              "status"
+            ],
+            "type": "object"
+          },
+          "outputSha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "outputSha256",
+          "finalArtifact",
+          "completedAt"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "failed"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "completedAt": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "error": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "error",
+          "completedAt"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "canceled"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "canceledAt": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "completedAt": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "canceledAt",
+          "completedAt"
+        ]
+      }
+    }
+  ],
   "properties": {
     "attempt": {
       "minimum": 0,
       "title": "Attempt",
       "type": "integer"
     },
-    "completed_at": {
+    "batchId": {
+      "anyOf": [
+        {
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Batchid"
+    },
+    "canceledAt": {
       "anyOf": [
         {
           "format": "date-time",
@@ -62,11 +299,32 @@
         }
       ],
       "default": null,
-      "title": "Completed At"
+      "title": "Canceledat"
     },
-    "created_at": {
+    "classroomDraftId": {
+      "minLength": 1,
+      "title": "Classroomdraftid",
+      "type": "string"
+    },
+    "completedAt": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Completedat"
+    },
+    "costSummary": {
+      "$ref": "#/$defs/CostSummary"
+    },
+    "createdAt": {
       "format": "date-time",
-      "title": "Created At",
+      "title": "Createdat",
       "type": "string"
     },
     "error": {
@@ -80,22 +338,90 @@
       ],
       "default": null
     },
-    "idempotency_key": {
+    "finalArtifact": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ArtifactState"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "heartbeatAt": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Heartbeatat"
+    },
+    "idempotencyKey": {
       "minLength": 1,
-      "title": "Idempotency Key",
+      "title": "Idempotencykey",
       "type": "string"
     },
-    "input_sha256": {
+    "inputSha256": {
       "pattern": "^[0-9a-f]{64}$",
-      "title": "Input Sha256",
+      "title": "Inputsha256",
       "type": "string"
     },
-    "job_id": {
+    "jobId": {
       "minLength": 1,
-      "title": "Job Id",
+      "title": "Jobid",
       "type": "string"
     },
-    "output_sha256": {
+    "leaseExpiresAt": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Leaseexpiresat"
+    },
+    "leaseId": {
+      "anyOf": [
+        {
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Leaseid"
+    },
+    "leaseOwner": {
+      "anyOf": [
+        {
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Leaseowner"
+    },
+    "modelId": {
+      "minLength": 1,
+      "title": "Modelid",
+      "type": "string"
+    },
+    "outputSha256": {
       "anyOf": [
         {
           "pattern": "^[0-9a-f]{64}$",
@@ -106,7 +432,7 @@
         }
       ],
       "default": null,
-      "title": "Output Sha256"
+      "title": "Outputsha256"
     },
     "phase": {
       "enum": [
@@ -117,43 +443,86 @@
       "title": "Phase",
       "type": "string"
     },
-    "progress_percent": {
+    "progressPercent": {
       "maximum": 100,
       "minimum": 0,
-      "title": "Progress Percent",
+      "title": "Progresspercent",
       "type": "integer"
     },
-    "schema_version": {
-      "const": "1.0",
-      "title": "Schema Version",
+    "quotaReservation": {
+      "$ref": "#/$defs/QuotaReservation"
+    },
+    "requestId": {
+      "minLength": 1,
+      "title": "Requestid",
       "type": "string"
+    },
+    "schemaVersion": {
+      "const": "1.0",
+      "title": "Schemaversion",
+      "type": "string"
+    },
+    "startedAt": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Startedat"
     },
     "status": {
       "$ref": "#/$defs/GenerationJobStatus"
     },
-    "tenant_id": {
+    "temporaryArtifact": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ArtifactState"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "tenantId": {
       "minLength": 1,
-      "title": "Tenant Id",
+      "title": "Tenantid",
       "type": "string"
     },
-    "updated_at": {
+    "updatedAt": {
       "format": "date-time",
-      "title": "Updated At",
+      "title": "Updatedat",
+      "type": "string"
+    },
+    "workPool": {
+      "minLength": 1,
+      "title": "Workpool",
       "type": "string"
     }
   },
   "required": [
-    "schema_version",
-    "tenant_id",
-    "job_id",
-    "idempotency_key",
+    "schemaVersion",
+    "tenantId",
+    "jobId",
+    "requestId",
+    "classroomDraftId",
+    "idempotencyKey",
+    "attempt",
+    "progressPercent",
+    "workPool",
+    "quotaReservation",
+    "costSummary",
+    "createdAt",
+    "updatedAt",
     "status",
     "phase",
-    "attempt",
-    "progress_percent",
-    "input_sha256",
-    "created_at",
-    "updated_at"
+    "modelId",
+    "inputSha256"
   ],
   "title": "GenerationJob",
   "type": "object"

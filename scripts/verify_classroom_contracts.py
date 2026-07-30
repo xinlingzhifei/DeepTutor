@@ -59,6 +59,9 @@ def verify_contract_schemas(
 ) -> list[str]:
     expected_schemas = generated_contract_schemas()
     errors: list[str] = []
+    committed_filenames = {path.name for path in schema_directory.glob("*") if path.is_file()}
+    unexpected_filenames = committed_filenames - set(CONTRACT_SCHEMA_FILENAMES)
+    errors.extend(f"{filename}: unexpected" for filename in sorted(unexpected_filenames))
 
     for filename in sorted(CONTRACT_SCHEMA_FILENAMES):
         schema_path = schema_directory / filename
