@@ -430,13 +430,13 @@ def _control_plane_requests(tenant_id: str) -> tuple[tuple[Any, ...], ...]:
             "POST",
             f"/api/v1/tenants/{tenant_id}/members",
             {"user_id": "u-student"},
-            {"X-Tenant-ID": tenant_id},
+            {"Cookie": f"dt_tenant={tenant_id}"},
         ),
         (
             "PUT",
             f"/api/v1/tenants/{tenant_id}/members/u-student/grants",
             {"roles": ["student"]},
-            {"X-Tenant-ID": tenant_id},
+            {"Cookie": f"dt_tenant={tenant_id}"},
         ),
     )
 
@@ -463,7 +463,13 @@ def test_local_platform_disabled_does_not_touch_repository(monkeypatch) -> None:
 
     app.dependency_overrides[get_tenant_repository] = lambda: repository
 
-    response = TestClient(app).get("/context")
+    response = TestClient(app).get(
+        "/context",
+        headers={
+            "X-Tenant-ID": "tenant-b",
+            "Cookie": "dt_tenant=tenant-a",
+        },
+    )
 
     assert response.status_code == 200
     assert response.json() == {
@@ -496,7 +502,7 @@ def test_platform_enabled_without_auth_fails_closed_before_repository(monkeypatc
 
     app.dependency_overrides[auth_router.require_auth] = auth_disabled
     requests = (
-        ("GET", "/context", None, {"X-Tenant-ID": "tenant-a"}),
+        ("GET", "/context", None, {"Cookie": "dt_tenant=tenant-a"}),
         ("GET", "/api/v1/tenants/mine", None, None),
         (
             "PUT",
@@ -558,7 +564,7 @@ def test_authoritative_role_downgrade_removes_admin_and_tenant_bypasses(monkeypa
     with TestClient(app) as client:
         created = client.post("/api/v1/tenants", json={"name": "Calculus"})
         mine = client.get("/api/v1/tenants/mine")
-        selected = client.get("/context", headers={"X-Tenant-ID": "tenant-a"})
+        selected = client.get("/context", headers={"Cookie": "dt_tenant=tenant-a"})
 
     assert created.status_code == 403
     assert mine.status_code == 200
@@ -602,7 +608,7 @@ def test_invalid_authoritative_user_is_rejected_and_status_is_anonymous(
     with TestClient(app) as client:
         context_response = client.get(
             "/context",
-            headers={"X-Tenant-ID": "tenant-a"},
+            headers={"Cookie": "dt_tenant=tenant-a"},
         )
         create_response = client.post(
             "/api/v1/tenants",
@@ -622,33 +628,48 @@ def test_invalid_authoritative_user_is_rejected_and_status_is_anonymous(
     _assert_repository_unused(repository)
 
 
-def test_single_active_membership_is_selected_automatically(monkeypatch) -> None:
+def test_single_active_membership_is_selected_automatically_despite_header(
+    monkeypatch,
+) -> None:
     repository = FakeTenantRepository()
     repository.add_tenant("tenant-a")
+    repository.add_tenant("tenant-b")
     repository.add_member("tenant-a", "u-alice", roles=frozenset({"teacher"}))
     app = _authenticated_app(monkeypatch, repository)
 
-    response = TestClient(app).get("/context")
+    response = TestClient(app).get(
+        "/context",
+        headers={"X-Tenant-ID": "tenant-b"},
+    )
 
     assert response.status_code == 200
     assert response.json()["tenant_id"] == "tenant-a"
     assert "classroom.edit" in response.json()["permissions"]
+    assert repository.access_calls == [("tenant-a", "u-alice", False)]
 
 
-def test_multiple_memberships_require_explicit_switch(monkeypatch) -> None:
+def test_header_only_with_multiple_memberships_requires_controlled_switch(
+    monkeypatch,
+) -> None:
     repository = FakeTenantRepository()
     for tenant_id in ("tenant-a", "tenant-b"):
         repository.add_tenant(tenant_id)
         repository.add_member(tenant_id, "u-alice")
     app = _authenticated_app(monkeypatch, repository)
 
-    response = TestClient(app).get("/context")
+    response = TestClient(app).get(
+        "/context",
+        headers={"X-Tenant-ID": "tenant-a"},
+    )
 
     assert response.status_code == 409
     assert "select" in response.json()["detail"].lower()
+    assert repository.access_calls == []
 
 
-def test_header_tenant_takes_precedence_over_cookie(monkeypatch) -> None:
+def test_conflicting_header_and_cookie_fail_closed_without_access_lookup(
+    monkeypatch,
+) -> None:
     repository = FakeTenantRepository()
     for tenant_id in ("tenant-a", "tenant-b"):
         repository.add_tenant(tenant_id)
@@ -658,13 +679,50 @@ def test_header_tenant_takes_precedence_over_cookie(monkeypatch) -> None:
     response = TestClient(app).get(
         "/context",
         headers={
-            "X-Tenant-ID": "tenant-a",
-            "Cookie": "dt_tenant=tenant-b",
+            "X-Tenant-ID": "tenant-b",
+            "Cookie": "dt_tenant=tenant-a",
+        },
+    )
+
+    assert response.status_code == 400
+    assert repository.access_calls == []
+
+
+def test_matching_header_and_cookie_use_cookie_selection(monkeypatch) -> None:
+    repository = FakeTenantRepository()
+    repository.add_tenant("tenant-a")
+    repository.add_member("tenant-a", "u-alice")
+    app = _authenticated_app(monkeypatch, repository)
+
+    response = TestClient(app).get(
+        "/context",
+        headers={
+            "X-Tenant-ID": " tenant-a ",
+            "Cookie": "dt_tenant=tenant-a",
         },
     )
 
     assert response.status_code == 200
     assert response.json()["tenant_id"] == "tenant-a"
+    assert repository.access_calls == [("tenant-a", "u-alice", False)]
+
+
+def test_empty_tenant_cookie_remains_invalid_when_header_is_present(monkeypatch) -> None:
+    repository = FakeTenantRepository()
+    repository.add_tenant("tenant-a")
+    repository.add_member("tenant-a", "u-alice")
+    app = _authenticated_app(monkeypatch, repository)
+
+    response = TestClient(app).get(
+        "/context",
+        headers={
+            "X-Tenant-ID": "tenant-a",
+            "Cookie": "dt_tenant=",
+        },
+    )
+
+    assert response.status_code == 400
+    assert repository.access_calls == []
 
 
 def test_normal_user_cannot_select_non_member_tenant(monkeypatch) -> None:
@@ -679,6 +737,23 @@ def test_normal_user_cannot_select_non_member_tenant(monkeypatch) -> None:
 
     assert response.status_code == 403
     assert "dt_tenant=" not in response.headers.get("set-cookie", "")
+    assert repository.access_calls == [("tenant-a", "u-alice", False)]
+
+
+def test_inactive_membership_rejects_active_tenant_cookie(monkeypatch) -> None:
+    repository = FakeTenantRepository()
+    repository.add_tenant("tenant-a")
+    repository.add_member("tenant-a", "u-alice")
+    repository.memberships[("tenant-a", "u-alice")] = "inactive"
+    app = _authenticated_app(monkeypatch, repository)
+
+    response = TestClient(app).get(
+        "/context",
+        headers={"Cookie": "dt_tenant=tenant-a"},
+    )
+
+    assert response.status_code == 403
+    assert repository.access_calls == [("tenant-a", "u-alice", False)]
 
 
 def test_non_member_cannot_probe_inactive_tenant_state(monkeypatch) -> None:
@@ -704,7 +779,7 @@ def test_provisioning_tenant_is_not_selectable_or_listed(monkeypatch) -> None:
     with TestClient(app) as client:
         context_response = client.get(
             "/context",
-            headers={"X-Tenant-ID": "tenant-p"},
+            headers={"Cookie": "dt_tenant=tenant-p"},
         )
         mine_response = client.get("/api/v1/tenants/mine")
 
@@ -725,9 +800,14 @@ def test_platform_admin_requires_explicit_active_tenant(monkeypatch) -> None:
 
     with TestClient(app) as client:
         missing = client.get("/context")
-        selected = client.get("/context", headers={"X-Tenant-ID": "tenant-a"})
+        switched = client.put(
+            "/api/v1/tenants/active",
+            json={"tenant_id": "tenant-a"},
+        )
+        selected = client.get("/context")
 
     assert missing.status_code == 409
+    assert switched.status_code == 200
     assert selected.status_code == 200
     assert selected.json()["tenant_id"] == "tenant-a"
     assert "tenant.manage" in selected.json()["permissions"]
@@ -748,7 +828,7 @@ def test_auth_admin_mapping_is_independent_of_unknown_database_roles(
 
     response = TestClient(app).get(
         "/context",
-        headers={"X-Tenant-ID": "tenant-a"},
+        headers={"Cookie": "dt_tenant=tenant-a"},
     )
 
     assert response.status_code == 200
@@ -1064,17 +1144,17 @@ def test_member_and_grant_writes_require_matching_tenant_manage_scope(
     with TestClient(app) as client:
         added = client.post(
             "/api/v1/tenants/tenant-a/members",
-            headers={"X-Tenant-ID": "tenant-a"},
+            headers={"Cookie": "dt_tenant=tenant-a"},
             json={"user_id": "u-student"},
         )
         replaced = client.put(
             "/api/v1/tenants/tenant-a/members/u-student/grants",
-            headers={"X-Tenant-ID": "tenant-a"},
+            headers={"Cookie": "dt_tenant=tenant-a"},
             json={"roles": ["teacher"]},
         )
         wrong_path = client.post(
             "/api/v1/tenants/tenant-b/members",
-            headers={"X-Tenant-ID": "tenant-a"},
+            headers={"Cookie": "dt_tenant=tenant-a"},
             json={"user_id": "u-other"},
         )
 
@@ -1102,7 +1182,7 @@ def test_member_write_without_exact_permission_is_denied(monkeypatch) -> None:
 
     response = TestClient(app).post(
         "/api/v1/tenants/tenant-a/members",
-        headers={"X-Tenant-ID": "tenant-a"},
+        headers={"Cookie": "dt_tenant=tenant-a"},
         json={"user_id": "u-student"},
     )
 
@@ -1575,6 +1655,43 @@ def test_auth_status_returns_only_tenant_summaries_and_valid_active_id(
     assert repository.list_admin_flags == [False]
 
 
+def test_auth_status_omits_inactive_membership_and_active_cookie(
+    monkeypatch,
+) -> None:
+    repository = FakeTenantRepository()
+    repository.add_tenant("tenant-a", name="Tenant A")
+    repository.add_member("tenant-a", "u-alice")
+    repository.memberships[("tenant-a", "u-alice")] = "inactive"
+    app = _authenticated_app(monkeypatch, repository)
+    monkeypatch.setattr(
+        auth_router,
+        "decode_token",
+        lambda _token: TokenPayload(
+            username="u-alice",
+            role="user",
+            user_id="u-alice",
+        ),
+    )
+    monkeypatch.setattr(
+        tenant_repositories,
+        "get_tenant_repository",
+        lambda: repository,
+    )
+
+    response = TestClient(app).get(
+        "/api/v1/auth/status",
+        headers={
+            "Authorization": "Bearer valid",
+            "Cookie": "dt_tenant=tenant-a",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["active_tenant_id"] is None
+    assert response.json()["tenants"] == []
+    assert repository.list_admin_flags == [False]
+
+
 def test_validate_pb_token_cache_is_scoped_to_normalized_provider_url(
     monkeypatch,
 ) -> None:
@@ -1677,7 +1794,7 @@ def test_pocketbase_auth_refresh_chain_preserves_identity_and_tenant_membership(
             "/context",
             headers={
                 "Authorization": "Bearer pb-token",
-                "X-Tenant-ID": "tenant-a",
+                "Cookie": "dt_tenant=tenant-a",
             },
         )
 
@@ -1724,7 +1841,7 @@ def test_pocketbase_auth_refresh_chain_rejects_invalid_identity(
             "/context",
             headers={
                 "Authorization": "Bearer invalid-pb-token",
-                "X-Tenant-ID": "tenant-a",
+                "Cookie": "dt_tenant=tenant-a",
             },
         )
 

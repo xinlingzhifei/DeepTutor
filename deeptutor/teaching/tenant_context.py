@@ -60,14 +60,19 @@ def _requested_tenant(
     header_value: str | None,
     cookie_value: str | None,
 ) -> str | None:
-    raw_value = header_value if header_value is not None else cookie_value
-    if raw_value is None:
+    normalized_header = header_value.strip() if header_value is not None else None
+    if cookie_value is None:
         return None
-    tenant_id = raw_value.strip()
+    tenant_id = cookie_value.strip()
     if not tenant_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Tenant selection cannot be empty",
+        )
+    if normalized_header and normalized_header != tenant_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Conflicting tenant selection",
         )
     return tenant_id
 

@@ -460,7 +460,7 @@ def _exercise_permission_scope(harness: IsolationHarness) -> BoundaryObservation
             f"/api/v1/tenants/{TENANT_B}/members/{MEMBER_B_SENTINEL}/grants",
             headers={
                 "Authorization": f"Bearer {missing_user_token}",
-                "X-Tenant-ID": TENANT_A,
+                "Cookie": f"dt_tenant={TENANT_A}",
             },
             json={"roles": ["teacher"]},
         )
@@ -476,7 +476,7 @@ def _exercise_permission_scope(harness: IsolationHarness) -> BoundaryObservation
             f"/api/v1/tenants/{TENANT_B}/members/{MEMBER_B_SENTINEL}/grants",
             headers={
                 "Authorization": f"Bearer {auth_token}",
-                "X-Tenant-ID": TENANT_A,
+                "Cookie": f"dt_tenant={TENANT_A}",
             },
             json={"roles": ["teacher"]},
         )
