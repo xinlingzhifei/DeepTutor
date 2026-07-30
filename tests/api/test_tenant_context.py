@@ -21,6 +21,7 @@ from deeptutor.teaching import tenant_context as tenant_context_module
 from deeptutor.teaching.permissions import ScopedPermission
 from deeptutor.teaching.repositories import tenants as tenant_repositories
 from deeptutor.teaching.repositories.tenants import (
+    GrantResourceNotFoundError,
     ProvisioningSummary,
     TenantAccess,
     TenantAccessDeniedError,
@@ -62,6 +63,7 @@ class FakeTenantRepository:
         self.tenants: dict[str, TenantSummary] = {}
         self.memberships: dict[tuple[str, str], str] = {}
         self.roles: dict[tuple[str, str], frozenset[str]] = {}
+        self.scoped_access_grants: dict[tuple[str, str], tuple[Any, ...]] = {}
         self.provisioning: dict[str, ProvisioningSummary] = {}
         self.created_provisioning = 0
         self.create_calls = 0
@@ -71,6 +73,8 @@ class FakeTenantRepository:
         self.access_calls: list[tuple[str, str, bool]] = []
         self.member_calls: list[tuple[str, str, frozenset[str]]] = []
         self.grant_calls: list[tuple[str, str, frozenset[str]]] = []
+        self.scoped_grant_calls: list[tuple[str, str, frozenset[tuple[str, str, str]]]] = []
+        self.scoped_grant_error: Exception | None = None
         self.activation_calls: list[tuple[str, str, int]] = []
         self.failure_calls: list[tuple[str, str, int]] = []
         self.policy_calls: list[tuple[str, str, int]] = []
@@ -159,10 +163,19 @@ class FakeTenantRepository:
             raise TenantAccessDeniedError(tenant_id)
         if summary.status != "active":
             raise TenantNotActiveError(tenant_id)
+        roles = self.roles.get((tenant_id, user_id), frozenset())
+        grants = self.scoped_access_grants.get((tenant_id, user_id))
+        if grants is not None:
+            return SimpleNamespace(
+                summary=summary,
+                schema_name=tenant_schema_name(tenant_id),
+                roles=roles,
+                grants=grants,
+            )
         return TenantAccess(
             summary=summary,
             schema_name=tenant_schema_name(tenant_id),
-            roles=self.roles.get((tenant_id, user_id), frozenset()),
+            roles=roles,
         )
 
     async def create_provisioning(
@@ -298,6 +311,20 @@ class FakeTenantRepository:
         self.grant_calls.append((tenant_id, user_id, roles))
         self.roles[(tenant_id, user_id)] = roles
 
+    async def replace_scoped_grants(
+        self,
+        tenant_id: str,
+        user_id: str,
+        grants: frozenset[Any],
+    ) -> None:
+        if self.scoped_grant_error is not None:
+            raise self.scoped_grant_error
+        normalized = frozenset((grant.role, grant.scope_type, grant.scope_id) for grant in grants)
+        self.scoped_grant_calls.append((tenant_id, user_id, normalized))
+        self.roles[(tenant_id, user_id)] = frozenset(
+            role for role, _scope_type, _scope_id in normalized
+        )
+
 
 def _set_platform_enabled(monkeypatch: Any, enabled: bool) -> None:
     settings = SimpleNamespace(enabled=enabled)
@@ -341,6 +368,14 @@ def _authenticated_app(
             "tenant_id": context.tenant_id,
             "schema_name": context.schema_name,
             "permissions": sorted(item.permission for item in context.permissions),
+            "permission_scopes": sorted(
+                (
+                    item.permission,
+                    item.scope_type,
+                    item.scope_id,
+                )
+                for item in context.permissions
+            ),
         }
 
     app.dependency_overrides[auth_router.require_auth] = fake_auth
@@ -646,6 +681,35 @@ def test_single_active_membership_is_selected_automatically_despite_header(
     assert response.json()["tenant_id"] == "tenant-a"
     assert "classroom.edit" in response.json()["permissions"]
     assert repository.access_calls == [("tenant-a", "u-alice", False)]
+
+
+def test_context_expands_persisted_grants_at_their_real_resource_scope(
+    monkeypatch,
+) -> None:
+    repository = FakeTenantRepository()
+    repository.add_tenant("tenant-a")
+    repository.add_member("tenant-a", "u-teacher", roles=frozenset({"teacher"}))
+    repository.scoped_access_grants[("tenant-a", "u-teacher")] = (
+        SimpleNamespace(role="teacher", scope_type="class", scope_id="class-a"),
+    )
+    app = _authenticated_app(
+        monkeypatch,
+        repository,
+        user_id="u-teacher",
+    )
+
+    response = TestClient(app).get(
+        "/context",
+        headers={"Cookie": "dt_tenant=tenant-a"},
+    )
+
+    assert response.status_code == 200
+    edit_scopes = {
+        tuple(scope)
+        for scope in response.json()["permission_scopes"]
+        if scope[0] == "classroom.edit"
+    }
+    assert edit_scopes == {("classroom.edit", "class", "class-a")}
 
 
 def test_header_only_with_multiple_memberships_requires_controlled_switch(
@@ -1133,7 +1197,7 @@ def test_member_and_grant_writes_require_matching_tenant_manage_scope(
     repository.add_member(
         "tenant-a",
         "u-manager",
-        roles=frozenset({"platform_admin"}),
+        roles=frozenset({"org_admin"}),
     )
     app = _authenticated_app(
         monkeypatch,
@@ -1152,6 +1216,49 @@ def test_member_and_grant_writes_require_matching_tenant_manage_scope(
             headers={"Cookie": "dt_tenant=tenant-a"},
             json={"roles": ["teacher"]},
         )
+        scoped = client.put(
+            "/api/v1/tenants/tenant-a/members/u-student/grants",
+            headers={"Cookie": "dt_tenant=tenant-a"},
+            json={
+                "grants": [
+                    {
+                        "role": "teacher",
+                        "scope_type": "class",
+                        "scope_id": "class-a",
+                    }
+                ]
+            },
+        )
+        ambiguous = client.put(
+            "/api/v1/tenants/tenant-a/members/u-student/grants",
+            headers={"Cookie": "dt_tenant=tenant-a"},
+            json={
+                "roles": ["teacher"],
+                "grants": [
+                    {
+                        "role": "teacher",
+                        "scope_type": "class",
+                        "scope_id": "class-a",
+                    }
+                ],
+            },
+        )
+        repository.scoped_grant_error = GrantResourceNotFoundError(
+            "resource is outside the path tenant"
+        )
+        missing_resource = client.put(
+            "/api/v1/tenants/tenant-a/members/u-student/grants",
+            headers={"Cookie": "dt_tenant=tenant-a"},
+            json={
+                "grants": [
+                    {
+                        "role": "teacher",
+                        "scope_type": "course",
+                        "scope_id": "shared-course-id",
+                    }
+                ]
+            },
+        )
         wrong_path = client.post(
             "/api/v1/tenants/tenant-b/members",
             headers={"Cookie": "dt_tenant=tenant-a"},
@@ -1162,6 +1269,23 @@ def test_member_and_grant_writes_require_matching_tenant_manage_scope(
     assert repository.member_calls == [("tenant-a", "u-student", frozenset({"student"}))]
     assert replaced.status_code == 200
     assert repository.grant_calls == [("tenant-a", "u-student", frozenset({"teacher"}))]
+    assert scoped.status_code == 200
+    assert scoped.json()["grants"] == [
+        {
+            "role": "teacher",
+            "scope_type": "class",
+            "scope_id": "class-a",
+        }
+    ]
+    assert repository.scoped_grant_calls == [
+        (
+            "tenant-a",
+            "u-student",
+            frozenset({("teacher", "class", "class-a")}),
+        )
+    ]
+    assert ambiguous.status_code == 422
+    assert missing_resource.status_code == 404
     assert wrong_path.status_code == 403
     assert all(call[0] == "tenant-a" for call in repository.member_calls)
 
@@ -1216,6 +1340,18 @@ def test_repository_selection_statements_pin_tenant_user_and_status_filters() ->
         assert "tenant_memberships.status = 'active'" in sql
         assert "tenant_memberships.user_id = 'u-alice'" in sql
     assert "tenants.id = 'tenant-a'" in access_sql
+
+    from deeptutor.teaching.repositories.tenants import (
+        build_role_grants_statement,
+    )
+
+    grants_sql = _compiled_sql(build_role_grants_statement("tenant-a", "u-alice"))
+    for fragment in (
+        "role_grants.tenant_id = 'tenant-a'",
+        "role_grants.user_id = 'u-alice'",
+        "tenant_memberships.status = 'active'",
+    ):
+        assert fragment in grants_sql
 
 
 def _compiled_sql(statement: Any) -> str:
@@ -1324,6 +1460,14 @@ class _Result:
     def one_or_none(self) -> Any:
         return self.value
 
+    def scalars(self) -> _Result:
+        return self
+
+    def all(self) -> list[Any]:
+        if self.value is None:
+            return []
+        return list(self.value)
+
 
 class _RecordingSession:
     def __init__(
@@ -1372,6 +1516,118 @@ def _install_recording_session(monkeypatch: Any, session: _RecordingSession) -> 
         "platform_session",
         recording_platform_session,
     )
+
+
+def _install_recording_tenant_session(
+    monkeypatch: Any,
+    session: _RecordingSession,
+    tenant_calls: list[str],
+) -> None:
+    @asynccontextmanager
+    async def recording_tenant_session(tenant_id: str) -> Any:
+        tenant_calls.append(tenant_id)
+        yield session
+
+    monkeypatch.setattr(
+        tenant_repositories,
+        "tenant_session",
+        recording_tenant_session,
+    )
+
+
+def test_scoped_grant_replacement_validates_resources_before_atomic_replace(
+    monkeypatch,
+) -> None:
+    from deeptutor.teaching.permissions import RoleGrant
+
+    session = _RecordingSession(
+        execute_results=(
+            _Result(("course-a",)),
+            _Result((("class-a", "course-a"),)),
+            _Result(),
+            _Result(),
+        ),
+        scalar_results=("u-teacher",),
+    )
+    tenant_calls: list[str] = []
+    _install_recording_tenant_session(monkeypatch, session, tenant_calls)
+    grants = frozenset(
+        {
+            RoleGrant("teacher", "course", "course-a"),
+            RoleGrant("teacher", "class", "class-a"),
+        }
+    )
+
+    asyncio.run(
+        tenant_repositories.TenantRepository().replace_scoped_grants(
+            "tenant-a",
+            "u-teacher",
+            grants,
+        )
+    )
+
+    assert tenant_calls == ["tenant-a"]
+    assert _trace_names(session)[-2:] == ("flush", "commit")
+    course_sql = _compiled_sql(session.trace[2][1])
+    class_sql = _compiled_sql(session.trace[3][1])
+    delete_sql = _compiled_sql(session.trace[4][1])
+    assert "courses.id in ('course-a')" in course_sql
+    assert "courses.status = 'active'" in course_sql
+    for fragment in (
+        "classes.id in ('class-a')",
+        "classes.course_id",
+        "join tenant.courses",
+        "classes.status = 'active'",
+        "courses.status = 'active'",
+    ):
+        assert fragment in class_sql
+    assert "delete from platform.role_grants" in delete_sql
+
+
+def test_missing_scoped_resource_rolls_back_before_deleting_existing_grants(
+    monkeypatch,
+) -> None:
+    from deeptutor.teaching.permissions import RoleGrant
+    from deeptutor.teaching.repositories.tenants import (
+        GrantResourceNotFoundError,
+    )
+
+    session = _RecordingSession(
+        execute_results=(_Result(()),),
+        scalar_results=("u-teacher",),
+    )
+    tenant_calls: list[str] = []
+    _install_recording_tenant_session(monkeypatch, session, tenant_calls)
+    operation = tenant_repositories.TenantRepository().replace_scoped_grants(
+        "tenant-a",
+        "u-teacher",
+        frozenset({RoleGrant("teacher", "course", "shared-course-id")}),
+    )
+
+    with pytest.raises(GrantResourceNotFoundError):
+        asyncio.run(operation)
+
+    assert tenant_calls == ["tenant-a"]
+    assert _trace_names(session)[-1] == "rollback"
+    executed_sql = [
+        _compiled_sql(statement) for name, statement in session.trace if name == "execute"
+    ]
+    assert len(executed_sql) == 1
+    assert all("delete from platform.role_grants" not in sql for sql in executed_sql)
+
+
+def test_tenant_scope_mismatch_is_rejected_before_opening_a_transaction() -> None:
+    from deeptutor.teaching.permissions import RoleGrant
+    from deeptutor.teaching.repositories.tenants import InvalidGrantScopeError
+
+    with pytest.raises(InvalidGrantScopeError):
+        asyncio.run(
+            tenant_repositories.TenantRepository().replace_scoped_grants(
+                "tenant-a",
+                "u-teacher",
+                frozenset({RoleGrant("teacher", "tenant", "tenant-b")}),
+            )
+        )
 
 
 def _trace_names(session: _RecordingSession) -> tuple[str, ...]:

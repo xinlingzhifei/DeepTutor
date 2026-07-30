@@ -10,7 +10,7 @@ from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.sql import Select
 
-from deeptutor.teaching.database import platform_session
+from deeptutor.teaching.database import platform_session, tenant_session
 from deeptutor.teaching.models.platform import (
     AuditLog,
     DataPlaneRoute,
@@ -22,7 +22,12 @@ from deeptutor.teaching.models.platform import (
 from deeptutor.teaching.models.platform import (
     RoleGrant as RoleGrantModel,
 )
-from deeptutor.teaching.permissions import DEFAULT_ROLE_PERMISSIONS
+from deeptutor.teaching.models.tenant import Course, TeachingClass
+from deeptutor.teaching.permissions import (
+    DEFAULT_ROLE_PERMISSIONS,
+    KNOWN_SCOPE_TYPES,
+    RoleGrant,
+)
 from deeptutor.teaching.schema_names import tenant_schema_name
 
 _POLICY_VERIFIED_ACTION = "tenant.provisioning.policy_verified"
@@ -57,6 +62,14 @@ class UnknownRoleError(TenantRepositoryError):
     """At least one requested role is not a fixed role template."""
 
 
+class InvalidGrantScopeError(TenantRepositoryError):
+    """A requested grant has an invalid or cross-tenant scope."""
+
+
+class GrantResourceNotFoundError(TenantRepositoryError):
+    """A requested course or class is not active in the path tenant."""
+
+
 @dataclass(frozen=True, slots=True)
 class TenantSummary:
     tenant_id: str
@@ -68,7 +81,29 @@ class TenantSummary:
 class TenantAccess:
     summary: TenantSummary
     schema_name: str
-    roles: frozenset[str]
+    roles: frozenset[str] = frozenset()
+    grants: frozenset[RoleGrant] = frozenset()
+
+    def __post_init__(self) -> None:
+        if self.grants:
+            object.__setattr__(
+                self,
+                "roles",
+                frozenset(grant.role for grant in self.grants),
+            )
+        elif self.roles:
+            object.__setattr__(
+                self,
+                "grants",
+                frozenset(
+                    RoleGrant(
+                        role=role,
+                        scope_type="tenant",
+                        scope_id=self.summary.tenant_id,
+                    )
+                    for role in self.roles
+                ),
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +186,34 @@ def _validate_roles(roles: frozenset[str]) -> None:
         raise UnknownRoleError("unknown role")
 
 
+def _tenant_role_grants(
+    tenant_id: str,
+    roles: frozenset[str],
+) -> frozenset[RoleGrant]:
+    return frozenset(
+        RoleGrant(
+            role=role,
+            scope_type="tenant",
+            scope_id=tenant_id,
+        )
+        for role in roles
+    )
+
+
+def _validate_scoped_grants(
+    tenant_id: str,
+    grants: frozenset[RoleGrant],
+) -> None:
+    if not grants:
+        raise InvalidGrantScopeError("at least one grant is required")
+    _validate_roles(frozenset(grant.role for grant in grants))
+    for grant in grants:
+        if grant.scope_type not in KNOWN_SCOPE_TYPES or not grant.scope_id:
+            raise InvalidGrantScopeError("invalid grant scope")
+        if grant.scope_type == "tenant" and grant.scope_id != tenant_id:
+            raise InvalidGrantScopeError("tenant grant scope does not match path tenant")
+
+
 def _advisory_lock_key(value: str) -> int:
     digest = hashlib.sha256(value.encode("utf-8")).digest()[:8]
     return int.from_bytes(digest, byteorder="big", signed=True)
@@ -195,20 +258,101 @@ def build_role_delete_statement(tenant_id: str, user_id: str) -> Any:
     )
 
 
-def build_role_insert_statement(
+def build_scoped_role_insert_statement(
     tenant_id: str,
     user_id: str,
-    roles: frozenset[str],
+    grants: frozenset[RoleGrant],
 ) -> Any:
     return insert(RoleGrantModel).values(
         [
             {
                 "tenant_id": tenant_id,
                 "user_id": user_id,
-                "role": role,
+                "role": grant.role,
+                "scope_type": grant.scope_type,
+                "scope_id": grant.scope_id,
             }
-            for role in sorted(roles)
+            for grant in sorted(
+                grants,
+                key=lambda item: (item.role, item.scope_type, item.scope_id),
+            )
         ]
+    )
+
+
+def build_role_insert_statement(
+    tenant_id: str,
+    user_id: str,
+    roles: frozenset[str],
+) -> Any:
+    return build_scoped_role_insert_statement(
+        tenant_id,
+        user_id,
+        _tenant_role_grants(tenant_id, roles),
+    )
+
+
+def build_active_membership_lock_statement(
+    tenant_id: str,
+    user_id: str,
+) -> Select[Any]:
+    return (
+        select(TenantMembership.user_id)
+        .join(Tenant, Tenant.id == TenantMembership.tenant_id)
+        .where(
+            Tenant.id == tenant_id,
+            Tenant.status == "active",
+            TenantMembership.tenant_id == tenant_id,
+            TenantMembership.user_id == user_id,
+            TenantMembership.status == "active",
+        )
+        .with_for_update()
+    )
+
+
+def build_role_grants_statement(
+    tenant_id: str,
+    user_id: str,
+) -> Select[Any]:
+    return (
+        select(
+            RoleGrantModel.role,
+            RoleGrantModel.scope_type,
+            RoleGrantModel.scope_id,
+        )
+        .join(
+            TenantMembership,
+            (TenantMembership.tenant_id == RoleGrantModel.tenant_id)
+            & (TenantMembership.user_id == RoleGrantModel.user_id),
+        )
+        .where(
+            RoleGrantModel.tenant_id == tenant_id,
+            RoleGrantModel.user_id == user_id,
+            TenantMembership.status == "active",
+        )
+    )
+
+
+def build_course_scope_validation_statement(
+    course_ids: frozenset[str],
+) -> Select[Any]:
+    return select(Course.id).where(
+        Course.id.in_(sorted(course_ids)),
+        Course.status == "active",
+    )
+
+
+def build_class_scope_validation_statement(
+    class_ids: frozenset[str],
+) -> Select[Any]:
+    return (
+        select(TeachingClass.id, TeachingClass.course_id)
+        .join(Course, Course.id == TeachingClass.course_id)
+        .where(
+            TeachingClass.id.in_(sorted(class_ids)),
+            TeachingClass.status == "active",
+            Course.status == "active",
+        )
     )
 
 
@@ -388,22 +532,21 @@ class TenantRepository:
                     raise TenantNotFoundError(tenant_id)
                 raise TenantAccessDeniedError(tenant_id)
 
-            role_statement = select(RoleGrantModel.role).where(
-                RoleGrantModel.tenant_id == tenant_id,
-                RoleGrantModel.user_id == user_id,
+            role_statement = build_role_grants_statement(tenant_id, user_id)
+            role_rows = (await session.execute(role_statement)).all()
+            grants = frozenset(
+                RoleGrant(
+                    role=str(role),
+                    scope_type=str(scope_type),
+                    scope_id=str(scope_id),
+                )
+                for role, scope_type, scope_id in role_rows
             )
-            if not is_platform_admin:
-                role_statement = role_statement.join(
-                    TenantMembership,
-                    (TenantMembership.tenant_id == RoleGrantModel.tenant_id)
-                    & (TenantMembership.user_id == RoleGrantModel.user_id),
-                ).where(TenantMembership.status == "active")
-            roles = frozenset((await session.scalars(role_statement)).all())
             schema_name = str(row["schema_name"] or tenant_schema_name(tenant_id))
             return TenantAccess(
                 summary=_summary_from_row(row),
                 schema_name=schema_name,
-                roles=roles,
+                grants=grants,
             )
 
     async def create_provisioning(
@@ -650,7 +793,12 @@ class TenantRepository:
                 if active_tenant is None:
                     raise TenantNotFoundError(tenant_id)
                 await session.execute(build_membership_upsert_statement(tenant_id, user_id))
-                await self._replace_roles(session, tenant_id, user_id, roles)
+                await self._replace_scoped_roles(
+                    session,
+                    tenant_id,
+                    user_id,
+                    _tenant_role_grants(tenant_id, roles),
+                )
 
     async def replace_grants(
         self,
@@ -661,33 +809,70 @@ class TenantRepository:
         """Replace one active member's role set inside one transaction."""
 
         _validate_roles(roles)
-        async with platform_session() as session:
+        await self.replace_scoped_grants(
+            tenant_id,
+            user_id,
+            _tenant_role_grants(tenant_id, roles),
+        )
+
+    async def replace_scoped_grants(
+        self,
+        tenant_id: str,
+        user_id: str,
+        grants: frozenset[RoleGrant],
+    ) -> None:
+        """Validate and atomically replace one active member's scoped grants."""
+
+        _validate_scoped_grants(tenant_id, grants)
+        async with tenant_session(tenant_id) as session:
             async with session.begin():
                 membership = await session.scalar(
-                    select(TenantMembership.user_id)
-                    .join(Tenant, Tenant.id == TenantMembership.tenant_id)
-                    .where(
-                        Tenant.id == tenant_id,
-                        Tenant.status == "active",
-                        TenantMembership.tenant_id == tenant_id,
-                        TenantMembership.user_id == user_id,
-                        TenantMembership.status == "active",
-                    )
-                    .with_for_update()
+                    build_active_membership_lock_statement(tenant_id, user_id)
                 )
                 if membership is None:
                     raise TenantAccessDeniedError(tenant_id)
-                await self._replace_roles(session, tenant_id, user_id, roles)
+                await self._validate_grant_resources(session, grants)
+                await self._replace_scoped_roles(
+                    session,
+                    tenant_id,
+                    user_id,
+                    grants,
+                )
 
     @staticmethod
-    async def _replace_roles(
+    async def _validate_grant_resources(
+        session: Any,
+        grants: frozenset[RoleGrant],
+    ) -> None:
+        course_ids = frozenset(grant.scope_id for grant in grants if grant.scope_type == "course")
+        if course_ids:
+            result = await session.execute(build_course_scope_validation_statement(course_ids))
+            found_courses = frozenset(str(value) for value in result.scalars().all())
+            if found_courses != course_ids:
+                raise GrantResourceNotFoundError("course is not active in tenant")
+
+        class_ids = frozenset(grant.scope_id for grant in grants if grant.scope_type == "class")
+        if class_ids:
+            result = await session.execute(build_class_scope_validation_statement(class_ids))
+            found_classes = frozenset(str(row[0]) for row in result.all())
+            if found_classes != class_ids:
+                raise GrantResourceNotFoundError("class is not active in tenant")
+
+    @staticmethod
+    async def _replace_scoped_roles(
         session: Any,
         tenant_id: str,
         user_id: str,
-        roles: frozenset[str],
+        grants: frozenset[RoleGrant],
     ) -> None:
         await session.execute(build_role_delete_statement(tenant_id, user_id))
-        await session.execute(build_role_insert_statement(tenant_id, user_id, roles))
+        await session.execute(
+            build_scoped_role_insert_statement(
+                tenant_id,
+                user_id,
+                grants,
+            )
+        )
         await session.flush()
 
 

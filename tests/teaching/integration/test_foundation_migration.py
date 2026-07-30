@@ -19,7 +19,8 @@ from deeptutor.teaching.models import PlatformBase, TenantBase
 from deeptutor.teaching.schema_names import tenant_schema_name
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-HEAD_REVISION = "20260728_0001"
+FOUNDATION_REVISION = "20260728_0001"
+HEAD_REVISION = "20260730_0002"
 
 
 @dataclass(frozen=True)
@@ -767,6 +768,179 @@ def test_foundation_migration_is_isolated_and_repeatable(migration_database):
     )
     assert tables_by_schema["platform"] == {"alembic_version"}
     assert versions["platform"] == []
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(migration_database, "scope=platform"),
+    )
+
+
+def test_scoped_role_grant_migration_backfills_and_refuses_lossy_downgrade(
+    migration_database,
+) -> None:
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(
+            migration_database,
+            "scope=platform",
+            action="downgrade",
+            revision="base",
+        ),
+    )
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(
+            migration_database,
+            "scope=platform",
+            revision=FOUNDATION_REVISION,
+        ),
+    )
+
+    async def seed_legacy_grant() -> None:
+        engine = create_async_engine(migration_database.url)
+        try:
+            async with engine.begin() as connection:
+                for statement in (
+                    """
+                        INSERT INTO platform.tenants (id, name, status)
+                        VALUES ('migration-tenant', 'Migration Tenant', 'active')
+                    """,
+                    """
+                        INSERT INTO platform.tenant_memberships
+                            (tenant_id, user_id, status)
+                        VALUES ('migration-tenant', 'migration-user', 'active')
+                    """,
+                    """
+                        INSERT INTO platform.role_grants (tenant_id, user_id, role)
+                        VALUES ('migration-tenant', 'migration-user', 'teacher')
+                    """,
+                ):
+                    await connection.execute(text(statement))
+        finally:
+            await engine.dispose()
+
+    asyncio.run(seed_legacy_grant())
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(migration_database, "scope=platform"),
+    )
+
+    async def inspect_grant_schema() -> tuple:
+        engine = create_async_engine(migration_database.url)
+        try:
+            async with engine.connect() as connection:
+                grant = (
+                    await connection.execute(
+                        text(
+                            """
+                            SELECT scope_type, scope_id
+                            FROM platform.role_grants
+                            WHERE tenant_id = 'migration-tenant'
+                            """
+                        )
+                    )
+                ).one()
+                columns = dict(
+                    (
+                        await connection.execute(
+                            text(
+                                """
+                                SELECT column_name, is_nullable
+                                FROM information_schema.columns
+                                WHERE table_schema = 'platform'
+                                  AND table_name = 'role_grants'
+                                  AND column_name IN ('scope_type', 'scope_id')
+                                """
+                            )
+                        )
+                    ).all()
+                )
+                constraints = dict(
+                    (
+                        await connection.execute(
+                            text(
+                                """
+                                SELECT constraint_name, check_clause
+                                FROM information_schema.check_constraints
+                                WHERE constraint_schema = 'platform'
+                                  AND constraint_name = 'ck_role_grants_scope_type'
+                                UNION ALL
+                                SELECT tc.constraint_name,
+                                       string_agg(kcu.column_name, ',' ORDER BY kcu.ordinal_position)
+                                FROM information_schema.table_constraints tc
+                                JOIN information_schema.key_column_usage kcu
+                                  ON kcu.constraint_schema = tc.constraint_schema
+                                 AND kcu.constraint_name = tc.constraint_name
+                                WHERE tc.table_schema = 'platform'
+                                  AND tc.table_name = 'role_grants'
+                                  AND tc.constraint_type = 'PRIMARY KEY'
+                                GROUP BY tc.constraint_name
+                                """
+                            )
+                        )
+                    ).all()
+                )
+                index_definition = await connection.scalar(
+                    text(
+                        """
+                        SELECT indexdef
+                        FROM pg_indexes
+                        WHERE schemaname = 'platform'
+                          AND indexname = 'ix_role_grants_tenant_user_scope'
+                        """
+                    )
+                )
+                version = await connection.scalar(
+                    text("SELECT version_num FROM platform.alembic_version")
+                )
+                return grant, columns, constraints, index_definition, version
+        finally:
+            await engine.dispose()
+
+    grant, columns, constraints, index_definition, version = asyncio.run(inspect_grant_schema())
+    assert tuple(grant) == ("tenant", "migration-tenant")
+    assert columns == {"scope_id": "NO", "scope_type": "NO"}
+    assert constraints["pk_role_grants"] == ("tenant_id,user_id,role,scope_type,scope_id")
+    assert all(
+        scope in constraints["ck_role_grants_scope_type"]
+        for scope in (
+            "tenant",
+            "course",
+            "class",
+        )
+    )
+    assert index_definition is not None
+    assert "(tenant_id, user_id, scope_type, scope_id)" in index_definition
+    assert version == HEAD_REVISION
+
+    async def set_scope(scope_type: str, scope_id: str) -> None:
+        engine = create_async_engine(migration_database.url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        """
+                        UPDATE platform.role_grants
+                        SET scope_type = :scope_type, scope_id = :scope_id
+                        WHERE tenant_id = 'migration-tenant'
+                        """
+                    ),
+                    {"scope_type": scope_type, "scope_id": scope_id},
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(set_scope("course", "course-a"))
+    refused = _run_alembic(
+        migration_database,
+        "scope=platform",
+        action="downgrade",
+        revision=FOUNDATION_REVISION,
+    )
+    assert refused.returncode != 0, _assert_secret_safe_output(
+        migration_database,
+        refused,
+    )
+    asyncio.run(set_scope("tenant", "migration-tenant"))
     _assert_migration_succeeded(
         migration_database,
         _run_alembic(migration_database, "scope=platform"),

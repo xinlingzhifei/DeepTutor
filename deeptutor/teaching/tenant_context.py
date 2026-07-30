@@ -16,6 +16,7 @@ from deeptutor.services.config import load_platform_settings
 from deeptutor.teaching.permissions import (
     KNOWN_PERMISSIONS,
     ScopedPermission,
+    permissions_for_grants,
     permissions_for_roles,
 )
 from deeptutor.teaching.repositories.tenants import (
@@ -45,6 +46,7 @@ def _local_tenant_context(user_id: str) -> TenantContext:
             permission=permission,
             scope_type="tenant",
             scope_id=LOCAL_TENANT_ID,
+            tenant_id=LOCAL_TENANT_ID,
         )
         for permission in KNOWN_PERMISSIONS
     )
@@ -147,10 +149,9 @@ async def require_tenant(
         _raise_http_for_repository_error(exc)
         raise AssertionError("unreachable") from exc
 
-    permissions = permissions_for_roles(
-        access.roles,
-        scope_type="tenant",
-        scope_id=access.summary.tenant_id,
+    permissions = permissions_for_grants(
+        access.grants,
+        tenant_id=access.summary.tenant_id,
     )
     if is_platform_admin:
         permissions |= permissions_for_roles(

@@ -6,6 +6,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     BigInteger,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     ForeignKeyConstraint,
@@ -81,6 +82,8 @@ class RoleGrant(PlatformBase):
     tenant_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     role: Mapped[str] = mapped_column(String(64), primary_key=True)
+    scope_type: Mapped[str] = mapped_column(String(16), primary_key=True)
+    scope_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     granted_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
@@ -95,7 +98,18 @@ class RoleGrant(PlatformBase):
             ],
             ondelete="CASCADE",
         ),
+        CheckConstraint(
+            "scope_type IN ('tenant', 'course', 'class')",
+            name="scope_type",
+        ),
         Index("ix_role_grants_user_id", "user_id"),
+        Index(
+            "ix_role_grants_tenant_user_scope",
+            "tenant_id",
+            "user_id",
+            "scope_type",
+            "scope_id",
+        ),
     )
 
 
