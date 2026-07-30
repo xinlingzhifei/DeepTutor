@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from enum import Enum
 import hashlib
 import json
@@ -120,6 +121,7 @@ class SourceReference(_ContractModel):
 
 class PermissionSummary(_ContractModel):
     allowed_source_ids: list[NonEmptyString]
+    allowed_fragment_ids: list[NonEmptyString]
     usage_scope: NonEmptyString
     attribution_required: bool
 
@@ -177,8 +179,9 @@ class SafetyPolicy(_ContractModel):
 def _teaching_brief_schema_extra(schema: dict[str, object]) -> None:
     schema["$comment"] = (
         "Draft 2020-12 enforces non-empty source structures for source_grounded. "
-        "Cross-array sourceId membership in permissionSummary.allowedSourceIds "
-        "requires semantic validation."
+        "SourceFragment fragmentId, SourceCitation citationId, and SourceReference "
+        "triple uniqueness plus cross-array lineage require semantic validation "
+        "against permissionSummary allowlists."
     )
     schema["allOf"] = [
         {
@@ -194,7 +197,14 @@ def _teaching_brief_schema_extra(schema: dict[str, object]) -> None:
                     "sourceRefs": {"minItems": 1},
                     "permissionSummary": {
                         "properties": {
-                            "allowedSourceIds": {"minItems": 1},
+                            "allowedSourceIds": {
+                                "minItems": 1,
+                                "uniqueItems": True,
+                            },
+                            "allowedFragmentIds": {
+                                "minItems": 1,
+                                "uniqueItems": True,
+                            },
                         }
                     },
                 }
@@ -245,8 +255,15 @@ class TeachingBrief(_ContractModel):
                     "source-grounded brief requires snapshot, fragments, citations, and source refs"
                 )
             allowed_source_ids = set(self.permission_summary.allowed_source_ids)
-            if not allowed_source_ids:
-                raise ValueError("source-grounded brief requires at least one allowed source")
+            allowed_fragment_ids = set(self.permission_summary.allowed_fragment_ids)
+            if not allowed_source_ids or not allowed_fragment_ids:
+                raise ValueError("source-grounded brief requires allowed source and fragment IDs")
+            if len(allowed_source_ids) != len(self.permission_summary.allowed_source_ids) or len(
+                allowed_fragment_ids
+            ) != len(self.permission_summary.allowed_fragment_ids):
+                raise ValueError(
+                    "source-grounded brief permission allowlists cannot contain duplicates"
+                )
             referenced_source_ids = {
                 item.source_id
                 for collection in (
@@ -261,6 +278,39 @@ class TeachingBrief(_ContractModel):
                 raise ValueError(
                     "source-grounded brief contains source IDs outside permission summary"
                 )
+            fragment_ids = [item.fragment_id for item in self.source_fragments]
+            if len(fragment_ids) != len(set(fragment_ids)):
+                raise ValueError("source-grounded brief fragment IDs must be unique")
+            fragments_by_id = {item.fragment_id: item for item in self.source_fragments}
+            if set(fragment_ids) != allowed_fragment_ids:
+                raise ValueError(
+                    "source-grounded brief fragments must exactly match allowed fragment IDs"
+                )
+            citation_ids = [item.citation_id for item in self.citations]
+            if len(citation_ids) != len(set(citation_ids)):
+                raise ValueError("source-grounded brief citation IDs must be unique")
+            citations_by_id = {item.citation_id: item for item in self.citations}
+            for citation in self.citations:
+                fragment = fragments_by_id.get(citation.fragment_id)
+                if fragment is None or fragment.source_id != citation.source_id:
+                    raise ValueError(
+                        "source-grounded brief citation does not match an authorized fragment"
+                    )
+            source_ref_triples = [
+                (item.citation_id, item.source_id, item.fragment_id) for item in self.source_refs
+            ]
+            if len(source_ref_triples) != len(set(source_ref_triples)):
+                raise ValueError("source-grounded brief source ref triples must be unique")
+            for source_ref in self.source_refs:
+                citation = citations_by_id.get(source_ref.citation_id)
+                if citation is None or (
+                    citation.source_id,
+                    citation.fragment_id,
+                ) != (
+                    source_ref.source_id,
+                    source_ref.fragment_id,
+                ):
+                    raise ValueError("source-grounded brief source ref does not match a citation")
         return self
 
 
@@ -335,11 +385,34 @@ class OutlineBundle(_ContractModel):
     contract_sha256: Sha256
 
 
+def _normalize_typed_canonical_value(value: object) -> object:
+    if isinstance(value, datetime):
+        if value.utcoffset() is None:
+            raise ValueError("canonical datetime must include a timezone")
+        return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    if isinstance(value, Enum):
+        return _normalize_typed_canonical_value(value.value)
+    if isinstance(value, dict):
+        if not all(isinstance(key, str) for key in value):
+            raise TypeError("canonical JSON object keys must be strings")
+        return {key: _normalize_typed_canonical_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_normalize_typed_canonical_value(item) for item in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    raise TypeError(f"unsupported canonical JSON value: {type(value).__name__}")
+
+
 def canonical_outline_json_bytes(
     value: OutlineBundle | dict[str, object],
 ) -> bytes:
     outline = OutlineBundle.model_validate(value)
-    return canonical_json_bytes(outline)
+    typed_value = outline.model_dump(
+        mode="python",
+        by_alias=True,
+        exclude_none=True,
+    )
+    return canonical_json_bytes(_normalize_typed_canonical_value(typed_value))
 
 
 def canonical_outline_sha256(
@@ -370,8 +443,8 @@ def _generation_request_schema_extra(schema: dict[str, object]) -> None:
     schema["$comment"] = (
         "confirmedOutlineSha256 is the SHA-256 of the canonical UTF-8 JSON "
         "serialization of the entire confirmed OutlineBundle: camelCase keys, "
-        "omitted nulls, schema-declared RFC 3339 UTC timestamps serialized with "
-        "a Z suffix, sorted keys, compact separators, and UTF-8 bytes."
+        "omitted nulls, schema-declared RFC 3339 timestamps normalized to UTC "
+        "with a Z suffix, sorted keys, compact separators, and UTF-8 bytes."
     )
     schema["allOf"] = [
         {
@@ -439,6 +512,36 @@ def _generation_request_schema_extra(schema: dict[str, object]) -> None:
                 },
             ]
         },
+        {
+            "if": {
+                "required": ["classroomMode"],
+                "properties": {"classroomMode": {"const": "micro"}},
+            },
+            "then": {
+                "properties": {
+                    "teachingBrief": {
+                        "properties": {
+                            "classroomMode": {"const": "micro"},
+                        }
+                    }
+                }
+            },
+        },
+        {
+            "if": {
+                "required": ["classroomMode"],
+                "properties": {"classroomMode": {"const": "full"}},
+            },
+            "then": {
+                "properties": {
+                    "teachingBrief": {
+                        "properties": {
+                            "classroomMode": {"const": "full"},
+                        }
+                    }
+                }
+            },
+        },
     ]
 
 
@@ -484,6 +587,10 @@ class GenerationRequest(_ContractModel):
         expected_classroom_mode = "micro" if self.phase == "micro" else "full"
         if self.classroom_mode != expected_classroom_mode:
             raise ValueError("generation phase and classroom mode must agree")
+        if self.classroom_mode != self.teaching_brief.classroom_mode:
+            raise ValueError(
+                "generation request classroom mode must match embedded teaching brief classroom mode"
+            )
         has_outline = self.confirmed_outline is not None
         has_hash = self.confirmed_outline_sha256 is not None
         if self.phase == "content" and not (has_outline and has_hash):

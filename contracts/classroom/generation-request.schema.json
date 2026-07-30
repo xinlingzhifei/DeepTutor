@@ -1,5 +1,5 @@
 {
-  "$comment": "confirmedOutlineSha256 is the SHA-256 of the canonical UTF-8 JSON serialization of the entire confirmed OutlineBundle: camelCase keys, omitted nulls, schema-declared RFC 3339 UTC timestamps serialized with a Z suffix, sorted keys, compact separators, and UTF-8 bytes.",
+  "$comment": "confirmedOutlineSha256 is the SHA-256 of the canonical UTF-8 JSON serialization of the entire confirmed OutlineBundle: camelCase keys, omitted nulls, schema-declared RFC 3339 timestamps normalized to UTC with a Z suffix, sorted keys, compact separators, and UTF-8 bytes.",
   "$defs": {
     "AssessmentPlan": {
       "additionalProperties": false,
@@ -433,6 +433,14 @@
     "PermissionSummary": {
       "additionalProperties": false,
       "properties": {
+        "allowedFragmentIds": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Allowedfragmentids",
+          "type": "array"
+        },
         "allowedSourceIds": {
           "items": {
             "minLength": 1,
@@ -453,6 +461,7 @@
       },
       "required": [
         "allowedSourceIds",
+        "allowedFragmentIds",
         "usageScope",
         "attributionRequired"
       ],
@@ -604,7 +613,7 @@
       "type": "object"
     },
     "TeachingBrief": {
-      "$comment": "Draft 2020-12 enforces non-empty source structures for source_grounded. Cross-array sourceId membership in permissionSummary.allowedSourceIds requires semantic validation.",
+      "$comment": "Draft 2020-12 enforces non-empty source structures for source_grounded. SourceFragment fragmentId, SourceCitation citationId, and SourceReference triple uniqueness plus cross-array lineage require semantic validation against permissionSummary allowlists.",
       "additionalProperties": false,
       "allOf": [
         {
@@ -625,8 +634,13 @@
               },
               "permissionSummary": {
                 "properties": {
+                  "allowedFragmentIds": {
+                    "minItems": 1,
+                    "uniqueItems": true
+                  },
                   "allowedSourceIds": {
-                    "minItems": 1
+                    "minItems": 1,
+                    "uniqueItems": true
                   }
                 }
               },
@@ -1014,6 +1028,52 @@
           ]
         }
       ]
+    },
+    {
+      "if": {
+        "properties": {
+          "classroomMode": {
+            "const": "micro"
+          }
+        },
+        "required": [
+          "classroomMode"
+        ]
+      },
+      "then": {
+        "properties": {
+          "teachingBrief": {
+            "properties": {
+              "classroomMode": {
+                "const": "micro"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "classroomMode": {
+            "const": "full"
+          }
+        },
+        "required": [
+          "classroomMode"
+        ]
+      },
+      "then": {
+        "properties": {
+          "teachingBrief": {
+            "properties": {
+              "classroomMode": {
+                "const": "full"
+              }
+            }
+          }
+        }
+      }
     }
   ],
   "properties": {

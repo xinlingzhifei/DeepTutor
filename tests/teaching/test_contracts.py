@@ -87,6 +87,7 @@ def valid_teaching_brief() -> dict[str, object]:
         ],
         "permission_summary": {
             "allowed_source_ids": ["source-1"],
+            "allowed_fragment_ids": ["fragment-1"],
             "usage_scope": "classroom_generation",
             "attribution_required": True,
         },
@@ -708,6 +709,39 @@ def test_generation_phase_and_classroom_mode_are_coupled(
         Draft202012Validator(committed_schema("generation-request.schema.json")).validate(dumped)
 
 
+@pytest.mark.parametrize(
+    ("phase", "request_mode", "brief_mode"),
+    [
+        ("outline", "full", "micro"),
+        ("micro", "micro", "full"),
+    ],
+)
+def test_generation_request_mode_matches_embedded_teaching_brief(
+    phase: str,
+    request_mode: str,
+    brief_mode: str,
+) -> None:
+    from deeptutor.teaching.contracts import GenerationRequest
+
+    payload = valid_generation_request()
+    payload.update({"phase": phase, "classroom_mode": request_mode})
+    teaching_brief = payload["teaching_brief"]
+    assert isinstance(teaching_brief, dict)
+    teaching_brief["classroom_mode"] = brief_mode
+    with pytest.raises(ValidationError, match="embedded teaching brief classroom mode"):
+        GenerationRequest.model_validate(payload)
+
+    valid_payload = valid_generation_request()
+    valid_payload.update({"phase": phase, "classroom_mode": request_mode})
+    valid_brief = valid_payload["teaching_brief"]
+    assert isinstance(valid_brief, dict)
+    valid_brief["classroom_mode"] = request_mode
+    dumped = GenerationRequest.model_validate(valid_payload).model_dump(mode="json")
+    dumped["teachingBrief"]["classroomMode"] = brief_mode
+    with pytest.raises(JsonSchemaValidationError):
+        Draft202012Validator(committed_schema("generation-request.schema.json")).validate(dumped)
+
+
 def test_generation_request_rejects_noncanonical_outline_hash() -> None:
     from deeptutor.teaching.contracts import GenerationRequest
 
@@ -937,6 +971,7 @@ def test_generated_schemas_preserve_required_enums_aliases_and_nesting() -> None
     assert brief_schema["properties"]["objectives"]["minItems"] == 1
     assert brief_schema["$defs"]["SourceFragment"]["additionalProperties"] is False
     assert brief_schema["$defs"]["PermissionSummary"]["additionalProperties"] is False
+    assert "allowedFragmentIds" in brief_schema["$defs"]["PermissionSummary"]["required"]
 
     classroom_schema = ClassroomDocument.model_json_schema(mode="validation")
     assert {
@@ -1047,18 +1082,44 @@ def test_source_grounded_brief_requires_authorized_source_material(
         Draft202012Validator(committed_schema("teaching-brief.schema.json")).validate(dumped)
 
 
-def test_source_grounded_brief_requires_nonempty_allowed_source_ids() -> None:
+@pytest.mark.parametrize(
+    ("field_name", "camel_name"),
+    [
+        ("allowed_source_ids", "allowedSourceIds"),
+        ("allowed_fragment_ids", "allowedFragmentIds"),
+    ],
+)
+def test_source_grounded_brief_requires_nonempty_source_and_fragment_allowlists(
+    field_name: str,
+    camel_name: str,
+) -> None:
     from deeptutor.teaching.contracts import TeachingBrief
 
     payload = valid_teaching_brief()
     permission_summary = payload["permission_summary"]
     assert isinstance(permission_summary, dict)
-    permission_summary["allowed_source_ids"] = []
-    with pytest.raises(ValidationError, match="allowed source"):
+    permission_summary[field_name] = []
+    with pytest.raises(ValidationError, match="allowed source and fragment"):
         TeachingBrief.model_validate(payload)
 
     dumped = TeachingBrief.model_validate(valid_teaching_brief()).model_dump(mode="json")
-    dumped["permissionSummary"]["allowedSourceIds"] = []
+    dumped["permissionSummary"][camel_name] = []
+    with pytest.raises(JsonSchemaValidationError):
+        Draft202012Validator(committed_schema("teaching-brief.schema.json")).validate(dumped)
+
+
+@pytest.mark.parametrize(
+    "camel_name",
+    ["allowedSourceIds", "allowedFragmentIds"],
+)
+def test_source_grounded_schema_rejects_duplicate_permission_allowlist_ids(
+    camel_name: str,
+) -> None:
+    from deeptutor.teaching.contracts import TeachingBrief
+
+    dumped = TeachingBrief.model_validate(valid_teaching_brief()).model_dump(mode="json")
+    allowlist = dumped["permissionSummary"][camel_name]
+    allowlist.append(allowlist[0])
     with pytest.raises(JsonSchemaValidationError):
         Draft202012Validator(committed_schema("teaching-brief.schema.json")).validate(dumped)
 
@@ -1095,6 +1156,87 @@ def test_source_grounded_brief_rejects_source_ids_outside_allowed_set(
     Draft202012Validator(schema).validate(dumped)
 
 
+@pytest.mark.parametrize(
+    "violation",
+    [
+        "fragment_outside_allowlist",
+        "nonexistent_allowed_fragment",
+        "duplicate_allowed_source",
+        "duplicate_allowed_fragment",
+        "duplicate_fragment_id",
+        "citation_unknown_fragment",
+        "citation_wrong_source",
+        "duplicate_citation_id",
+        "source_ref_unknown_citation",
+        "source_ref_wrong_source",
+        "source_ref_wrong_fragment",
+        "duplicate_source_ref",
+    ],
+)
+def test_source_grounded_brief_rejects_broken_source_lineage(
+    violation: str,
+) -> None:
+    from deeptutor.teaching.contracts import TeachingBrief
+
+    payload = valid_teaching_brief()
+    permission_summary = payload["permission_summary"]
+    fragments = payload["source_fragments"]
+    citations = payload["citations"]
+    source_refs = payload["source_refs"]
+    assert isinstance(permission_summary, dict)
+    assert isinstance(fragments, list)
+    assert isinstance(citations, list)
+    assert isinstance(source_refs, list)
+
+    if violation == "fragment_outside_allowlist":
+        fragments[0]["fragment_id"] = "fragment-not-authorized"
+    elif violation == "nonexistent_allowed_fragment":
+        permission_summary["allowed_fragment_ids"].append("fragment-missing")
+    elif violation == "duplicate_allowed_source":
+        permission_summary["allowed_source_ids"].append("source-1")
+    elif violation == "duplicate_allowed_fragment":
+        permission_summary["allowed_fragment_ids"].append("fragment-1")
+    elif violation == "duplicate_fragment_id":
+        fragments.append(copy.deepcopy(fragments[0]))
+    elif violation == "citation_unknown_fragment":
+        citations[0]["fragment_id"] = "fragment-missing"
+    elif violation == "citation_wrong_source":
+        permission_summary["allowed_source_ids"].append("source-2")
+        citations[0]["source_id"] = "source-2"
+    elif violation == "duplicate_citation_id":
+        citations.append(copy.deepcopy(citations[0]))
+    elif violation == "source_ref_unknown_citation":
+        source_refs[0]["citation_id"] = "citation-missing"
+    elif violation == "source_ref_wrong_source":
+        permission_summary["allowed_source_ids"].append("source-2")
+        source_refs[0]["source_id"] = "source-2"
+    elif violation == "source_ref_wrong_fragment":
+        source_refs[0]["fragment_id"] = "fragment-missing"
+    elif violation == "duplicate_source_ref":
+        source_refs.append(copy.deepcopy(source_refs[0]))
+    else:
+        raise AssertionError(f"unhandled violation: {violation}")
+
+    with pytest.raises(ValidationError, match="source-grounded brief"):
+        TeachingBrief.model_validate(payload)
+
+
+def test_source_lineage_cross_array_boundary_is_documented_for_json_schema() -> None:
+    from deeptutor.teaching.contracts import TeachingBrief
+
+    schema = committed_schema("teaching-brief.schema.json")
+    comment = schema["$comment"].lower()
+    assert "fragment" in comment
+    assert "citation" in comment
+    assert "sourceref" in comment
+    assert "semantic validation" in comment
+
+    dumped = TeachingBrief.model_validate(valid_teaching_brief()).model_dump(mode="json")
+    dumped["citations"][0]["sourceId"] = "source-not-matching-fragment"
+    # Draft 2020-12 cannot join sibling arrays by their identifier fields.
+    Draft202012Validator(schema).validate(dumped)
+
+
 def test_open_creation_brief_allows_no_source_material() -> None:
     from deeptutor.teaching.contracts import TeachingBrief
 
@@ -1111,6 +1253,7 @@ def test_open_creation_brief_allows_no_source_material() -> None:
     permission_summary = payload["permission_summary"]
     assert isinstance(permission_summary, dict)
     permission_summary["allowed_source_ids"] = []
+    permission_summary["allowed_fragment_ids"] = []
 
     dumped = TeachingBrief.model_validate(payload).model_dump(mode="json")
     Draft202012Validator(committed_schema("teaching-brief.schema.json")).validate(dumped)
@@ -1544,20 +1687,20 @@ def test_outline_hash_normalizes_only_schema_known_rfc3339_fields() -> None:
     outline = OutlineBundle.model_validate(valid_outline_bundle())
     dumped = outline.model_dump(mode="json", exclude_none=True)
     utc_offset_dumped = copy.deepcopy(dumped)
-    utc_offset_dumped["confirmationMetadata"]["confirmedAt"] = "2026-07-30T08:00:00+00:00"
-    utc_offset_dumped["generationMetadata"]["generatedAt"] = "2026-07-30T08:00:00+00:00"
+    utc_offset_dumped["confirmationMetadata"]["confirmedAt"] = "2026-07-30T16:00:00+08:00"
+    utc_offset_dumped["generationMetadata"]["generatedAt"] = "2026-07-30T16:00:00+08:00"
     offset_dumped = copy.deepcopy(utc_offset_dumped)
-    offset_dumped["title"] = "2026-07-30T08:00:00+00:00"
+    offset_dumped["title"] = "2026-07-30T16:00:00+08:00"
 
     normalized = json.loads(canonical_outline_json_bytes(offset_dumped))
     assert normalized["confirmationMetadata"]["confirmedAt"] == GENERATED_AT
     assert normalized["generationMetadata"]["generatedAt"] == GENERATED_AT
-    assert normalized["title"] == "2026-07-30T08:00:00+00:00"
+    assert normalized["title"] == "2026-07-30T16:00:00+08:00"
     assert canonical_outline_sha256(outline) == canonical_outline_sha256(dumped)
     assert canonical_outline_sha256(outline) == canonical_outline_sha256(utc_offset_dumped)
 
-    body = {"body": "2026-07-30T08:00:00+00:00"}
-    assert canonical_json_bytes(body) == (b'{"body":"2026-07-30T08:00:00+00:00"}')
+    body = {"body": "2026-07-30T16:00:00+08:00"}
+    assert canonical_json_bytes(body) == (b'{"body":"2026-07-30T16:00:00+08:00"}')
 
 
 @pytest.mark.parametrize(

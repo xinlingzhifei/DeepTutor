@@ -1,5 +1,5 @@
 {
-  "$comment": "Draft 2020-12 enforces non-empty source structures for source_grounded. Cross-array sourceId membership in permissionSummary.allowedSourceIds requires semantic validation.",
+  "$comment": "Draft 2020-12 enforces non-empty source structures for source_grounded. SourceFragment fragmentId, SourceCitation citationId, and SourceReference triple uniqueness plus cross-array lineage require semantic validation against permissionSummary allowlists.",
   "$defs": {
     "AssessmentPlan": {
       "additionalProperties": false,
@@ -137,6 +137,14 @@
     "PermissionSummary": {
       "additionalProperties": false,
       "properties": {
+        "allowedFragmentIds": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Allowedfragmentids",
+          "type": "array"
+        },
         "allowedSourceIds": {
           "items": {
             "minLength": 1,
@@ -157,6 +165,7 @@
       },
       "required": [
         "allowedSourceIds",
+        "allowedFragmentIds",
         "usageScope",
         "attributionRequired"
       ],
@@ -380,8 +389,13 @@
           },
           "permissionSummary": {
             "properties": {
+              "allowedFragmentIds": {
+                "minItems": 1,
+                "uniqueItems": true
+              },
               "allowedSourceIds": {
-                "minItems": 1
+                "minItems": 1,
+                "uniqueItems": true
               }
             }
           },
