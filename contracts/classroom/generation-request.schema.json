@@ -1,0 +1,481 @@
+{
+  "$defs": {
+    "GenerationMetadata": {
+      "additionalProperties": false,
+      "properties": {
+        "generated_at": {
+          "format": "date-time",
+          "title": "Generated At",
+          "type": "string"
+        },
+        "generator": {
+          "minLength": 1,
+          "title": "Generator",
+          "type": "string"
+        },
+        "generator_version": {
+          "minLength": 1,
+          "title": "Generator Version",
+          "type": "string"
+        },
+        "model_id": {
+          "minLength": 1,
+          "title": "Model Id",
+          "type": "string"
+        },
+        "teaching_brief_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Teaching Brief Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "generator",
+        "generator_version",
+        "model_id",
+        "generated_at",
+        "teaching_brief_sha256"
+      ],
+      "title": "GenerationMetadata",
+      "type": "object"
+    },
+    "KnowledgePoint": {
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "minLength": 1,
+          "title": "Description",
+          "type": "string"
+        },
+        "knowledge_point_id": {
+          "minLength": 1,
+          "title": "Knowledge Point Id",
+          "type": "string"
+        },
+        "title": {
+          "minLength": 1,
+          "title": "Title",
+          "type": "string"
+        }
+      },
+      "required": [
+        "knowledge_point_id",
+        "title",
+        "description"
+      ],
+      "title": "KnowledgePoint",
+      "type": "object"
+    },
+    "OutlineBundle": {
+      "additionalProperties": false,
+      "properties": {
+        "content_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Content Sha256",
+          "type": "string"
+        },
+        "generation_metadata": {
+          "$ref": "#/$defs/GenerationMetadata"
+        },
+        "language": {
+          "minLength": 1,
+          "title": "Language",
+          "type": "string"
+        },
+        "outline_id": {
+          "minLength": 1,
+          "title": "Outline Id",
+          "type": "string"
+        },
+        "scenes": {
+          "items": {
+            "$ref": "#/$defs/OutlineScene"
+          },
+          "minItems": 1,
+          "title": "Scenes",
+          "type": "array"
+        },
+        "schema_version": {
+          "const": "1.0",
+          "title": "Schema Version",
+          "type": "string"
+        },
+        "title": {
+          "minLength": 1,
+          "title": "Title",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_version",
+        "outline_id",
+        "title",
+        "language",
+        "scenes",
+        "generation_metadata",
+        "content_sha256"
+      ],
+      "title": "OutlineBundle",
+      "type": "object"
+    },
+    "OutlineScene": {
+      "additionalProperties": false,
+      "properties": {
+        "knowledge_point_ids": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Knowledge Point Ids",
+          "type": "array"
+        },
+        "scene_id": {
+          "minLength": 1,
+          "title": "Scene Id",
+          "type": "string"
+        },
+        "source_refs": {
+          "items": {
+            "$ref": "#/$defs/SourceReference"
+          },
+          "title": "Source Refs",
+          "type": "array"
+        },
+        "summary": {
+          "minLength": 1,
+          "title": "Summary",
+          "type": "string"
+        },
+        "title": {
+          "minLength": 1,
+          "title": "Title",
+          "type": "string"
+        }
+      },
+      "required": [
+        "scene_id",
+        "title",
+        "summary",
+        "knowledge_point_ids",
+        "source_refs"
+      ],
+      "title": "OutlineScene",
+      "type": "object"
+    },
+    "PermissionSummary": {
+      "additionalProperties": false,
+      "properties": {
+        "allowed_source_ids": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Allowed Source Ids",
+          "type": "array"
+        },
+        "attribution_required": {
+          "title": "Attribution Required",
+          "type": "boolean"
+        },
+        "usage_scope": {
+          "minLength": 1,
+          "title": "Usage Scope",
+          "type": "string"
+        }
+      },
+      "required": [
+        "allowed_source_ids",
+        "usage_scope",
+        "attribution_required"
+      ],
+      "title": "PermissionSummary",
+      "type": "object"
+    },
+    "SourceCitation": {
+      "additionalProperties": false,
+      "properties": {
+        "citation_id": {
+          "minLength": 1,
+          "title": "Citation Id",
+          "type": "string"
+        },
+        "label": {
+          "minLength": 1,
+          "title": "Label",
+          "type": "string"
+        },
+        "snippet_id": {
+          "minLength": 1,
+          "title": "Snippet Id",
+          "type": "string"
+        },
+        "source_id": {
+          "minLength": 1,
+          "title": "Source Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "citation_id",
+        "source_id",
+        "snippet_id",
+        "label"
+      ],
+      "title": "SourceCitation",
+      "type": "object"
+    },
+    "SourceReference": {
+      "additionalProperties": false,
+      "properties": {
+        "citation_id": {
+          "minLength": 1,
+          "title": "Citation Id",
+          "type": "string"
+        },
+        "snippet_id": {
+          "minLength": 1,
+          "title": "Snippet Id",
+          "type": "string"
+        },
+        "source_id": {
+          "minLength": 1,
+          "title": "Source Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "citation_id",
+        "source_id",
+        "snippet_id"
+      ],
+      "title": "SourceReference",
+      "type": "object"
+    },
+    "SourceSnippet": {
+      "additionalProperties": false,
+      "properties": {
+        "content_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Content Sha256",
+          "type": "string"
+        },
+        "snippet_id": {
+          "minLength": 1,
+          "title": "Snippet Id",
+          "type": "string"
+        },
+        "source_id": {
+          "minLength": 1,
+          "title": "Source Id",
+          "type": "string"
+        },
+        "text": {
+          "minLength": 1,
+          "title": "Text",
+          "type": "string"
+        }
+      },
+      "required": [
+        "snippet_id",
+        "source_id",
+        "text",
+        "content_sha256"
+      ],
+      "title": "SourceSnippet",
+      "type": "object"
+    },
+    "TeachingBrief": {
+      "additionalProperties": false,
+      "properties": {
+        "citations": {
+          "items": {
+            "$ref": "#/$defs/SourceCitation"
+          },
+          "title": "Citations",
+          "type": "array"
+        },
+        "content_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Content Sha256",
+          "type": "string"
+        },
+        "duration_minutes": {
+          "minimum": 1,
+          "title": "Duration Minutes",
+          "type": "integer"
+        },
+        "knowledge_points": {
+          "items": {
+            "$ref": "#/$defs/KnowledgePoint"
+          },
+          "minItems": 1,
+          "title": "Knowledge Points",
+          "type": "array"
+        },
+        "objectives": {
+          "items": {
+            "$ref": "#/$defs/TeachingObjective"
+          },
+          "minItems": 1,
+          "title": "Objectives",
+          "type": "array"
+        },
+        "permission_summary": {
+          "$ref": "#/$defs/PermissionSummary"
+        },
+        "schema_version": {
+          "const": "1.0",
+          "title": "Schema Version",
+          "type": "string"
+        },
+        "source_mode": {
+          "enum": [
+            "grounded",
+            "open"
+          ],
+          "title": "Source Mode",
+          "type": "string"
+        },
+        "source_snippets": {
+          "items": {
+            "$ref": "#/$defs/SourceSnippet"
+          },
+          "title": "Source Snippets",
+          "type": "array"
+        }
+      },
+      "required": [
+        "schema_version",
+        "source_mode",
+        "source_snippets",
+        "citations",
+        "permission_summary",
+        "knowledge_points",
+        "objectives",
+        "duration_minutes",
+        "content_sha256"
+      ],
+      "title": "TeachingBrief",
+      "type": "object"
+    },
+    "TeachingObjective": {
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "minLength": 1,
+          "title": "Description",
+          "type": "string"
+        },
+        "knowledge_point_ids": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Knowledge Point Ids",
+          "type": "array"
+        },
+        "objective_id": {
+          "minLength": 1,
+          "title": "Objective Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "objective_id",
+        "description",
+        "knowledge_point_ids"
+      ],
+      "title": "TeachingObjective",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "confirmed_outline": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/OutlineBundle"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "confirmed_outline_sha256": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Confirmed Outline Sha256"
+    },
+    "data_plane_route_id": {
+      "minLength": 1,
+      "title": "Data Plane Route Id",
+      "type": "string"
+    },
+    "idempotency_key": {
+      "minLength": 1,
+      "title": "Idempotency Key",
+      "type": "string"
+    },
+    "job_id": {
+      "minLength": 1,
+      "title": "Job Id",
+      "type": "string"
+    },
+    "phase": {
+      "enum": [
+        "outline",
+        "content",
+        "micro"
+      ],
+      "title": "Phase",
+      "type": "string"
+    },
+    "priority": {
+      "enum": [
+        "student_micro",
+        "interaction",
+        "teacher",
+        "full",
+        "batch"
+      ],
+      "title": "Priority",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "teaching_brief": {
+      "$ref": "#/$defs/TeachingBrief"
+    },
+    "tenant_id": {
+      "minLength": 1,
+      "title": "Tenant Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "tenant_id",
+    "job_id",
+    "idempotency_key",
+    "phase",
+    "teaching_brief",
+    "data_plane_route_id",
+    "priority"
+  ],
+  "title": "GenerationRequest",
+  "type": "object"
+}

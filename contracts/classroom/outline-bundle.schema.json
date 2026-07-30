@@ -1,0 +1,165 @@
+{
+  "$defs": {
+    "GenerationMetadata": {
+      "additionalProperties": false,
+      "properties": {
+        "generated_at": {
+          "format": "date-time",
+          "title": "Generated At",
+          "type": "string"
+        },
+        "generator": {
+          "minLength": 1,
+          "title": "Generator",
+          "type": "string"
+        },
+        "generator_version": {
+          "minLength": 1,
+          "title": "Generator Version",
+          "type": "string"
+        },
+        "model_id": {
+          "minLength": 1,
+          "title": "Model Id",
+          "type": "string"
+        },
+        "teaching_brief_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Teaching Brief Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "generator",
+        "generator_version",
+        "model_id",
+        "generated_at",
+        "teaching_brief_sha256"
+      ],
+      "title": "GenerationMetadata",
+      "type": "object"
+    },
+    "OutlineScene": {
+      "additionalProperties": false,
+      "properties": {
+        "knowledge_point_ids": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Knowledge Point Ids",
+          "type": "array"
+        },
+        "scene_id": {
+          "minLength": 1,
+          "title": "Scene Id",
+          "type": "string"
+        },
+        "source_refs": {
+          "items": {
+            "$ref": "#/$defs/SourceReference"
+          },
+          "title": "Source Refs",
+          "type": "array"
+        },
+        "summary": {
+          "minLength": 1,
+          "title": "Summary",
+          "type": "string"
+        },
+        "title": {
+          "minLength": 1,
+          "title": "Title",
+          "type": "string"
+        }
+      },
+      "required": [
+        "scene_id",
+        "title",
+        "summary",
+        "knowledge_point_ids",
+        "source_refs"
+      ],
+      "title": "OutlineScene",
+      "type": "object"
+    },
+    "SourceReference": {
+      "additionalProperties": false,
+      "properties": {
+        "citation_id": {
+          "minLength": 1,
+          "title": "Citation Id",
+          "type": "string"
+        },
+        "snippet_id": {
+          "minLength": 1,
+          "title": "Snippet Id",
+          "type": "string"
+        },
+        "source_id": {
+          "minLength": 1,
+          "title": "Source Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "citation_id",
+        "source_id",
+        "snippet_id"
+      ],
+      "title": "SourceReference",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "content_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Content Sha256",
+      "type": "string"
+    },
+    "generation_metadata": {
+      "$ref": "#/$defs/GenerationMetadata"
+    },
+    "language": {
+      "minLength": 1,
+      "title": "Language",
+      "type": "string"
+    },
+    "outline_id": {
+      "minLength": 1,
+      "title": "Outline Id",
+      "type": "string"
+    },
+    "scenes": {
+      "items": {
+        "$ref": "#/$defs/OutlineScene"
+      },
+      "minItems": 1,
+      "title": "Scenes",
+      "type": "array"
+    },
+    "schema_version": {
+      "const": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "title": {
+      "minLength": 1,
+      "title": "Title",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "outline_id",
+    "title",
+    "language",
+    "scenes",
+    "generation_metadata",
+    "content_sha256"
+  ],
+  "title": "OutlineBundle",
+  "type": "object"
+}

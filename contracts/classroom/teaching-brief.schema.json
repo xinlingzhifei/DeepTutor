@@ -1,0 +1,229 @@
+{
+  "$defs": {
+    "KnowledgePoint": {
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "minLength": 1,
+          "title": "Description",
+          "type": "string"
+        },
+        "knowledge_point_id": {
+          "minLength": 1,
+          "title": "Knowledge Point Id",
+          "type": "string"
+        },
+        "title": {
+          "minLength": 1,
+          "title": "Title",
+          "type": "string"
+        }
+      },
+      "required": [
+        "knowledge_point_id",
+        "title",
+        "description"
+      ],
+      "title": "KnowledgePoint",
+      "type": "object"
+    },
+    "PermissionSummary": {
+      "additionalProperties": false,
+      "properties": {
+        "allowed_source_ids": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Allowed Source Ids",
+          "type": "array"
+        },
+        "attribution_required": {
+          "title": "Attribution Required",
+          "type": "boolean"
+        },
+        "usage_scope": {
+          "minLength": 1,
+          "title": "Usage Scope",
+          "type": "string"
+        }
+      },
+      "required": [
+        "allowed_source_ids",
+        "usage_scope",
+        "attribution_required"
+      ],
+      "title": "PermissionSummary",
+      "type": "object"
+    },
+    "SourceCitation": {
+      "additionalProperties": false,
+      "properties": {
+        "citation_id": {
+          "minLength": 1,
+          "title": "Citation Id",
+          "type": "string"
+        },
+        "label": {
+          "minLength": 1,
+          "title": "Label",
+          "type": "string"
+        },
+        "snippet_id": {
+          "minLength": 1,
+          "title": "Snippet Id",
+          "type": "string"
+        },
+        "source_id": {
+          "minLength": 1,
+          "title": "Source Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "citation_id",
+        "source_id",
+        "snippet_id",
+        "label"
+      ],
+      "title": "SourceCitation",
+      "type": "object"
+    },
+    "SourceSnippet": {
+      "additionalProperties": false,
+      "properties": {
+        "content_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Content Sha256",
+          "type": "string"
+        },
+        "snippet_id": {
+          "minLength": 1,
+          "title": "Snippet Id",
+          "type": "string"
+        },
+        "source_id": {
+          "minLength": 1,
+          "title": "Source Id",
+          "type": "string"
+        },
+        "text": {
+          "minLength": 1,
+          "title": "Text",
+          "type": "string"
+        }
+      },
+      "required": [
+        "snippet_id",
+        "source_id",
+        "text",
+        "content_sha256"
+      ],
+      "title": "SourceSnippet",
+      "type": "object"
+    },
+    "TeachingObjective": {
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "minLength": 1,
+          "title": "Description",
+          "type": "string"
+        },
+        "knowledge_point_ids": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Knowledge Point Ids",
+          "type": "array"
+        },
+        "objective_id": {
+          "minLength": 1,
+          "title": "Objective Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "objective_id",
+        "description",
+        "knowledge_point_ids"
+      ],
+      "title": "TeachingObjective",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "citations": {
+      "items": {
+        "$ref": "#/$defs/SourceCitation"
+      },
+      "title": "Citations",
+      "type": "array"
+    },
+    "content_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Content Sha256",
+      "type": "string"
+    },
+    "duration_minutes": {
+      "minimum": 1,
+      "title": "Duration Minutes",
+      "type": "integer"
+    },
+    "knowledge_points": {
+      "items": {
+        "$ref": "#/$defs/KnowledgePoint"
+      },
+      "minItems": 1,
+      "title": "Knowledge Points",
+      "type": "array"
+    },
+    "objectives": {
+      "items": {
+        "$ref": "#/$defs/TeachingObjective"
+      },
+      "minItems": 1,
+      "title": "Objectives",
+      "type": "array"
+    },
+    "permission_summary": {
+      "$ref": "#/$defs/PermissionSummary"
+    },
+    "schema_version": {
+      "const": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "source_mode": {
+      "enum": [
+        "grounded",
+        "open"
+      ],
+      "title": "Source Mode",
+      "type": "string"
+    },
+    "source_snippets": {
+      "items": {
+        "$ref": "#/$defs/SourceSnippet"
+      },
+      "title": "Source Snippets",
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "source_mode",
+    "source_snippets",
+    "citations",
+    "permission_summary",
+    "knowledge_points",
+    "objectives",
+    "duration_minutes",
+    "content_sha256"
+  ],
+  "title": "TeachingBrief",
+  "type": "object"
+}

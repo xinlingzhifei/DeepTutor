@@ -1,0 +1,378 @@
+{
+  "$defs": {
+    "ClassroomScene": {
+      "additionalProperties": false,
+      "properties": {
+        "content": {
+          "$ref": "#/$defs/SceneContent"
+        },
+        "knowledgePointIds": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Knowledgepointids",
+          "type": "array"
+        },
+        "scene_id": {
+          "minLength": 1,
+          "title": "Scene Id",
+          "type": "string"
+        },
+        "sourceRefs": {
+          "items": {
+            "$ref": "#/$defs/SourceReference"
+          },
+          "title": "Sourcerefs",
+          "type": "array"
+        },
+        "title": {
+          "minLength": 1,
+          "title": "Title",
+          "type": "string"
+        }
+      },
+      "required": [
+        "scene_id",
+        "title",
+        "content",
+        "sourceRefs",
+        "knowledgePointIds"
+      ],
+      "title": "ClassroomScene",
+      "type": "object"
+    },
+    "ClassroomStage": {
+      "additionalProperties": false,
+      "properties": {
+        "scene_ids": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Scene Ids",
+          "type": "array"
+        },
+        "stage_id": {
+          "minLength": 1,
+          "title": "Stage Id",
+          "type": "string"
+        },
+        "title": {
+          "minLength": 1,
+          "title": "Title",
+          "type": "string"
+        }
+      },
+      "required": [
+        "stage_id",
+        "title",
+        "scene_ids"
+      ],
+      "title": "ClassroomStage",
+      "type": "object"
+    },
+    "GenerationMetadata": {
+      "additionalProperties": false,
+      "properties": {
+        "generated_at": {
+          "format": "date-time",
+          "title": "Generated At",
+          "type": "string"
+        },
+        "generator": {
+          "minLength": 1,
+          "title": "Generator",
+          "type": "string"
+        },
+        "generator_version": {
+          "minLength": 1,
+          "title": "Generator Version",
+          "type": "string"
+        },
+        "model_id": {
+          "minLength": 1,
+          "title": "Model Id",
+          "type": "string"
+        },
+        "teaching_brief_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Teaching Brief Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "generator",
+        "generator_version",
+        "model_id",
+        "generated_at",
+        "teaching_brief_sha256"
+      ],
+      "title": "GenerationMetadata",
+      "type": "object"
+    },
+    "KnowledgePointMapping": {
+      "additionalProperties": false,
+      "properties": {
+        "knowledgePointId": {
+          "minLength": 1,
+          "title": "Knowledgepointid",
+          "type": "string"
+        },
+        "sceneIds": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Sceneids",
+          "type": "array"
+        },
+        "sourceRefs": {
+          "items": {
+            "$ref": "#/$defs/SourceReference"
+          },
+          "title": "Sourcerefs",
+          "type": "array"
+        }
+      },
+      "required": [
+        "knowledgePointId",
+        "sceneIds",
+        "sourceRefs"
+      ],
+      "title": "KnowledgePointMapping",
+      "type": "object"
+    },
+    "MediaManifestItem": {
+      "additionalProperties": false,
+      "properties": {
+        "mediaId": {
+          "minLength": 1,
+          "title": "Mediaid",
+          "type": "string"
+        },
+        "mimeType": {
+          "minLength": 1,
+          "title": "Mimetype",
+          "type": "string"
+        },
+        "relativePath": {
+          "minLength": 1,
+          "title": "Relativepath",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "sizeBytes": {
+          "minimum": 0,
+          "title": "Sizebytes",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "mediaId",
+        "relativePath",
+        "mimeType",
+        "sha256",
+        "sizeBytes"
+      ],
+      "title": "MediaManifestItem",
+      "type": "object"
+    },
+    "SceneContent": {
+      "additionalProperties": false,
+      "properties": {
+        "body": {
+          "minLength": 1,
+          "title": "Body",
+          "type": "string"
+        },
+        "type": {
+          "enum": [
+            "slide",
+            "quiz",
+            "interactive",
+            "pbl"
+          ],
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "body"
+      ],
+      "title": "SceneContent",
+      "type": "object"
+    },
+    "SourceReference": {
+      "additionalProperties": false,
+      "properties": {
+        "citation_id": {
+          "minLength": 1,
+          "title": "Citation Id",
+          "type": "string"
+        },
+        "snippet_id": {
+          "minLength": 1,
+          "title": "Snippet Id",
+          "type": "string"
+        },
+        "source_id": {
+          "minLength": 1,
+          "title": "Source Id",
+          "type": "string"
+        }
+      },
+      "required": [
+        "citation_id",
+        "source_id",
+        "snippet_id"
+      ],
+      "title": "SourceReference",
+      "type": "object"
+    },
+    "ValidationIssue": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "minLength": 1,
+          "title": "Code",
+          "type": "string"
+        },
+        "message": {
+          "minLength": 1,
+          "title": "Message",
+          "type": "string"
+        },
+        "path": {
+          "minLength": 1,
+          "title": "Path",
+          "type": "string"
+        },
+        "severity": {
+          "enum": [
+            "error",
+            "warning"
+          ],
+          "title": "Severity",
+          "type": "string"
+        }
+      },
+      "required": [
+        "severity",
+        "code",
+        "message",
+        "path"
+      ],
+      "title": "ValidationIssue",
+      "type": "object"
+    },
+    "ValidationResult": {
+      "additionalProperties": false,
+      "properties": {
+        "issues": {
+          "items": {
+            "$ref": "#/$defs/ValidationIssue"
+          },
+          "title": "Issues",
+          "type": "array"
+        },
+        "valid": {
+          "title": "Valid",
+          "type": "boolean"
+        },
+        "validatedAt": {
+          "format": "date-time",
+          "title": "Validatedat",
+          "type": "string"
+        }
+      },
+      "required": [
+        "valid",
+        "issues",
+        "validatedAt"
+      ],
+      "title": "ValidationResult",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "classroomId": {
+      "minLength": 1,
+      "title": "Classroomid",
+      "type": "string"
+    },
+    "dslVersion": {
+      "minLength": 1,
+      "title": "Dslversion",
+      "type": "string"
+    },
+    "generationMetadata": {
+      "$ref": "#/$defs/GenerationMetadata"
+    },
+    "knowledgePointMappings": {
+      "items": {
+        "$ref": "#/$defs/KnowledgePointMapping"
+      },
+      "minItems": 1,
+      "title": "Knowledgepointmappings",
+      "type": "array"
+    },
+    "mediaManifest": {
+      "items": {
+        "$ref": "#/$defs/MediaManifestItem"
+      },
+      "minItems": 1,
+      "title": "Mediamanifest",
+      "type": "array"
+    },
+    "scenes": {
+      "items": {
+        "$ref": "#/$defs/ClassroomScene"
+      },
+      "minItems": 1,
+      "title": "Scenes",
+      "type": "array"
+    },
+    "schema_version": {
+      "const": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "sourceRefs": {
+      "items": {
+        "$ref": "#/$defs/SourceReference"
+      },
+      "title": "Sourcerefs",
+      "type": "array"
+    },
+    "stage": {
+      "$ref": "#/$defs/ClassroomStage"
+    },
+    "validationResult": {
+      "$ref": "#/$defs/ValidationResult"
+    }
+  },
+  "required": [
+    "schema_version",
+    "classroomId",
+    "dslVersion",
+    "stage",
+    "scenes",
+    "sourceRefs",
+    "knowledgePointMappings",
+    "mediaManifest",
+    "generationMetadata",
+    "validationResult"
+  ],
+  "title": "ClassroomDocument",
+  "type": "object"
+}

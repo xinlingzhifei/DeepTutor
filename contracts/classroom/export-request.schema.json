@@ -1,0 +1,90 @@
+{
+  "$defs": {
+    "ExportFormat": {
+      "enum": [
+        "classroom_zip",
+        "pptx",
+        "offline_html",
+        "mp4"
+      ],
+      "title": "ExportFormat",
+      "type": "string"
+    },
+    "ExportPolicy": {
+      "additionalProperties": false,
+      "properties": {
+        "allow_external_links": {
+          "title": "Allow External Links",
+          "type": "boolean"
+        },
+        "include_source_attribution": {
+          "title": "Include Source Attribution",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "include_source_attribution",
+        "allow_external_links"
+      ],
+      "title": "ExportPolicy",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "classroom_document_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Classroom Document Sha256",
+      "type": "string"
+    },
+    "export_policy": {
+      "$ref": "#/$defs/ExportPolicy"
+    },
+    "format": {
+      "$ref": "#/$defs/ExportFormat"
+    },
+    "idempotency_key": {
+      "minLength": 1,
+      "title": "Idempotency Key",
+      "type": "string"
+    },
+    "job_id": {
+      "minLength": 1,
+      "title": "Job Id",
+      "type": "string"
+    },
+    "language": {
+      "minLength": 1,
+      "title": "Language",
+      "type": "string"
+    },
+    "media_manifest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Media Manifest Sha256",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "tenant_id": {
+      "minLength": 1,
+      "title": "Tenant Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "tenant_id",
+    "job_id",
+    "idempotency_key",
+    "classroom_document_sha256",
+    "media_manifest_sha256",
+    "format",
+    "language",
+    "export_policy"
+  ],
+  "title": "ExportRequest",
+  "type": "object"
+}
