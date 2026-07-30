@@ -59,8 +59,18 @@
     "ExportManifestItem": {
       "additionalProperties": false,
       "properties": {
+        "expiresAt": {
+          "format": "date-time",
+          "title": "Expiresat",
+          "type": "string"
+        },
         "format": {
           "$ref": "#/$defs/ExportFormat"
+        },
+        "mimeType": {
+          "minLength": 1,
+          "title": "Mimetype",
+          "type": "string"
         },
         "relativePath": {
           "minLength": 1,
@@ -71,12 +81,26 @@
           "pattern": "^[0-9a-f]{64}$",
           "title": "Sha256",
           "type": "string"
+        },
+        "sizeBytes": {
+          "minimum": 0,
+          "title": "Sizebytes",
+          "type": "integer"
+        },
+        "temporaryDownloadPath": {
+          "minLength": 1,
+          "title": "Temporarydownloadpath",
+          "type": "string"
         }
       },
       "required": [
         "format",
         "relativePath",
-        "sha256"
+        "sha256",
+        "sizeBytes",
+        "mimeType",
+        "temporaryDownloadPath",
+        "expiresAt"
       ],
       "title": "ExportManifestItem",
       "type": "object"
@@ -138,6 +162,27 @@
       "title": "GenerationMetadata",
       "type": "object"
     },
+    "InteractiveSandbox": {
+      "additionalProperties": false,
+      "properties": {
+        "allowSameOrigin": {
+          "const": false,
+          "title": "Allowsameorigin",
+          "type": "boolean"
+        },
+        "allowScripts": {
+          "const": true,
+          "title": "Allowscripts",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "allowScripts",
+        "allowSameOrigin"
+      ],
+      "title": "InteractiveSandbox",
+      "type": "object"
+    },
     "InteractiveScene": {
       "additionalProperties": false,
       "properties": {
@@ -194,12 +239,18 @@
     "InteractiveSceneContent": {
       "additionalProperties": false,
       "properties": {
-        "config": {
-          "additionalProperties": {
-            "$ref": "#/$defs/JsonValue"
-          },
-          "title": "Config",
-          "type": "object"
+        "bridgeVersion": {
+          "const": "1.0",
+          "title": "Bridgeversion",
+          "type": "string"
+        },
+        "html": {
+          "minLength": 1,
+          "title": "Html",
+          "type": "string"
+        },
+        "sandbox": {
+          "$ref": "#/$defs/InteractiveSandbox"
         },
         "type": {
           "const": "interactive",
@@ -209,7 +260,9 @@
       },
       "required": [
         "type",
-        "config"
+        "html",
+        "bridgeVersion",
+        "sandbox"
       ],
       "title": "InteractiveSceneContent",
       "type": "object"
@@ -281,6 +334,11 @@
     "MediaManifestItem": {
       "additionalProperties": false,
       "properties": {
+        "expiresAt": {
+          "format": "date-time",
+          "title": "Expiresat",
+          "type": "string"
+        },
         "mediaId": {
           "minLength": 1,
           "title": "Mediaid",
@@ -305,6 +363,11 @@
           "minimum": 0,
           "title": "Sizebytes",
           "type": "integer"
+        },
+        "temporaryDownloadPath": {
+          "minLength": 1,
+          "title": "Temporarydownloadpath",
+          "type": "string"
         }
       },
       "required": [
@@ -312,7 +375,9 @@
         "relativePath",
         "mimeType",
         "sha256",
-        "sizeBytes"
+        "sizeBytes",
+        "temporaryDownloadPath",
+        "expiresAt"
       ],
       "title": "MediaManifestItem",
       "type": "object"
@@ -433,6 +498,60 @@
       "title": "OpenMaicStage",
       "type": "object"
     },
+    "PblMilestone": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "minLength": 1,
+          "title": "Id",
+          "type": "string"
+        },
+        "rubric": {
+          "minLength": 1,
+          "title": "Rubric",
+          "type": "string"
+        },
+        "title": {
+          "minLength": 1,
+          "title": "Title",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "rubric"
+      ],
+      "title": "PblMilestone",
+      "type": "object"
+    },
+    "PblRole": {
+      "additionalProperties": false,
+      "properties": {
+        "brief": {
+          "minLength": 1,
+          "title": "Brief",
+          "type": "string"
+        },
+        "id": {
+          "minLength": 1,
+          "title": "Id",
+          "type": "string"
+        },
+        "name": {
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "brief"
+      ],
+      "title": "PblRole",
+      "type": "object"
+    },
     "PblScene": {
       "additionalProperties": false,
       "properties": {
@@ -489,12 +608,26 @@
     "PblSceneContent": {
       "additionalProperties": false,
       "properties": {
-        "config": {
-          "additionalProperties": {
-            "$ref": "#/$defs/JsonValue"
+        "milestones": {
+          "items": {
+            "$ref": "#/$defs/PblMilestone"
           },
-          "title": "Config",
-          "type": "object"
+          "minItems": 1,
+          "title": "Milestones",
+          "type": "array"
+        },
+        "roles": {
+          "items": {
+            "$ref": "#/$defs/PblRole"
+          },
+          "minItems": 1,
+          "title": "Roles",
+          "type": "array"
+        },
+        "scenario": {
+          "minLength": 1,
+          "title": "Scenario",
+          "type": "string"
         },
         "type": {
           "const": "pbl",
@@ -504,7 +637,9 @@
       },
       "required": [
         "type",
-        "config"
+        "scenario",
+        "roles",
+        "milestones"
       ],
       "title": "PblSceneContent",
       "type": "object"

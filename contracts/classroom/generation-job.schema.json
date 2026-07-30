@@ -1,7 +1,88 @@
 {
+  "$comment": "Draft 2020-12 enforces terminal, artifact, and lease structure. For succeeded jobs, finalArtifact.sha256 and the primary artifactManifest item sha256 equality with outputSha256 require semantic validation.",
   "$defs": {
+    "ArtifactManifestItem": {
+      "additionalProperties": false,
+      "properties": {
+        "expiresAt": {
+          "format": "date-time",
+          "title": "Expiresat",
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "dsl_json",
+            "media",
+            "export"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "mimeType": {
+          "minLength": 1,
+          "title": "Mimetype",
+          "type": "string"
+        },
+        "relativePath": {
+          "minLength": 1,
+          "title": "Relativepath",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "sizeBytes": {
+          "minimum": 0,
+          "title": "Sizebytes",
+          "type": "integer"
+        },
+        "temporaryDownloadPath": {
+          "minLength": 1,
+          "title": "Temporarydownloadpath",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "relativePath",
+        "sha256",
+        "sizeBytes",
+        "mimeType",
+        "temporaryDownloadPath",
+        "expiresAt"
+      ],
+      "title": "ArtifactManifestItem",
+      "type": "object"
+    },
     "ArtifactState": {
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "ready"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "sha256": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "sha256"
+            ]
+          }
+        }
+      ],
       "properties": {
         "artifactId": {
           "minLength": 1,
@@ -171,6 +252,127 @@
   "additionalProperties": false,
   "allOf": [
     {
+      "oneOf": [
+        {
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "leaseId"
+                ]
+              },
+              {
+                "required": [
+                  "leaseOwner"
+                ]
+              },
+              {
+                "required": [
+                  "leaseExpiresAt"
+                ]
+              },
+              {
+                "required": [
+                  "heartbeatAt"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "properties": {
+            "heartbeatAt": {
+              "type": "null"
+            },
+            "leaseExpiresAt": {
+              "type": "null"
+            },
+            "leaseId": {
+              "type": "null"
+            },
+            "leaseOwner": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "leaseId",
+            "leaseOwner",
+            "leaseExpiresAt",
+            "heartbeatAt"
+          ]
+        },
+        {
+          "properties": {
+            "heartbeatAt": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "leaseExpiresAt": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "leaseId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "leaseOwner": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "leaseId",
+            "leaseOwner",
+            "leaseExpiresAt",
+            "heartbeatAt"
+          ]
+        }
+      ]
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "enum": [
+              "generating_outline",
+              "generating_content",
+              "validating",
+              "materializing"
+            ]
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "heartbeatAt": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "leaseExpiresAt": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "leaseId": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "leaseOwner": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "leaseId",
+          "leaseOwner",
+          "leaseExpiresAt",
+          "heartbeatAt"
+        ]
+      }
+    },
+    {
       "if": {
         "properties": {
           "status": {
@@ -183,6 +385,38 @@
       },
       "then": {
         "properties": {
+          "artifactManifest": {
+            "allOf": [
+              {
+                "contains": {
+                  "properties": {
+                    "kind": {
+                      "const": "dsl_json"
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ],
+                  "type": "object"
+                },
+                "minContains": 1
+              },
+              {
+                "contains": {
+                  "properties": {
+                    "kind": {
+                      "const": "media"
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ],
+                  "type": "object"
+                },
+                "minContains": 1
+              }
+            ]
+          },
           "completedAt": {
             "format": "date-time",
             "type": "string"
@@ -209,6 +443,7 @@
         "required": [
           "outputSha256",
           "finalArtifact",
+          "artifactManifest",
           "completedAt"
         ]
       }
@@ -232,6 +467,35 @@
           },
           "error": {
             "type": "object"
+          },
+          "finalArtifact": {
+            "type": "null"
+          },
+          "outputSha256": {
+            "type": "null"
+          },
+          "temporaryArtifact": {
+            "anyOf": [
+              {
+                "type": "null"
+              },
+              {
+                "properties": {
+                  "status": {
+                    "enum": [
+                      "pending",
+                      "materializing",
+                      "failed",
+                      "discarded"
+                    ]
+                  }
+                },
+                "required": [
+                  "status"
+                ],
+                "type": "object"
+              }
+            ]
           }
         },
         "required": [
@@ -260,6 +524,35 @@
           "completedAt": {
             "format": "date-time",
             "type": "string"
+          },
+          "finalArtifact": {
+            "type": "null"
+          },
+          "outputSha256": {
+            "type": "null"
+          },
+          "temporaryArtifact": {
+            "anyOf": [
+              {
+                "type": "null"
+              },
+              {
+                "properties": {
+                  "status": {
+                    "enum": [
+                      "pending",
+                      "materializing",
+                      "failed",
+                      "discarded"
+                    ]
+                  }
+                },
+                "required": [
+                  "status"
+                ],
+                "type": "object"
+              }
+            ]
           }
         },
         "required": [
@@ -270,6 +563,13 @@
     }
   ],
   "properties": {
+    "artifactManifest": {
+      "items": {
+        "$ref": "#/$defs/ArtifactManifestItem"
+      },
+      "title": "Artifactmanifest",
+      "type": "array"
+    },
     "attempt": {
       "minimum": 0,
       "title": "Attempt",
@@ -517,6 +817,7 @@
     "workPool",
     "quotaReservation",
     "costSummary",
+    "artifactManifest",
     "createdAt",
     "updatedAt",
     "status",

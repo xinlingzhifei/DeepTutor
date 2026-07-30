@@ -283,6 +283,8 @@ def valid_classroom_document() -> dict[str, object]:
                 "mime_type": "audio/mpeg",
                 "sha256": SHA256,
                 "size_bytes": 128,
+                "temporary_download_path": "downloads/media/voice.mp3",
+                "expires_at": GENERATED_AT,
             }
         ],
         "file_sha256": SHA256,
@@ -291,6 +293,10 @@ def valid_classroom_document() -> dict[str, object]:
                 "format": "classroom_zip",
                 "relative_path": "exports/classroom.zip",
                 "sha256": OTHER_SHA256,
+                "size_bytes": 256,
+                "mime_type": "application/zip",
+                "temporary_download_path": "downloads/exports/classroom.zip",
+                "expires_at": GENERATED_AT,
             }
         ],
         "generation_metadata": valid_generation_metadata(),
@@ -359,6 +365,7 @@ def _valid_job_base(
         "lease_expires_at": None,
         "temporary_artifact": None,
         "final_artifact": None,
+        "artifact_manifest": [],
         "output_sha256": None,
         "error": None,
         "created_at": GENERATED_AT,
@@ -440,6 +447,27 @@ def valid_generation_job(status: str = "queued") -> dict[str, object]:
             "diagnostic_summary": "Upstream service unavailable.",
         },
     )
+    if status == "succeeded":
+        payload["artifact_manifest"] = [
+            {
+                "kind": "dsl_json",
+                "relative_path": "classroom/document.json",
+                "sha256": OTHER_SHA256,
+                "size_bytes": 512,
+                "mime_type": "application/json",
+                "temporary_download_path": "downloads/classroom/document.json",
+                "expires_at": GENERATED_AT,
+            },
+            {
+                "kind": "media",
+                "relative_path": "media/voice.mp3",
+                "sha256": SHA256,
+                "size_bytes": 128,
+                "mime_type": "audio/mpeg",
+                "temporary_download_path": "downloads/media/voice.mp3",
+                "expires_at": GENERATED_AT,
+            },
+        ]
     return payload
 
 
@@ -479,6 +507,20 @@ def valid_export_job(status: str = "queued") -> dict[str, object]:
             "diagnostic_summary": "Renderer rejected one slide.",
         },
     )
+    if status == "succeeded":
+        payload["artifact_manifest"] = [
+            {
+                "kind": "export",
+                "relative_path": "exports/classroom.pptx",
+                "sha256": OTHER_SHA256,
+                "size_bytes": 1024,
+                "mime_type": (
+                    "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                ),
+                "temporary_download_path": "downloads/exports/classroom.pptx",
+                "expires_at": GENERATED_AT,
+            }
+        ]
     return payload
 
 
@@ -498,8 +540,13 @@ def test_generation_request_never_contains_provider_secret() -> None:
     from deeptutor.teaching.contracts import GenerationRequest
 
     fields = set(GenerationRequest.model_fields)
-    assert "provider_api_key" not in fields
-    assert "provider_base_url" not in fields
+    assert {
+        "provider_id",
+        "provider_api_key",
+        "provider_base_url",
+        "provider_route_id",
+        "model_route",
+    }.isdisjoint(fields)
     assert {
         "schema_version",
         "tenant_id",
@@ -522,6 +569,9 @@ def test_generation_request_never_contains_provider_secret() -> None:
         "data_plane_route_id",
         "priority",
     } <= fields
+    route_schema = GenerationRequest.model_json_schema()["properties"]["dataPlaneRouteId"]
+    assert "opaque control-plane routing key" in route_schema["description"]
+    assert "provider" in route_schema["description"].lower()
 
 
 @pytest.mark.parametrize(
@@ -558,7 +608,7 @@ def test_content_phase_accepts_confirmed_outline_and_hash() -> None:
     from deeptutor.teaching.contracts import (
         GenerationRequest,
         OutlineBundle,
-        canonical_sha256,
+        canonical_outline_sha256,
     )
 
     request = valid_generation_request()
@@ -567,11 +617,95 @@ def test_content_phase_accepts_confirmed_outline_and_hash() -> None:
         {
             "phase": "content",
             "confirmed_outline": valid_outline_bundle(),
-            "confirmed_outline_sha256": canonical_sha256(outline),
+            "confirmed_outline_sha256": canonical_outline_sha256(outline),
         }
     )
 
     assert GenerationRequest.model_validate(request).phase == "content"
+
+
+def test_content_phase_rejects_draft_outline_in_model_and_schema() -> None:
+    from deeptutor.teaching.contracts import (
+        GenerationRequest,
+        OutlineBundle,
+        canonical_outline_sha256,
+    )
+
+    outline_payload = valid_outline_bundle()
+    confirmation = outline_payload["confirmation_metadata"]
+    assert isinstance(confirmation, dict)
+    confirmation.update(
+        {
+            "status": "draft",
+            "confirmed_at": None,
+            "confirmed_by": None,
+        }
+    )
+    outline = OutlineBundle.model_validate(outline_payload)
+    request = valid_generation_request()
+    request.update(
+        {
+            "phase": "content",
+            "confirmed_outline": outline_payload,
+            "confirmed_outline_sha256": canonical_outline_sha256(outline),
+        }
+    )
+
+    with pytest.raises(ValidationError, match="confirmed outline status"):
+        GenerationRequest.model_validate(request)
+
+    camel_payload = GenerationRequest.model_validate(valid_generation_request()).model_dump(
+        mode="json"
+    )
+    camel_payload.update(
+        {
+            "phase": "content",
+            "confirmedOutline": outline.model_dump(mode="json"),
+            "confirmedOutlineSha256": canonical_outline_sha256(outline),
+        }
+    )
+    with pytest.raises(JsonSchemaValidationError):
+        Draft202012Validator(committed_schema("generation-request.schema.json")).validate(
+            camel_payload
+        )
+
+
+@pytest.mark.parametrize(
+    ("phase", "classroom_mode"),
+    [
+        ("micro", "full"),
+        ("outline", "micro"),
+        ("content", "micro"),
+    ],
+)
+def test_generation_phase_and_classroom_mode_are_coupled(
+    phase: str,
+    classroom_mode: str,
+) -> None:
+    from deeptutor.teaching.contracts import GenerationRequest
+
+    request = valid_generation_request()
+    request.update({"phase": phase, "classroom_mode": classroom_mode})
+    if phase == "content":
+        from deeptutor.teaching.contracts import OutlineBundle, canonical_outline_sha256
+
+        outline = OutlineBundle.model_validate(valid_outline_bundle())
+        request["confirmed_outline"] = valid_outline_bundle()
+        request["confirmed_outline_sha256"] = canonical_outline_sha256(outline)
+
+    with pytest.raises(ValidationError, match="classroom mode"):
+        GenerationRequest.model_validate(request)
+
+    dumped = GenerationRequest.model_validate(valid_generation_request()).model_dump(mode="json")
+    dumped.update({"phase": phase, "classroomMode": classroom_mode})
+    if phase == "content":
+        from deeptutor.teaching.contracts import OutlineBundle, canonical_outline_sha256
+
+        outline = OutlineBundle.model_validate(valid_outline_bundle())
+        dumped["confirmedOutline"] = outline.model_dump(mode="json")
+        dumped["confirmedOutlineSha256"] = canonical_outline_sha256(outline)
+    with pytest.raises(JsonSchemaValidationError):
+        Draft202012Validator(committed_schema("generation-request.schema.json")).validate(dumped)
 
 
 def test_generation_request_rejects_noncanonical_outline_hash() -> None:
@@ -602,6 +736,20 @@ def test_generation_request_default_dump_is_camel_case() -> None:
     assert "dataPlaneRouteId" in dumped
     assert "schema_version" not in dumped
     assert "tenant_id" not in dumped
+
+
+def test_contract_config_is_pydantic_2_0_compatible_and_serializes_aliases() -> None:
+    from deeptutor.teaching.contracts import GenerationRequest
+
+    config = GenerationRequest.model_config
+    assert config["populate_by_name"] is True
+
+    request = GenerationRequest.model_validate(valid_generation_request())
+    dumped = request.model_dump(mode="json")
+    dumped_json = json.loads(request.model_dump_json())
+    assert dumped_json == dumped
+    assert "schemaVersion" in dumped_json
+    assert "schema_version" not in dumped_json
 
 
 def test_generation_request_json_schema_rejects_content_without_outline() -> None:
@@ -668,6 +816,9 @@ def test_export_contract_uses_only_supported_formats() -> None:
     [
         ("GenerationRequest", valid_generation_request(), "provider_api_key"),
         ("GenerationRequest", valid_generation_request(), "provider_base_url"),
+        ("GenerationRequest", valid_generation_request(), "provider_id"),
+        ("GenerationRequest", valid_generation_request(), "provider_route_id"),
+        ("GenerationRequest", valid_generation_request(), "model_route"),
         ("GenerationRequest", valid_generation_request(), "object_store_secret"),
         ("TeachingBrief", valid_teaching_brief(), "provider_api_key"),
         ("OutlineBundle", valid_outline_bundle(), "provider_api_key"),
@@ -896,6 +1047,54 @@ def test_source_grounded_brief_requires_authorized_source_material(
         Draft202012Validator(committed_schema("teaching-brief.schema.json")).validate(dumped)
 
 
+def test_source_grounded_brief_requires_nonempty_allowed_source_ids() -> None:
+    from deeptutor.teaching.contracts import TeachingBrief
+
+    payload = valid_teaching_brief()
+    permission_summary = payload["permission_summary"]
+    assert isinstance(permission_summary, dict)
+    permission_summary["allowed_source_ids"] = []
+    with pytest.raises(ValidationError, match="allowed source"):
+        TeachingBrief.model_validate(payload)
+
+    dumped = TeachingBrief.model_validate(valid_teaching_brief()).model_dump(mode="json")
+    dumped["permissionSummary"]["allowedSourceIds"] = []
+    with pytest.raises(JsonSchemaValidationError):
+        Draft202012Validator(committed_schema("teaching-brief.schema.json")).validate(dumped)
+
+
+@pytest.mark.parametrize("collection_name", ["source_fragments", "citations", "source_refs"])
+def test_source_grounded_brief_rejects_source_ids_outside_allowed_set(
+    collection_name: str,
+) -> None:
+    from deeptutor.teaching.contracts import TeachingBrief
+
+    payload = valid_teaching_brief()
+    collection = payload[collection_name]
+    assert isinstance(collection, list)
+    first = collection[0]
+    assert isinstance(first, dict)
+    first["source_id"] = "source-not-authorized"
+    with pytest.raises(ValidationError, match="outside permission summary"):
+        TeachingBrief.model_validate(payload)
+
+    schema = committed_schema("teaching-brief.schema.json")
+    assert "cross-array" in schema["$comment"].lower()
+    assert "semantic validation" in schema["$comment"].lower()
+    dumped = TeachingBrief.model_validate(valid_teaching_brief()).model_dump(mode="json")
+    camel_collection = {
+        "source_fragments": "sourceFragments",
+        "citations": "citations",
+        "source_refs": "sourceRefs",
+    }[collection_name]
+    dumped_collection = dumped[camel_collection]
+    assert isinstance(dumped_collection, list)
+    dumped_collection[0]["sourceId"] = "source-not-authorized"
+    # Draft 2020-12 cannot compare values across sibling arrays. The committed
+    # schema documents that boundary; Pydantic owns the membership check.
+    Draft202012Validator(schema).validate(dumped)
+
+
 def test_open_creation_brief_allows_no_source_material() -> None:
     from deeptutor.teaching.contracts import TeachingBrief
 
@@ -909,6 +1108,9 @@ def test_open_creation_brief_allows_no_source_material() -> None:
             "source_refs": [],
         }
     )
+    permission_summary = payload["permission_summary"]
+    assert isinstance(permission_summary, dict)
+    permission_summary["allowed_source_ids"] = []
 
     dumped = TeachingBrief.model_validate(payload).model_dump(mode="json")
     Draft202012Validator(committed_schema("teaching-brief.schema.json")).validate(dumped)
@@ -1009,9 +1211,11 @@ def test_openmaic_document_accepts_all_scene_discriminators_losslessly() -> None
                 "type": "interactive",
                 "content": {
                     "type": "interactive",
-                    "config": {
-                        "kind": "simulation",
-                        "parameters": {"frequencies": [1, 2, 3]},
+                    "html": "<button id='frequency-slider'>Explore</button>",
+                    "bridge_version": "1.0",
+                    "sandbox": {
+                        "allow_scripts": True,
+                        "allow_same_origin": False,
                     },
                 },
                 "actions": [{"type": "highlight", "target": "frequency-slider"}],
@@ -1024,10 +1228,21 @@ def test_openmaic_document_accepts_all_scene_discriminators_losslessly() -> None
                 "type": "pbl",
                 "content": {
                     "type": "pbl",
-                    "config": {
-                        "kind": "project",
-                        "milestones": [{"id": "m1", "done": False}],
-                    },
+                    "scenario": "Build a Fourier signal analyzer for the school lab.",
+                    "roles": [
+                        {
+                            "id": "engineer",
+                            "name": "Signal engineer",
+                            "brief": "Design and explain the analyzer.",
+                        }
+                    ],
+                    "milestones": [
+                        {
+                            "id": "m1",
+                            "title": "Working prototype",
+                            "rubric": "Identifies at least three signal frequencies.",
+                        }
+                    ],
                 },
             },
         ]
@@ -1051,6 +1266,137 @@ def test_openmaic_document_accepts_all_scene_discriminators_losslessly() -> None
         None,
     ]
     assert dumped["openmaic"]["scenes"][2]["actions"][0]["target"] == ("frequency-slider")
+
+
+def test_portable_scene_content_matches_task4_without_arbitrary_config() -> None:
+    from deeptutor.teaching.contracts import (
+        ClassroomDocument,
+        InteractiveSceneContent,
+        PblSceneContent,
+    )
+
+    interactive = {
+        "type": "interactive",
+        "html": "<button>Run</button>",
+        "bridge_version": "1.0",
+        "sandbox": {
+            "allow_scripts": True,
+            "allow_same_origin": False,
+        },
+    }
+    pbl = {
+        "type": "pbl",
+        "scenario": "Investigate a noisy classroom signal.",
+        "roles": [
+            {
+                "id": "analyst",
+                "name": "Signal analyst",
+                "brief": "Find the dominant frequencies.",
+            }
+        ],
+        "milestones": [
+            {
+                "id": "m1",
+                "title": "Frequency report",
+                "rubric": "Names and justifies the dominant frequencies.",
+            }
+        ],
+    }
+
+    assert InteractiveSceneContent.model_validate(interactive).model_dump(mode="json") == {
+        "type": "interactive",
+        "html": "<button>Run</button>",
+        "bridgeVersion": "1.0",
+        "sandbox": {
+            "allowScripts": True,
+            "allowSameOrigin": False,
+        },
+    }
+    assert PblSceneContent.model_validate(pbl).model_dump(mode="json")["scenario"] == (
+        "Investigate a noisy classroom signal."
+    )
+    with pytest.raises(ValidationError):
+        InteractiveSceneContent.model_validate(
+            {"type": "interactive", "config": {"kind": "simulation"}}
+        )
+    with pytest.raises(ValidationError):
+        PblSceneContent.model_validate({"type": "pbl", "config": {"kind": "project"}})
+    with pytest.raises(ValidationError):
+        InteractiveSceneContent.model_validate({**interactive, "html": ""})
+    with pytest.raises(ValidationError):
+        PblSceneContent.model_validate({**pbl, "scenario": ""})
+    with pytest.raises(ValidationError):
+        PblSceneContent.model_validate({**pbl, "roles": []})
+    with pytest.raises(ValidationError):
+        PblSceneContent.model_validate({**pbl, "milestones": []})
+
+    definitions = ClassroomDocument.model_json_schema()["$defs"]
+    interactive_schema = definitions["InteractiveSceneContent"]
+    assert set(interactive_schema["properties"]) == {
+        "type",
+        "html",
+        "bridgeVersion",
+        "sandbox",
+    }
+    assert set(interactive_schema["required"]) == {
+        "type",
+        "html",
+        "bridgeVersion",
+        "sandbox",
+    }
+    pbl_schema = definitions["PblSceneContent"]
+    assert set(pbl_schema["properties"]) == {
+        "type",
+        "scenario",
+        "roles",
+        "milestones",
+    }
+    assert set(pbl_schema["required"]) == {
+        "type",
+        "scenario",
+        "roles",
+        "milestones",
+    }
+
+
+@pytest.mark.parametrize(
+    ("manifest_name", "field_name", "camel_name"),
+    [
+        ("media_manifest", "sha256", "sha256"),
+        ("media_manifest", "size_bytes", "sizeBytes"),
+        ("media_manifest", "mime_type", "mimeType"),
+        ("media_manifest", "temporary_download_path", "temporaryDownloadPath"),
+        ("media_manifest", "expires_at", "expiresAt"),
+        ("export_manifest", "sha256", "sha256"),
+        ("export_manifest", "size_bytes", "sizeBytes"),
+        ("export_manifest", "mime_type", "mimeType"),
+        ("export_manifest", "temporary_download_path", "temporaryDownloadPath"),
+        ("export_manifest", "expires_at", "expiresAt"),
+    ],
+)
+def test_every_manifest_file_requires_integrity_and_temporary_download_metadata(
+    manifest_name: str,
+    field_name: str,
+    camel_name: str,
+) -> None:
+    from deeptutor.teaching.contracts import ClassroomDocument
+
+    payload = valid_classroom_document()
+    manifest = payload[manifest_name]
+    assert isinstance(manifest, list)
+    item = manifest[0]
+    assert isinstance(item, dict)
+    del item[field_name]
+    with pytest.raises(ValidationError):
+        ClassroomDocument.model_validate(payload)
+
+    dumped = ClassroomDocument.model_validate(valid_classroom_document()).model_dump(mode="json")
+    dumped_manifest = dumped[
+        "mediaManifest" if manifest_name == "media_manifest" else "exportManifest"
+    ]
+    del dumped_manifest[0][camel_name]
+    with pytest.raises(JsonSchemaValidationError):
+        Draft202012Validator(committed_schema("classroom-document.schema.json")).validate(dumped)
 
 
 @pytest.mark.parametrize("content_type", ["quiz", "interactive", "pbl"])
@@ -1159,6 +1505,8 @@ def test_confirmed_outline_hash_uses_documented_canonical_bundle_json() -> None:
     from deeptutor.teaching.contracts import (
         OutlineBundle,
         canonical_json_bytes,
+        canonical_outline_json_bytes,
+        canonical_outline_sha256,
         canonical_sha256,
     )
 
@@ -1174,13 +1522,42 @@ def test_confirmed_outline_hash_uses_documented_canonical_bundle_json() -> None:
     ).encode("utf-8")
 
     assert canonical_json_bytes(outline) == expected
+    assert canonical_outline_json_bytes(outline) == expected
     assert canonical_sha256(outline) == hashlib.sha256(expected).hexdigest()
+    assert canonical_outline_sha256(outline) == hashlib.sha256(expected).hexdigest()
     schema = committed_schema("generation-request.schema.json")
     assert "canonical UTF-8 JSON" in schema["$comment"]
     assert (
         "entire confirmed OutlineBundle"
         in schema["properties"]["confirmedOutlineSha256"]["description"]
     )
+
+
+def test_outline_hash_normalizes_only_schema_known_rfc3339_fields() -> None:
+    from deeptutor.teaching.contracts import (
+        OutlineBundle,
+        canonical_json_bytes,
+        canonical_outline_json_bytes,
+        canonical_outline_sha256,
+    )
+
+    outline = OutlineBundle.model_validate(valid_outline_bundle())
+    dumped = outline.model_dump(mode="json", exclude_none=True)
+    utc_offset_dumped = copy.deepcopy(dumped)
+    utc_offset_dumped["confirmationMetadata"]["confirmedAt"] = "2026-07-30T08:00:00+00:00"
+    utc_offset_dumped["generationMetadata"]["generatedAt"] = "2026-07-30T08:00:00+00:00"
+    offset_dumped = copy.deepcopy(utc_offset_dumped)
+    offset_dumped["title"] = "2026-07-30T08:00:00+00:00"
+
+    normalized = json.loads(canonical_outline_json_bytes(offset_dumped))
+    assert normalized["confirmationMetadata"]["confirmedAt"] == GENERATED_AT
+    assert normalized["generationMetadata"]["generatedAt"] == GENERATED_AT
+    assert normalized["title"] == "2026-07-30T08:00:00+00:00"
+    assert canonical_outline_sha256(outline) == canonical_outline_sha256(dumped)
+    assert canonical_outline_sha256(outline) == canonical_outline_sha256(utc_offset_dumped)
+
+    body = {"body": "2026-07-30T08:00:00+00:00"}
+    assert canonical_json_bytes(body) == (b'{"body":"2026-07-30T08:00:00+00:00"}')
 
 
 @pytest.mark.parametrize(
@@ -1269,6 +1646,389 @@ def test_terminal_job_invariants_are_enforced_by_pydantic_and_json_schema(
     valid_dump[camel_name] = None
     with pytest.raises(JsonSchemaValidationError):
         Draft202012Validator(committed_schema(schema_filename)).validate(valid_dump)
+
+
+@pytest.mark.parametrize(
+    ("model_name", "schema_filename", "payload_factory"),
+    [
+        ("GenerationJob", "generation-job.schema.json", valid_generation_job),
+        ("ExportJob", "export-job.schema.json", valid_export_job),
+    ],
+)
+def test_ready_artifact_requires_sha256_in_model_and_schema(
+    model_name: str,
+    schema_filename: str,
+    payload_factory: PayloadFactory,
+) -> None:
+    from deeptutor.teaching import contracts
+
+    payload = payload_factory("succeeded")
+    artifact = payload["final_artifact"]
+    assert isinstance(artifact, dict)
+    artifact["sha256"] = None
+    with pytest.raises(ValidationError, match="ready artifact requires sha256"):
+        getattr(contracts, model_name).model_validate(payload)
+
+    dumped = (
+        getattr(contracts, model_name)
+        .model_validate(payload_factory("succeeded"))
+        .model_dump(mode="json")
+    )
+    dumped["finalArtifact"]["sha256"] = None
+    with pytest.raises(JsonSchemaValidationError):
+        Draft202012Validator(committed_schema(schema_filename)).validate(dumped)
+
+
+@pytest.mark.parametrize(
+    (
+        "model_name",
+        "schema_filename",
+        "payload_factory",
+        "removed_kind",
+        "expected_kinds",
+    ),
+    [
+        (
+            "GenerationJob",
+            "generation-job.schema.json",
+            valid_generation_job,
+            "dsl_json",
+            {"dsl_json", "media"},
+        ),
+        (
+            "GenerationJob",
+            "generation-job.schema.json",
+            valid_generation_job,
+            "media",
+            {"dsl_json", "media"},
+        ),
+        (
+            "ExportJob",
+            "export-job.schema.json",
+            valid_export_job,
+            "export",
+            {"export"},
+        ),
+    ],
+)
+def test_succeeded_job_manifest_requires_task4_file_kinds(
+    model_name: str,
+    schema_filename: str,
+    payload_factory: PayloadFactory,
+    removed_kind: str,
+    expected_kinds: set[str],
+) -> None:
+    from deeptutor.teaching import contracts
+
+    model = getattr(contracts, model_name)
+    valid_payload = payload_factory("succeeded")
+    parsed = model.model_validate(valid_payload)
+    assert {item.kind for item in parsed.artifact_manifest} == expected_kinds
+    Draft202012Validator(committed_schema(schema_filename)).validate(parsed.model_dump(mode="json"))
+
+    payload = payload_factory("succeeded")
+    manifest = payload["artifact_manifest"]
+    assert isinstance(manifest, list)
+    payload["artifact_manifest"] = [
+        item for item in manifest if isinstance(item, dict) and item["kind"] != removed_kind
+    ]
+    with pytest.raises(ValidationError, match="missing required file kinds"):
+        model.model_validate(payload)
+
+    dumped = parsed.model_dump(mode="json")
+    dumped["artifactManifest"] = [
+        item for item in dumped["artifactManifest"] if item["kind"] != removed_kind
+    ]
+    with pytest.raises(JsonSchemaValidationError):
+        Draft202012Validator(committed_schema(schema_filename)).validate(dumped)
+
+
+@pytest.mark.parametrize(
+    ("model_name", "schema_filename", "payload_factory"),
+    [
+        ("GenerationJob", "generation-job.schema.json", valid_generation_job),
+        ("ExportJob", "export-job.schema.json", valid_export_job),
+    ],
+)
+@pytest.mark.parametrize(
+    ("field_name", "camel_name"),
+    [
+        ("sha256", "sha256"),
+        ("size_bytes", "sizeBytes"),
+        ("mime_type", "mimeType"),
+        ("temporary_download_path", "temporaryDownloadPath"),
+        ("expires_at", "expiresAt"),
+    ],
+)
+def test_job_manifest_every_file_requires_task4_metadata(
+    model_name: str,
+    schema_filename: str,
+    payload_factory: PayloadFactory,
+    field_name: str,
+    camel_name: str,
+) -> None:
+    from deeptutor.teaching import contracts
+
+    model = getattr(contracts, model_name)
+    payload = payload_factory("succeeded")
+    manifest = payload["artifact_manifest"]
+    assert isinstance(manifest, list)
+    item = manifest[0]
+    assert isinstance(item, dict)
+    del item[field_name]
+    with pytest.raises(ValidationError):
+        model.model_validate(payload)
+
+    dumped = model.model_validate(payload_factory("succeeded")).model_dump(mode="json")
+    del dumped["artifactManifest"][0][camel_name]
+    with pytest.raises(JsonSchemaValidationError):
+        Draft202012Validator(committed_schema(schema_filename)).validate(dumped)
+
+
+@pytest.mark.parametrize(
+    ("model_name", "schema_filename", "payload_factory"),
+    [
+        ("GenerationJob", "generation-job.schema.json", valid_generation_job),
+        ("ExportJob", "export-job.schema.json", valid_export_job),
+    ],
+)
+def test_succeeded_job_primary_manifest_hash_matches_output_semantically(
+    model_name: str,
+    schema_filename: str,
+    payload_factory: PayloadFactory,
+) -> None:
+    from deeptutor.teaching import contracts
+
+    model = getattr(contracts, model_name)
+    payload = payload_factory("succeeded")
+    manifest = payload["artifact_manifest"]
+    assert isinstance(manifest, list)
+    primary = manifest[0]
+    assert isinstance(primary, dict)
+    primary["sha256"] = SHA256
+    with pytest.raises(ValidationError, match="primary artifact manifest sha256"):
+        model.model_validate(payload)
+
+    schema = committed_schema(schema_filename)
+    assert "primary artifactManifest" in schema["$comment"]
+    dumped = model.model_validate(payload_factory("succeeded")).model_dump(mode="json")
+    dumped["artifactManifest"][0]["sha256"] = SHA256
+    Draft202012Validator(schema).validate(dumped)
+
+
+@pytest.mark.parametrize(
+    ("model_name", "schema_filename", "payload_factory", "status", "field_name"),
+    [
+        (
+            "GenerationJob",
+            "generation-job.schema.json",
+            valid_generation_job,
+            "failed",
+            "output_sha256",
+        ),
+        (
+            "GenerationJob",
+            "generation-job.schema.json",
+            valid_generation_job,
+            "canceled",
+            "final_artifact",
+        ),
+        (
+            "ExportJob",
+            "export-job.schema.json",
+            valid_export_job,
+            "failed",
+            "final_artifact",
+        ),
+        (
+            "ExportJob",
+            "export-job.schema.json",
+            valid_export_job,
+            "canceled",
+            "output_sha256",
+        ),
+    ],
+)
+def test_unsuccessful_terminal_jobs_forbid_output_and_ready_final_artifact(
+    model_name: str,
+    schema_filename: str,
+    payload_factory: PayloadFactory,
+    status: str,
+    field_name: str,
+) -> None:
+    from deeptutor.teaching import contracts
+
+    payload = payload_factory(status)
+    if field_name == "output_sha256":
+        payload[field_name] = OTHER_SHA256
+        camel_name = "outputSha256"
+        camel_value: object = OTHER_SHA256
+    else:
+        payload[field_name] = {
+            "artifact_id": "artifact-residual",
+            "status": "ready",
+            "sha256": OTHER_SHA256,
+        }
+        camel_name = "finalArtifact"
+        camel_value = {
+            "artifactId": "artifact-residual",
+            "status": "ready",
+            "sha256": OTHER_SHA256,
+        }
+    with pytest.raises(ValidationError, match="failed or canceled job"):
+        getattr(contracts, model_name).model_validate(payload)
+
+    dumped = (
+        getattr(contracts, model_name)
+        .model_validate(payload_factory(status))
+        .model_dump(mode="json")
+    )
+    dumped[camel_name] = camel_value
+    with pytest.raises(JsonSchemaValidationError):
+        Draft202012Validator(committed_schema(schema_filename)).validate(dumped)
+
+
+@pytest.mark.parametrize(
+    ("model_name", "schema_filename", "payload_factory"),
+    [
+        ("GenerationJob", "generation-job.schema.json", valid_generation_job),
+        ("ExportJob", "export-job.schema.json", valid_export_job),
+    ],
+)
+def test_succeeded_job_output_hash_matches_final_artifact_semantically(
+    model_name: str,
+    schema_filename: str,
+    payload_factory: PayloadFactory,
+) -> None:
+    from deeptutor.teaching import contracts
+
+    payload = payload_factory("succeeded")
+    artifact = payload["final_artifact"]
+    assert isinstance(artifact, dict)
+    artifact["sha256"] = SHA256
+    with pytest.raises(ValidationError, match="final artifact sha256"):
+        getattr(contracts, model_name).model_validate(payload)
+
+    schema = committed_schema(schema_filename)
+    assert "semantic validation" in schema["$comment"].lower()
+    dumped = (
+        getattr(contracts, model_name)
+        .model_validate(payload_factory("succeeded"))
+        .model_dump(mode="json")
+    )
+    dumped["finalArtifact"]["sha256"] = SHA256
+    # Draft 2020-12 cannot assert equality between sibling values.
+    Draft202012Validator(schema).validate(dumped)
+
+
+@pytest.mark.parametrize(
+    ("model_name", "schema_filename", "payload_factory"),
+    [
+        ("GenerationJob", "generation-job.schema.json", valid_generation_job),
+        ("ExportJob", "export-job.schema.json", valid_export_job),
+    ],
+)
+def test_failed_jobs_may_keep_only_temporary_nonready_residuals(
+    model_name: str,
+    schema_filename: str,
+    payload_factory: PayloadFactory,
+) -> None:
+    from deeptutor.teaching import contracts
+
+    payload = payload_factory("failed")
+    payload["temporary_artifact"] = {
+        "artifact_id": "artifact-temporary",
+        "status": "failed",
+        "sha256": None,
+    }
+    model = getattr(contracts, model_name)
+    dumped = model.model_validate(payload).model_dump(mode="json")
+    Draft202012Validator(committed_schema(schema_filename)).validate(dumped)
+
+
+@pytest.mark.parametrize(
+    ("model_name", "schema_filename", "payload_factory"),
+    [
+        ("GenerationJob", "generation-job.schema.json", valid_generation_job),
+        ("ExportJob", "export-job.schema.json", valid_export_job),
+    ],
+)
+def test_job_lease_fields_are_all_present_or_all_absent(
+    model_name: str,
+    schema_filename: str,
+    payload_factory: PayloadFactory,
+) -> None:
+    from deeptutor.teaching import contracts
+
+    payload = payload_factory()
+    payload["lease_id"] = "lease-1"
+    with pytest.raises(ValidationError, match="lease fields"):
+        getattr(contracts, model_name).model_validate(payload)
+
+    dumped = (
+        getattr(contracts, model_name).model_validate(payload_factory()).model_dump(mode="json")
+    )
+    dumped["leaseId"] = "lease-1"
+    with pytest.raises(JsonSchemaValidationError):
+        Draft202012Validator(committed_schema(schema_filename)).validate(dumped)
+
+
+@pytest.mark.parametrize(
+    (
+        "model_name",
+        "schema_filename",
+        "payload_factory",
+        "running_status",
+        "running_phase",
+    ),
+    [
+        (
+            "GenerationJob",
+            "generation-job.schema.json",
+            valid_generation_job,
+            "generating_content",
+            "content",
+        ),
+        (
+            "ExportJob",
+            "export-job.schema.json",
+            valid_export_job,
+            "exporting",
+            "exporting",
+        ),
+    ],
+)
+def test_running_jobs_require_complete_lease(
+    model_name: str,
+    schema_filename: str,
+    payload_factory: PayloadFactory,
+    running_status: str,
+    running_phase: str,
+) -> None:
+    from deeptutor.teaching import contracts
+
+    payload = payload_factory(running_status)
+    payload["phase"] = running_phase
+    with pytest.raises(ValidationError, match="running job requires"):
+        getattr(contracts, model_name).model_validate(payload)
+
+    dumped = (
+        getattr(contracts, model_name).model_validate(payload_factory()).model_dump(mode="json")
+    )
+    dumped.update({"status": running_status, "phase": running_phase})
+    with pytest.raises(JsonSchemaValidationError):
+        Draft202012Validator(committed_schema(schema_filename)).validate(dumped)
+
+    payload.update(
+        {
+            "lease_id": "lease-1",
+            "lease_owner": "worker-1",
+            "lease_expires_at": GENERATED_AT,
+            "heartbeat_at": GENERATED_AT,
+        }
+    )
+    parsed = getattr(contracts, model_name).model_validate(payload)
+    Draft202012Validator(committed_schema(schema_filename)).validate(parsed.model_dump(mode="json"))
 
 
 @pytest.mark.parametrize(

@@ -5,7 +5,7 @@ from __future__ import annotations
 from enum import Enum
 import hashlib
 import json
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import (
     AwareDatetime,
@@ -77,10 +77,16 @@ class _ContractModel(BaseModel):
     model_config = ConfigDict(
         alias_generator=_to_camel,
         extra="forbid",
-        serialize_by_alias=True,
-        validate_by_alias=True,
-        validate_by_name=True,
+        populate_by_name=True,
     )
+
+    def model_dump(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        kwargs.setdefault("by_alias", True)
+        return super().model_dump(*args, **kwargs)
+
+    def model_dump_json(self, *args: Any, **kwargs: Any) -> str:
+        kwargs.setdefault("by_alias", True)
+        return super().model_dump_json(*args, **kwargs)
 
 
 class SourceSnapshot(_ContractModel):
@@ -169,6 +175,11 @@ class SafetyPolicy(_ContractModel):
 
 
 def _teaching_brief_schema_extra(schema: dict[str, object]) -> None:
+    schema["$comment"] = (
+        "Draft 2020-12 enforces non-empty source structures for source_grounded. "
+        "Cross-array sourceId membership in permissionSummary.allowedSourceIds "
+        "requires semantic validation."
+    )
     schema["allOf"] = [
         {
             "if": {
@@ -181,6 +192,11 @@ def _teaching_brief_schema_extra(schema: dict[str, object]) -> None:
                     "sourceFragments": {"minItems": 1},
                     "citations": {"minItems": 1},
                     "sourceRefs": {"minItems": 1},
+                    "permissionSummary": {
+                        "properties": {
+                            "allowedSourceIds": {"minItems": 1},
+                        }
+                    },
                 }
             },
         }
@@ -218,15 +234,33 @@ class TeachingBrief(_ContractModel):
 
     @model_validator(mode="after")
     def require_grounded_sources(self) -> TeachingBrief:
-        if self.content_mode == "source_grounded" and (
-            self.source_snapshot is None
-            or not self.source_fragments
-            or not self.citations
-            or not self.source_refs
-        ):
-            raise ValueError(
-                "source-grounded brief requires snapshot, fragments, citations, and source refs"
-            )
+        if self.content_mode == "source_grounded":
+            if (
+                self.source_snapshot is None
+                or not self.source_fragments
+                or not self.citations
+                or not self.source_refs
+            ):
+                raise ValueError(
+                    "source-grounded brief requires snapshot, fragments, citations, and source refs"
+                )
+            allowed_source_ids = set(self.permission_summary.allowed_source_ids)
+            if not allowed_source_ids:
+                raise ValueError("source-grounded brief requires at least one allowed source")
+            referenced_source_ids = {
+                item.source_id
+                for collection in (
+                    self.source_fragments,
+                    self.citations,
+                    self.source_refs,
+                )
+                for item in collection
+            }
+            unauthorized_source_ids = referenced_source_ids - allowed_source_ids
+            if unauthorized_source_ids:
+                raise ValueError(
+                    "source-grounded brief contains source IDs outside permission summary"
+                )
         return self
 
 
@@ -301,6 +335,19 @@ class OutlineBundle(_ContractModel):
     contract_sha256: Sha256
 
 
+def canonical_outline_json_bytes(
+    value: OutlineBundle | dict[str, object],
+) -> bytes:
+    outline = OutlineBundle.model_validate(value)
+    return canonical_json_bytes(outline)
+
+
+def canonical_outline_sha256(
+    value: OutlineBundle | dict[str, object],
+) -> str:
+    return hashlib.sha256(canonical_outline_json_bytes(value)).hexdigest()
+
+
 class ExportFormat(str, Enum):
     CLASSROOM_ZIP = "classroom_zip"
     PPTX = "pptx"
@@ -323,7 +370,8 @@ def _generation_request_schema_extra(schema: dict[str, object]) -> None:
     schema["$comment"] = (
         "confirmedOutlineSha256 is the SHA-256 of the canonical UTF-8 JSON "
         "serialization of the entire confirmed OutlineBundle: camelCase keys, "
-        "omitted nulls, sorted keys, compact separators, and UTF-8 bytes."
+        "omitted nulls, schema-declared RFC 3339 UTC timestamps serialized with "
+        "a Z suffix, sorted keys, compact separators, and UTF-8 bytes."
     )
     schema["allOf"] = [
         {
@@ -352,6 +400,44 @@ def _generation_request_schema_extra(schema: dict[str, object]) -> None:
                 "properties": {"phase": {"const": "content"}},
             },
             "then": non_null_pair,
+        },
+        {
+            "if": {
+                "required": ["phase"],
+                "properties": {"phase": {"const": "content"}},
+            },
+            "then": {
+                "properties": {
+                    "confirmedOutline": {
+                        "properties": {
+                            "confirmationMetadata": {
+                                "required": ["status"],
+                                "properties": {
+                                    "status": {"const": "confirmed"},
+                                },
+                            }
+                        }
+                    }
+                }
+            },
+        },
+        {
+            "oneOf": [
+                {
+                    "required": ["phase", "classroomMode"],
+                    "properties": {
+                        "phase": {"const": "micro"},
+                        "classroomMode": {"const": "micro"},
+                    },
+                },
+                {
+                    "required": ["phase", "classroomMode"],
+                    "properties": {
+                        "phase": {"enum": ["outline", "content"]},
+                        "classroomMode": {"const": "full"},
+                    },
+                },
+            ]
         },
     ]
 
@@ -385,23 +471,38 @@ class GenerationRequest(_ContractModel):
     duration_minutes: int = Field(ge=1)
     requested_exports: list[ExportFormat] = Field(min_length=1)
     callback_context: OpaqueIdentifier
-    data_plane_route_id: OpaqueIdentifier
+    data_plane_route_id: OpaqueIdentifier = Field(
+        description=(
+            "opaque control-plane routing key resolved by server configuration; "
+            "not a provider identifier, secret, URL, or client-selectable model route."
+        )
+    )
     priority: GenerationPriority
 
     @model_validator(mode="after")
     def validate_request_links(self) -> GenerationRequest:
+        expected_classroom_mode = "micro" if self.phase == "micro" else "full"
+        if self.classroom_mode != expected_classroom_mode:
+            raise ValueError("generation phase and classroom mode must agree")
         has_outline = self.confirmed_outline is not None
         has_hash = self.confirmed_outline_sha256 is not None
         if self.phase == "content" and not (has_outline and has_hash):
             raise ValueError("content phase requires a confirmed outline and hash")
+        if (
+            self.phase == "content"
+            and self.confirmed_outline is not None
+            and self.confirmed_outline.confirmation_metadata.status != "confirmed"
+        ):
+            raise ValueError("content phase requires confirmed outline status")
         if has_outline != has_hash:
             raise ValueError("confirmed outline and hash must be provided together")
         if self.teaching_brief_id != self.teaching_brief.brief_id:
             raise ValueError("teaching brief identity does not match embedded brief")
         if self.teaching_brief_sha256 != self.teaching_brief.content_sha256:
             raise ValueError("teaching brief hash does not match embedded brief")
-        if self.confirmed_outline is not None and self.confirmed_outline_sha256 != canonical_sha256(
-            self.confirmed_outline
+        if (
+            self.confirmed_outline is not None
+            and self.confirmed_outline_sha256 != canonical_outline_sha256(self.confirmed_outline)
         ):
             raise ValueError("confirmed outline hash does not match canonical JSON")
         return self
@@ -442,14 +543,35 @@ class QuizSceneContent(_ContractModel):
     questions: list[QuizQuestion] = Field(min_length=1)
 
 
+class InteractiveSandbox(_ContractModel):
+    allow_scripts: Literal[True]
+    allow_same_origin: Literal[False]
+
+
 class InteractiveSceneContent(_ContractModel):
     type: Literal["interactive"]
-    config: dict[str, JsonValue]
+    html: NonEmptyString
+    bridge_version: Literal["1.0"]
+    sandbox: InteractiveSandbox
+
+
+class PblRole(_ContractModel):
+    id: NonEmptyString
+    name: NonEmptyString
+    brief: NonEmptyString
+
+
+class PblMilestone(_ContractModel):
+    id: NonEmptyString
+    title: NonEmptyString
+    rubric: NonEmptyString
 
 
 class PblSceneContent(_ContractModel):
     type: Literal["pbl"]
-    config: dict[str, JsonValue]
+    scenario: NonEmptyString
+    roles: list[PblRole] = Field(min_length=1)
+    milestones: list[PblMilestone] = Field(min_length=1)
 
 
 class _OpenMaicSceneBase(_ContractModel):
@@ -506,12 +628,18 @@ class MediaManifestItem(_ContractModel):
     mime_type: NonEmptyString
     sha256: Sha256
     size_bytes: int = Field(ge=0)
+    temporary_download_path: NonEmptyString
+    expires_at: AwareDatetime
 
 
 class ExportManifestItem(_ContractModel):
     format: ExportFormat
     relative_path: NonEmptyString
     sha256: Sha256
+    size_bytes: int = Field(ge=0)
+    mime_type: NonEmptyString
+    temporary_download_path: NonEmptyString
+    expires_at: AwareDatetime
 
 
 class ClassroomAuditMetadata(_ContractModel):
@@ -628,21 +756,142 @@ class CostSummary(_ContractModel):
     actual_amount: FiniteFloat = Field(ge=0)
 
 
+def _artifact_state_schema_extra(schema: dict[str, object]) -> None:
+    schema["allOf"] = [
+        {
+            "if": {
+                "required": ["status"],
+                "properties": {"status": {"const": "ready"}},
+            },
+            "then": {
+                "required": ["sha256"],
+                "properties": {
+                    "sha256": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{64}$",
+                    }
+                },
+            },
+        }
+    ]
+
+
 class ArtifactState(_ContractModel):
+    model_config = ConfigDict(json_schema_extra=_artifact_state_schema_extra)
+
     artifact_id: NonEmptyString
     status: Literal["pending", "materializing", "ready", "failed", "discarded"]
     sha256: Sha256 | None = None
 
+    @model_validator(mode="after")
+    def require_ready_hash(self) -> ArtifactState:
+        if self.status == "ready" and self.sha256 is None:
+            raise ValueError("ready artifact requires sha256")
+        return self
 
-def _terminal_job_schema_extra(schema: dict[str, object]) -> None:
+
+ArtifactManifestKind = Literal["dsl_json", "media", "export"]
+
+
+class ArtifactManifestItem(_ContractModel):
+    kind: ArtifactManifestKind
+    relative_path: NonEmptyString
+    sha256: Sha256
+    size_bytes: int = Field(ge=0)
+    mime_type: NonEmptyString
+    temporary_download_path: NonEmptyString
+    expires_at: AwareDatetime
+
+
+_LEASE_FIELDS = ["leaseId", "leaseOwner", "leaseExpiresAt", "heartbeatAt"]
+
+
+def _job_schema_extra(
+    schema: dict[str, object],
+    *,
+    running_statuses: list[str],
+    required_succeeded_manifest_kinds: list[str],
+) -> None:
+    lease_all_non_null = {
+        "required": _LEASE_FIELDS,
+        "properties": {
+            "leaseId": {"type": "string", "minLength": 1},
+            "leaseOwner": {"type": "string", "minLength": 1},
+            "leaseExpiresAt": {"type": "string", "format": "date-time"},
+            "heartbeatAt": {"type": "string", "format": "date-time"},
+        },
+    }
+    lease_all_null = {
+        "required": _LEASE_FIELDS,
+        "properties": {field_name: {"type": "null"} for field_name in _LEASE_FIELDS},
+    }
+    lease_all_absent = {
+        "not": {"anyOf": [{"required": [field_name]} for field_name in _LEASE_FIELDS]}
+    }
+    nonready_temporary_artifact = {
+        "anyOf": [
+            {"type": "null"},
+            {
+                "type": "object",
+                "required": ["status"],
+                "properties": {
+                    "status": {
+                        "enum": [
+                            "pending",
+                            "materializing",
+                            "failed",
+                            "discarded",
+                        ]
+                    }
+                },
+            },
+        ]
+    }
+    schema["$comment"] = (
+        "Draft 2020-12 enforces terminal, artifact, and lease structure. "
+        "For succeeded jobs, finalArtifact.sha256 and the primary artifactManifest "
+        "item sha256 equality with outputSha256 require semantic validation."
+    )
+    succeeded_manifest = {
+        "allOf": [
+            {
+                "contains": {
+                    "type": "object",
+                    "required": ["kind"],
+                    "properties": {"kind": {"const": kind}},
+                },
+                "minContains": 1,
+            }
+            for kind in required_succeeded_manifest_kinds
+        ]
+    }
     schema["allOf"] = [
+        {
+            "oneOf": [
+                lease_all_absent,
+                lease_all_null,
+                lease_all_non_null,
+            ]
+        },
+        {
+            "if": {
+                "required": ["status"],
+                "properties": {"status": {"enum": running_statuses}},
+            },
+            "then": lease_all_non_null,
+        },
         {
             "if": {
                 "required": ["status"],
                 "properties": {"status": {"const": "succeeded"}},
             },
             "then": {
-                "required": ["outputSha256", "finalArtifact", "completedAt"],
+                "required": [
+                    "outputSha256",
+                    "finalArtifact",
+                    "artifactManifest",
+                    "completedAt",
+                ],
                 "properties": {
                     "outputSha256": {
                         "type": "string",
@@ -655,6 +904,7 @@ def _terminal_job_schema_extra(schema: dict[str, object]) -> None:
                     },
                     "completedAt": {"type": "string", "format": "date-time"},
                     "error": {"type": "null"},
+                    "artifactManifest": succeeded_manifest,
                 },
             },
         },
@@ -668,6 +918,9 @@ def _terminal_job_schema_extra(schema: dict[str, object]) -> None:
                 "properties": {
                     "error": {"type": "object"},
                     "completedAt": {"type": "string", "format": "date-time"},
+                    "outputSha256": {"type": "null"},
+                    "finalArtifact": {"type": "null"},
+                    "temporaryArtifact": nonready_temporary_artifact,
                 },
             },
         },
@@ -681,10 +934,38 @@ def _terminal_job_schema_extra(schema: dict[str, object]) -> None:
                 "properties": {
                     "canceledAt": {"type": "string", "format": "date-time"},
                     "completedAt": {"type": "string", "format": "date-time"},
+                    "outputSha256": {"type": "null"},
+                    "finalArtifact": {"type": "null"},
+                    "temporaryArtifact": nonready_temporary_artifact,
                 },
             },
         },
     ]
+
+
+def _generation_job_schema_extra(schema: dict[str, object]) -> None:
+    _job_schema_extra(
+        schema,
+        running_statuses=[
+            "generating_outline",
+            "generating_content",
+            "validating",
+            "materializing",
+        ],
+        required_succeeded_manifest_kinds=["dsl_json", "media"],
+    )
+
+
+def _export_job_schema_extra(schema: dict[str, object]) -> None:
+    _job_schema_extra(
+        schema,
+        running_statuses=[
+            "exporting",
+            "validating",
+            "materializing",
+        ],
+        required_succeeded_manifest_kinds=["export"],
+    )
 
 
 class _JobContract(_ContractModel):
@@ -706,6 +987,7 @@ class _JobContract(_ContractModel):
     lease_expires_at: AwareDatetime | None = None
     temporary_artifact: ArtifactState | None = None
     final_artifact: ArtifactState | None = None
+    artifact_manifest: list[ArtifactManifestItem]
     output_sha256: Sha256 | None = None
     error: JobError | None = None
     created_at: AwareDatetime
@@ -714,7 +996,25 @@ class _JobContract(_ContractModel):
     canceled_at: AwareDatetime | None = None
     completed_at: AwareDatetime | None = None
 
-    def _validate_terminal_status(self, status: str) -> None:
+    def _validate_job_status(
+        self,
+        status: str,
+        *,
+        running_statuses: set[str],
+        required_succeeded_manifest_kinds: set[str],
+        primary_manifest_kind: str,
+    ) -> None:
+        lease_values = (
+            self.lease_id,
+            self.lease_owner,
+            self.lease_expires_at,
+            self.heartbeat_at,
+        )
+        lease_count = sum(value is not None for value in lease_values)
+        if lease_count not in {0, len(lease_values)}:
+            raise ValueError("lease fields must be all present or all absent")
+        if status in running_statuses and lease_count == 0:
+            raise ValueError("running job requires a complete lease")
         if status in {"succeeded", "failed", "canceled"} and (self.completed_at is None):
             raise ValueError("terminal job requires completed_at")
         if status == "succeeded":
@@ -722,12 +1022,30 @@ class _JobContract(_ContractModel):
                 raise ValueError("succeeded job requires output_sha256")
             if self.final_artifact is None or self.final_artifact.status != "ready":
                 raise ValueError("succeeded job requires a ready final artifact")
+            if self.final_artifact.sha256 != self.output_sha256:
+                raise ValueError("final artifact sha256 must match output_sha256")
+            manifest_kinds = {item.kind for item in self.artifact_manifest}
+            missing_manifest_kinds = required_succeeded_manifest_kinds - manifest_kinds
+            if missing_manifest_kinds:
+                raise ValueError("succeeded job artifact manifest is missing required file kinds")
+            if not any(
+                item.kind == primary_manifest_kind and item.sha256 == self.output_sha256
+                for item in self.artifact_manifest
+            ):
+                raise ValueError("primary artifact manifest sha256 must match output_sha256")
             if self.error is not None:
                 raise ValueError("succeeded job cannot contain an error")
-        elif status == "failed" and self.error is None:
-            raise ValueError("failed job requires an error")
-        elif status == "canceled" and self.canceled_at is None:
-            raise ValueError("canceled job requires canceled_at")
+        elif status in {"failed", "canceled"}:
+            if self.output_sha256 is not None or self.final_artifact is not None:
+                raise ValueError("failed or canceled job cannot contain output or final artifact")
+            if self.temporary_artifact is not None and self.temporary_artifact.status == "ready":
+                raise ValueError(
+                    "failed or canceled job may retain only a non-ready temporary artifact"
+                )
+            if status == "failed" and self.error is None:
+                raise ValueError("failed job requires an error")
+            if status == "canceled" and self.canceled_at is None:
+                raise ValueError("canceled job requires canceled_at")
 
 
 class GenerationJobStatus(str, Enum):
@@ -745,7 +1063,7 @@ class GenerationJobStatus(str, Enum):
 
 
 class GenerationJob(_JobContract):
-    model_config = ConfigDict(json_schema_extra=_terminal_job_schema_extra)
+    model_config = ConfigDict(json_schema_extra=_generation_job_schema_extra)
 
     status: GenerationJobStatus
     phase: GenerationPhase
@@ -754,7 +1072,17 @@ class GenerationJob(_JobContract):
 
     @model_validator(mode="after")
     def validate_terminal_status(self) -> GenerationJob:
-        self._validate_terminal_status(self.status.value)
+        self._validate_job_status(
+            self.status.value,
+            running_statuses={
+                "generating_outline",
+                "generating_content",
+                "validating",
+                "materializing",
+            },
+            required_succeeded_manifest_kinds={"dsl_json", "media"},
+            primary_manifest_kind="dsl_json",
+        )
         return self
 
 
@@ -796,7 +1124,7 @@ class ExportJobPhase(str, Enum):
 
 
 class ExportJob(_JobContract):
-    model_config = ConfigDict(json_schema_extra=_terminal_job_schema_extra)
+    model_config = ConfigDict(json_schema_extra=_export_job_schema_extra)
 
     status: ExportJobStatus
     phase: ExportJobPhase
@@ -807,11 +1135,22 @@ class ExportJob(_JobContract):
 
     @model_validator(mode="after")
     def validate_terminal_status(self) -> ExportJob:
-        self._validate_terminal_status(self.status.value)
+        self._validate_job_status(
+            self.status.value,
+            running_statuses={
+                "exporting",
+                "validating",
+                "materializing",
+            },
+            required_succeeded_manifest_kinds={"export"},
+            primary_manifest_kind="export",
+        )
         return self
 
 
 __all__ = [
+    "ArtifactManifestItem",
+    "ArtifactManifestKind",
     "ArtifactState",
     "AssessmentPlan",
     "ClassroomAuditMetadata",
@@ -836,6 +1175,7 @@ __all__ = [
     "GenerationRequest",
     "InteractiveScene",
     "InteractiveSceneContent",
+    "InteractiveSandbox",
     "JobError",
     "JsonValue",
     "KnowledgeCoverage",
@@ -853,6 +1193,8 @@ __all__ = [
     "OutlineScene",
     "PblScene",
     "PblSceneContent",
+    "PblMilestone",
+    "PblRole",
     "PermissionSummary",
     "QuizOption",
     "QuizQuestion",
@@ -876,5 +1218,7 @@ __all__ = [
     "ValidationIssue",
     "ValidationResult",
     "canonical_json_bytes",
+    "canonical_outline_json_bytes",
+    "canonical_outline_sha256",
     "canonical_sha256",
 ]

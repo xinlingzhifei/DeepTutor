@@ -1,5 +1,5 @@
 {
-  "$comment": "confirmedOutlineSha256 is the SHA-256 of the canonical UTF-8 JSON serialization of the entire confirmed OutlineBundle: camelCase keys, omitted nulls, sorted keys, compact separators, and UTF-8 bytes.",
+  "$comment": "confirmedOutlineSha256 is the SHA-256 of the canonical UTF-8 JSON serialization of the entire confirmed OutlineBundle: camelCase keys, omitted nulls, schema-declared RFC 3339 UTC timestamps serialized with a Z suffix, sorted keys, compact separators, and UTF-8 bytes.",
   "$defs": {
     "AssessmentPlan": {
       "additionalProperties": false,
@@ -604,6 +604,7 @@
       "type": "object"
     },
     "TeachingBrief": {
+      "$comment": "Draft 2020-12 enforces non-empty source structures for source_grounded. Cross-array sourceId membership in permissionSummary.allowedSourceIds requires semantic validation.",
       "additionalProperties": false,
       "allOf": [
         {
@@ -621,6 +622,13 @@
             "properties": {
               "citations": {
                 "minItems": 1
+              },
+              "permissionSummary": {
+                "properties": {
+                  "allowedSourceIds": {
+                    "minItems": 1
+                  }
+                }
               },
               "sourceFragments": {
                 "minItems": 1
@@ -941,6 +949,71 @@
           "confirmedOutlineSha256"
         ]
       }
+    },
+    {
+      "if": {
+        "properties": {
+          "phase": {
+            "const": "content"
+          }
+        },
+        "required": [
+          "phase"
+        ]
+      },
+      "then": {
+        "properties": {
+          "confirmedOutline": {
+            "properties": {
+              "confirmationMetadata": {
+                "properties": {
+                  "status": {
+                    "const": "confirmed"
+                  }
+                },
+                "required": [
+                  "status"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "oneOf": [
+        {
+          "properties": {
+            "classroomMode": {
+              "const": "micro"
+            },
+            "phase": {
+              "const": "micro"
+            }
+          },
+          "required": [
+            "phase",
+            "classroomMode"
+          ]
+        },
+        {
+          "properties": {
+            "classroomMode": {
+              "const": "full"
+            },
+            "phase": {
+              "enum": [
+                "outline",
+                "content"
+              ]
+            }
+          },
+          "required": [
+            "phase",
+            "classroomMode"
+          ]
+        }
+      ]
     }
   ],
   "properties": {
@@ -984,6 +1057,7 @@
       "title": "Confirmedoutlinesha256"
     },
     "dataPlaneRouteId": {
+      "description": "opaque control-plane routing key resolved by server configuration; not a provider identifier, secret, URL, or client-selectable model route.",
       "minLength": 1,
       "pattern": "^[^:\\s]+$",
       "title": "Dataplanerouteid",
