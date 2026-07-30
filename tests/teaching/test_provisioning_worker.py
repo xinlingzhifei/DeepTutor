@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from sqlalchemy import exc as sqlalchemy_exc
 from sqlalchemy.dialects import postgresql
 
 from deeptutor.services.config import PlatformSettings
@@ -346,6 +347,117 @@ def test_schema_deterministic_command_error_is_not_retryable(
     assert captured.value.category == "schema"
     assert captured.value.code == "migration_failed"
     assert captured.value.retryable is False
+
+
+def _capture_schema_revision_query_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    revision_error: Exception,
+) -> ProvisioningStepError:
+    from deeptutor.teaching import provisioning_worker as worker_module
+
+    class FailingConnection:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args: Any) -> None:
+            return None
+
+        async def scalar(self, _statement):
+            raise revision_error
+
+    class FailingEngine:
+        def connect(self) -> FailingConnection:
+            return FailingConnection()
+
+    monkeypatch.setattr(worker_module, "run_migration", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        worker_module,
+        "get_platform_engine",
+        lambda: FailingEngine(),
+    )
+
+    with pytest.raises(ProvisioningStepError) as captured:
+        asyncio.run(worker_module.AlembicTenantSchemaProvisioner().provision("tenant-a"))
+    return captured.value
+
+
+@pytest.mark.parametrize(
+    "revision_error",
+    [
+        pytest.param(
+            sqlalchemy_exc.OperationalError(
+                "SELECT",
+                {},
+                RuntimeError("deterministic missing table"),
+            ),
+            id="operational-error",
+        ),
+        pytest.param(
+            sqlalchemy_exc.InterfaceError(
+                "SELECT",
+                {},
+                RuntimeError("deterministic driver response"),
+            ),
+            id="interface-error",
+        ),
+        pytest.param(
+            sqlalchemy_exc.TimeoutError("deterministic pool response"),
+            id="sqlalchemy-timeout",
+        ),
+        pytest.param(
+            sqlalchemy_exc.DBAPIError(
+                "SELECT",
+                {},
+                RuntimeError("deterministic invalidation response"),
+                connection_invalidated=True,
+            ),
+            id="invalidated-dbapi-error",
+        ),
+    ],
+)
+def test_schema_revision_query_transient_errors_are_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+    revision_error: Exception,
+) -> None:
+    failure = _capture_schema_revision_query_failure(
+        monkeypatch,
+        revision_error,
+    )
+
+    assert failure.category == "schema"
+    assert failure.code == "verification_unavailable"
+    assert failure.retryable is True
+
+
+@pytest.mark.parametrize(
+    "revision_error",
+    [
+        pytest.param(
+            sqlalchemy_exc.ProgrammingError(
+                "SELECT",
+                {},
+                RuntimeError("connection reset and timed out"),
+            ),
+            id="programming-error",
+        ),
+        pytest.param(
+            ValueError("deterministic verification failure"),
+            id="deterministic-error",
+        ),
+    ],
+)
+def test_schema_revision_query_deterministic_errors_are_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+    revision_error: Exception,
+) -> None:
+    failure = _capture_schema_revision_query_failure(
+        monkeypatch,
+        revision_error,
+    )
+
+    assert failure.category == "schema"
+    assert failure.code == "verification_failed"
+    assert failure.retryable is False
 
 
 def test_migration_runtime_error_translation_preserves_transient_types() -> None:

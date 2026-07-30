@@ -20,6 +20,7 @@ from deeptutor.teaching.artifacts import tenant_artifact_prefix
 from deeptutor.teaching.database import get_platform_engine
 from deeptutor.teaching.migrations.runner import (
     MigrationUnavailableError,
+    is_transient_database_error,
     run_migration,
 )
 from deeptutor.teaching.schema_names import tenant_schema_name
@@ -306,19 +307,16 @@ class AlembicTenantSchemaProvisioner:
                 scope="tenant",
                 tenant_schema=schema_name,
             )
-        except MigrationUnavailableError:
-            raise ProvisioningStepError(
-                category="schema",
-                code="migration_unavailable",
-                retryable=True,
-            ) from None
-        except (ConnectionError, OSError, TimeoutError):
-            raise ProvisioningStepError(
-                category="schema",
-                code="migration_unavailable",
-                retryable=True,
-            ) from None
-        except Exception:
+        except Exception as exc:
+            if (
+                isinstance(exc, MigrationUnavailableError)
+                or is_transient_database_error(exc)
+            ):
+                raise ProvisioningStepError(
+                    category="schema",
+                    code="migration_unavailable",
+                    retryable=True,
+                ) from None
             raise ProvisioningStepError(
                 category="schema",
                 code="migration_failed",
@@ -331,13 +329,13 @@ class AlembicTenantSchemaProvisioner:
                 revision = await connection.scalar(
                     text(f'SELECT version_num FROM "{schema_name}".alembic_version')
                 )
-        except (ConnectionError, OSError, TimeoutError):
-            raise ProvisioningStepError(
-                category="schema",
-                code="verification_unavailable",
-                retryable=True,
-            ) from None
-        except Exception:
+        except Exception as exc:
+            if is_transient_database_error(exc):
+                raise ProvisioningStepError(
+                    category="schema",
+                    code="verification_unavailable",
+                    retryable=True,
+                ) from None
             raise ProvisioningStepError(
                 category="schema",
                 code="verification_failed",
