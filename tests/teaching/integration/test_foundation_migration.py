@@ -11,7 +11,7 @@ import sys
 import zipfile
 
 import pytest
-from sqlalchemy import make_url, select, text
+from sqlalchemy import func, make_url, select, text
 from sqlalchemy.ext.asyncio import create_async_engine
 from testcontainers.community.postgres import PostgresContainer
 
@@ -875,6 +875,7 @@ def test_provisioning_worker_migration_roundtrips_0002_and_backfills_routes(
                                   AND table_name = 'tenant_provisioning_jobs'
                                   AND column_name IN (
                                       'lease_owner',
+                                      'lease_token',
                                       'lease_expires_at',
                                       'heartbeat_at',
                                       'next_attempt_at',
@@ -912,6 +913,7 @@ def test_provisioning_worker_migration_roundtrips_0002_and_backfills_routes(
         "heartbeat_at",
         "lease_expires_at",
         "lease_owner",
+        "lease_token",
         "max_attempts",
         "next_attempt_at",
         "started_at",
@@ -1228,7 +1230,7 @@ def _install_source_runtime_database(
     return settings, database_module
 
 
-def test_postgres_claims_are_unique_stale_leases_reclaim_and_old_owner_is_fenced(
+def test_postgres_claims_are_unique_and_stale_same_owner_token_is_fenced(
     migration_database,
     monkeypatch,
 ) -> None:
@@ -1243,6 +1245,8 @@ def test_postgres_claims_are_unique_stale_leases_reclaim_and_old_owner_is_fenced
         TENANT_SCHEMA_REVISION,
         ProvisioningClaim,
         SchemaProvisioningResult,
+        StorageProvisioningResult,
+        build_default_policy_result,
     )
     from deeptutor.teaching.repositories.provisioning import (
         SqlAlchemyProvisioningRepository,
@@ -1333,34 +1337,67 @@ def test_postgres_claims_are_unique_stale_leases_reclaim_and_old_owner_is_fenced
                             operation="provision",
                             status="running",
                             attempt_count=2,
-                            lease_owner="worker-old",
+                            lease_owner="worker-same",
+                            lease_token="lease-old",
                             lease_expires_at=datetime.now(UTC) - timedelta(minutes=1),
                             heartbeat_at=datetime.now(UTC) - timedelta(minutes=2),
                         )
                     )
 
             reclaimed = await repository.claim_next(
-                "worker-new",
+                "worker-same",
                 lease_seconds=60,
             )
-            assert reclaimed == ProvisioningClaim(
-                tenant_id="worker-stale",
-                job_id="job-worker-stale",
-                attempt_count=2,
-                lease_owner="worker-new",
-            )
+            assert reclaimed is not None
+            assert reclaimed.tenant_id == "worker-stale"
+            assert reclaimed.job_id == "job-worker-stale"
+            assert reclaimed.attempt_count == 2
+            assert reclaimed.lease_owner == "worker-same"
+            assert reclaimed.lease_token != "lease-old"
             old_claim = ProvisioningClaim(
                 tenant_id="worker-stale",
                 job_id="job-worker-stale",
                 attempt_count=2,
-                lease_owner="worker-old",
+                lease_owner="worker-same",
+                lease_token="lease-old",
             )
             schema_result = SchemaProvisioningResult(
                 schema_name=tenant_schema_name("worker-stale"),
                 revision=TENANT_SCHEMA_REVISION,
             )
+            storage_result = StorageProvisioningResult.local("worker-stale")
+            policy_result = build_default_policy_result()
+            assert await repository.heartbeat(old_claim, lease_seconds=60) is False
             assert await repository.record_schema_ready(old_claim, schema_result) is False
+            assert await repository.record_storage_ready(old_claim, storage_result) is False
+            assert (
+                await repository.record_default_policy_ready(
+                    old_claim,
+                    policy_result,
+                )
+                is False
+            )
             assert await repository.record_schema_ready(reclaimed, schema_result) is True
+            assert await repository.record_storage_ready(reclaimed, storage_result) is True
+            assert (
+                await repository.record_default_policy_ready(
+                    reclaimed,
+                    policy_result,
+                )
+                is True
+            )
+            assert (
+                await repository.record_failure(
+                    old_claim,
+                    category="worker",
+                    code="unexpected_error",
+                    retryable=False,
+                    backoff_seconds=5,
+                )
+                is False
+            )
+            assert await repository.activate(old_claim) is False
+            assert await repository.activate(reclaimed) is True
 
             async with database_module.platform_session() as session:
                 state = await session.get(TenantSchemaState, "worker-stale")
@@ -1368,7 +1405,9 @@ def test_postgres_claims_are_unique_stale_leases_reclaim_and_old_owner_is_fenced
                 assert state.revision == TENANT_SCHEMA_REVISION
                 job = await session.get(TenantProvisioningJob, "job-worker-stale")
                 assert job is not None
-                assert job.lease_owner == "worker-new"
+                assert job.status == "completed"
+                assert job.lease_owner is None
+                assert job.lease_token is None
         finally:
             await database_module.dispose_platform_engine()
 
@@ -1385,9 +1424,11 @@ def test_postgres_activation_requires_all_states_and_s3_credential_binding(
         TenantDefaultPolicyState,
         TenantProvisioningJob,
         TenantStorageCredential,
+        TenantStorageState,
     )
     from deeptutor.teaching.provisioning_worker import (
         TENANT_SCHEMA_REVISION,
+        ProvisioningStepError,
         SchemaProvisioningResult,
         StorageProvisioningResult,
         build_default_policy_result,
@@ -1397,6 +1438,10 @@ def test_postgres_activation_requires_all_states_and_s3_credential_binding(
     )
     from deeptutor.teaching.repositories.tenants import TenantRepository
 
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(migration_database, "scope=platform"),
+    )
     _settings, database_module = _install_source_runtime_database(
         monkeypatch,
         migration_database,
@@ -1426,10 +1471,30 @@ def test_postgres_activation_requires_all_states_and_s3_credential_binding(
             assert await repository.record_schema_ready(claim, schema_result) is True
             assert await repository.activate(claim) is False
 
-            storage_result = replace(
-                StorageProvisioningResult.local(claim.tenant_id),
+            local_storage = StorageProvisioningResult.local(claim.tenant_id)
+            cross_tenant_storage = replace(
+                local_storage,
                 mode="s3",
-                secret_ref="activation-prerequisites/credential",
+                secret_ref="another-tenant/object-store",
+                access_key_fingerprint="a" * 64,
+            )
+            with pytest.raises(ProvisioningStepError):
+                await repository.record_storage_ready(
+                    claim,
+                    cross_tenant_storage,
+                )
+            assert await repository.activate(claim) is False
+            async with database_module.platform_session() as session:
+                assert (
+                    await session.get(TenantStorageCredential, claim.tenant_id)
+                    is None
+                )
+                assert await session.get(TenantStorageState, claim.tenant_id) is None
+
+            storage_result = replace(
+                local_storage,
+                mode="s3",
+                secret_ref="activation-prerequisites/object-store",
                 access_key_fingerprint="a" * 64,
             )
             assert await repository.record_storage_ready(claim, storage_result) is True
@@ -1564,6 +1629,10 @@ def test_postgres_step_failures_never_activate_and_persist_fixed_retry_state(
     )
     from deeptutor.teaching.repositories.tenants import TenantRepository
 
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(migration_database, "scope=platform"),
+    )
     _settings, database_module = _install_source_runtime_database(
         monkeypatch,
         migration_database,
@@ -1690,6 +1759,10 @@ def test_create_intent_runs_to_active_with_real_schema_revision_and_local_storag
         TenantProvisioningService,
     )
 
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(migration_database, "scope=platform"),
+    )
     settings, database_module = _install_source_runtime_database(
         monkeypatch,
         migration_database,
@@ -1720,9 +1793,44 @@ def test_create_intent_runs_to_active_with_real_schema_revision_and_local_storag
                 ),
                 policy_provisioner=FixedTenantPolicyProvisioner(),
                 lease_seconds=60,
-                heartbeat_interval_seconds=0.05,
+                heartbeat_interval_seconds=0.5,
             )
-            assert await worker.run_once() is True
+            safe_state = None
+            for attempt_index in range(3):
+                assert await worker.run_once() is True
+                async with database_module.platform_session() as session:
+                    tenant = await session.get(Tenant, intent.tenant_id)
+                    job = await session.get(TenantProvisioningJob, intent.job_id)
+                    database_now = await session.scalar(select(func.now()))
+                    assert tenant is not None
+                    assert job is not None
+                    safe_state = (
+                        tenant.status,
+                        job.status,
+                        job.error_category,
+                        job.error_code,
+                    )
+                    if tenant.status == "active" and job.status == "completed":
+                        break
+                    assert job.status == "pending", (
+                        f"provisioning stopped in safe state {safe_state!r}"
+                    )
+                    assert (job.error_category, job.error_code) in {
+                        ("infrastructure", "temporarily_unavailable"),
+                        ("schema", "migration_unavailable"),
+                    }
+                    assert database_now is not None
+                    delay_seconds = max(
+                        0.0,
+                        (job.next_attempt_at - database_now).total_seconds(),
+                    )
+                if attempt_index == 2:
+                    pytest.fail(
+                        f"provisioning did not activate: {safe_state!r}",
+                    )
+                await asyncio.sleep(min(delay_seconds + 0.05, 10.05))
+            else:
+                pytest.fail(f"provisioning did not activate: {safe_state!r}")
 
             schema_name = tenant_schema_name(intent.tenant_id)
             async with database_module.platform_session() as session:

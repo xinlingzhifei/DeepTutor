@@ -13,6 +13,7 @@ from sqlalchemy.schema import CreateSchema
 from deeptutor.services.config import load_platform_settings
 from deeptutor.teaching.migrations.runner import (
     MigrationScope,
+    translate_migration_runtime_error,
     validate_migration_scope,
 )
 
@@ -107,4 +108,4 @@ try:
 except CommandError:
     raise
 except Exception as exc:
-    raise CommandError(f"database migration failed ({type(exc).__name__})") from None
+    raise translate_migration_runtime_error(exc) from None

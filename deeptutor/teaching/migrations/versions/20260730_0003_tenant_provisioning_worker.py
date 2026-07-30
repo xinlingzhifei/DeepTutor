@@ -172,6 +172,7 @@ def upgrade() -> None:
     )
     for column in (
         sa.Column("lease_owner", sa.String(length=128), nullable=True),
+        sa.Column("lease_token", sa.String(length=64), nullable=True),
         sa.Column("lease_expires_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("heartbeat_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("error_category", sa.String(length=64), nullable=True),
@@ -229,6 +230,7 @@ def downgrade() -> None:
         "error_category",
         "heartbeat_at",
         "lease_expires_at",
+        "lease_token",
         "lease_owner",
         "next_attempt_at",
         "max_attempts",

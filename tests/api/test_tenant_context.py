@@ -1496,6 +1496,7 @@ def test_write_statements_bind_scope_state_and_conflict_keys() -> None:
         "attempt_count + 1",
         "next_attempt_at=now()",
         "lease_owner=null",
+        "lease_token=null",
         "lease_expires_at=null",
         "heartbeat_at=null",
         "error_category=null",

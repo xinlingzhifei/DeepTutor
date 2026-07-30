@@ -397,6 +397,7 @@ def build_failed_job_retry_statement(
             attempt_count=TenantProvisioningJob.attempt_count + 1,
             next_attempt_at=func.now(),
             lease_owner=None,
+            lease_token=None,
             lease_expires_at=None,
             heartbeat_at=None,
             error_category=None,

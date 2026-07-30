@@ -240,6 +240,7 @@ class TenantProvisioningJob(PlatformBase):
         server_default=func.now(),
     )
     lease_owner: Mapped[str | None] = mapped_column(String(128))
+    lease_token: Mapped[str | None] = mapped_column(String(64))
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error_category: Mapped[str | None] = mapped_column(String(64))

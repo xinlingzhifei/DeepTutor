@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+import secrets
 from typing import Any
 
 from sqlalchemy import and_, func, or_, select, update
@@ -112,6 +113,7 @@ def build_fenced_attempt_statement(
             TenantProvisioningJob.status == "running",
             TenantProvisioningJob.attempt_count == claim.attempt_count,
             TenantProvisioningJob.lease_owner == claim.lease_owner,
+            TenantProvisioningJob.lease_token == claim.lease_token,
             TenantProvisioningJob.lease_expires_at.is_not(None),
             TenantProvisioningJob.lease_expires_at > reference_time,
         )
@@ -224,8 +226,10 @@ class SqlAlchemyProvisioningRepository:
                 if row is None:
                     return None
                 job, _tenant = row
+                lease_token = secrets.token_hex(32)
                 job.status = "running"
                 job.lease_owner = worker_id
+                job.lease_token = lease_token
                 job.lease_expires_at = now + timedelta(seconds=lease_seconds)
                 job.heartbeat_at = now
                 job.started_at = job.started_at or now
@@ -237,6 +241,7 @@ class SqlAlchemyProvisioningRepository:
                     job_id=job.id,
                     attempt_count=job.attempt_count,
                     lease_owner=worker_id,
+                    lease_token=lease_token,
                 )
                 await _record_audit_once(
                     session,
@@ -266,6 +271,7 @@ class SqlAlchemyProvisioningRepository:
                         TenantProvisioningJob.status == "running",
                         TenantProvisioningJob.attempt_count == claim.attempt_count,
                         TenantProvisioningJob.lease_owner == claim.lease_owner,
+                        TenantProvisioningJob.lease_token == claim.lease_token,
                         TenantProvisioningJob.lease_expires_at.is_not(None),
                         TenantProvisioningJob.lease_expires_at > now,
                     )
@@ -460,6 +466,7 @@ class SqlAlchemyProvisioningRepository:
                 job.status = "completed"
                 job.completed_at = now
                 job.lease_owner = None
+                job.lease_token = None
                 job.lease_expires_at = None
                 job.heartbeat_at = now
                 job.updated_at = now
@@ -489,6 +496,7 @@ class SqlAlchemyProvisioningRepository:
                 job.error_category = category
                 job.error_code = code
                 job.lease_owner = None
+                job.lease_token = None
                 job.lease_expires_at = None
                 job.heartbeat_at = None
                 job.updated_at = now

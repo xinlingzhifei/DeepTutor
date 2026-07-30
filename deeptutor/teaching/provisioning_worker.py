@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 from pathlib import Path, PureWindowsPath
@@ -18,7 +18,10 @@ from deeptutor.runtime.home import get_runtime_data_root
 from deeptutor.services.config import PlatformSettings, load_platform_settings
 from deeptutor.teaching.artifacts import tenant_artifact_prefix
 from deeptutor.teaching.database import get_platform_engine
-from deeptutor.teaching.migrations.runner import run_migration
+from deeptutor.teaching.migrations.runner import (
+    MigrationUnavailableError,
+    run_migration,
+)
 from deeptutor.teaching.schema_names import tenant_schema_name
 
 TENANT_SCHEMA_REVISION = "20260730_0003"
@@ -74,6 +77,7 @@ class ProvisioningClaim:
     job_id: str
     attempt_count: int
     lease_owner: str
+    lease_token: str = field(repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,6 +143,7 @@ class StorageProvisioningResult:
             or "\x00" in secret_ref
             or PureWindowsPath(secret_ref).drive
             or any(part in {"", ".", ".."} for part in secret_ref.split("/"))
+            or secret_ref != f"{tenant_id}/object-store"
             or fingerprint is None
             or len(fingerprint) != 64
             or any(character not in "0123456789abcdef" for character in fingerprint)
@@ -301,6 +306,12 @@ class AlembicTenantSchemaProvisioner:
                 scope="tenant",
                 tenant_schema=schema_name,
             )
+        except MigrationUnavailableError:
+            raise ProvisioningStepError(
+                category="schema",
+                code="migration_unavailable",
+                retryable=True,
+            ) from None
         except (ConnectionError, OSError, TimeoutError):
             raise ProvisioningStepError(
                 category="schema",

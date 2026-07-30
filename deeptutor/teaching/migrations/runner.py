@@ -11,9 +11,40 @@ from typing import Literal, NamedTuple
 from alembic import command
 from alembic.config import Config
 from alembic.util import CommandError
+from sqlalchemy.exc import DBAPIError, DisconnectionError, OperationalError
 
 _TENANT_SCHEMA_PATTERN = re.compile(r"tenant_[0-9a-f]{16}")
 _SUPPORTED_ACTIONS = frozenset({"upgrade", "downgrade"})
+
+
+class MigrationUnavailableError(CommandError):
+    """Fixed machine-readable transient migration failure."""
+
+    code = "migration_unavailable"
+
+    def __init__(self) -> None:
+        super().__init__("database migration is temporarily unavailable")
+
+
+def translate_migration_runtime_error(exc: Exception) -> CommandError:
+    """Preserve transient connection failures without parsing messages."""
+
+    if isinstance(exc, MigrationUnavailableError):
+        return exc
+    if isinstance(
+        exc,
+        (
+            ConnectionError,
+            DisconnectionError,
+            OperationalError,
+            OSError,
+            TimeoutError,
+        ),
+    ) or isinstance(exc, DBAPIError) and exc.connection_invalidated:
+        return MigrationUnavailableError()
+    if isinstance(exc, CommandError):
+        return exc
+    return CommandError(f"database migration failed ({type(exc).__name__})")
 
 
 class MigrationScope(NamedTuple):

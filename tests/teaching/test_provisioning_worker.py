@@ -33,6 +33,7 @@ class FakeProvisioningRepository:
             job_id="job-a",
             attempt_count=0,
             lease_owner="worker-a",
+            lease_token="lease-a",
         )
         self.failures: list[tuple[str, str, bool, int]] = []
 
@@ -308,6 +309,72 @@ def test_s3_default_admin_boundary_fails_closed_without_credential_metadata(
     assert "password" not in repr(captured.value).lower()
 
 
+def test_schema_migration_unavailable_error_is_retryable_and_machine_readable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from deeptutor.teaching import provisioning_worker as worker_module
+    from deeptutor.teaching.migrations.runner import MigrationUnavailableError
+
+    def unavailable(**_kwargs: Any) -> None:
+        raise MigrationUnavailableError()
+
+    monkeypatch.setattr(worker_module, "run_migration", unavailable)
+
+    with pytest.raises(ProvisioningStepError) as captured:
+        asyncio.run(worker_module.AlembicTenantSchemaProvisioner().provision("tenant-a"))
+
+    assert captured.value.category == "schema"
+    assert captured.value.code == "migration_unavailable"
+    assert captured.value.retryable is True
+
+
+def test_schema_deterministic_command_error_is_not_retryable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from alembic.util import CommandError
+
+    from deeptutor.teaching import provisioning_worker as worker_module
+
+    def deterministic(**_kwargs: Any) -> None:
+        raise CommandError("deterministic migration failure")
+
+    monkeypatch.setattr(worker_module, "run_migration", deterministic)
+
+    with pytest.raises(ProvisioningStepError) as captured:
+        asyncio.run(worker_module.AlembicTenantSchemaProvisioner().provision("tenant-a"))
+
+    assert captured.value.category == "schema"
+    assert captured.value.code == "migration_failed"
+    assert captured.value.retryable is False
+
+
+def test_migration_runtime_error_translation_preserves_transient_types() -> None:
+    from alembic.util import CommandError
+    from sqlalchemy.exc import OperationalError
+
+    from deeptutor.teaching.migrations.runner import (
+        MigrationUnavailableError,
+        translate_migration_runtime_error,
+    )
+
+    transients = (
+        ConnectionError("connection message must not be parsed"),
+        TimeoutError("timeout message must not be parsed"),
+        OperationalError(
+            "connect",
+            {},
+            RuntimeError("SQL message must not be parsed"),
+        ),
+    )
+    deterministic = CommandError("same words: temporarily unavailable")
+
+    for transient in transients:
+        translated = translate_migration_runtime_error(transient)
+        assert isinstance(translated, MigrationUnavailableError)
+        assert translated.code == "migration_unavailable"
+    assert translate_migration_runtime_error(deterministic) is deterministic
+
+
 def test_injected_s3_admin_must_execute_and_return_verified_tenant_binding(
     tmp_path: Path,
 ) -> None:
@@ -382,6 +449,23 @@ def test_s3_credential_reference_must_be_resolver_safe() -> None:
     assert captured.value.code == "invalid_credential_metadata"
 
 
+def test_s3_credential_reference_must_be_bound_to_current_tenant() -> None:
+    local = StorageProvisioningResult.local("tenant-a")
+    cross_tenant = StorageProvisioningResult(
+        mode="s3",
+        policy_version=local.policy_version,
+        policy_payload=local.policy_payload,
+        policy_hash=local.policy_hash,
+        secret_ref="tenant-b/object-store",
+        access_key_fingerprint="a" * 64,
+    )
+
+    with pytest.raises(ProvisioningStepError) as captured:
+        cross_tenant.validate("tenant-a")
+
+    assert captured.value.code == "invalid_credential_metadata"
+
+
 def test_unknown_failure_classification_is_rejected_before_persistence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -392,6 +476,7 @@ def test_unknown_failure_classification_is_rejected_before_persistence(
         job_id="job-a",
         attempt_count=0,
         lease_owner="worker-a",
+        lease_token="lease-a",
     )
     repository = repository_module.SqlAlchemyProvisioningRepository()
     opened = False
@@ -454,6 +539,7 @@ def test_blocked_step_is_heartbeated_before_another_worker_can_reclaim() -> None
                         job_id="job-a",
                         attempt_count=0,
                         lease_owner="worker-b",
+                        lease_token="lease-b",
                     )
                 return None
 
@@ -591,6 +677,7 @@ def test_fenced_query_binds_tenant_job_attempt_owner_and_live_lease() -> None:
         job_id="job-a",
         attempt_count=3,
         lease_owner="worker-a",
+        lease_token="lease-new",
     )
     sql = _compiled_sql(
         build_fenced_attempt_statement(
@@ -606,6 +693,7 @@ def test_fenced_query_binds_tenant_job_attempt_owner_and_live_lease() -> None:
         "tenant_provisioning_jobs.tenant_id = 'tenant-a'",
         "tenant_provisioning_jobs.attempt_count = 3",
         "tenant_provisioning_jobs.lease_owner = 'worker-a'",
+        "tenant_provisioning_jobs.lease_token = 'lease-new'",
         "tenant_provisioning_jobs.status = 'running'",
         "tenant_provisioning_jobs.lease_expires_at >",
         "for update",
@@ -623,6 +711,7 @@ def test_worker_activation_requires_schema_policy_and_mode_specific_storage() ->
         job_id="job-a",
         attempt_count=3,
         lease_owner="worker-a",
+        lease_token="lease-a",
     )
     sql = _compiled_sql(
         build_worker_activation_statement(
