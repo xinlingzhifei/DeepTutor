@@ -76,6 +76,7 @@ def build_tenant_claim_statement(
     worker_pool_ref: str,
     queue_ref: str,
     slot_pool: str,
+    job_kind: str | None = None,
 ) -> Select[tuple[TenantSchedulerState]]:
     """Lock the least-recently dispatched tenant that has due queued work."""
 
@@ -89,6 +90,11 @@ def build_tenant_claim_statement(
             GenerationQueue.slot_pool == slot_pool,
             GenerationQueue.status == "queued",
             GenerationQueue.available_at <= func.now(),
+            *(
+                (GenerationQueue.job_kind == job_kind,)
+                if job_kind is not None
+                else ()
+            ),
         )
     ).exists()
     available_tenant_slot = (
@@ -253,6 +259,7 @@ class FairScheduler:
         queue_ref: str,
         worker_id: str,
         lease_seconds: int,
+        job_kind: str | None = None,
     ) -> ClaimedGenerationJob | None:
         for value, name, max_length in (
             (data_plane_route_id, "data_plane_route_id", 63),
@@ -274,6 +281,8 @@ class FairScheduler:
             raise ValueError("data_plane_route_id is invalid")
         if slot_pool not in {"generation", "mp4_export"}:
             raise ValueError("slot_pool is invalid")
+        if job_kind not in {None, "generation", "export"}:
+            raise ValueError("job_kind is invalid")
         if (
             not isinstance(worker_id, str)
             or not worker_id
@@ -322,6 +331,7 @@ class FairScheduler:
                         worker_pool_ref,
                         queue_ref,
                         slot_pool,
+                        job_kind,
                     )
                 )
                 if tenant_state is None:
@@ -366,6 +376,11 @@ class FairScheduler:
                             GenerationQueue.slot_pool == slot_pool,
                             GenerationQueue.status == "queued",
                             GenerationQueue.available_at <= now,
+                            *(
+                                (GenerationQueue.job_kind == job_kind,)
+                                if job_kind is not None
+                                else ()
+                            ),
                         )
                         .order_by(
                             GenerationQueue.priority.desc(),

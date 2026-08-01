@@ -203,6 +203,44 @@ class SqlAlchemyDataPlaneRepository:
             return None
         return route
 
+    async def resolve_worker_selection(
+        self,
+        *,
+        tenant_id: str,
+        route_id: str,
+        provider_profile_id: str,
+        worker_pool_ref: str,
+        queue_ref: str,
+    ) -> DataPlaneSelection | None:
+        """Resolve one persisted job binding without trusting process input."""
+
+        resolution = await self.resolve(tenant_id)
+        if resolution is None:
+            return None
+        route = resolution.route
+        profile = resolution.provider_profile
+        if (
+            route is None
+            or profile is None
+            or route.route_id != route_id
+            or route.provider_profile_id != provider_profile_id
+            or route.worker_pool != worker_pool_ref
+            or route.queue_name != queue_ref
+            or route.status != "active"
+            or route.health_status != "healthy"
+            or profile.profile_id != provider_profile_id
+            or profile.status != "active"
+        ):
+            return None
+        return DataPlaneSelection(
+            tenant_id=tenant_id,
+            route_ref=route.route_id,
+            provider_profile_ref=profile.profile_id,
+            mode=route.mode,
+            worker_pool_ref=route.worker_pool,
+            queue_ref=route.queue_name,
+        )
+
     async def set_health(self, route_id: str, health_status: str) -> bool:
         if health_status not in {"healthy", "unhealthy"}:
             raise ValueError("health_status must be healthy or unhealthy")

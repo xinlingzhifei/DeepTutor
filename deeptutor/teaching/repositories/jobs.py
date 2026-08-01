@@ -256,6 +256,46 @@ class GenerationJobRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class GenerationJobDetails:
+    tenant_id: str
+    job_id: str
+    job_kind: str
+    phase: str
+    export_format: str | None
+    status: str
+    priority: int
+    quota_units: int
+    actor_id: str
+    owner_id: str
+    visibility: str
+    request_id: str
+    idempotency_key: str
+    classroom_draft_id: str | None
+    batch_id: str | None
+    request_sha256: str
+    data_plane_route_id: str
+    provider_profile_id: str
+    worker_pool_ref: str
+    queue_ref: str
+    request_payload: str
+    progress_percent: int
+    waiting_reason: str | None
+    cancel_requested: bool
+    error_category: str | None
+    error_code: str | None
+    result_payload: str | None
+    result_ref: str | None
+    retry_of_job_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ExportArtifactRecord:
+    relative_name: str
+    object_key: str
+    mime_type: str
+
+
+@dataclass(frozen=True, slots=True)
 class ClaimedJobPayload:
     request_payload: str
     request_sha256: str
@@ -614,12 +654,62 @@ class SqlAlchemyGenerationJobRepository:
         self,
         tenant_id: str,
         job_id: str,
+        *,
+        request_payload: str,
+        request_sha256: str,
     ) -> bool:
         """Move a confirmed outline to content and append its second event."""
+
+        _required(request_payload, "request_payload", 1_000_000)
+        if hashlib.sha256(request_payload.encode()).hexdigest() != request_sha256:
+            raise ValueError("request_sha256 does not match request_payload")
+        try:
+            parsed_payload = json.loads(request_payload)
+        except (json.JSONDecodeError, UnicodeError):
+            raise ValueError("request_payload must be canonical JSON") from None
+        if not isinstance(parsed_payload, dict) or parsed_payload.get("phase") != "content":
+            raise ValueError("confirmed request payload must use content phase")
+        if json.dumps(
+            parsed_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ) != request_payload:
+            raise ValueError("request_payload must be canonical JSON")
 
         session_factory = self._session_factory(tenant_id)
         async with session_factory() as session:
             async with session.begin():
+                job = await session.scalar(
+                    select(GenerationJob)
+                    .where(
+                        GenerationJob.id == job_id,
+                        GenerationJob.tenant_id == tenant_id,
+                        GenerationJob.job_kind == "generation",
+                        GenerationJob.phase == "outline",
+                        GenerationJob.status == "awaiting_confirmation",
+                    )
+                    .with_for_update()
+                )
+                if job is None:
+                    return False
+                if (
+                    parsed_payload.get("tenantId") != tenant_id
+                    or parsed_payload.get("jobId") != job_id
+                    or parsed_payload.get("requestId") != job.request_id
+                    or parsed_payload.get("idempotencyKey") != job.idempotency_key
+                    or parsed_payload.get("dataPlaneRouteId") != job.data_plane_route_id
+                ):
+                    raise ValueError("confirmed request identity does not match the job")
+                if not await lock_active_job_binding(
+                    session,
+                    tenant_id=tenant_id,
+                    data_plane_route_id=job.data_plane_route_id,
+                    provider_profile_id=job.provider_profile_id,
+                    worker_pool_ref=job.worker_pool_ref,
+                    queue_ref=job.queue_ref,
+                ):
+                    raise DataPlaneBindingUnavailable()
                 old_queue = await session.scalar(
                     select(GenerationQueue.job_id)
                     .where(
@@ -639,32 +729,13 @@ class SqlAlchemyGenerationJobRepository:
                 if old_queue is not None or claimed_slot is not None:
                     raise ContentRequeueConflict()
                 now = await _database_now(session)
-                result = await session.execute(
-                    update(GenerationJob)
-                    .where(
-                        GenerationJob.id == job_id,
-                        GenerationJob.tenant_id == tenant_id,
-                        GenerationJob.job_kind == "generation",
-                        GenerationJob.phase == "outline",
-                        GenerationJob.status == "awaiting_confirmation",
-                    )
-                    .values(
-                        phase="content",
-                        status="queued",
-                        waiting_reason=None,
-                        updated_at=now,
-                    )
-                    .returning(
-                        GenerationJob.priority,
-                        GenerationJob.data_plane_route_id,
-                        GenerationJob.provider_profile_id,
-                        GenerationJob.worker_pool_ref,
-                        GenerationJob.queue_ref,
-                    )
-                )
-                binding = result.one_or_none()
-                if binding is None:
-                    return False
+                job.phase = "content"
+                job.status = "queued"
+                job.request_payload = request_payload
+                job.request_sha256 = request_sha256
+                job.next_attempt_at = now
+                job.waiting_reason = None
+                job.updated_at = now
                 session.add(
                     OutboxMessage(
                         event_id=_event_id(tenant_id, job_id, "content"),
@@ -672,14 +743,14 @@ class SqlAlchemyGenerationJobRepository:
                         job_id=job_id,
                         job_kind="generation",
                         phase="content",
-                        data_plane_route_id=binding.data_plane_route_id,
-                        provider_profile_id=binding.provider_profile_id,
-                        worker_pool_ref=binding.worker_pool_ref,
-                        queue_ref=binding.queue_ref,
+                        data_plane_route_id=job.data_plane_route_id,
+                        provider_profile_id=job.provider_profile_id,
+                        worker_pool_ref=job.worker_pool_ref,
+                        queue_ref=job.queue_ref,
                         slot_pool="generation",
-                        priority=binding.priority,
+                        priority=job.priority,
                         event_type="generation_job.content_ready",
-                        payload="content",
+                        payload=request_sha256,
                         available_at=now,
                     )
                 )
@@ -702,6 +773,75 @@ class SqlAlchemyGenerationJobRepository:
             if job is None:
                 return None
             return self._record(job)
+
+    async def get_job_details(
+        self,
+        tenant_id: str,
+        job_id: str,
+    ) -> GenerationJobDetails | None:
+        session_factory = self._session_factory(tenant_id)
+        async with session_factory() as session:
+            job = await session.scalar(
+                select(GenerationJob).where(
+                    GenerationJob.id == job_id,
+                    GenerationJob.tenant_id == tenant_id,
+                )
+            )
+            if job is None:
+                return None
+            return GenerationJobDetails(
+                tenant_id=job.tenant_id,
+                job_id=job.id,
+                job_kind=job.job_kind,
+                phase=job.phase,
+                export_format=job.export_format,
+                status=job.status,
+                priority=job.priority,
+                quota_units=job.quota_units,
+                actor_id=job.actor_id,
+                owner_id=job.owner_id,
+                visibility=job.visibility,
+                request_id=job.request_id,
+                idempotency_key=job.idempotency_key,
+                classroom_draft_id=job.classroom_draft_id,
+                batch_id=job.batch_id,
+                request_sha256=job.request_sha256,
+                data_plane_route_id=job.data_plane_route_id,
+                provider_profile_id=job.provider_profile_id,
+                worker_pool_ref=job.worker_pool_ref,
+                queue_ref=job.queue_ref,
+                request_payload=job.request_payload,
+                progress_percent=job.progress_percent,
+                waiting_reason=job.waiting_reason,
+                cancel_requested=job.cancel_requested,
+                error_category=job.error_category,
+                error_code=job.error_code,
+                result_payload=job.result_payload,
+                result_ref=job.result_ref,
+                retry_of_job_id=job.retry_of_job_id,
+            )
+
+    async def get_export_artifact(
+        self,
+        tenant_id: str,
+        job_id: str,
+    ) -> ExportArtifactRecord | None:
+        session_factory = self._session_factory(tenant_id)
+        async with session_factory() as session:
+            artifact = await session.scalar(
+                select(ClassroomArtifact).where(
+                    ClassroomArtifact.tenant_id == tenant_id,
+                    ClassroomArtifact.source_job_id == job_id,
+                    ClassroomArtifact.artifact_kind == "export",
+                )
+            )
+            if artifact is None:
+                return None
+            return ExportArtifactRecord(
+                relative_name=artifact.relative_name,
+                object_key=artifact.object_key,
+                mime_type=artifact.mime_type,
+            )
 
     @staticmethod
     async def _lock_claim(

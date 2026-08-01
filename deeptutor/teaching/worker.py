@@ -201,16 +201,20 @@ class GenerationWorker:
         clients: WorkerClientProvider,
         stores: WorkerStoreProvider,
         worker_id: str,
+        job_kind: str | None = None,
         repairer: DslRepairer | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         if not worker_id:
             raise ValueError("worker_id is required")
+        if job_kind not in {None, "generation", "export"}:
+            raise ValueError("job_kind is invalid")
         self._scheduler = scheduler
         self._repository = repository
         self._clients = clients
         self._stores = stores
         self._worker_id = worker_id
+        self._job_kind = job_kind
         self._repairer = repairer
         self._sleep = sleep
 
@@ -231,9 +235,12 @@ class GenerationWorker:
             queue_ref=queue_ref,
             worker_id=self._worker_id,
             lease_seconds=LEASE_SECONDS,
+            job_kind=self._job_kind,
         )
         if claim is None:
             return False
+        if self._job_kind is not None and claim.job_kind != self._job_kind:
+            raise RuntimeError("scheduler returned an unexpected job kind")
         try:
             await self._run_claim(claim)
         except JobLeaseLost:

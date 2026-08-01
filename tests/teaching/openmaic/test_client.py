@@ -597,7 +597,7 @@ def test_invalid_json_drops_the_response_body_from_the_exception_chain() -> None
 
 
 def test_poll_uses_bounded_exponential_backoff_and_jitter() -> None:
-    responses = iter(["queued", "generating_content", "succeeded"])
+    responses = iter(["queued", "running", "succeeded"])
     delays: list[float] = []
 
     async def record_sleep(delay: float) -> None:

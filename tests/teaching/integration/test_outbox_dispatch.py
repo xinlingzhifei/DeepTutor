@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import replace
 from datetime import UTC, datetime
 import hashlib
+import json
 from typing import Any
 
 import pytest
@@ -443,10 +444,25 @@ def test_content_requeue_requires_the_outline_queue_and_slots_to_be_released(
                     )
 
             repository = SqlAlchemyGenerationJobRepository(engine)
+            content_payload = json.dumps(
+                {
+                    "tenantId": tenant_id,
+                    "jobId": job_id,
+                    "requestId": "content-requeue-request",
+                    "idempotencyKey": "content-requeue-idempotency",
+                    "dataPlaneRouteId": "shared-primary",
+                    "phase": "content",
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            content_sha256 = hashlib.sha256(content_payload.encode()).hexdigest()
             with pytest.raises(ContentRequeueConflict):
                 await repository.requeue_confirmed_content(
                     tenant_id,
                     job_id,
+                    request_payload=content_payload,
+                    request_sha256=content_sha256,
                 )
 
             async with session_factory() as session:
@@ -476,11 +492,17 @@ def test_content_requeue_requires_the_outline_queue_and_slots_to_be_released(
             assert await repository.requeue_confirmed_content(
                 tenant_id,
                 job_id,
+                request_payload=content_payload,
+                request_sha256=content_sha256,
             )
             job = await repository.get_job(tenant_id, job_id)
             assert job is not None
             assert job.phase == "content"
             assert job.status == "queued"
+            details = await repository.get_job_details(tenant_id, job_id)
+            assert details is not None
+            assert details.request_payload == content_payload
+            assert details.request_sha256 == content_sha256
         finally:
             await engine.dispose()
 

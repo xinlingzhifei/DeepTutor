@@ -65,6 +65,18 @@ class ExistingFrontendRuntime:
     lock_path: Path
 
 
+def _teaching_process_commands(enabled: bool) -> tuple[tuple[str, list[str]], ...]:
+    if not enabled:
+        return ()
+    return tuple(
+        (
+            f"teaching-{process_name}",
+            [sys.executable, "-m", "deeptutor.teaching.processes", process_name],
+        )
+        for process_name in ("dispatcher", "worker", "export-worker", "reaper")
+    )
+
+
 def _log(message: str) -> None:
     print(message, flush=True)
 
@@ -754,6 +766,7 @@ def start(home: str | Path | None = None) -> None:
         get_ws_max_size,
         load_auth_settings,
         load_launch_settings,
+        load_platform_settings,
     )
     from deeptutor.services.setup import init_user_directories
 
@@ -762,6 +775,7 @@ def start(home: str | Path | None = None) -> None:
     settings = load_launch_settings(runtime_home)
     runtime_env = export_runtime_settings_to_env(overwrite=True)
     auth_enabled = bool(load_auth_settings()["enabled"])
+    platform_enabled = load_platform_settings().enabled
 
     global _ACTIVE_LABELS
     language = resolve_language()
@@ -895,8 +909,8 @@ def start(home: str | Path | None = None) -> None:
         if cleanup_started:
             return
         cleanup_started = True
-        _terminate(web)
-        _terminate(backend)
+        for process in reversed(processes):
+            _terminate(process)
 
     _install_signal_handlers(request_shutdown)
     atexit.register(cleanup)
@@ -912,6 +926,15 @@ def start(home: str | Path | None = None) -> None:
             timeout=BACKEND_READY_TIMEOUT,
             should_stop=lambda: shutdown_requested,
         )
+
+        for process_name, command in _teaching_process_commands(platform_enabled):
+            teaching_process = _spawn(
+                command,
+                cwd=runtime_home,
+                env=common_env,
+                name=process_name,
+            )
+            processes.append(teaching_process)
 
         if existing_frontend is not None:
             pid = existing_frontend.pid if existing_frontend.pid is not None else "unknown"

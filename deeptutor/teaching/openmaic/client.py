@@ -43,6 +43,7 @@ _JOB_STATUSES = {
         {
             "created",
             "queued",
+            "running",
             "generating_outline",
             *_TERMINAL_STATUSES,
         }
@@ -51,6 +52,7 @@ _JOB_STATUSES = {
         {
             "created",
             "queued",
+            "running",
             "generating_content",
             "validating",
             "materializing",
@@ -61,6 +63,7 @@ _JOB_STATUSES = {
         {
             "created",
             "queued",
+            "running",
             "exporting",
             "validating",
             "materializing",
