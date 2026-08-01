@@ -4,13 +4,16 @@ import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from sqlalchemy import CheckConstraint
 from sqlalchemy import exc as sqlalchemy_exc
 from sqlalchemy.dialects import postgresql
 
 from deeptutor.services.config import PlatformSettings
+from deeptutor.teaching.models import TenantProvisioningJob
 from deeptutor.teaching.provisioning_worker import (
     DEFAULT_POLICY_PAYLOAD,
     DEFAULT_POLICY_VERSION,
@@ -23,6 +26,11 @@ from deeptutor.teaching.provisioning_worker import (
     build_default_policy_result,
     build_storage_provisioner,
     retry_backoff_seconds,
+)
+from deeptutor.teaching.repositories.provisioning import (
+    build_claim_statement,
+    build_schema_upgrade_candidate_statement,
+    schema_upgrade_job_id,
 )
 
 
@@ -109,7 +117,7 @@ class FakeSchemaProvisioner:
             raise self.failure
         return SchemaProvisioningResult(
             schema_name="tenant_9e4714402f06d0f7",
-            revision="20260730_0004",
+            revision="20260730_0005",
         )
 
 
@@ -166,7 +174,7 @@ def test_run_once_executes_and_persists_steps_in_fixed_order() -> None:
     assert trace == [
         "claim",
         "schema",
-        "persist:schema:20260730_0004",
+        "persist:schema:20260730_0005",
         "storage",
         "persist:storage:local",
         "policy",
@@ -174,6 +182,109 @@ def test_run_once_executes_and_persists_steps_in_fixed_order() -> None:
         "activate",
     ]
     assert repository.failures == []
+
+
+def test_active_tenant_schema_upgrade_runs_only_the_schema_step() -> None:
+    trace: list[str] = []
+    repository = FakeProvisioningRepository(trace)
+    repository.claim = SimpleNamespace(
+        tenant_id="tenant-a",
+        job_id="upgrade-a",
+        attempt_count=0,
+        lease_owner="worker-a",
+        lease_token="lease-a",
+        operation="upgrade_schema",
+    )
+
+    handled = asyncio.run(_worker(repository, trace).run_once())
+
+    assert handled is True
+    assert trace == [
+        "claim",
+        "schema",
+        "persist:schema:20260730_0005",
+    ]
+
+
+def test_claim_query_keeps_active_schema_upgrades_separate_from_provisioning() -> None:
+    sql = str(
+        build_claim_statement(datetime(2026, 7, 30, tzinfo=UTC)).compile(
+            dialect=postgresql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    ).replace("platform.", "")
+
+    assert "operation = 'provision'" in sql
+    assert "tenants.status = 'provisioning'" in sql
+    assert "operation = 'upgrade_schema'" in sql
+    assert "tenants.status = 'active'" in sql
+    assert "tenant_schema_states.revision IN ('20260730_0004', '20260730_0005')" in sql
+    assert "FOR UPDATE OF tenant_provisioning_jobs, tenants" in sql
+
+
+def test_provisioning_job_operation_is_database_constrained() -> None:
+    operation_constraints = {
+        str(constraint.sqltext)
+        for constraint in TenantProvisioningJob.__table__.constraints
+        if isinstance(constraint, CheckConstraint)
+        and constraint.name == "ck_tenant_provisioning_jobs_operation"
+    }
+
+    assert operation_constraints == {
+        "operation IN ('provision', 'upgrade_schema')",
+    }
+
+
+def test_schema_upgrade_reconciliation_is_locked_targeted_and_idempotent() -> None:
+    sql = str(
+        build_schema_upgrade_candidate_statement().compile(
+            dialect=postgresql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    ).replace("platform.", "")
+
+    assert "tenants.status = 'active'" in sql
+    assert "tenant_schema_states.status = 'active'" in sql
+    assert "tenant_schema_states.revision = '20260730_0004'" in sql
+    assert "tenant_schema_states.revision != '20260730_0005'" not in sql
+    assert "tenant_provisioning_jobs.operation = 'upgrade_schema'" in sql
+    assert "tenant_provisioning_jobs.target_revision = '20260730_0005'" in sql
+    assert "NOT (EXISTS" in sql
+    assert "FOR UPDATE OF tenants, tenant_schema_states SKIP LOCKED" in sql
+    assert schema_upgrade_job_id("tenant-a") == schema_upgrade_job_id("tenant-a")
+    assert schema_upgrade_job_id("tenant-a") != schema_upgrade_job_id("tenant-b")
+    assert len(schema_upgrade_job_id("tenant-a")) == 64
+
+
+def test_upgrade_claim_accepts_only_the_previous_or_current_revision() -> None:
+    sql = str(
+        build_claim_statement(datetime(2026, 7, 30, tzinfo=UTC)).compile(
+            dialect=postgresql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    ).replace("platform.", "")
+
+    assert "tenant_schema_states.revision IN ('20260730_0004', '20260730_0005')" in sql
+    assert "tenant_schema_states.revision != '20260730_0005'" not in sql
+
+
+def test_provisioning_job_attempt_and_lease_state_are_database_constrained() -> None:
+    constraints = {
+        constraint.name: str(constraint.sqltext)
+        for constraint in TenantProvisioningJob.__table__.constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+
+    assert constraints["ck_tenant_provisioning_jobs_attempts"] == (
+        "attempt_count >= 0 AND max_attempts > 0 AND attempt_count < max_attempts"
+    )
+    assert constraints["ck_tenant_provisioning_jobs_status_lease_fence"] == (
+        "(status = 'running' AND lease_owner IS NOT NULL "
+        "AND lease_token IS NOT NULL AND lease_expires_at IS NOT NULL "
+        "AND heartbeat_at IS NOT NULL) OR (status != 'running' "
+        "AND lease_owner IS NULL AND lease_token IS NULL "
+        "AND lease_expires_at IS NULL AND heartbeat_at IS NULL)"
+    )
 
 
 @pytest.mark.parametrize(
@@ -190,7 +301,7 @@ def test_run_once_executes_and_persists_steps_in_fixed_order() -> None:
             [
                 "claim",
                 "schema",
-                "persist:schema:20260730_0004",
+                "persist:schema:20260730_0005",
                 "storage",
                 "failure",
             ],
@@ -202,7 +313,7 @@ def test_run_once_executes_and_persists_steps_in_fixed_order() -> None:
             [
                 "claim",
                 "schema",
-                "persist:schema:20260730_0004",
+                "persist:schema:20260730_0005",
                 "storage",
                 "persist:storage:local",
                 "policy",
@@ -672,7 +783,7 @@ def test_blocked_step_is_heartbeated_before_another_worker_can_reclaim() -> None
                 await release.wait()
                 return SchemaProvisioningResult(
                     schema_name="tenant_9e4714402f06d0f7",
-                    revision="20260730_0004",
+                    revision="20260730_0005",
                 )
 
         repository = LeaseRepository()
@@ -763,9 +874,7 @@ def _compiled_sql(statement: Any) -> str:
 def test_claim_query_is_due_stale_and_skip_locked() -> None:
     from deeptutor.teaching.repositories.provisioning import build_claim_statement
 
-    sql = _compiled_sql(
-        build_claim_statement(datetime(2026, 7, 30, 12, tzinfo=UTC))
-    )
+    sql = _compiled_sql(build_claim_statement(datetime(2026, 7, 30, 12, tzinfo=UTC)))
 
     for fragment in (
         "tenants.status = 'provisioning'",
@@ -774,7 +883,7 @@ def test_claim_query_is_due_stale_and_skip_locked() -> None:
         "tenant_provisioning_jobs.next_attempt_at <=",
         "tenant_provisioning_jobs.status = 'running'",
         "tenant_provisioning_jobs.lease_expires_at <=",
-        "for update of tenant_provisioning_jobs skip locked",
+        "for update of tenant_provisioning_jobs, tenants skip locked",
     ):
         assert fragment in sql
 
@@ -834,7 +943,7 @@ def test_worker_activation_requires_schema_policy_and_mode_specific_storage() ->
 
     for fragment in (
         "tenant_schema_states.status = 'active'",
-        "tenant_schema_states.revision = '20260730_0004'",
+        "tenant_schema_states.revision = '20260730_0005'",
         "tenant_storage_states.status = 'active'",
         "tenant_storage_states.mode = 'local'",
         "tenant_storage_states.mode = 's3'",

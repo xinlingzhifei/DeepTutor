@@ -22,7 +22,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 FOUNDATION_REVISION = "20260728_0001"
 SCOPED_GRANTS_REVISION = "20260730_0002"
 PROVISIONING_REVISION = "20260730_0003"
-HEAD_REVISION = "20260730_0004"
+HEAD_REVISION = "20260730_0005"
 
 
 @dataclass(frozen=True)
@@ -443,6 +443,8 @@ def test_migration_runs_from_outside_repository(
         "classes",
         "courses",
         "enrollments",
+        "generation_jobs",
+        "quota_ledger",
     }
 
 
@@ -465,6 +467,7 @@ def test_wheel_packages_migrations_and_full_app_entrypoint(
         "deeptutor/teaching/migrations/versions/20260730_0002_scoped_role_grants.py",
         "deeptutor/teaching/migrations/versions/20260730_0003_tenant_provisioning_worker.py",
         "deeptutor/teaching/migrations/versions/20260730_0004_data_plane_routing.py",
+        "deeptutor/teaching/migrations/versions/20260730_0005_generation_jobs.py",
     }.issubset(names)
     assert "deeptutor-migrate = deeptutor.teaching.migrations.cli:main" in entry_points
     assert "deeptutor-provisioner = deeptutor.teaching.provisioning_cli:main" in entry_points
@@ -514,11 +517,15 @@ def test_packaged_entrypoint_runs_platform_and_tenant_scopes(
         "alembic_version",
         "audit_log",
         "data_plane_routes",
+        "generation_queue",
+        "generation_slots",
+        "outbox_messages",
         "provider_profiles",
         "role_grants",
         "tenant_default_policy_states",
         "tenant_memberships",
         "tenant_provisioning_jobs",
+        "tenant_scheduler_state",
         "tenant_schema_states",
         "tenant_storage_credentials",
         "tenant_storage_states",
@@ -529,6 +536,8 @@ def test_packaged_entrypoint_runs_platform_and_tenant_scopes(
         "classes",
         "courses",
         "enrollments",
+        "generation_jobs",
+        "quota_ledger",
     }
 
 
@@ -698,11 +707,15 @@ def test_foundation_migration_is_isolated_and_repeatable(migration_database):
         "alembic_version",
         "audit_log",
         "data_plane_routes",
+        "generation_queue",
+        "generation_slots",
+        "outbox_messages",
         "provider_profiles",
         "role_grants",
         "tenant_default_policy_states",
         "tenant_memberships",
         "tenant_provisioning_jobs",
+        "tenant_scheduler_state",
         "tenant_schema_states",
         "tenant_storage_credentials",
         "tenant_storage_states",
@@ -713,12 +726,16 @@ def test_foundation_migration_is_isolated_and_repeatable(migration_database):
         "classes",
         "courses",
         "enrollments",
+        "generation_jobs",
+        "quota_ledger",
     }
     assert tables_by_schema[tenant_b] == {
         "alembic_version",
         "classes",
         "courses",
         "enrollments",
+        "generation_jobs",
+        "quota_ledger",
     }
     assert "tenant" not in tables_by_schema
     assert {
@@ -1775,6 +1792,325 @@ def test_postgres_data_plane_routing_is_fail_closed_and_owner_bound(
     asyncio.run(exercise())
 
 
+def test_active_0004_tenant_schema_upgrade_is_idempotent_and_recoverable(
+    migration_database,
+    monkeypatch,
+) -> None:
+    from deeptutor.teaching.models import (
+        Tenant,
+        TenantProvisioningJob,
+        TenantSchemaState,
+    )
+    from deeptutor.teaching.provisioning_worker import (
+        TENANT_SCHEMA_REVISION,
+        AlembicTenantSchemaProvisioner,
+        ProvisioningStepError,
+        ProvisioningWorker,
+    )
+    from deeptutor.teaching.repositories.provisioning import (
+        SqlAlchemyProvisioningRepository,
+    )
+
+    tenant_id = "active-schema-upgrade"
+    schema_name = tenant_schema_name(tenant_id)
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(migration_database, "scope=platform"),
+    )
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(
+            migration_database,
+            "scope=tenant",
+            f"tenant_schema={schema_name}",
+            revision="20260730_0004",
+        ),
+    )
+    _settings, database_module = _install_source_runtime_database(
+        monkeypatch,
+        migration_database,
+    )
+
+    class RecoveringSchemaProvisioner:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.delegate = AlembicTenantSchemaProvisioner()
+
+        async def provision(self, requested_tenant_id):
+            self.calls += 1
+            if self.calls == 1:
+                raise ProvisioningStepError(
+                    category="schema",
+                    code="migration_unavailable",
+                    retryable=True,
+                )
+            return await self.delegate.provision(requested_tenant_id)
+
+    class ForbiddenStorageProvisioner:
+        calls = 0
+
+        async def provision(self, requested_tenant_id):
+            self.calls += 1
+            raise AssertionError("schema upgrade must not provision storage")
+
+    class ForbiddenPolicyProvisioner:
+        calls = 0
+
+        async def provision(self, requested_tenant_id):
+            self.calls += 1
+            raise AssertionError("schema upgrade must not provision policy")
+
+    async def exercise() -> None:
+        await database_module.dispose_platform_engine()
+        repository = SqlAlchemyProvisioningRepository()
+        schema = RecoveringSchemaProvisioner()
+        storage = ForbiddenStorageProvisioner()
+        policy = ForbiddenPolicyProvisioner()
+        worker = ProvisioningWorker(
+            enabled=True,
+            worker_id="active-upgrade-worker",
+            repository=repository,
+            schema_upgrade_reconciler=repository,
+            schema_provisioner=schema,
+            storage_provisioner=storage,
+            policy_provisioner=policy,
+            lease_seconds=60,
+        )
+        try:
+            async with database_module.platform_session() as session:
+                async with session.begin():
+                    session.add(
+                        Tenant(
+                            id=tenant_id,
+                            name="Active schema upgrade",
+                            status="active",
+                            data_plane_mode="shared",
+                        )
+                    )
+                    session.add(
+                        TenantSchemaState(
+                            tenant_id=tenant_id,
+                            schema_name=schema_name,
+                            revision="20260730_0004",
+                            status="active",
+                        )
+                    )
+
+            assert await worker.run_once() is True
+            async with database_module.platform_session() as session:
+                tenant = await session.get(Tenant, tenant_id)
+                state = await session.get(TenantSchemaState, tenant_id)
+                job = await session.scalar(
+                    select(TenantProvisioningJob).where(
+                        TenantProvisioningJob.tenant_id == tenant_id,
+                        TenantProvisioningJob.operation == "upgrade_schema",
+                    )
+                )
+                assert tenant is not None and tenant.status == "active"
+                assert state is not None and state.revision == "20260730_0004"
+                assert job is not None
+                assert job.target_revision == TENANT_SCHEMA_REVISION
+                assert job.status == "pending"
+                assert job.attempt_count == 1
+                assert job.error_code == "migration_unavailable"
+
+            async with database_module.platform_session() as session:
+                async with session.begin():
+                    job = await session.scalar(
+                        select(TenantProvisioningJob).where(
+                            TenantProvisioningJob.tenant_id == tenant_id,
+                            TenantProvisioningJob.operation == "upgrade_schema",
+                        )
+                    )
+                    assert job is not None
+                    job.next_attempt_at = await session.scalar(select(func.now()))
+
+            reclaimed = await repository.claim_next(
+                "active-upgrade-worker",
+                lease_seconds=60,
+            )
+            assert reclaimed is not None
+            assert reclaimed.operation == "upgrade_schema"
+            schema_result = await schema.provision(tenant_id)
+            assert await repository.record_schema_ready(reclaimed, schema_result) is True
+            # Simulate the worker disappearing immediately after the persistence call.
+            # The schema revision and upgrade terminal state must share one transaction.
+            assert await worker.run_once() is False
+            async with database_module.platform_session() as session:
+                tenant = await session.get(Tenant, tenant_id)
+                state = await session.get(TenantSchemaState, tenant_id)
+                jobs = (
+                    await session.scalars(
+                        select(TenantProvisioningJob).where(
+                            TenantProvisioningJob.tenant_id == tenant_id,
+                            TenantProvisioningJob.operation == "upgrade_schema",
+                        )
+                    )
+                ).all()
+                assert tenant is not None and tenant.status == "active"
+                assert state is not None
+                assert state.revision == TENANT_SCHEMA_REVISION
+                assert state.status == "active"
+                assert len(jobs) == 1
+                assert jobs[0].status == "completed"
+                assert jobs[0].target_revision == TENANT_SCHEMA_REVISION
+                assert jobs[0].lease_owner is None
+                assert jobs[0].lease_token is None
+                assert jobs[0].lease_expires_at is None
+                assert jobs[0].heartbeat_at is None
+
+            async with database_module.get_platform_engine().connect() as connection:
+                revision = await connection.scalar(
+                    text(f'SELECT version_num FROM "{schema_name}".alembic_version')
+                )
+                tenant_fk = await connection.scalar(
+                    text(
+                        """
+                        SELECT confrelid::regclass::text
+                        FROM pg_constraint
+                        WHERE conrelid = CAST(:table_name AS regclass)
+                          AND conname = 'fk_generation_jobs_tenant_id_tenants'
+                        """
+                    ),
+                    {"table_name": f'"{schema_name}".generation_jobs'},
+                )
+            assert revision == TENANT_SCHEMA_REVISION
+            assert tenant_fk == "platform.tenants"
+            assert schema.calls == 2
+            assert storage.calls == 0
+            assert policy.calls == 0
+        finally:
+            await database_module.dispose_platform_engine()
+
+    asyncio.run(exercise())
+
+
+def test_generation_tenant_migration_roundtrip_keeps_platform_revision_in_sync(
+    migration_database,
+) -> None:
+    tenant_id = "generation-migration-roundtrip"
+    schema_name = tenant_schema_name(tenant_id)
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(migration_database, "scope=platform"),
+    )
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(
+            migration_database,
+            "scope=tenant",
+            f"tenant_schema={schema_name}",
+            revision="20260730_0004",
+        ),
+    )
+
+    async def seed() -> None:
+        engine = create_async_engine(migration_database.url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO platform.tenants (id, name, status)
+                        VALUES (:tenant_id, 'Generation migration roundtrip', 'active')
+                        ON CONFLICT (id) DO NOTHING
+                        """
+                    ),
+                    {"tenant_id": tenant_id},
+                )
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO platform.tenant_schema_states (
+                            tenant_id, schema_name, revision, status
+                        ) VALUES (
+                            :tenant_id, :schema_name, '20260730_0004', 'active'
+                        )
+                        ON CONFLICT (tenant_id) DO UPDATE
+                        SET schema_name = EXCLUDED.schema_name,
+                            revision = EXCLUDED.revision,
+                            status = EXCLUDED.status
+                        """
+                    ),
+                    {"tenant_id": tenant_id, "schema_name": schema_name},
+                )
+        finally:
+            await engine.dispose()
+
+    async def inspect() -> tuple[str, set[str]]:
+        engine = create_async_engine(migration_database.url)
+        try:
+            async with engine.connect() as connection:
+                revision = await connection.scalar(
+                    text(
+                        "SELECT revision FROM platform.tenant_schema_states "
+                        "WHERE tenant_id = :tenant_id"
+                    ),
+                    {"tenant_id": tenant_id},
+                )
+                tables = set(
+                    (
+                        await connection.execute(
+                            text(
+                                """
+                                SELECT table_name
+                                FROM information_schema.tables
+                                WHERE table_schema = :schema_name
+                                """
+                            ),
+                            {"schema_name": schema_name},
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                return str(revision), tables
+        finally:
+            await engine.dispose()
+
+    asyncio.run(seed())
+    revision, _tables = asyncio.run(inspect())
+    assert revision == "20260730_0004"
+
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(
+            migration_database,
+            "scope=tenant",
+            f"tenant_schema={schema_name}",
+        ),
+    )
+    revision, tables = asyncio.run(inspect())
+    assert revision == "20260730_0005"
+    assert {"generation_jobs", "quota_ledger"}.issubset(tables)
+
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(
+            migration_database,
+            "scope=tenant",
+            f"tenant_schema={schema_name}",
+            action="downgrade",
+            revision="20260730_0004",
+        ),
+    )
+    revision, tables = asyncio.run(inspect())
+    assert revision == "20260730_0004"
+    assert {"generation_jobs", "quota_ledger"}.isdisjoint(tables)
+
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(
+            migration_database,
+            "scope=tenant",
+            f"tenant_schema={schema_name}",
+        ),
+    )
+    revision, tables = asyncio.run(inspect())
+    assert revision == "20260730_0005"
+    assert {"generation_jobs", "quota_ledger"}.issubset(tables)
+
+
 def test_postgres_claims_are_unique_and_stale_same_owner_token_is_fenced(
     migration_database,
     monkeypatch,
@@ -1850,7 +2186,9 @@ def test_postgres_claims_are_unique_and_stale_same_owner_token_is_fenced(
                             UPDATE platform.tenant_provisioning_jobs
                             SET status = 'completed',
                                 lease_owner = NULL,
+                                lease_token = NULL,
                                 lease_expires_at = NULL,
+                                heartbeat_at = NULL,
                                 completed_at = now()
                             WHERE id IN (
                                 'job-worker-claim-a',
@@ -1896,7 +2234,7 @@ def test_postgres_claims_are_unique_and_stale_same_owner_token_is_fenced(
             assert reclaimed is not None
             assert reclaimed.tenant_id == "worker-stale"
             assert reclaimed.job_id == "job-worker-stale"
-            assert reclaimed.attempt_count == 2
+            assert reclaimed.attempt_count == 3
             assert reclaimed.lease_owner == "worker-same"
             assert reclaimed.lease_token != "lease-old"
             old_claim = ProvisioningClaim(
@@ -1953,6 +2291,185 @@ def test_postgres_claims_are_unique_and_stale_same_owner_token_is_fenced(
                 assert job.status == "completed"
                 assert job.lease_owner is None
                 assert job.lease_token is None
+                assert job.lease_expires_at is None
+                assert job.heartbeat_at is None
+        finally:
+            await database_module.dispose_platform_engine()
+
+    asyncio.run(exercise())
+
+
+def test_stale_provisioning_claims_stop_at_max_attempts_without_deactivating_upgrade_tenant(
+    migration_database,
+    monkeypatch,
+) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from deeptutor.teaching.models import (
+        Tenant,
+        TenantProvisioningJob,
+        TenantSchemaState,
+    )
+    from deeptutor.teaching.repositories.provisioning import (
+        SqlAlchemyProvisioningRepository,
+    )
+
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(migration_database, "scope=platform"),
+    )
+    _settings, database_module = _install_source_runtime_database(
+        monkeypatch,
+        migration_database,
+    )
+
+    async def exercise() -> None:
+        await database_module.dispose_platform_engine()
+        expired_at = datetime.now(UTC) - timedelta(minutes=1)
+        repository = SqlAlchemyProvisioningRepository()
+        try:
+            async with database_module.platform_session() as session:
+                async with session.begin():
+                    session.add_all(
+                        [
+                            Tenant(
+                                id="stale-provision-limit",
+                                name="Stale provision limit",
+                                status="provisioning",
+                            ),
+                            Tenant(
+                                id="stale-upgrade-limit",
+                                name="Stale upgrade limit",
+                                status="active",
+                            ),
+                        ]
+                    )
+                    session.add(
+                        TenantSchemaState(
+                            tenant_id="stale-upgrade-limit",
+                            schema_name=tenant_schema_name("stale-upgrade-limit"),
+                            revision="20260730_0004",
+                            status="active",
+                        )
+                    )
+                    for tenant_id, operation in (
+                        ("stale-provision-limit", "provision"),
+                        ("stale-upgrade-limit", "upgrade_schema"),
+                    ):
+                        session.add(
+                            TenantProvisioningJob(
+                                id=f"job-{tenant_id}",
+                                tenant_id=tenant_id,
+                                operation=operation,
+                                target_revision=(
+                                    "20260730_0005"
+                                    if operation == "upgrade_schema"
+                                    else None
+                                ),
+                                status="running",
+                                attempt_count=4,
+                                max_attempts=5,
+                                lease_owner="crashed-worker",
+                                lease_token=f"token-{tenant_id}",
+                                lease_expires_at=expired_at,
+                                heartbeat_at=expired_at,
+                            )
+                        )
+
+            assert await repository.claim_next("replacement-worker", lease_seconds=60) is None
+            assert await repository.claim_next("replacement-worker", lease_seconds=60) is None
+
+            async with database_module.platform_session() as session:
+                provision_tenant = await session.get(Tenant, "stale-provision-limit")
+                upgrade_tenant = await session.get(Tenant, "stale-upgrade-limit")
+                provision_job = await session.get(
+                    TenantProvisioningJob,
+                    "job-stale-provision-limit",
+                )
+                upgrade_job = await session.get(
+                    TenantProvisioningJob,
+                    "job-stale-upgrade-limit",
+                )
+                assert provision_tenant is not None
+                assert upgrade_tenant is not None
+                assert provision_job is not None
+                assert upgrade_job is not None
+                assert provision_tenant.status == "failed"
+                assert upgrade_tenant.status == "active"
+                for job in (provision_job, upgrade_job):
+                    assert job.status == "failed"
+                    assert job.attempt_count == 4
+                    assert job.lease_owner is None
+                    assert job.lease_token is None
+                    assert job.lease_expires_at is None
+                    assert job.heartbeat_at is None
+        finally:
+            await database_module.dispose_platform_engine()
+
+    asyncio.run(exercise())
+
+
+def test_future_tenant_schema_revision_is_not_enqueued_or_claimed(
+    migration_database,
+    monkeypatch,
+) -> None:
+    from deeptutor.teaching.models import (
+        Tenant,
+        TenantProvisioningJob,
+        TenantSchemaState,
+    )
+    from deeptutor.teaching.repositories.provisioning import (
+        SqlAlchemyProvisioningRepository,
+    )
+
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(migration_database, "scope=platform"),
+    )
+    _settings, database_module = _install_source_runtime_database(
+        monkeypatch,
+        migration_database,
+    )
+
+    async def exercise() -> None:
+        await database_module.dispose_platform_engine()
+        repository = SqlAlchemyProvisioningRepository()
+        try:
+            async with database_module.platform_session() as session:
+                async with session.begin():
+                    session.add(
+                        Tenant(
+                            id="future-schema-tenant",
+                            name="Future schema tenant",
+                            status="active",
+                        )
+                    )
+                    session.add(
+                        TenantSchemaState(
+                            tenant_id="future-schema-tenant",
+                            schema_name=tenant_schema_name("future-schema-tenant"),
+                            revision="20260730_0006",
+                            status="active",
+                        )
+                    )
+                    session.add(
+                        TenantProvisioningJob(
+                            id="future-schema-old-worker-job",
+                            tenant_id="future-schema-tenant",
+                            operation="upgrade_schema",
+                            target_revision="20260730_0005",
+                            status="pending",
+                        )
+                    )
+
+            assert await repository.enqueue_next_schema_upgrade() is False
+            assert await repository.claim_next("old-worker", lease_seconds=60) is None
+            async with database_module.platform_session() as session:
+                job = await session.get(
+                    TenantProvisioningJob,
+                    "future-schema-old-worker-job",
+                )
+                assert job is not None and job.status == "pending"
         finally:
             await database_module.dispose_platform_engine()
 

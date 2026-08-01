@@ -45,11 +45,15 @@ def test_model_metadata_uses_only_platform_and_logical_tenant_schemas():
     assert set(PlatformBase.metadata.tables) == {
         "platform.audit_log",
         "platform.data_plane_routes",
+        "platform.generation_queue",
+        "platform.generation_slots",
+        "platform.outbox_messages",
         "platform.provider_profiles",
         "platform.role_grants",
         "platform.tenant_default_policy_states",
         "platform.tenant_memberships",
         "platform.tenant_provisioning_jobs",
+        "platform.tenant_scheduler_state",
         "platform.tenant_schema_states",
         "platform.tenant_storage_credentials",
         "platform.tenant_storage_states",
@@ -59,11 +63,29 @@ def test_model_metadata_uses_only_platform_and_logical_tenant_schemas():
         "tenant.classes",
         "tenant.courses",
         "tenant.enrollments",
+        "tenant.generation_jobs",
+        "tenant.quota_ledger",
     }
 
+    cross_schema_foreign_keys = set()
     for table in TenantBase.metadata.tables.values():
         for foreign_key in table.foreign_keys:
-            assert foreign_key.target_fullname.startswith("tenant.")
+            if foreign_key.target_fullname.startswith("tenant."):
+                continue
+            cross_schema_foreign_keys.add(
+                (
+                    table.fullname,
+                    foreign_key.parent.name,
+                    foreign_key.target_fullname,
+                )
+            )
+    assert cross_schema_foreign_keys == {
+        (
+            "tenant.generation_jobs",
+            "tenant_id",
+            "platform.tenants.id",
+        )
+    }
 
 
 def test_tenant_storage_credentials_metadata_excludes_plaintext_secrets():

@@ -1,5 +1,15 @@
 """Teaching ORM model exports."""
 
+from .jobs import (
+    GenerationJob,
+    GenerationQueue,
+    GenerationSlot,
+    InvalidJobTransition,
+    OutboxMessage,
+    QuotaLedger,
+    TenantSchedulerState,
+    require_job_transition,
+)
 from .platform import (
     AuditLog,
     DataPlaneRoute,
@@ -21,8 +31,14 @@ __all__ = [
     "Course",
     "DataPlaneRoute",
     "Enrollment",
+    "GenerationJob",
+    "GenerationQueue",
+    "GenerationSlot",
+    "InvalidJobTransition",
+    "OutboxMessage",
     "PlatformBase",
     "ProviderProfile",
+    "QuotaLedger",
     "RoleGrant",
     "TeachingClass",
     "Tenant",
@@ -31,6 +47,8 @@ __all__ = [
     "TenantMembership",
     "TenantProvisioningJob",
     "TenantSchemaState",
+    "TenantSchedulerState",
     "TenantStorageCredential",
     "TenantStorageState",
+    "require_job_transition",
 ]

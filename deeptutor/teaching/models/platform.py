@@ -357,6 +357,7 @@ class TenantProvisioningJob(PlatformBase):
         ForeignKey("platform.tenants.id", ondelete="CASCADE"),
     )
     operation: Mapped[str] = mapped_column(String(32), server_default="provision")
+    target_revision: Mapped[str | None] = mapped_column(String(64))
     status: Mapped[str] = mapped_column(String(32), server_default="pending")
     attempt_count: Mapped[int] = mapped_column(Integer, server_default="0")
     max_attempts: Mapped[int] = mapped_column(Integer, server_default="5")
@@ -382,6 +383,33 @@ class TenantProvisioningJob(PlatformBase):
     )
 
     __table_args__ = (
+        CheckConstraint(
+            "operation IN ('provision', 'upgrade_schema')",
+            name="operation",
+        ),
+        CheckConstraint(
+            "(operation = 'provision' AND target_revision IS NULL) OR "
+            "(operation = 'upgrade_schema' AND target_revision IS NOT NULL)",
+            name="operation_target",
+        ),
+        CheckConstraint(
+            "attempt_count >= 0 AND max_attempts > 0 AND attempt_count < max_attempts",
+            name="attempts",
+        ),
+        CheckConstraint(
+            "(status = 'running' AND lease_owner IS NOT NULL "
+            "AND lease_token IS NOT NULL AND lease_expires_at IS NOT NULL "
+            "AND heartbeat_at IS NOT NULL) OR (status != 'running' "
+            "AND lease_owner IS NULL AND lease_token IS NULL "
+            "AND lease_expires_at IS NULL AND heartbeat_at IS NULL)",
+            name="status_lease_fence",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "operation",
+            "target_revision",
+            name="uq_tenant_provisioning_jobs_upgrade_target",
+        ),
         Index("ix_tenant_provisioning_jobs_tenant_status", "tenant_id", "status"),
         Index(
             "ix_tenant_provisioning_jobs_claim",
