@@ -813,6 +813,34 @@ def test_credential_resolver_rejects_fingerprint_or_tenant_mismatch(
         )
 
 
+def test_credential_resolver_rejects_cross_tenant_secret_reference(
+    tmp_path,
+) -> None:
+    access_key = "tenant-b-access"
+    foreign_directory = tmp_path / "tenant-b" / "object-store"
+    foreign_directory.mkdir(parents=True)
+    (foreign_directory / "object-store-access-key").write_text(
+        access_key,
+        encoding="utf-8",
+    )
+    (foreign_directory / "object-store-secret-key").write_text(
+        "tenant-b-secret",
+        encoding="utf-8",
+    )
+    record = TenantStorageCredentialRecord(
+        tenant_id="tenant-a",
+        secret_ref="tenant-b/object-store",
+        access_key_fingerprint=hashlib.sha256(access_key.encode()).hexdigest(),
+        status="active",
+    )
+
+    with pytest.raises(StorageCredentialError):
+        TenantStorageCredentialResolver(tmp_path).resolve(
+            record,
+            tenant_id="tenant-a",
+        )
+
+
 @pytest.mark.asyncio
 async def test_factory_builds_distinct_explicit_s3_clients_from_secret_refs(
     tmp_path,

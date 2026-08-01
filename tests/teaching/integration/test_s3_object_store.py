@@ -155,9 +155,9 @@ def minio_harness(tmp_path_factory) -> MinioHarness:
     policy_paths: dict[str, Path] = {}
     records: dict[str, TenantStorageCredentialRecord] = {}
     for tenant_id, (access_key, secret_key) in tenant_credentials.items():
-        secret_ref = f"secret-{tenant_id}"
+        secret_ref = f"{tenant_id}/object-store"
         secret_directory = credentials_root / secret_ref
-        secret_directory.mkdir()
+        secret_directory.mkdir(parents=True)
         (secret_directory / "object-store-access-key").write_text(
             f"{access_key}\n",
             encoding="utf-8",

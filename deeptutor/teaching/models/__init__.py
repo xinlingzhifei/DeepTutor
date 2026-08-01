@@ -4,11 +4,15 @@ from .platform import (
     AuditLog,
     DataPlaneRoute,
     PlatformBase,
+    ProviderProfile,
     RoleGrant,
     Tenant,
+    TenantDefaultPolicyState,
     TenantMembership,
     TenantProvisioningJob,
+    TenantSchemaState,
     TenantStorageCredential,
+    TenantStorageState,
 )
 from .tenant import Course, Enrollment, TeachingClass, TenantBase
 
@@ -18,11 +22,15 @@ __all__ = [
     "DataPlaneRoute",
     "Enrollment",
     "PlatformBase",
+    "ProviderProfile",
     "RoleGrant",
     "TeachingClass",
     "Tenant",
     "TenantBase",
+    "TenantDefaultPolicyState",
     "TenantMembership",
     "TenantProvisioningJob",
+    "TenantSchemaState",
     "TenantStorageCredential",
+    "TenantStorageState",
 ]

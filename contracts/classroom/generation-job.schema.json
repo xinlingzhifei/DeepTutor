@@ -1,0 +1,830 @@
+{
+  "$comment": "Draft 2020-12 enforces terminal, artifact, and lease structure. For succeeded jobs, finalArtifact.sha256 and the primary artifactManifest item sha256 equality with outputSha256 require semantic validation.",
+  "$defs": {
+    "ArtifactManifestItem": {
+      "additionalProperties": false,
+      "properties": {
+        "expiresAt": {
+          "format": "date-time",
+          "title": "Expiresat",
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "dsl_json",
+            "media",
+            "export"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "mimeType": {
+          "minLength": 1,
+          "title": "Mimetype",
+          "type": "string"
+        },
+        "relativePath": {
+          "minLength": 1,
+          "title": "Relativepath",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "sizeBytes": {
+          "minimum": 0,
+          "title": "Sizebytes",
+          "type": "integer"
+        },
+        "temporaryDownloadPath": {
+          "minLength": 1,
+          "title": "Temporarydownloadpath",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "relativePath",
+        "sha256",
+        "sizeBytes",
+        "mimeType",
+        "temporaryDownloadPath",
+        "expiresAt"
+      ],
+      "title": "ArtifactManifestItem",
+      "type": "object"
+    },
+    "ArtifactState": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "ready"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "sha256": {
+                "pattern": "^[0-9a-f]{64}$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "sha256"
+            ]
+          }
+        }
+      ],
+      "properties": {
+        "artifactId": {
+          "minLength": 1,
+          "title": "Artifactid",
+          "type": "string"
+        },
+        "sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sha256"
+        },
+        "status": {
+          "enum": [
+            "pending",
+            "materializing",
+            "ready",
+            "failed",
+            "discarded"
+          ],
+          "title": "Status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "artifactId",
+        "status"
+      ],
+      "title": "ArtifactState",
+      "type": "object"
+    },
+    "CostSummary": {
+      "additionalProperties": false,
+      "properties": {
+        "actualAmount": {
+          "minimum": 0,
+          "title": "Actualamount",
+          "type": "number"
+        },
+        "currency": {
+          "pattern": "^[A-Z]{3}$",
+          "title": "Currency",
+          "type": "string"
+        },
+        "estimatedAmount": {
+          "minimum": 0,
+          "title": "Estimatedamount",
+          "type": "number"
+        }
+      },
+      "required": [
+        "currency",
+        "estimatedAmount",
+        "actualAmount"
+      ],
+      "title": "CostSummary",
+      "type": "object"
+    },
+    "GenerationJobStatus": {
+      "enum": [
+        "created",
+        "quota_reserved",
+        "queued",
+        "generating_outline",
+        "awaiting_confirmation",
+        "generating_content",
+        "validating",
+        "materializing",
+        "succeeded",
+        "failed",
+        "canceled"
+      ],
+      "title": "GenerationJobStatus",
+      "type": "string"
+    },
+    "JobError": {
+      "additionalProperties": false,
+      "properties": {
+        "category": {
+          "enum": [
+            "validation",
+            "quota",
+            "provider",
+            "timeout",
+            "canceled",
+            "internal",
+            "artifact"
+          ],
+          "title": "Category",
+          "type": "string"
+        },
+        "code": {
+          "minLength": 1,
+          "title": "Code",
+          "type": "string"
+        },
+        "diagnosticSummary": {
+          "minLength": 1,
+          "title": "Diagnosticsummary",
+          "type": "string"
+        },
+        "message": {
+          "minLength": 1,
+          "title": "Message",
+          "type": "string"
+        },
+        "retryable": {
+          "title": "Retryable",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "category",
+        "code",
+        "message",
+        "retryable",
+        "diagnosticSummary"
+      ],
+      "title": "JobError",
+      "type": "object"
+    },
+    "QuotaReservation": {
+      "additionalProperties": false,
+      "properties": {
+        "actualUnits": {
+          "minimum": 0,
+          "title": "Actualunits",
+          "type": "integer"
+        },
+        "reservationId": {
+          "minLength": 1,
+          "title": "Reservationid",
+          "type": "string"
+        },
+        "reservedUnits": {
+          "minimum": 0,
+          "title": "Reservedunits",
+          "type": "integer"
+        },
+        "unit": {
+          "enum": [
+            "credits",
+            "tokens",
+            "seconds"
+          ],
+          "title": "Unit",
+          "type": "string"
+        }
+      },
+      "required": [
+        "reservationId",
+        "reservedUnits",
+        "actualUnits",
+        "unit"
+      ],
+      "title": "QuotaReservation",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "leaseId"
+                ]
+              },
+              {
+                "required": [
+                  "leaseOwner"
+                ]
+              },
+              {
+                "required": [
+                  "leaseExpiresAt"
+                ]
+              },
+              {
+                "required": [
+                  "heartbeatAt"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "properties": {
+            "heartbeatAt": {
+              "type": "null"
+            },
+            "leaseExpiresAt": {
+              "type": "null"
+            },
+            "leaseId": {
+              "type": "null"
+            },
+            "leaseOwner": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "leaseId",
+            "leaseOwner",
+            "leaseExpiresAt",
+            "heartbeatAt"
+          ]
+        },
+        {
+          "properties": {
+            "heartbeatAt": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "leaseExpiresAt": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "leaseId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "leaseOwner": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "leaseId",
+            "leaseOwner",
+            "leaseExpiresAt",
+            "heartbeatAt"
+          ]
+        }
+      ]
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "enum": [
+              "generating_outline",
+              "generating_content",
+              "validating",
+              "materializing"
+            ]
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "heartbeatAt": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "leaseExpiresAt": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "leaseId": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "leaseOwner": {
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "leaseId",
+          "leaseOwner",
+          "leaseExpiresAt",
+          "heartbeatAt"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "succeeded"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "artifactManifest": {
+            "allOf": [
+              {
+                "contains": {
+                  "properties": {
+                    "kind": {
+                      "const": "dsl_json"
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ],
+                  "type": "object"
+                },
+                "minContains": 1
+              },
+              {
+                "contains": {
+                  "properties": {
+                    "kind": {
+                      "const": "media"
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ],
+                  "type": "object"
+                },
+                "minContains": 1
+              }
+            ]
+          },
+          "completedAt": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "error": {
+            "type": "null"
+          },
+          "finalArtifact": {
+            "properties": {
+              "status": {
+                "const": "ready"
+              }
+            },
+            "required": [
+              "status"
+            ],
+            "type": "object"
+          },
+          "outputSha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "outputSha256",
+          "finalArtifact",
+          "artifactManifest",
+          "completedAt"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "failed"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "completedAt": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "error": {
+            "type": "object"
+          },
+          "finalArtifact": {
+            "type": "null"
+          },
+          "outputSha256": {
+            "type": "null"
+          },
+          "temporaryArtifact": {
+            "anyOf": [
+              {
+                "type": "null"
+              },
+              {
+                "properties": {
+                  "status": {
+                    "enum": [
+                      "pending",
+                      "materializing",
+                      "failed",
+                      "discarded"
+                    ]
+                  }
+                },
+                "required": [
+                  "status"
+                ],
+                "type": "object"
+              }
+            ]
+          }
+        },
+        "required": [
+          "error",
+          "completedAt"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "canceled"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "canceledAt": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "completedAt": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "finalArtifact": {
+            "type": "null"
+          },
+          "outputSha256": {
+            "type": "null"
+          },
+          "temporaryArtifact": {
+            "anyOf": [
+              {
+                "type": "null"
+              },
+              {
+                "properties": {
+                  "status": {
+                    "enum": [
+                      "pending",
+                      "materializing",
+                      "failed",
+                      "discarded"
+                    ]
+                  }
+                },
+                "required": [
+                  "status"
+                ],
+                "type": "object"
+              }
+            ]
+          }
+        },
+        "required": [
+          "canceledAt",
+          "completedAt"
+        ]
+      }
+    }
+  ],
+  "properties": {
+    "artifactManifest": {
+      "items": {
+        "$ref": "#/$defs/ArtifactManifestItem"
+      },
+      "title": "Artifactmanifest",
+      "type": "array"
+    },
+    "attempt": {
+      "minimum": 0,
+      "title": "Attempt",
+      "type": "integer"
+    },
+    "batchId": {
+      "anyOf": [
+        {
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Batchid"
+    },
+    "canceledAt": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Canceledat"
+    },
+    "classroomDraftId": {
+      "minLength": 1,
+      "title": "Classroomdraftid",
+      "type": "string"
+    },
+    "completedAt": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Completedat"
+    },
+    "costSummary": {
+      "$ref": "#/$defs/CostSummary"
+    },
+    "createdAt": {
+      "format": "date-time",
+      "title": "Createdat",
+      "type": "string"
+    },
+    "error": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/JobError"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "finalArtifact": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ArtifactState"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "heartbeatAt": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Heartbeatat"
+    },
+    "idempotencyKey": {
+      "minLength": 1,
+      "title": "Idempotencykey",
+      "type": "string"
+    },
+    "inputSha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Inputsha256",
+      "type": "string"
+    },
+    "jobId": {
+      "minLength": 1,
+      "title": "Jobid",
+      "type": "string"
+    },
+    "leaseExpiresAt": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Leaseexpiresat"
+    },
+    "leaseId": {
+      "anyOf": [
+        {
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Leaseid"
+    },
+    "leaseOwner": {
+      "anyOf": [
+        {
+          "minLength": 1,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Leaseowner"
+    },
+    "modelId": {
+      "minLength": 1,
+      "title": "Modelid",
+      "type": "string"
+    },
+    "outputSha256": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Outputsha256"
+    },
+    "phase": {
+      "enum": [
+        "outline",
+        "content",
+        "micro"
+      ],
+      "title": "Phase",
+      "type": "string"
+    },
+    "progressPercent": {
+      "maximum": 100,
+      "minimum": 0,
+      "title": "Progresspercent",
+      "type": "integer"
+    },
+    "quotaReservation": {
+      "$ref": "#/$defs/QuotaReservation"
+    },
+    "requestId": {
+      "minLength": 1,
+      "title": "Requestid",
+      "type": "string"
+    },
+    "schemaVersion": {
+      "const": "1.0",
+      "title": "Schemaversion",
+      "type": "string"
+    },
+    "startedAt": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Startedat"
+    },
+    "status": {
+      "$ref": "#/$defs/GenerationJobStatus"
+    },
+    "temporaryArtifact": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ArtifactState"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "tenantId": {
+      "minLength": 1,
+      "title": "Tenantid",
+      "type": "string"
+    },
+    "updatedAt": {
+      "format": "date-time",
+      "title": "Updatedat",
+      "type": "string"
+    },
+    "workPool": {
+      "minLength": 1,
+      "title": "Workpool",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "tenantId",
+    "jobId",
+    "requestId",
+    "classroomDraftId",
+    "idempotencyKey",
+    "attempt",
+    "progressPercent",
+    "workPool",
+    "quotaReservation",
+    "costSummary",
+    "artifactManifest",
+    "createdAt",
+    "updatedAt",
+    "status",
+    "phase",
+    "modelId",
+    "inputSha256"
+  ],
+  "title": "GenerationJob",
+  "type": "object"
+}
