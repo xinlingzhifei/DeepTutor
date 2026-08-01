@@ -125,6 +125,8 @@ cache/
 .cache/
 .ruff_cache
 .playwright-cli/
+web/playwright-report/
+web/test-results/
 
 # Log files
 *.log
