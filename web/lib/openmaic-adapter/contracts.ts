@@ -995,7 +995,10 @@ function rewriteMediaValue(
   return value;
 }
 
-function assertInteractiveHtmlIsPortable(html: string, path: string): void {
+export function assertPortableInteractiveHtml(
+  html: string,
+  path = "/content/html",
+): void {
   if (
     /\b(?:src|srcset|action|poster)\s*=/i.test(html) ||
     /\bhref\s*=\s*["']?\s*(?!#)/i.test(html) ||
@@ -1036,7 +1039,7 @@ export function resolveClassroomMediaReferences(
   const controlledUrls = new Set(pathToUrl.values());
   document.openmaic.scenes = document.openmaic.scenes.map((scene, index) => {
     if (scene.type === "interactive") {
-      assertInteractiveHtmlIsPortable(
+      assertPortableInteractiveHtml(
         scene.content.html,
         `/openmaic/scenes/${index}/content/html`,
       );
