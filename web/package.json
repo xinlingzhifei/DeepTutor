@@ -3,8 +3,11 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
+    "predev": "node ./scripts/sync-openmaic-importer.mjs",
     "dev": "node --max-old-space-size=4096 ./node_modules/next/dist/bin/next dev",
+    "predev:turbo": "node ./scripts/sync-openmaic-importer.mjs",
     "dev:turbo": "node --max-old-space-size=6144 ./node_modules/next/dist/bin/next dev --turbopack",
+    "prebuild": "node ./scripts/sync-openmaic-importer.mjs",
     "build": "next build",
     "start": "next start",
     "lint": "eslint .",

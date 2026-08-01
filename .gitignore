@@ -318,3 +318,4 @@ celerybeat.pid
 # Local Git Worktrees
 # ============================================
 .worktrees/
+web/public/vendor/maic-importer/
