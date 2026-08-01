@@ -357,6 +357,84 @@ def test_skip_locked_dispatch_is_concurrent_and_queue_insertion_is_idempotent(
     asyncio.run(scenario())
 
 
+def test_cancel_retires_outbox_and_dispatcher_consumes_terminal_stale_event(
+    generation_database: Any,
+) -> None:
+    tenant_id = "cancel-outbox-tenant"
+    job_id = "cancel-outbox-job"
+    generation_database.migrate_tenant(tenant_id)
+
+    async def scenario() -> None:
+        engine = create_async_engine(generation_database.url, poolclass=NullPool)
+        try:
+            await _insert_active_tenant(engine, tenant_id)
+            repository = SqlAlchemyGenerationJobRepository(engine)
+            await repository.grant_quota(
+                tenant_id,
+                grant_id="grant-cancel-outbox",
+                units=10,
+            )
+            await repository.create_job_and_reserve(_request(tenant_id, job_id))
+
+            cancellation = await repository.request_cancel(tenant_id, job_id)
+
+            assert cancellation is not None and not cancellation.running
+            session_factory = async_sessionmaker(engine, expire_on_commit=False)
+            async with session_factory() as session:
+                message = await session.scalar(
+                    select(OutboxMessage).where(
+                        OutboxMessage.tenant_id == tenant_id,
+                        OutboxMessage.job_id == job_id,
+                    )
+                )
+                assert message is not None and message.delivered_at is not None
+                assert (
+                    await session.scalar(
+                        select(GenerationQueue).where(
+                            GenerationQueue.tenant_id == tenant_id,
+                            GenerationQueue.job_id == job_id,
+                        )
+                    )
+                    is None
+                )
+
+            async with session_factory() as session:
+                async with session.begin():
+                    await session.execute(
+                        update(OutboxMessage)
+                        .where(
+                            OutboxMessage.tenant_id == tenant_id,
+                            OutboxMessage.job_id == job_id,
+                        )
+                        .values(delivered_at=None)
+                    )
+
+            retired = await OutboxDispatcher(engine).dispatch_next()
+
+            assert retired is not None
+            async with session_factory() as session:
+                message = await session.scalar(
+                    select(OutboxMessage).where(
+                        OutboxMessage.tenant_id == tenant_id,
+                        OutboxMessage.job_id == job_id,
+                    )
+                )
+                assert message is not None and message.delivered_at is not None
+                assert (
+                    await session.scalar(
+                        select(GenerationQueue).where(
+                            GenerationQueue.tenant_id == tenant_id,
+                            GenerationQueue.job_id == job_id,
+                        )
+                    )
+                    is None
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
 def test_content_requeue_requires_the_outline_queue_and_slots_to_be_released(
     generation_database: Any,
 ) -> None:

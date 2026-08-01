@@ -160,12 +160,11 @@ def test_missing_default_settings_file_returns_disabled_defaults(
     [
         (
             b'{"database_url":"postgresql+asyncpg://user:'
-            b"PLATFORM_FILE_DECODE_LEAK\xff@db/yfeistai\"}",
+            b'PLATFORM_FILE_DECODE_LEAK\xff@db/yfeistai"}',
             "PLATFORM_FILE_DECODE_LEAK",
         ),
         (
-            b'{"database_url":"postgresql+asyncpg://user:'
-            b'PLATFORM_JSON_PARSE_LEAK@db/yfeistai"',
+            b'{"database_url":"postgresql+asyncpg://user:PLATFORM_JSON_PARSE_LEAK@db/yfeistai"',
             "PLATFORM_JSON_PARSE_LEAK",
         ),
     ],
@@ -223,9 +222,7 @@ def test_invalid_environment_database_url_fails_closed(
     invalid_url: str,
 ) -> None:
     json_sentinel = "JSON_URL_MUST_NOT_LEAK"
-    json_database_url = (
-        f"postgresql+asyncpg://user:{json_sentinel}@db/yfeistai"
-    )
+    json_database_url = f"postgresql+asyncpg://user:{json_sentinel}@db/yfeistai"
     settings = _write_settings(
         tmp_path,
         {
@@ -294,9 +291,7 @@ def test_database_url_is_redacted_from_validation_errors(
         (
             {
                 "enabled": False,
-                "databse_url": (
-                    "postgresql+asyncpg://user:TYPO_DATABASE_URL_LEAK@db/yfeistai"
-                ),
+                "databse_url": ("postgresql+asyncpg://user:TYPO_DATABASE_URL_LEAK@db/yfeistai"),
             },
             "databse_url",
             "TYPO_DATABASE_URL_LEAK",
@@ -391,6 +386,27 @@ def test_enabled_s3_accepts_tenant_credentials_root(tmp_path: Path) -> None:
     assert loaded.object_store_tenant_credentials_dir == credentials_dir
 
 
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "http://downloads.example",
+        "https://user@downloads.example",
+        "https://downloads.example/path",
+    ],
+)
+def test_public_download_origin_must_be_a_bare_https_origin(
+    tmp_path: Path,
+    origin: str,
+) -> None:
+    settings = _write_settings(
+        tmp_path,
+        {"object_store_public_download_origins": [origin]},
+    )
+
+    with pytest.raises(ValueError, match="invalid platform settings"):
+        load_platform_settings(settings)
+
+
 def test_disabled_platform_ignores_incomplete_s3_settings(tmp_path: Path) -> None:
     settings = _write_settings(
         tmp_path,
@@ -420,9 +436,7 @@ def test_password_file_read_failure_is_secret_safe(
     contents: bytes | None,
     sentinel: str,
 ) -> None:
-    password_file = tmp_path / (
-        sentinel if contents is None else "database-password"
-    )
+    password_file = tmp_path / (sentinel if contents is None else "database-password")
     if contents is not None:
         password_file.write_bytes(contents)
     settings = _write_settings(

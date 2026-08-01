@@ -119,6 +119,36 @@ class OutboxDispatcher:
                     },
                 )
                 if updated_job.scalar_one_or_none() is None:
+                    terminal_status = await session.scalar(
+                        text(
+                            f"""
+                            SELECT status
+                            FROM {_tenant_generation_jobs_table(message.tenant_id)}
+                            WHERE id = :job_id
+                              AND tenant_id = :tenant_id
+                              AND status IN ('succeeded', 'failed', 'canceled')
+                            FOR UPDATE
+                            """
+                        ),
+                        {
+                            "job_id": message.job_id,
+                            "tenant_id": message.tenant_id,
+                        },
+                    )
+                    if terminal_status is not None:
+                        message.delivered_at = now
+                        await session.flush()
+                        return DispatchedJob(
+                            tenant_id=message.tenant_id,
+                            job_id=message.job_id,
+                            job_kind=message.job_kind,
+                            phase=message.phase,
+                            slot_pool=message.slot_pool,
+                            data_plane_route_id=message.data_plane_route_id,
+                            provider_profile_id=message.provider_profile_id,
+                            worker_pool_ref=message.worker_pool_ref,
+                            queue_ref=message.queue_ref,
+                        )
                     raise OutboxDispatchConflict("tenant job cannot accept outbox delivery")
                 queue_insert = (
                     insert(GenerationQueue)

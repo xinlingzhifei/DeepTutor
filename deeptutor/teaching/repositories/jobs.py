@@ -109,6 +109,9 @@ class GenerationJobRequest:
     request_payload: str
     classroom_draft_id: str | None = None
     batch_id: str | None = None
+    resource_course_id: str | None = None
+    resource_class_id: str | None = None
+    public_request_sha256: str | None = None
     max_attempts: int = 5
     retry_of_job_id: str | None = None
 
@@ -145,6 +148,16 @@ class GenerationJobRequest:
             _required(self.classroom_draft_id, "classroom_draft_id", 64)
         if self.batch_id is not None:
             _required(self.batch_id, "batch_id", 64)
+        if (self.resource_course_id is None) != (self.resource_class_id is None):
+            raise ValueError("resource course and class IDs must be provided together")
+        if self.resource_course_id is not None and self.resource_class_id is not None:
+            _required(self.resource_course_id, "resource_course_id", 64)
+            _required(self.resource_class_id, "resource_class_id", 64)
+        if self.public_request_sha256 is not None and (
+            len(self.public_request_sha256) != 64
+            or any(character not in _LOWER_HEX_DIGITS for character in self.public_request_sha256)
+        ):
+            raise ValueError("public_request_sha256 must be a lowercase SHA-256 hex digest")
         if self.retry_of_job_id is not None:
             _required(self.retry_of_job_id, "retry_of_job_id", 64)
             if self.retry_of_job_id == self.job_id:
@@ -196,6 +209,8 @@ def build_explicit_retry_request(
     job_id: str,
     request_id: str,
     idempotency_key: str,
+    actor_id: str | None = None,
+    public_request_sha256: str | None = None,
 ) -> GenerationJobRequest:
     """Clone immutable work only under a completely new public identity."""
 
@@ -240,6 +255,8 @@ def build_explicit_retry_request(
         idempotency_key=idempotency_key,
         request_payload=retry_payload,
         request_sha256=hashlib.sha256(retry_payload.encode()).hexdigest(),
+        actor_id=actor_id if actor_id is not None else original.actor_id,
+        public_request_sha256=public_request_sha256,
         retry_of_job_id=original.job_id,
     )
 
@@ -272,6 +289,9 @@ class GenerationJobDetails:
     idempotency_key: str
     classroom_draft_id: str | None
     batch_id: str | None
+    resource_course_id: str | None
+    resource_class_id: str | None
+    public_request_sha256: str | None
     request_sha256: str
     data_plane_route_id: str
     provider_profile_id: str
@@ -464,6 +484,18 @@ class SqlAlchemyGenerationJobRepository:
         session_factory = self._session_factory(request.tenant_id)
         async with session_factory() as session:
             async with session.begin():
+                existing = await session.scalar(
+                    select(GenerationJob)
+                    .where(
+                        GenerationJob.tenant_id == request.tenant_id,
+                        GenerationJob.idempotency_key == request.idempotency_key,
+                    )
+                    .with_for_update()
+                )
+                if existing is not None:
+                    if not self._matches_idempotent_request(existing, request):
+                        raise IdempotencyConflict()
+                    return self._record(existing)
                 if not await lock_active_job_binding(
                     session,
                     tenant_id=request.tenant_id,
@@ -473,16 +505,6 @@ class SqlAlchemyGenerationJobRepository:
                     queue_ref=request.queue_ref,
                 ):
                     raise DataPlaneBindingUnavailable()
-                existing = await session.scalar(
-                    select(GenerationJob).where(
-                        GenerationJob.tenant_id == request.tenant_id,
-                        GenerationJob.idempotency_key == request.idempotency_key,
-                    )
-                )
-                if existing is not None:
-                    if not self._matches_idempotent_request(existing, request):
-                        raise IdempotencyConflict()
-                    return self._record(existing)
                 balance = await self._quota_balance(session, request.tenant_id)
                 reserve_quota(
                     balance=balance,
@@ -505,6 +527,9 @@ class SqlAlchemyGenerationJobRepository:
                     idempotency_key=request.idempotency_key,
                     classroom_draft_id=request.classroom_draft_id,
                     batch_id=request.batch_id,
+                    resource_course_id=request.resource_course_id,
+                    resource_class_id=request.resource_class_id,
+                    public_request_sha256=request.public_request_sha256,
                     request_sha256=request.request_sha256.lower(),
                     data_plane_route_id=request.data_plane_route_id,
                     provider_profile_id=request.provider_profile_id,
@@ -575,6 +600,14 @@ class SqlAlchemyGenerationJobRepository:
         existing: GenerationJob,
         request: GenerationJobRequest,
     ) -> bool:
+        if existing.public_request_sha256 is not None or request.public_request_sha256 is not None:
+            return (
+                existing.id == request.job_id
+                and existing.job_kind == request.job_kind
+                and existing.actor_id == request.actor_id
+                and existing.idempotency_key == request.idempotency_key
+                and existing.public_request_sha256 == request.public_request_sha256
+            )
         return (
             existing.id == request.job_id
             and existing.job_kind == request.job_kind
@@ -588,6 +621,8 @@ class SqlAlchemyGenerationJobRepository:
             and existing.request_id == request.request_id
             and existing.classroom_draft_id == request.classroom_draft_id
             and existing.batch_id == request.batch_id
+            and existing.resource_course_id == request.resource_course_id
+            and existing.resource_class_id == request.resource_class_id
             and existing.request_sha256 == request.request_sha256.lower()
             and existing.data_plane_route_id == request.data_plane_route_id
             and existing.provider_profile_id == request.provider_profile_id
@@ -669,12 +704,15 @@ class SqlAlchemyGenerationJobRepository:
             raise ValueError("request_payload must be canonical JSON") from None
         if not isinstance(parsed_payload, dict) or parsed_payload.get("phase") != "content":
             raise ValueError("confirmed request payload must use content phase")
-        if json.dumps(
-            parsed_payload,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ) != request_payload:
+        if (
+            json.dumps(
+                parsed_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            != request_payload
+        ):
             raise ValueError("request_payload must be canonical JSON")
 
         session_factory = self._session_factory(tenant_id)
@@ -735,6 +773,7 @@ class SqlAlchemyGenerationJobRepository:
                 job.request_sha256 = request_sha256
                 job.next_attempt_at = now
                 job.waiting_reason = None
+                job.progress_percent = max(job.progress_percent, 50)
                 job.updated_at = now
                 session.add(
                     OutboxMessage(
@@ -805,6 +844,9 @@ class SqlAlchemyGenerationJobRepository:
                 idempotency_key=job.idempotency_key,
                 classroom_draft_id=job.classroom_draft_id,
                 batch_id=job.batch_id,
+                resource_course_id=job.resource_course_id,
+                resource_class_id=job.resource_class_id,
+                public_request_sha256=job.public_request_sha256,
                 request_sha256=job.request_sha256,
                 data_plane_route_id=job.data_plane_route_id,
                 provider_profile_id=job.provider_profile_id,
@@ -871,11 +913,7 @@ class SqlAlchemyGenerationJobRepository:
             (
                 await session.scalars(
                     select(GenerationSlot)
-                    .where(
-                        GenerationSlot.id.in_(
-                            (claim.global_slot_id, claim.tenant_slot_id)
-                        )
-                    )
+                    .where(GenerationSlot.id.in_((claim.global_slot_id, claim.tenant_slot_id)))
                     .order_by(GenerationSlot.id)
                     .with_for_update()
                 )
@@ -999,7 +1037,7 @@ class SqlAlchemyGenerationJobRepository:
                 if job.status != expected_status:
                     raise JobLeaseLost("job status no longer matches")
                 job.status = target_status
-                job.progress_percent = progress_percent
+                job.progress_percent = max(job.progress_percent, progress_percent)
                 job.updated_at = now
                 await session.flush()
 
@@ -1017,7 +1055,7 @@ class SqlAlchemyGenerationJobRepository:
                     raise JobAlreadyTerminal("outline completion lost cancellation race")
                 job.status = "awaiting_confirmation"
                 job.result_payload = result_payload
-                job.progress_percent = 100
+                job.progress_percent = max(job.progress_percent, 50)
                 job.updated_at = now
                 self._clear_job_lease(job)
                 await session.delete(queue)
@@ -1155,6 +1193,18 @@ class SqlAlchemyGenerationJobRepository:
         async with session_factory() as session:
             async with session.begin():
                 now = await _database_now(session)
+                undelivered_messages = (
+                    await session.scalars(
+                        select(OutboxMessage)
+                        .where(
+                            OutboxMessage.tenant_id == tenant_id,
+                            OutboxMessage.job_id == job_id,
+                            OutboxMessage.delivered_at.is_(None),
+                        )
+                        .order_by(OutboxMessage.event_id)
+                        .with_for_update()
+                    )
+                ).all()
                 job = await session.scalar(
                     select(GenerationJob)
                     .where(
@@ -1190,6 +1240,8 @@ class SqlAlchemyGenerationJobRepository:
                 )
                 if queue is not None:
                     await session.delete(queue)
+                for message in undelivered_messages:
+                    message.delivered_at = now
                 job.status = "canceled"
                 job.error_category = "canceled"
                 job.error_code = "job_canceled"
@@ -1294,10 +1346,7 @@ class SqlAlchemyGenerationJobRepository:
                 )
                 if existing is None:
                     await session.execute(
-                        text(
-                            "SELECT pg_advisory_xact_lock("
-                            "hashtextextended(:classroom_key, 0))"
-                        ),
+                        text("SELECT pg_advisory_xact_lock(hashtextextended(:classroom_key, 0))"),
                         {"classroom_key": f"{claim.tenant_id}\0{classroom_id}"},
                     )
                     max_version = max(
@@ -1520,8 +1569,7 @@ class SqlAlchemyGenerationJobRepository:
                     .where(
                         ClassroomVersion.tenant_id == claim.tenant_id,
                         ClassroomVersion.document_sha256 == input_document_sha256,
-                        ClassroomVersion.media_manifest_sha256
-                        == input_media_manifest_sha256,
+                        ClassroomVersion.media_manifest_sha256 == input_media_manifest_sha256,
                     )
                     .order_by(ClassroomVersion.version_number.desc())
                     .limit(1)
@@ -1603,9 +1651,10 @@ class SqlAlchemyGenerationJobRepository:
                     raise JobLeaseLost("expired queue does not own exactly two fenced slots")
                 jobs_table = _tenant_table(queue.tenant_id, "generation_jobs")
                 job = (
-                    await session.execute(
-                        text(
-                            f"""
+                    (
+                        await session.execute(
+                            text(
+                                f"""
                             SELECT status, attempt_count, max_attempts,
                                    cancel_requested, quota_units, lease_token,
                                    lease_expires_at
@@ -1613,10 +1662,13 @@ class SqlAlchemyGenerationJobRepository:
                             WHERE id = :job_id AND tenant_id = :tenant_id
                             FOR UPDATE
                             """
-                        ),
-                        {"job_id": queue.job_id, "tenant_id": queue.tenant_id},
+                            ),
+                            {"job_id": queue.job_id, "tenant_id": queue.tenant_id},
+                        )
                     )
-                ).mappings().one_or_none()
+                    .mappings()
+                    .one_or_none()
+                )
                 if (
                     job is None
                     or job["status"] not in LEASED_JOB_STATUSES
@@ -1626,9 +1678,8 @@ class SqlAlchemyGenerationJobRepository:
                 ):
                     raise JobLeaseLost("expired queue does not match the tenant job fence")
 
-                should_retry = (
-                    not job["cancel_requested"]
-                    and int(job["attempt_count"]) < int(job["max_attempts"])
+                should_retry = not job["cancel_requested"] and int(job["attempt_count"]) < int(
+                    job["max_attempts"]
                 )
                 terminal_status: str | None = None
                 next_attempt_at: datetime | None = None

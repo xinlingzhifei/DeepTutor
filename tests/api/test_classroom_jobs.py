@@ -12,12 +12,14 @@ from deeptutor.api.routers import auth as auth_router
 from deeptutor.api.routers import classroom_jobs as jobs_router
 from deeptutor.teaching.contracts import (
     GenerationRequest,
+    TeachingBrief,
     canonical_json_bytes,
     canonical_outline_sha256,
+    canonical_teaching_brief_sha256,
 )
 from deeptutor.teaching.object_store import ObjectStoreConfigurationError
-from deeptutor.teaching.openmaic.data_planes import DataPlaneSelection
-from deeptutor.teaching.permissions import permissions_for_roles
+from deeptutor.teaching.openmaic.data_planes import DataPlaneSelection, DataPlaneUnavailable
+from deeptutor.teaching.permissions import ResourceScope, permissions_for_roles
 from deeptutor.teaching.repositories.jobs import GenerationJobRecord
 from deeptutor.teaching.tenant_context import TenantContext, require_tenant
 from tests.teaching.test_contracts import (
@@ -26,15 +28,27 @@ from tests.teaching.test_contracts import (
 )
 
 
+def _sealed_teaching_brief(brief: dict[str, object] | None = None) -> TeachingBrief:
+    parsed = TeachingBrief.model_validate(
+        brief if brief is not None else valid_generation_request()["teaching_brief"]
+    )
+    digest = canonical_teaching_brief_sha256(parsed)
+    return TeachingBrief.model_validate(
+        {**parsed.model_dump(mode="json", by_alias=False), "content_sha256": digest}
+    )
+
+
 def _public_request() -> dict[str, object]:
     request = valid_generation_request()
+    brief = _sealed_teaching_brief(request["teaching_brief"])
+    request["teaching_brief_sha256"] = brief.content_sha256
     request.pop("tenant_id")
     request.pop("job_id")
     request.pop("data_plane_route_id")
     request.pop("confirmed_outline")
     request.pop("confirmed_outline_sha256")
-    request["quota_units"] = 2
-    request["visibility"] = "private"
+    request.pop("teaching_brief")
+    request.pop("priority")
     return request
 
 
@@ -70,6 +84,7 @@ def _context(
     role: str,
     *,
     tenant_id: str = "tenant-1",
+    scope_type: str = "class",
     scope_id: str = "class-1",
 ) -> TenantContext:
     return TenantContext(
@@ -78,7 +93,7 @@ def _context(
         user_id=user_id,
         permissions=permissions_for_roles(
             {role},
-            scope_type="class",
+            scope_type=scope_type,
             scope_id=scope_id,
             tenant_id=tenant_id,
         ),
@@ -97,6 +112,12 @@ def _detail(
     result_payload: str | None = None,
     result_ref: str | None = None,
     export_format: str | None = None,
+    resource_course_id: str | None = "course-1",
+    resource_class_id: str | None = "class-1",
+    public_request_sha256: str | None = None,
+    progress_percent: int = 50,
+    error_category: str | None = None,
+    error_code: str | None = None,
 ):
     if request_payload is None:
         request_payload = canonical_json_bytes(
@@ -117,17 +138,20 @@ def _detail(
         idempotency_key="key-existing",
         classroom_draft_id=None,
         batch_id=None,
+        resource_course_id=resource_course_id,
+        resource_class_id=resource_class_id,
+        public_request_sha256=public_request_sha256,
         request_sha256=hashlib.sha256(request_payload.encode()).hexdigest(),
         data_plane_route_id="route-trusted",
         provider_profile_id="provider-private",
         worker_pool_ref="workers-private",
         queue_ref="queue-private",
         request_payload=request_payload,
-        progress_percent=50,
+        progress_percent=progress_percent,
         waiting_reason="outline_confirmation" if status == "awaiting_confirmation" else None,
         cancel_requested=False,
-        error_category=None,
-        error_code=None,
+        error_category=error_category,
+        error_code=error_code,
         result_payload=result_payload,
         result_ref=result_ref,
         retry_of_job_id=None,
@@ -147,6 +171,34 @@ class FakeSelector:
             mode="shared",
             worker_pool_ref="workers-private",
             queue_ref="queue-private",
+        )
+
+
+class FakeTrustedTeachingBriefResolver:
+    def __init__(
+        self,
+        *,
+        brief: TeachingBrief | None = None,
+        priority: str = "teacher",
+        quota_units: int = 2,
+        visibility: str = "private",
+    ) -> None:
+        self.brief = brief or _sealed_teaching_brief()
+        self.priority = priority
+        self.quota_units = quota_units
+        self.visibility = visibility
+
+    async def resolve(self, **_kwargs):
+        return jobs_router.TrustedTeachingBrief(
+            brief=self.brief,
+            resource=ResourceScope(
+                tenant_id=self.brief.tenant_id,
+                course_id=self.brief.course_id,
+                class_id=self.brief.target_class_id,
+            ),
+            priority=self.priority,
+            quota_units=self.quota_units,
+            visibility=self.visibility,
         )
 
 
@@ -180,6 +232,9 @@ class FakeRepository:
             job_kind=request.job_kind,
             request_payload=request.request_payload,
             export_format=request.export_format,
+            resource_course_id=request.resource_course_id,
+            resource_class_id=request.resource_class_id,
+            public_request_sha256=request.public_request_sha256,
         )
         detail.idempotency_key = request.idempotency_key
         detail.request_id = request.request_id
@@ -257,9 +312,7 @@ class FakeRepository:
         return SimpleNamespace(
             relative_name="exports/classroom.pptx",
             object_key=job.result_ref,
-            mime_type=(
-                "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-            ),
+            mime_type=("application/vnd.openxmlformats-officedocument.presentationml.presentation"),
         )
 
 
@@ -274,10 +327,19 @@ class FakeCancellationGateway:
 class FakeStore:
     def __init__(self) -> None:
         self.presign_calls: list[tuple[str, int]] = []
+        self.open_calls: list[str] = []
 
     async def presign_download(self, key: str, expires_seconds: int) -> str:
         self.presign_calls.append((key, expires_seconds))
         return "https://signed.example/download-token"
+
+    async def open(self, key: str):
+        self.open_calls.append(key)
+
+        async def chunks():
+            yield b"verified-export"
+
+        return chunks()
 
 
 class FakeStores:
@@ -301,8 +363,12 @@ def api_harness():
     app.include_router(jobs_router.router, prefix="/api/v1")
     app.dependency_overrides[jobs_router.get_job_repository] = lambda: repository
     app.dependency_overrides[jobs_router.get_data_plane_selector] = FakeSelector
+    app.dependency_overrides[jobs_router.get_trusted_teaching_brief_resolver] = lambda: (
+        FakeTrustedTeachingBriefResolver()
+    )
     app.dependency_overrides[jobs_router.get_cancellation_gateway] = lambda: cancellation
     app.dependency_overrides[jobs_router.get_download_store_provider] = lambda: stores
+    app.dependency_overrides[jobs_router.get_public_download_origins] = lambda: frozenset()
     app.dependency_overrides[auth_router.require_platform_enabled] = lambda: None
     app.dependency_overrides[require_tenant] = lambda: _context("teacher-1", "teacher")
     return app, repository, cancellation, stores, store
@@ -324,6 +390,48 @@ def test_duplicate_idempotency_key_returns_same_server_job(api_harness) -> None:
     assert "queue-private" not in rendered
 
 
+def test_idempotent_replay_returns_before_data_plane_selection(api_harness) -> None:
+    app, _repository, _cancellation, _stores, _store = api_harness
+
+    class OneShotSelector:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def resolve(self, tenant_id: str):
+            self.calls += 1
+            if self.calls > 1:
+                raise DataPlaneUnavailable()
+            return await FakeSelector().resolve(tenant_id)
+
+    selector = OneShotSelector()
+    app.dependency_overrides[jobs_router.get_data_plane_selector] = lambda: selector
+    client = TestClient(app)
+
+    first = client.post("/api/v1/classroom-jobs", json=_public_request())
+    replay = client.post("/api/v1/classroom-jobs", json=_public_request())
+
+    assert first.status_code == replay.status_code == 202
+    assert first.json()["job_id"] == replay.json()["job_id"]
+    assert selector.calls == 1
+
+
+def test_idempotency_key_reuse_with_changed_public_request_is_rejected(
+    api_harness,
+) -> None:
+    app, _repository, _cancellation, _stores, _store = api_harness
+    client = TestClient(app)
+    changed = _public_request()
+    changed["duration_minutes"] = int(changed["duration_minutes"]) + 1
+
+    first = client.post("/api/v1/classroom-jobs", json=_public_request())
+    conflict = client.post("/api/v1/classroom-jobs", json=changed)
+
+    assert first.status_code == 202
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"] == "Idempotency conflict"
+    assert FakeSelector.resolve_calls == ["tenant-1"]
+
+
 def test_create_rejects_client_selected_tenant_job_and_route(api_harness) -> None:
     app, _repository, _cancellation, _stores, _store = api_harness
     body = _public_request()
@@ -336,6 +444,87 @@ def test_create_rejects_client_selected_tenant_job_and_route(api_harness) -> Non
     response = TestClient(app).post("/api/v1/classroom-jobs", json=body)
 
     assert response.status_code == 422
+
+
+def test_create_rejects_client_selected_policy_and_embedded_brief(api_harness) -> None:
+    app, _repository, _cancellation, _stores, _store = api_harness
+    body = _public_request()
+    body.update(
+        teaching_brief=valid_generation_request()["teaching_brief"],
+        priority="student_micro",
+        quota_units=1,
+        visibility="tenant",
+        classroom_draft_id="draft-client-selected",
+    )
+
+    response = TestClient(app).post("/api/v1/classroom-jobs", json=body)
+
+    assert response.status_code == 422
+
+
+def test_create_rejects_trusted_brief_when_canonical_hash_is_stale(api_harness) -> None:
+    app, repository, _cancellation, _stores, _store = api_harness
+    brief = _sealed_teaching_brief().model_dump(mode="json", by_alias=False)
+    brief["network_policy"] = {
+        "allow_web_access": True,
+        "allowed_domains": ["untrusted.example"],
+    }
+    brief["safety_policy"] = {"policy_id": "disabled", "blocked_categories": []}
+    app.dependency_overrides[jobs_router.get_trusted_teaching_brief_resolver] = lambda: (
+        FakeTrustedTeachingBriefResolver(brief=TeachingBrief.model_validate(brief))
+    )
+
+    response = TestClient(app).post("/api/v1/classroom-jobs", json=_public_request())
+
+    assert response.status_code == 409
+    assert repository.created_requests == []
+    assert FakeSelector.resolve_calls == []
+
+
+def test_create_fails_closed_when_trusted_brief_crosses_tenant_boundary(
+    api_harness,
+) -> None:
+    app, repository, _cancellation, _stores, _store = api_harness
+    raw_brief = _sealed_teaching_brief().model_dump(mode="json", by_alias=False)
+    raw_brief["tenant_id"] = "tenant-other"
+    brief = _sealed_teaching_brief(raw_brief)
+
+    class CrossTenantResolver:
+        async def resolve(self, **_kwargs):
+            return jobs_router.TrustedTeachingBrief(
+                brief=brief,
+                resource=ResourceScope(
+                    tenant_id="tenant-1",
+                    course_id=brief.course_id,
+                    class_id=brief.target_class_id,
+                ),
+                priority="teacher",
+                quota_units=2,
+                visibility="private",
+            )
+
+    body = _public_request()
+    body["teaching_brief_sha256"] = brief.content_sha256
+    app.dependency_overrides[jobs_router.get_trusted_teaching_brief_resolver] = CrossTenantResolver
+
+    response = TestClient(app).post("/api/v1/classroom-jobs", json=body)
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "Trusted teaching brief unavailable"
+    assert repository.created_requests == []
+    assert FakeSelector.resolve_calls == []
+
+
+def test_create_fails_closed_without_a_trusted_brief_resolver(api_harness) -> None:
+    app, repository, _cancellation, _stores, _store = api_harness
+    del app.dependency_overrides[jobs_router.get_trusted_teaching_brief_resolver]
+
+    response = TestClient(app).post("/api/v1/classroom-jobs", json=_public_request())
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "Trusted teaching brief unavailable"
+    assert repository.created_requests == []
+    assert FakeSelector.resolve_calls == []
 
 
 def test_content_phase_can_only_be_entered_through_outline_confirmation(
@@ -376,7 +565,7 @@ def test_micro_generation_keeps_micro_contract_but_uses_content_queue_phase(
     body = _public_request()
     body["phase"] = "micro"
     body["classroom_mode"] = "micro"
-    brief = body["teaching_brief"]
+    brief = _sealed_teaching_brief().model_dump(mode="json", by_alias=False)
     brief["classroom_mode"] = "micro"
     brief["content_mode"] = "open_creation"
     brief["source_snapshot"] = None
@@ -385,6 +574,11 @@ def test_micro_generation_keeps_micro_contract_but_uses_content_queue_phase(
     brief["source_refs"] = []
     brief["permission_summary"]["allowed_source_ids"] = []
     brief["permission_summary"]["allowed_fragment_ids"] = []
+    sealed_brief = _sealed_teaching_brief(brief)
+    body["teaching_brief_sha256"] = sealed_brief.content_sha256
+    app.dependency_overrides[jobs_router.get_trusted_teaching_brief_resolver] = lambda: (
+        FakeTrustedTeachingBriefResolver(brief=sealed_brief)
+    )
 
     response = TestClient(app).post("/api/v1/classroom-jobs", json=body)
 
@@ -415,6 +609,22 @@ def test_disabled_platform_rejects_before_job_repository_access(monkeypatch) -> 
     assert response.json()["detail"] == "Tenant platform is disabled"
 
 
+def test_disabled_teaching_does_not_register_classroom_routes() -> None:
+    from deeptutor.api.main import _register_classroom_job_routes
+
+    app = FastAPI()
+
+    registered = _register_classroom_job_routes(
+        app,
+        enabled=False,
+        dependencies=[],
+    )
+
+    assert registered is False
+    assert all("classroom-jobs" not in route.path for route in app.routes)
+    assert all("classroom-exports" not in route.path for route in app.routes)
+
+
 def test_student_cannot_read_another_users_private_job(api_harness) -> None:
     app, repository, _cancellation, _stores, _store = api_harness
     repository.jobs["job-other"] = _detail(job_id="job-other", owner_id="teacher-1")
@@ -443,6 +653,54 @@ def test_non_private_job_still_requires_matching_resource_scope(api_harness) -> 
 
     assert denied.status_code == 404
     assert allowed.status_code == 200
+
+
+def test_job_access_uses_persisted_resource_binding_not_request_ancestry(
+    api_harness,
+) -> None:
+    app, repository, _cancellation, _stores, _store = api_harness
+    request = _internal_request(job_id="job-forged-course")
+    request["teaching_brief"]["course_id"] = "course-forged"
+    repository.jobs["job-forged-course"] = _detail(
+        job_id="job-forged-course",
+        owner_id="teacher-other",
+        visibility="class",
+        request_payload=canonical_json_bytes(GenerationRequest.model_validate(request)).decode(),
+        resource_course_id="course-real",
+        resource_class_id="class-1",
+    )
+    app.dependency_overrides[require_tenant] = lambda: _context(
+        "teacher-forged",
+        "teacher",
+        scope_type="course",
+        scope_id="course-forged",
+    )
+
+    denied = TestClient(app).get("/api/v1/classroom-jobs/job-forged-course")
+
+    assert denied.status_code == 404
+
+
+def test_retry_attributes_the_new_job_to_the_current_actor(api_harness) -> None:
+    app, repository, _cancellation, _stores, _store = api_harness
+    repository.jobs["job-failed-other"] = _detail(
+        job_id="job-failed-other",
+        owner_id="teacher-other",
+        status="failed",
+        phase="content",
+        visibility="class",
+    )
+    app.dependency_overrides[require_tenant] = lambda: _context("teacher-current", "teacher")
+
+    response = TestClient(app).post(
+        "/api/v1/classroom-jobs/job-failed-other/retry",
+        json={"requestId": "request-retry-current", "idempotencyKey": "retry-current"},
+    )
+
+    assert response.status_code == 202
+    retried = repository.created_requests[-1]
+    assert retried.actor_id == "teacher-current"
+    assert retried.owner_id == "teacher-other"
 
 
 def test_unvalidated_outline_fields_are_not_exposed(api_harness) -> None:
@@ -537,7 +795,9 @@ def test_explicit_retry_creates_a_new_linked_job(api_harness) -> None:
     assert json.loads(retried.request_payload)["jobId"] == retried.job_id
 
 
-def test_export_status_and_download_hide_internal_object_key(api_harness) -> None:
+def test_export_download_streams_by_default_and_hides_internal_object_key(
+    api_harness,
+) -> None:
     app, repository, _cancellation, stores, store = api_harness
     object_key = "tenants/tenant-1/classrooms/export-export-1/versions/1/output.pptx"
     repository.jobs["export-1"] = _detail(
@@ -554,17 +814,78 @@ def test_export_status_and_download_hide_internal_object_key(api_harness) -> Non
     status_response = client.get("/api/v1/classroom-exports/export-1")
     download_response = client.get(
         "/api/v1/classroom-exports/export-1/download?expiresSeconds=3600",
-        follow_redirects=False,
     )
 
     assert status_response.status_code == 200
     assert status_response.json()["download_ready"] is True
     assert object_key not in json.dumps(status_response.json())
-    assert download_response.status_code == 307
-    assert download_response.headers["location"] == "https://signed.example/download-token"
+    assert download_response.status_code == 200
+    assert download_response.content == b"verified-export"
     assert stores.tenants == ["tenant-1"]
-    assert store.presign_calls == [(object_key, 60)]
+    assert store.presign_calls == []
+    assert store.open_calls == [object_key]
     assert object_key not in download_response.text
+
+
+def test_export_download_redirects_only_to_an_allowlisted_public_https_origin(
+    api_harness,
+) -> None:
+    app, repository, _cancellation, _stores, store = api_harness
+    object_key = "tenants/tenant-1/classrooms/export-public/versions/1/output.pptx"
+    repository.jobs["export-public"] = _detail(
+        job_id="export-public",
+        status="succeeded",
+        phase="export",
+        job_kind="export",
+        request_payload=_export_payload("export-public"),
+        result_ref=object_key,
+        export_format="pptx",
+    )
+    app.dependency_overrides[jobs_router.get_public_download_origins] = lambda: frozenset(
+        {"https://signed.example"}
+    )
+
+    response = TestClient(app).get(
+        "/api/v1/classroom-exports/export-public/download",
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 307
+    assert response.headers["location"] == "https://signed.example/download-token"
+    assert store.presign_calls == [(object_key, 60)]
+    assert store.open_calls == []
+
+
+def test_export_download_streams_when_signed_url_is_not_public_https(
+    api_harness,
+) -> None:
+    app, repository, _cancellation, _stores, store = api_harness
+    object_key = "tenants/tenant-1/classrooms/export-http/versions/1/output.pptx"
+    repository.jobs["export-http"] = _detail(
+        job_id="export-http",
+        status="succeeded",
+        phase="export",
+        job_kind="export",
+        request_payload=_export_payload("export-http"),
+        result_ref=object_key,
+        export_format="pptx",
+    )
+
+    async def internal_presign(key: str, expires_seconds: int) -> str:
+        store.presign_calls.append((key, expires_seconds))
+        return "http://minio:9000/private-download-token"
+
+    store.presign_download = internal_presign
+    app.dependency_overrides[jobs_router.get_public_download_origins] = lambda: frozenset(
+        {"https://downloads.example"}
+    )
+
+    response = TestClient(app).get("/api/v1/classroom-exports/export-http/download")
+
+    assert response.status_code == 200
+    assert response.content == b"verified-export"
+    assert store.presign_calls == [(object_key, 60)]
+    assert store.open_calls == [object_key]
 
 
 def test_local_export_download_uses_verified_streaming(api_harness) -> None:
@@ -603,7 +924,7 @@ def test_local_export_download_uses_verified_streaming(api_harness) -> None:
     assert response.headers["content-disposition"] == (
         "attachment; filename*=UTF-8''classroom.pptx"
     )
-    assert local_store.presign_calls == [(object_key, 60)]
+    assert local_store.presign_calls == []
 
 
 def test_other_tenant_or_owner_cannot_download_private_export(api_harness) -> None:
@@ -636,3 +957,89 @@ def test_other_tenant_or_owner_cannot_download_private_export(api_harness) -> No
     assert wrong_owner.status_code == 404
     assert wrong_tenant.status_code == 404
     assert stores.tenants == []
+
+
+def test_non_owner_cannot_access_class_visible_export_without_resource_binding(
+    api_harness,
+) -> None:
+    app, repository, _cancellation, stores, _store = api_harness
+    repository.jobs["export-class"] = _detail(
+        job_id="export-class",
+        owner_id="teacher-other",
+        status="succeeded",
+        phase="export",
+        visibility="class",
+        job_kind="export",
+        request_payload=_export_payload("export-class"),
+        result_ref="tenants/tenant-1/classrooms/export-class/versions/1/output.pptx",
+        export_format="pptx",
+    )
+
+    status_response = TestClient(app).get("/api/v1/classroom-exports/export-class")
+    download_response = TestClient(app).get("/api/v1/classroom-exports/export-class/download")
+
+    assert status_response.status_code == 404
+    assert download_response.status_code == 404
+    assert stores.tenants == []
+
+
+@pytest.mark.parametrize(
+    (
+        "job_status",
+        "stored_progress",
+        "stored_error",
+        "expected_progress",
+        "expected_cancellable",
+        "expected_retryable",
+        "expected_download",
+        "expected_error",
+    ),
+    [
+        ("succeeded", 90, "stale_error", 100, False, False, True, None),
+        ("failed", 80, "engine_failed", 80, False, True, False, "engine_failed"),
+        ("canceled", 20, "job_canceled", 20, False, True, False, "job_canceled"),
+        ("queued", 10, "stale_error", 10, True, False, False, None),
+    ],
+)
+def test_export_status_response_has_one_stable_lifecycle_contract(
+    api_harness,
+    job_status: str,
+    stored_progress: int,
+    stored_error: str,
+    expected_progress: int,
+    expected_cancellable: bool,
+    expected_retryable: bool,
+    expected_download: bool,
+    expected_error: str | None,
+) -> None:
+    app, repository, _cancellation, _stores, _store = api_harness
+    job_id = f"export-contract-{job_status}"
+    repository.jobs[job_id] = _detail(
+        job_id=job_id,
+        status=job_status,
+        phase="export",
+        job_kind="export",
+        request_payload=_export_payload(job_id),
+        result_ref=(
+            f"tenants/tenant-1/classrooms/{job_id}/versions/1/output.pptx"
+            if job_status == "succeeded"
+            else None
+        ),
+        export_format="pptx",
+        progress_percent=stored_progress,
+        error_category="engine" if stored_error else None,
+        error_code=stored_error,
+    )
+
+    response = TestClient(app).get(f"/api/v1/classroom-exports/{job_id}")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["phase"] == "export"
+    assert payload["status"] == job_status
+    assert payload["progress_percent"] == expected_progress
+    assert payload["cancellable"] is expected_cancellable
+    assert payload["retryable"] is expected_retryable
+    assert payload["download_ready"] is expected_download
+    assert payload["error_code"] == expected_error
+    assert payload["error_category"] == ("engine" if expected_error else None)

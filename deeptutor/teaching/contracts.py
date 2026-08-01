@@ -314,6 +314,18 @@ class TeachingBrief(_ContractModel):
         return self
 
 
+def canonical_teaching_brief_sha256(brief: TeachingBrief) -> str:
+    """Hash the immutable brief content without its self-reported digest field."""
+
+    payload = brief.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+        exclude={"content_sha256"},
+    )
+    return canonical_sha256(payload)
+
+
 class GenerationMetadata(_ContractModel):
     generator: NonEmptyString
     generator_version: NonEmptyString
@@ -1328,4 +1340,5 @@ __all__ = [
     "canonical_outline_json_bytes",
     "canonical_outline_sha256",
     "canonical_sha256",
+    "canonical_teaching_brief_sha256",
 ]

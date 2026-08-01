@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import hashlib
+import hmac
 from pathlib import PurePosixPath
 from typing import Any, Literal, Protocol
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import RedirectResponse, StreamingResponse
@@ -24,6 +26,7 @@ from deeptutor.teaching.contracts import (
     TeachingBrief,
     canonical_json_bytes,
     canonical_outline_sha256,
+    canonical_teaching_brief_sha256,
 )
 from deeptutor.teaching.job_route_binding import DataPlaneBindingUnavailable
 from deeptutor.teaching.models.jobs import TERMINAL_JOB_STATUSES
@@ -71,6 +74,38 @@ class _ApiModel(BaseModel):
     )
 
 
+@dataclass(frozen=True, slots=True)
+class TrustedTeachingBrief:
+    brief: TeachingBrief
+    resource: ResourceScope
+    priority: GenerationPriority
+    quota_units: int
+    visibility: Literal["private", "class", "tenant"]
+    classroom_draft_id: str | None = None
+
+
+class TrustedTeachingBriefResolver(Protocol):
+    async def resolve(
+        self,
+        *,
+        context: TenantContext,
+        teaching_brief_id: str,
+        teaching_brief_sha256: str,
+        phase: str,
+        classroom_mode: ClassroomMode,
+        requested_exports: tuple[ExportFormat, ...],
+    ) -> TrustedTeachingBrief | None: ...
+
+
+class TrustedTeachingBriefUnavailable(RuntimeError):
+    pass
+
+
+class _UnavailableTrustedTeachingBriefResolver:
+    async def resolve(self, **_kwargs: object) -> TrustedTeachingBrief | None:
+        raise TrustedTeachingBriefUnavailable()
+
+
 class ClassroomJobCreateRequest(_ApiModel):
     """Public generation input; trusted tenant, job, and route fields are absent."""
 
@@ -81,23 +116,19 @@ class ClassroomJobCreateRequest(_ApiModel):
     classroom_mode: ClassroomMode
     teaching_brief_id: str = Field(min_length=1)
     teaching_brief_sha256: Sha256
-    teaching_brief: TeachingBrief
     template_id: str = Field(min_length=1)
     template_version: str = Field(min_length=1)
     scene_budget: int = Field(ge=1)
     duration_minutes: int = Field(ge=1)
     requested_exports: list[ExportFormat] = Field(min_length=1)
     callback_context: str = Field(min_length=1, pattern=r"^[^:\s]+$")
-    priority: GenerationPriority
-    quota_units: int = Field(default=1, ge=1)
-    visibility: Literal["private", "class", "tenant"] = "private"
-    classroom_draft_id: str | None = Field(default=None, min_length=1, max_length=64)
 
     def to_generation_request(
         self,
         *,
         context: TenantContext,
         selection: DataPlaneSelection,
+        trusted: TrustedTeachingBrief,
         job_id: str,
     ) -> GenerationRequest:
         return GenerationRequest(
@@ -110,7 +141,7 @@ class ClassroomJobCreateRequest(_ApiModel):
             classroom_mode=self.classroom_mode,
             teaching_brief_id=self.teaching_brief_id,
             teaching_brief_sha256=self.teaching_brief_sha256,
-            teaching_brief=self.teaching_brief,
+            teaching_brief=trusted.brief,
             confirmed_outline=None,
             confirmed_outline_sha256=None,
             template_id=self.template_id,
@@ -120,7 +151,7 @@ class ClassroomJobCreateRequest(_ApiModel):
             requested_exports=self.requested_exports,
             callback_context=self.callback_context,
             data_plane_route_id=selection.route_ref,
-            priority=self.priority,
+            priority=trusted.priority,
         )
 
 
@@ -132,8 +163,7 @@ class ConfirmOutlineRequest(_ApiModel):
     def validate_confirmation(self) -> ConfirmOutlineRequest:
         if (
             self.confirmed_outline.confirmation_metadata.status != "confirmed"
-            or canonical_outline_sha256(self.confirmed_outline)
-            != self.confirmed_outline_sha256
+            or canonical_outline_sha256(self.confirmed_outline) != self.confirmed_outline_sha256
         ):
             raise ValueError("confirmed outline hash does not match canonical JSON")
         return self
@@ -180,6 +210,10 @@ def get_data_plane_selector() -> DataPlaneSelector:
     )
 
 
+def get_trusted_teaching_brief_resolver() -> TrustedTeachingBriefResolver:
+    return _UnavailableTrustedTeachingBriefResolver()
+
+
 def get_cancellation_gateway() -> JobCancellationGateway:
     from deeptutor.teaching.processes import RuntimeCancellationGateway
 
@@ -192,9 +226,59 @@ def get_download_store_provider() -> DownloadStoreProvider:
     return RuntimeStoreProvider(load_platform_settings())
 
 
+def _public_https_origin(value: str) -> str | None:
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return None
+    return f"https://{parsed.netloc.lower()}"
+
+
+def get_public_download_origins() -> frozenset[str]:
+    origins = load_platform_settings().object_store_public_download_origins
+    return frozenset(
+        origin for value in origins if (origin := _public_https_origin(value)) is not None
+    )
+
+
 def _server_job_id(tenant_id: str, idempotency_key: str) -> str:
     digest = hashlib.sha256(f"{tenant_id}\0{idempotency_key}".encode()).hexdigest()
     return f"job-{digest[:48]}"
+
+
+def _validate_trusted_brief(
+    request: ClassroomJobCreateRequest,
+    context: TenantContext,
+    trusted: TrustedTeachingBrief,
+) -> None:
+    brief = trusted.brief
+    canonical_sha256 = canonical_teaching_brief_sha256(brief)
+    request_matches_brief = (
+        request.teaching_brief_id == brief.brief_id
+        and hmac.compare_digest(request.teaching_brief_sha256, canonical_sha256)
+        and request.classroom_mode == brief.classroom_mode
+        and request.template_id == brief.template_policy.template_id
+        and request.template_version == brief.template_policy.template_version
+        and request.duration_minutes == brief.duration_minutes
+    )
+    if not request_matches_brief:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Teaching brief changed",
+        )
+    trusted_binding_is_valid = (
+        hmac.compare_digest(brief.content_sha256, canonical_sha256)
+        and brief.tenant_id == context.tenant_id
+        and trusted.resource.tenant_id == context.tenant_id
+        and trusted.resource.course_id == brief.course_id
+        and trusted.resource.class_id == brief.target_class_id
+    )
+    if not trusted_binding_is_valid:
+        raise TrustedTeachingBriefUnavailable()
 
 
 def _resource_for_brief(tenant_id: str, brief: TeachingBrief) -> ResourceScope:
@@ -203,10 +287,6 @@ def _resource_for_brief(tenant_id: str, brief: TeachingBrief) -> ResourceScope:
         course_id=brief.course_id,
         class_id=brief.target_class_id,
     )
-
-
-def _resource_for_generation(request: GenerationRequest) -> ResourceScope:
-    return _resource_for_brief(request.tenant_id, request.teaching_brief)
 
 
 def _allows_any(
@@ -269,16 +349,14 @@ def _can_access(
         return True
     if details.visibility == "private":
         return False
-    try:
-        parsed = _parse_request(details)
-    except HTTPException:
+    if details.job_kind != "generation":
         return False
-    if parsed.tenant_id != context.tenant_id:
+    if details.resource_course_id is None or details.resource_class_id is None:
         return False
-    resource = (
-        _resource_for_generation(parsed)
-        if isinstance(parsed, GenerationRequest)
-        else ResourceScope(tenant_id=context.tenant_id)
+    resource = ResourceScope(
+        tenant_id=context.tenant_id,
+        course_id=details.resource_course_id,
+        class_id=details.resource_class_id,
     )
     permissions = (
         {"classroom.edit", "tenant.manage"}
@@ -319,18 +397,19 @@ def _outline_payload(details: GenerationJobDetails) -> dict[str, Any] | None:
 
 def _response(details: GenerationJobDetails) -> JobStatusResponse:
     terminal = details.status in TERMINAL_JOB_STATUSES
+    failed_or_canceled = details.status in {"failed", "canceled"}
     return JobStatusResponse(
         job_id=details.job_id,
         job_kind=details.job_kind,
         phase=details.phase,
         status=details.status,
-        progress_percent=details.progress_percent,
-        waiting_reason=details.waiting_reason,
+        progress_percent=100 if details.status == "succeeded" else details.progress_percent,
+        waiting_reason=None if terminal else details.waiting_reason,
         cancellable=not terminal,
-        retryable=details.status in {"failed", "canceled"},
+        retryable=failed_or_canceled,
         outline=_outline_payload(details),
-        error_category=details.error_category,
-        error_code=details.error_code,
+        error_category=details.error_category if failed_or_canceled else None,
+        error_code=details.error_code if failed_or_canceled else None,
         retry_of_job_id=details.retry_of_job_id,
         export_format=details.export_format,
         download_ready=details.job_kind == "export" and details.status == "succeeded",
@@ -367,6 +446,8 @@ def _generation_job_request(
         request_payload=details.request_payload,
         classroom_draft_id=details.classroom_draft_id,
         batch_id=details.batch_id,
+        resource_course_id=details.resource_course_id,
+        resource_class_id=details.resource_class_id,
     )
 
 
@@ -380,20 +461,47 @@ async def create_classroom_job(
     context: TenantContext = Depends(require_tenant),
     repository: SqlAlchemyGenerationJobRepository = Depends(get_job_repository),
     selector: DataPlaneSelector = Depends(get_data_plane_selector),
+    brief_resolver: TrustedTeachingBriefResolver = Depends(get_trusted_teaching_brief_resolver),
 ) -> JobStatusResponse:
     try:
+        job_id = _server_job_id(context.tenant_id, request.idempotency_key)
+        public_request_sha256 = hashlib.sha256(canonical_json_bytes(request)).hexdigest()
+        existing = await repository.get_job_details(context.tenant_id, job_id)
+        if existing is not None:
+            if (
+                existing.job_kind != "generation"
+                or existing.actor_id != context.user_id
+                or existing.idempotency_key != request.idempotency_key
+                or existing.public_request_sha256 != public_request_sha256
+            ):
+                raise IdempotencyConflict()
+            return _response(existing)
+        trusted = await brief_resolver.resolve(
+            context=context,
+            teaching_brief_id=request.teaching_brief_id,
+            teaching_brief_sha256=request.teaching_brief_sha256,
+            phase=request.phase,
+            classroom_mode=request.classroom_mode,
+            requested_exports=tuple(request.requested_exports),
+        )
+        if trusted is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Teaching brief not found",
+            )
+        _validate_trusted_brief(request, context, trusted)
         _require_create_access(
             context,
             classroom_mode=request.classroom_mode,
-            brief=request.teaching_brief,
+            brief=trusted.brief,
         )
         selection = await selector.resolve(context.tenant_id)
         if selection is None:
             raise DataPlaneUnavailable()
-        job_id = _server_job_id(context.tenant_id, request.idempotency_key)
         generation = request.to_generation_request(
             context=context,
             selection=selection,
+            trusted=trusted,
             job_id=job_id,
         )
         payload = canonical_json_bytes(generation).decode()
@@ -405,10 +513,10 @@ async def create_classroom_job(
                 phase="content" if generation.phase == "micro" else generation.phase,
                 export_format=None,
                 priority=generation.priority,
-                quota_units=request.quota_units,
+                quota_units=trusted.quota_units,
                 actor_id=context.user_id,
                 owner_id=context.user_id,
-                visibility=request.visibility,
+                visibility=trusted.visibility,
                 request_id=generation.request_id,
                 idempotency_key=generation.idempotency_key,
                 request_sha256=hashlib.sha256(payload.encode()).hexdigest(),
@@ -417,9 +525,17 @@ async def create_classroom_job(
                 worker_pool_ref=selection.worker_pool_ref,
                 queue_ref=selection.queue_ref,
                 request_payload=payload,
-                classroom_draft_id=request.classroom_draft_id,
+                classroom_draft_id=trusted.classroom_draft_id,
+                resource_course_id=trusted.resource.course_id,
+                resource_class_id=trusted.resource.class_id,
+                public_request_sha256=public_request_sha256,
             )
         )
+    except TrustedTeachingBriefUnavailable:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Trusted teaching brief unavailable",
+        ) from None
     except ValidationError:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -436,7 +552,9 @@ async def create_classroom_job(
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Idempotency conflict")
     details = await repository.get_job_details(context.tenant_id, job_id)
     if details is None:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Job unavailable")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Job unavailable"
+        )
     return _response(details)
 
 
@@ -468,13 +586,16 @@ async def confirm_outline(
         details.job_kind != "generation"
         or details.phase != "outline"
         or details.status != "awaiting_confirmation"
-        or confirmation.confirmed_outline.confirmation_metadata.confirmed_by
-        != context.user_id
+        or confirmation.confirmed_outline.confirmation_metadata.confirmed_by != context.user_id
     ):
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Outline cannot be confirmed")
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="Outline cannot be confirmed"
+        )
     original = _parse_request(details)
     if not isinstance(original, GenerationRequest):
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Outline cannot be confirmed")
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="Outline cannot be confirmed"
+        )
     content_payload = original.model_dump(mode="json", by_alias=True, exclude_none=True)
     content_payload.update(
         phase="content",
@@ -512,7 +633,9 @@ async def confirm_outline(
             detail="Outline cannot be confirmed",
         ) from None
     if not requeued:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Outline cannot be confirmed")
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="Outline cannot be confirmed"
+        )
     updated = await repository.get_job_details(context.tenant_id, job_id)
     if updated is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
@@ -566,12 +689,22 @@ async def retry_job(
     if details.job_kind != "generation" or details.status not in {"failed", "canceled"}:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Job cannot be retried")
     new_job_id = _server_job_id(context.tenant_id, retry.idempotency_key)
+    public_request_sha256 = hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "retryOfJobId": job_id,
+                "request": retry.model_dump(mode="json", by_alias=True),
+            }
+        )
+    ).hexdigest()
     try:
         retried = build_explicit_retry_request(
             _generation_job_request(details),
             job_id=new_job_id,
             request_id=retry.request_id,
             idempotency_key=retry.idempotency_key,
+            actor_id=context.user_id,
+            public_request_sha256=public_request_sha256,
         )
         await repository.create_job_and_reserve(retried)
     except IdempotencyConflict:
@@ -590,7 +723,9 @@ async def retry_job(
         ) from None
     updated = await repository.get_job_details(context.tenant_id, new_job_id)
     if updated is None:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Job unavailable")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Job unavailable"
+        )
     return _response(updated)
 
 
@@ -612,6 +747,7 @@ async def download_classroom_export(
     context: TenantContext = Depends(require_tenant),
     repository: SqlAlchemyGenerationJobRepository = Depends(get_job_repository),
     stores: DownloadStoreProvider = Depends(get_download_store_provider),
+    public_download_origins: frozenset[str] = Depends(get_public_download_origins),
 ):
     details = await _authorized_job(repository, context, job_id)
     if details.job_kind != "export":
@@ -622,31 +758,45 @@ async def download_classroom_export(
     if artifact is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Export not found")
     store = await stores.store_for_tenant(context.tenant_id)
-    try:
-        signed_url = await store.presign_download(
-            artifact.object_key,
-            _DOWNLOAD_TTL_SECONDS,
-        )
-    except ObjectStoreConfigurationError:
+    if public_download_origins:
         try:
-            stream = await store.open(artifact.object_key)
+            signed_url = await store.presign_download(
+                artifact.object_key,
+                _DOWNLOAD_TTL_SECONDS,
+            )
+        except ObjectStoreConfigurationError:
+            pass
         except ObjectStoreNotFound:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Export not found")
-        filename = quote(PurePosixPath(artifact.relative_name).name, safe="")
-        return StreamingResponse(
-            stream,
-            media_type=artifact.mime_type,
-            headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"},
-        )
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Export not found",
+            ) from None
+        else:
+            if _public_https_origin(signed_url) in public_download_origins:
+                return RedirectResponse(
+                    signed_url,
+                    status_code=status.HTTP_307_TEMPORARY_REDIRECT,
+                )
+    try:
+        stream = await store.open(artifact.object_key)
     except ObjectStoreNotFound:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Export not found")
-    return RedirectResponse(signed_url, status_code=status.HTTP_307_TEMPORARY_REDIRECT)
+    filename = quote(PurePosixPath(artifact.relative_name).name, safe="")
+    return StreamingResponse(
+        stream,
+        media_type=artifact.mime_type,
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"},
+    )
 
 
 __all__ = [
+    "TrustedTeachingBrief",
+    "TrustedTeachingBriefResolver",
     "get_cancellation_gateway",
     "get_data_plane_selector",
     "get_download_store_provider",
     "get_job_repository",
+    "get_public_download_origins",
+    "get_trusted_teaching_brief_resolver",
     "router",
 ]

@@ -67,12 +67,12 @@ def _upgrade_tenant() -> None:
     op.add_column(
         "generation_jobs",
         sa.Column("result_payload", sa.Text(), nullable=True),
-        schema="tenant",
+        schema=tenant_schema,
     )
     op.add_column(
         "generation_jobs",
         sa.Column("retry_of_job_id", sa.String(length=64), nullable=True),
-        schema="tenant",
+        schema=tenant_schema,
     )
     op.add_column(
         "generation_jobs",
@@ -82,7 +82,7 @@ def _upgrade_tenant() -> None:
             server_default=sa.text("0"),
             nullable=False,
         ),
-        schema="tenant",
+        schema=tenant_schema,
     )
     op.create_foreign_key(
         "fk_generation_jobs_retry_of_job_id_generation_jobs",
@@ -90,15 +90,15 @@ def _upgrade_tenant() -> None:
         "generation_jobs",
         ["retry_of_job_id"],
         ["id"],
-        source_schema="tenant",
-        referent_schema="tenant",
+        source_schema=tenant_schema,
+        referent_schema=tenant_schema,
         ondelete="RESTRICT",
     )
     op.create_check_constraint(
         "ck_generation_jobs_dsl_repair_attempts",
         "generation_jobs",
         "dsl_repair_attempts >= 0 AND dsl_repair_attempts <= 2",
-        schema="tenant",
+        schema=tenant_schema,
     )
 
     op.create_table(
@@ -281,33 +281,32 @@ def upgrade() -> None:
 
 
 def _downgrade_tenant() -> None:
-    quoted_schema = f'"{_tenant_schema()}"'
+    tenant_schema = _tenant_schema()
+    quoted_schema = f'"{tenant_schema}"'
     _sync_tenant_schema_revision("20260801_0006", "20260730_0005")
     for table_name in ("classroom_artifacts", "classroom_versions"):
         op.execute(
-            sa.text(
-                f"DROP TRIGGER reject_{table_name}_mutation ON {quoted_schema}.{table_name}"
-            )
+            sa.text(f"DROP TRIGGER reject_{table_name}_mutation ON {quoted_schema}.{table_name}")
         )
     op.execute(sa.text(f"DROP FUNCTION {quoted_schema}.reject_immutable_classroom_record()"))
-    op.drop_table("classroom_artifacts", schema="tenant")
-    op.drop_table("classroom_versions", schema="tenant")
-    op.drop_table("artifact_promotion_states", schema="tenant")
+    op.drop_table("classroom_artifacts", schema=tenant_schema)
+    op.drop_table("classroom_versions", schema=tenant_schema)
+    op.drop_table("artifact_promotion_states", schema=tenant_schema)
     op.drop_constraint(
         "ck_generation_jobs_dsl_repair_attempts",
         "generation_jobs",
         type_="check",
-        schema="tenant",
+        schema=tenant_schema,
     )
     op.drop_constraint(
         "fk_generation_jobs_retry_of_job_id_generation_jobs",
         "generation_jobs",
         type_="foreignkey",
-        schema="tenant",
+        schema=tenant_schema,
     )
-    op.drop_column("generation_jobs", "dsl_repair_attempts", schema="tenant")
-    op.drop_column("generation_jobs", "retry_of_job_id", schema="tenant")
-    op.drop_column("generation_jobs", "result_payload", schema="tenant")
+    op.drop_column("generation_jobs", "dsl_repair_attempts", schema=tenant_schema)
+    op.drop_column("generation_jobs", "retry_of_job_id", schema=tenant_schema)
+    op.drop_column("generation_jobs", "result_payload", schema=tenant_schema)
 
 
 def downgrade() -> None:

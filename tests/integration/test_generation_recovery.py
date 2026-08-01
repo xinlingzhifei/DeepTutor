@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 import hashlib
 
@@ -42,6 +43,7 @@ async def _seed_binding(engine, tenant_id: str) -> None:
                     data_plane_mode="shared",
                 )
             )
+            await session.flush()
             session.add(
                 ProviderProfile(
                     id="recovery-provider",
@@ -55,6 +57,7 @@ async def _seed_binding(engine, tenant_id: str) -> None:
                     status="active",
                 )
             )
+            await session.flush()
             session.add(
                 DataPlaneRoute(
                     id="recovery-route",
@@ -80,9 +83,7 @@ async def _make_due(engine, tenant_id: str, job_id: str) -> None:
         async with session.begin():
             now = await session.scalar(select(func.now()))
             await session.execute(
-                update(GenerationJob)
-                .where(GenerationJob.id == job_id)
-                .values(next_attempt_at=now)
+                update(GenerationJob).where(GenerationJob.id == job_id).values(next_attempt_at=now)
             )
             await session.execute(
                 update(GenerationQueue)
@@ -123,6 +124,71 @@ async def _expire_claim(engine, tenant_id: str, job_id: str) -> None:
                 )
                 .values(lease_expires_at=expired_at, heartbeat_at=expired_at)
             )
+
+
+def test_outline_completion_uses_monotonic_whole_job_progress(
+    generation_database,
+) -> None:
+    tenant_id = "outline-progress"
+    job_id = "outline-progress-job"
+    generation_database.migrate_tenant(tenant_id)
+
+    async def scenario() -> None:
+        engine = create_async_engine(generation_database.url, poolclass=NullPool)
+        try:
+            await _seed_binding(engine, tenant_id)
+            repository = SqlAlchemyGenerationJobRepository(engine)
+            await repository.grant_quota(tenant_id, grant_id="outline-progress-grant", units=10)
+            payload = "{}"
+            await repository.create_job_and_reserve(
+                GenerationJobRequest(
+                    tenant_id=tenant_id,
+                    job_id=job_id,
+                    job_kind="generation",
+                    phase="outline",
+                    export_format=None,
+                    priority="teacher",
+                    quota_units=2,
+                    actor_id="teacher-progress",
+                    owner_id="teacher-progress",
+                    visibility="private",
+                    request_id="request-outline-progress",
+                    idempotency_key="idempotency-outline-progress",
+                    request_sha256=hashlib.sha256(payload.encode()).hexdigest(),
+                    data_plane_route_id="recovery-route",
+                    provider_profile_id="recovery-provider",
+                    worker_pool_ref="recovery-workers",
+                    queue_ref="openmaic.recovery",
+                    request_payload=payload,
+                )
+            )
+            assert await OutboxDispatcher(engine).dispatch_next() is not None
+            scheduler = FairScheduler(engine)
+            await scheduler.ensure_generation_capacity(
+                (tenant_id,),
+                worker_pool_ref="recovery-workers",
+            )
+            claim = await scheduler.claim(
+                "generation",
+                data_plane_route_id="recovery-route",
+                provider_profile_id="recovery-provider",
+                worker_pool_ref="recovery-workers",
+                queue_ref="openmaic.recovery",
+                worker_id="outline-progress-worker",
+                lease_seconds=60,
+            )
+            assert claim is not None
+
+            await repository.complete_outline(claim, result_payload="{}")
+
+            details = await repository.get_job_details(tenant_id, job_id)
+            assert details is not None
+            assert details.status == "awaiting_confirmation"
+            assert details.progress_percent == 50
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
 
 
 def test_expired_lease_and_object_commit_are_recovered_exactly_once(
@@ -189,9 +255,7 @@ def test_expired_lease_and_object_commit_are_recovered_exactly_once(
                 )
                 heartbeat_slots = (
                     await heartbeat_session.scalars(
-                        select(GenerationSlot).where(
-                            GenerationSlot.claimed_job_id == job_id
-                        )
+                        select(GenerationSlot).where(GenerationSlot.claimed_job_id == job_id)
                     )
                 ).all()
                 assert heartbeat_job is not None and heartbeat_queue is not None
@@ -316,10 +380,14 @@ def test_expired_lease_and_object_commit_are_recovered_exactly_once(
             factory = async_sessionmaker(translated, expire_on_commit=False)
             async with factory() as session:
                 assert await session.scalar(select(func.count()).select_from(ClassroomVersion)) == 1
-                assert await session.scalar(select(func.count()).select_from(ClassroomArtifact)) == 2
+                assert (
+                    await session.scalar(select(func.count()).select_from(ClassroomArtifact)) == 2
+                )
                 assert (
                     await session.scalar(
-                        select(func.count()).select_from(QuotaLedger).where(
+                        select(func.count())
+                        .select_from(QuotaLedger)
+                        .where(
                             QuotaLedger.job_id == job_id,
                             QuotaLedger.entry_type == "settle",
                         )
@@ -334,24 +402,22 @@ def test_expired_lease_and_object_commit_are_recovered_exactly_once(
                 assert state is not None and state.status == "finalized"
                 assert (
                     await session.scalar(
-                        select(func.count()).select_from(GenerationQueue).where(
-                            GenerationQueue.job_id == job_id
-                        )
+                        select(func.count())
+                        .select_from(GenerationQueue)
+                        .where(GenerationQueue.job_id == job_id)
                     )
                     == 0
                 )
                 assert (
                     await session.scalar(
-                        select(func.count()).select_from(GenerationSlot).where(
-                            GenerationSlot.claimed_job_id == job_id
-                        )
+                        select(func.count())
+                        .select_from(GenerationSlot)
+                        .where(GenerationSlot.claimed_job_id == job_id)
                     )
                     == 0
                 )
             assert await repository.request_cancel(tenant_id, job_id) is None
         finally:
             await engine.dispose()
-
-    import asyncio
 
     asyncio.run(scenario())
