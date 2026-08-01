@@ -142,7 +142,7 @@ test("interactive and PBL edits use the portable publication contract", () => {
   const next = applySceneOperations(initial, [
     {
       type: "interactive.update", sceneId: "interactive-1",
-      html: "<main><button id=\"go\">Go</button><script>void 0</script></main>",
+      html: '<main><button data-yfeistai-event="interactive.completed">Go</button></main>',
       config: { bridgeVersion: "1.0", sandbox: { allowScripts: true, allowSameOrigin: false } },
     },
     {
@@ -158,6 +158,7 @@ test("interactive and PBL edits use the portable publication contract", () => {
   assert.equal(pbl?.type === "pbl" && pbl.content.scenario, "Updated scenario");
 
   for (const html of [
+    "<script>void 0</script>",
     '<script src="https://evil.example/x.js"></script>',
     '<a href="https://evil.example">leave</a>',
     '<iframe srcdoc="<p>nested</p>"></iframe>',

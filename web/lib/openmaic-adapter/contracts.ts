@@ -929,6 +929,7 @@ const MEDIA_KEYS = new Set([
   "audioUrl",
   "videoUrl",
   "imageUrl",
+  "pattern",
 ]);
 
 function unsafeExternalReference(value: string): boolean {
@@ -1004,13 +1005,15 @@ export function assertPortableInteractiveHtml(
     /\bhref\s*=\s*["']?\s*(?!#)/i.test(html) ||
     /\b(?:src|href|srcset|action|poster)\s*=\s*["']?\s*(?:[a-z][a-z0-9+.-]*:|\/\/|\/|\\\\)/i.test(html) ||
     /url\s*\(\s*["']?\s*(?:[a-z][a-z0-9+.-]*:|\/\/|\/|\\\\)/i.test(html) ||
-    /<(?:base|iframe|object|embed)\b/i.test(html)
+    /<(?:base|iframe|object|embed|script|style|meta|link)\b/i.test(html) ||
+    /\son[a-z]+\s*=/i.test(html) ||
+    /javascript\s*:/i.test(html)
   ) {
     throw new ClassroomCompatibilityError("UNSAFE_MEDIA_REFERENCE", [
       {
         path,
         code: "EXTERNAL_INTERACTIVE_RESOURCE",
-        message: "interactive HTML must be self-contained and cannot embed nested frames",
+        message: "interactive HTML must be declarative, self-contained, and cannot run user scripts",
       },
     ]);
   }

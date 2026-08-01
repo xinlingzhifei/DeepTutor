@@ -17,7 +17,7 @@ export function InteractiveEditor({
   return (
     <div className="space-y-3">
       <p className="text-xs text-[var(--muted-foreground)]">
-        Inline scripts run only in the published sandbox. External links, external scripts and nested frames are rejected before save.
+        Interactions use data-yfeistai-event attributes. Scripts, external links, and nested frames are rejected before save.
       </p>
       <textarea
         key={`${scene.id}:${scene.content.html}`}
