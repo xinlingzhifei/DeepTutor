@@ -1,5 +1,6 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 
 import { describe, expect, test, vi } from "vitest";
 
@@ -419,30 +420,86 @@ describe("outline-only generation boundary", () => {
 });
 
 describe("outline service API security and idempotency", () => {
+  test("reclaims an expired durable outline lease and fences the old owner", async () => {
+    const root = mkdtempSync(join(tmpdir(), "openmaic-outline-reclaim-"));
+    let now = 1_000;
+    let release!: () => void;
+    const blocked = new Promise<void>((resolveBlocked) => {
+      release = resolveBlocked;
+    });
+    const request = validRequest();
+    const submission = {
+      tenantId: request.tenantId,
+      jobId: request.jobId,
+      idempotencyKey: request.idempotencyKey,
+      action: "outline" as const,
+      canonicalBody: JSON.stringify(request),
+    };
+    const staleOutline = validOutlineBundle();
+    staleOutline.title = "stale";
+    const recoveredOutline = validOutlineBundle();
+    recoveredOutline.title = "recovered";
+    const staleJob = await generateOutlineJob(request, {
+      generateOutlines: async () => staleOutline,
+      now: () => new Date(GENERATED_AT),
+    });
+    const recoveredJob = await generateOutlineJob(request, {
+      generateOutlines: async () => recoveredOutline,
+      now: () => new Date(GENERATED_AT),
+    });
+    const abandoned = new OutlineJobStore(root, 100, () => now, false);
+    const oldCompletion = abandoned.submit(submission, async () => {
+      await blocked;
+      return staleJob;
+    });
+
+    now = 1_200;
+    const recovered = new OutlineJobStore(root, 100, () => now, false);
+    await expect(
+      recovered.submit(submission, async () => recoveredJob),
+    ).resolves.toEqual(recoveredJob);
+    release();
+    await expect(oldCompletion).resolves.toEqual(recoveredJob);
+
+    const restarted = new OutlineJobStore(root, 100, () => now, false);
+    await expect(
+      restarted.read(request.tenantId, request.jobId),
+    ).resolves.toEqual(recoveredJob);
+  });
+
   test("shares the in-process store across isolated route module loads", async () => {
     const firstModule = await import("../../lib/yfeistai/job-store");
+    const sharedTenantId = "shared-tenant-durable";
+    const sharedJobId = "shared-job-durable";
+    const sharedIdempotencyKey = "shared-idempotency-durable";
     const request = validRequest();
     const job = await generateOutlineJob(request, {
       generateOutlines: async () => validOutlineBundle(),
       now: () => new Date(GENERATED_AT),
     });
+    const sharedJob = {
+      ...job,
+      tenantId: sharedTenantId,
+      jobId: sharedJobId,
+      idempotencyKey: sharedIdempotencyKey,
+    };
     await firstModule.outlineJobStore.submit(
       {
-        tenantId: "shared-tenant",
-        jobId: "shared-job",
-        idempotencyKey: "shared-idempotency",
+        tenantId: sharedTenantId,
+        jobId: sharedJobId,
+        idempotencyKey: sharedIdempotencyKey,
         action: "outline",
         canonicalBody: "{}",
       },
-      async () => job,
+      async () => sharedJob,
     );
 
     vi.resetModules();
     const secondModule = await import("../../lib/yfeistai/job-store");
 
     await expect(
-      secondModule.outlineJobStore.read("shared-tenant", "shared-job"),
-    ).resolves.toEqual(job);
+      secondModule.outlineJobStore.read(sharedTenantId, sharedJobId),
+    ).resolves.toEqual(sharedJob);
   });
 
   test("authenticates before parsing malformed JSON", async () => {
