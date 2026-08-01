@@ -5,8 +5,8 @@
     "outDir": "./dist/node-tests",
     "rootDir": ".",
     "baseUrl": ".",
-    "module": "commonjs",
-    "moduleResolution": "node",
+    "module": "esnext",
+    "moduleResolution": "bundler",
     "incremental": false,
     "paths": {
       "@/*": ["./*"]

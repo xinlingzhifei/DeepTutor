@@ -1,5 +1,12 @@
 export * from "./contracts";
 export * from "./dsl";
+export * from "./playback/action-reducer";
+export * from "./playback/controller";
+export * from "./playback/events";
+export * from "./playback/interactive-bridge";
+export * from "./playback/quiz-submission";
+export * from "./playback/types";
+export * from "./sanitize";
 
 export {
   HighlightOverlay as ClassroomHighlightOverlay,

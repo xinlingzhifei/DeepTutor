@@ -28,6 +28,7 @@ import {
   type QuizScene,
   type SlideScene,
 } from "./contracts";
+import { sanitizeRendererSlide } from "./sanitize";
 
 export interface ReadClassroomDocumentOptions {
   theme?: ClassroomThemeId;
@@ -225,7 +226,17 @@ function slideFromScene(scene: SlideScene, theme: ClassroomThemeId): Slide {
   if (background === null || background === undefined) {
     delete candidate.background;
   }
-  return candidate as unknown as Slide;
+  try {
+    return sanitizeRendererSlide(candidate as unknown as Slide);
+  } catch (error) {
+    throw new ClassroomCompatibilityError("OPENMAIC_VALIDATION_FAILED", [
+      {
+        path: `/openmaic/scenes/${scene.id}/content/canvas`,
+        code: "SANITIZATION_FAILED",
+        message: error instanceof Error ? error.message : "slide sanitization failed",
+      },
+    ]);
+  }
 }
 
 function renderableSlideScene(
