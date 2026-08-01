@@ -1,6 +1,9 @@
 """Teaching ORM model exports."""
 
 from .jobs import (
+    ArtifactPromotionState,
+    ClassroomArtifact,
+    ClassroomVersion,
     GenerationJob,
     GenerationQueue,
     GenerationSlot,
@@ -27,8 +30,11 @@ from .platform import (
 from .tenant import Course, Enrollment, TeachingClass, TenantBase
 
 __all__ = [
+    "ArtifactPromotionState",
     "AuditLog",
     "Course",
+    "ClassroomArtifact",
+    "ClassroomVersion",
     "DataPlaneRoute",
     "Enrollment",
     "GenerationJob",

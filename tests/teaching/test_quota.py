@@ -199,5 +199,6 @@ def test_generation_job_orm_declares_the_platform_tenant_foreign_key() -> None:
     }
 
     assert foreign_keys == {
+        ("retry_of_job_id", "tenant.generation_jobs.id", "RESTRICT"),
         ("tenant_id", "platform.tenants.id", "CASCADE"),
     }

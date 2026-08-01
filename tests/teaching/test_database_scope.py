@@ -60,6 +60,9 @@ def test_model_metadata_uses_only_platform_and_logical_tenant_schemas():
         "platform.tenants",
     }
     assert set(TenantBase.metadata.tables) == {
+        "tenant.artifact_promotion_states",
+        "tenant.classroom_artifacts",
+        "tenant.classroom_versions",
         "tenant.classes",
         "tenant.courses",
         "tenant.enrollments",

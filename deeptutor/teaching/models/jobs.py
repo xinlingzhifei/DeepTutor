@@ -144,6 +144,12 @@ class GenerationJob(TenantBase):
     error_code: Mapped[str | None] = mapped_column(String(64))
     result_ref: Mapped[str | None] = mapped_column(String(512))
     artifact_manifest_ref: Mapped[str | None] = mapped_column(String(512))
+    result_payload: Mapped[str | None] = mapped_column(Text)
+    retry_of_job_id: Mapped[str | None] = mapped_column(
+        String(64),
+        ForeignKey("tenant.generation_jobs.id", ondelete="RESTRICT"),
+    )
+    dsl_repair_attempts: Mapped[int] = mapped_column(Integer, server_default="0")
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     canceled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -195,6 +201,10 @@ class GenerationJob(TenantBase):
             name="attempts",
         ),
         CheckConstraint(
+            "dsl_repair_attempts >= 0 AND dsl_repair_attempts <= 2",
+            name="dsl_repair_attempts",
+        ),
+        CheckConstraint(
             "("
             "status IN ("
             "'generating_outline', 'generating_content', 'exporting', "
@@ -229,6 +239,149 @@ class GenerationJob(TenantBase):
             "ix_generation_jobs_status_available",
             "status",
             "next_attempt_at",
+        ),
+    )
+
+
+class ArtifactPromotionState(TenantBase):
+    """Recoverable bridge between an object-store commit and the DB commit."""
+
+    __tablename__ = "artifact_promotion_states"
+
+    job_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64))
+    classroom_id: Mapped[str] = mapped_column(String(128))
+    version_number: Mapped[int] = mapped_column(Integer)
+    manifest_sha256: Mapped[str | None] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(32), server_default="prepared")
+    object_committed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finalized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        CheckConstraint("version_number > 0", name="version_number"),
+        CheckConstraint(
+            "status IN ('prepared', 'object_committed', 'finalized')",
+            name="status",
+        ),
+        ForeignKeyConstraint(
+            ["job_id", "tenant_id"],
+            [
+                "tenant.generation_jobs.id",
+                "tenant.generation_jobs.tenant_id",
+            ],
+            name="fk_artifact_promotion_job_tenant_generation_jobs",
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "classroom_id",
+            "version_number",
+            name="uq_artifact_promotion_tenant_classroom_version",
+        ),
+    )
+
+
+class ClassroomVersion(TenantBase):
+    """Minimal immutable generated version; Plan 04 adds lifecycle metadata."""
+
+    __tablename__ = "classroom_versions"
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64))
+    classroom_id: Mapped[str] = mapped_column(String(128))
+    version_number: Mapped[int] = mapped_column(Integer)
+    generation_job_id: Mapped[str] = mapped_column(String(64))
+    document_sha256: Mapped[str] = mapped_column(String(64))
+    media_manifest_sha256: Mapped[str] = mapped_column(String(64))
+    document_object_key: Mapped[str] = mapped_column(String(512))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        CheckConstraint("version_number > 0", name="version_number"),
+        ForeignKeyConstraint(
+            ["generation_job_id", "tenant_id"],
+            [
+                "tenant.generation_jobs.id",
+                "tenant.generation_jobs.tenant_id",
+            ],
+            name="fk_classroom_versions_job_tenant_generation_jobs",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "classroom_id",
+            "version_number",
+            name="uq_classroom_versions_tenant_classroom_version",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "generation_job_id",
+            name="uq_classroom_versions_tenant_generation_job",
+        ),
+    )
+
+
+class ClassroomArtifact(TenantBase):
+    """Immutable integrity record for one promoted generation/export file."""
+
+    __tablename__ = "classroom_artifacts"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64))
+    source_job_id: Mapped[str] = mapped_column(String(64))
+    classroom_version_id: Mapped[str | None] = mapped_column(
+        String(128),
+        ForeignKey("tenant.classroom_versions.id", ondelete="RESTRICT"),
+    )
+    artifact_kind: Mapped[str] = mapped_column(String(16))
+    relative_name: Mapped[str] = mapped_column(String(512))
+    object_key: Mapped[str] = mapped_column(String(512))
+    sha256: Mapped[str] = mapped_column(String(64))
+    size_bytes: Mapped[int] = mapped_column(BigInteger)
+    mime_type: Mapped[str] = mapped_column(String(160))
+    input_document_sha256: Mapped[str | None] = mapped_column(String(64))
+    input_media_manifest_sha256: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "artifact_kind IN ('dsl_json', 'media', 'export')",
+            name="artifact_kind",
+        ),
+        CheckConstraint("size_bytes >= 0", name="size_bytes"),
+        ForeignKeyConstraint(
+            ["source_job_id", "tenant_id"],
+            [
+                "tenant.generation_jobs.id",
+                "tenant.generation_jobs.tenant_id",
+            ],
+            name="fk_classroom_artifacts_job_tenant_generation_jobs",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "source_job_id",
+            "relative_name",
+            name="uq_classroom_artifacts_tenant_job_name",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "object_key",
+            name="uq_classroom_artifacts_tenant_object_key",
         ),
     )
 

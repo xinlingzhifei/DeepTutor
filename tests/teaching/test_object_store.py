@@ -1291,6 +1291,69 @@ async def test_partial_multi_file_promotion_is_invisible_until_commit(
 
 
 @pytest.mark.asyncio
+async def test_uncommitted_formal_objects_are_not_a_confirmed_publish(tmp_path) -> None:
+    payload = b'{"not":"committed"}'
+    manifest = _manifest(payload, "uncommitted-publish")
+    store = LocalClassroomArtifactStore(tmp_path, "tenant-a")
+    claim = await store.acquire_publish_claim(manifest)
+    temporary_key = temporary_artifact_key(
+        "tenant-a",
+        manifest.job_id,
+        f"{claim.ownership_token}/classroom.json",
+    )
+    await store.put_verified(
+        temporary_key,
+        _body(payload),
+        manifest.entries[0].sha256,
+        manifest.entries[0].size,
+        content_type=manifest.entries[0].content_type,
+    )
+    await store.copy(
+        temporary_key,
+        classroom_artifact_key("tenant-a", "asset-1", 1, "classroom.json"),
+        sha256=manifest.entries[0].sha256,
+        size=manifest.entries[0].size,
+        content_type=manifest.entries[0].content_type,
+        claim=claim,
+    )
+
+    assert await store.confirmed_publish(manifest) is None
+
+
+@pytest.mark.asyncio
+async def test_committed_publish_is_confirmed_and_promotion_is_idempotent(tmp_path) -> None:
+    payload = b'{"committed":true}'
+    manifest = _manifest(payload, "confirmed-publish")
+    store = LocalClassroomArtifactStore(tmp_path, "tenant-a")
+    service = ClassroomArtifactPromotionService(store)
+
+    promoted = await service.promote(
+        manifest,
+        {"classroom.json": _body(payload)},
+    )
+
+    assert await store.confirmed_publish(manifest) == promoted
+    assert await service.promote(
+        manifest,
+        {"classroom.json": _body(payload)},
+    ) == promoted
+
+
+@pytest.mark.asyncio
+async def test_confirmed_publish_rejects_a_different_manifest(tmp_path) -> None:
+    payload = b'{"committed":true}'
+    store = LocalClassroomArtifactStore(tmp_path, "tenant-a")
+    await ClassroomArtifactPromotionService(store).promote(
+        _manifest(payload, "original-publish"),
+        {"classroom.json": _body(payload)},
+    )
+    replacement = b'{"committed":false}'
+
+    with pytest.raises(ObjectStoreConflictError):
+        await store.confirmed_publish(_manifest(replacement, "replacement-publish"))
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("mutation", ["missing", "same-size-tamper"])
 async def test_local_published_version_visibility_is_all_or_none(
     tmp_path,

@@ -22,7 +22,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 FOUNDATION_REVISION = "20260728_0001"
 SCOPED_GRANTS_REVISION = "20260730_0002"
 PROVISIONING_REVISION = "20260730_0003"
-HEAD_REVISION = "20260730_0005"
+HEAD_REVISION = "20260801_0006"
 
 
 @dataclass(frozen=True)
@@ -468,6 +468,7 @@ def test_wheel_packages_migrations_and_full_app_entrypoint(
         "deeptutor/teaching/migrations/versions/20260730_0003_tenant_provisioning_worker.py",
         "deeptutor/teaching/migrations/versions/20260730_0004_data_plane_routing.py",
         "deeptutor/teaching/migrations/versions/20260730_0005_generation_jobs.py",
+        "deeptutor/teaching/migrations/versions/20260801_0006_job_recovery.py",
     }.issubset(names)
     assert "deeptutor-migrate = deeptutor.teaching.migrations.cli:main" in entry_points
     assert "deeptutor-provisioner = deeptutor.teaching.provisioning_cli:main" in entry_points
@@ -1792,7 +1793,7 @@ def test_postgres_data_plane_routing_is_fail_closed_and_owner_bound(
     asyncio.run(exercise())
 
 
-def test_active_0004_tenant_schema_upgrade_is_idempotent_and_recoverable(
+def test_active_0005_tenant_schema_upgrade_is_idempotent_and_recoverable(
     migration_database,
     monkeypatch,
 ) -> None:
@@ -1823,7 +1824,7 @@ def test_active_0004_tenant_schema_upgrade_is_idempotent_and_recoverable(
             migration_database,
             "scope=tenant",
             f"tenant_schema={schema_name}",
-            revision="20260730_0004",
+            revision="20260730_0005",
         ),
     )
     _settings, database_module = _install_source_runtime_database(
@@ -1891,7 +1892,7 @@ def test_active_0004_tenant_schema_upgrade_is_idempotent_and_recoverable(
                         TenantSchemaState(
                             tenant_id=tenant_id,
                             schema_name=schema_name,
-                            revision="20260730_0004",
+                            revision="20260730_0005",
                             status="active",
                         )
                     )
@@ -1907,7 +1908,7 @@ def test_active_0004_tenant_schema_upgrade_is_idempotent_and_recoverable(
                     )
                 )
                 assert tenant is not None and tenant.status == "active"
-                assert state is not None and state.revision == "20260730_0004"
+                assert state is not None and state.revision == "20260730_0005"
                 assert job is not None
                 assert job.target_revision == TENANT_SCHEMA_REVISION
                 assert job.status == "pending"
@@ -2081,7 +2082,7 @@ def test_generation_tenant_migration_roundtrip_keeps_platform_revision_in_sync(
         ),
     )
     revision, tables = asyncio.run(inspect())
-    assert revision == "20260730_0005"
+    assert revision == "20260801_0006"
     assert {"generation_jobs", "quota_ledger"}.issubset(tables)
 
     _assert_migration_succeeded(
@@ -2107,7 +2108,7 @@ def test_generation_tenant_migration_roundtrip_keeps_platform_revision_in_sync(
         ),
     )
     revision, tables = asyncio.run(inspect())
-    assert revision == "20260730_0005"
+    assert revision == "20260801_0006"
     assert {"generation_jobs", "quota_ledger"}.issubset(tables)
 
 
@@ -2348,7 +2349,7 @@ def test_stale_provisioning_claims_stop_at_max_attempts_without_deactivating_upg
                         TenantSchemaState(
                             tenant_id="stale-upgrade-limit",
                             schema_name=tenant_schema_name("stale-upgrade-limit"),
-                            revision="20260730_0004",
+                            revision="20260730_0005",
                             status="active",
                         )
                     )
@@ -2362,7 +2363,7 @@ def test_stale_provisioning_claims_stop_at_max_attempts_without_deactivating_upg
                                 tenant_id=tenant_id,
                                 operation=operation,
                                 target_revision=(
-                                    "20260730_0005"
+                                    "20260801_0006"
                                     if operation == "upgrade_schema"
                                     else None
                                 ),
@@ -2448,7 +2449,7 @@ def test_future_tenant_schema_revision_is_not_enqueued_or_claimed(
                         TenantSchemaState(
                             tenant_id="future-schema-tenant",
                             schema_name=tenant_schema_name("future-schema-tenant"),
-                            revision="20260730_0006",
+                            revision="20260801_0007",
                             status="active",
                         )
                     )
@@ -2457,7 +2458,7 @@ def test_future_tenant_schema_revision_is_not_enqueued_or_claimed(
                             id="future-schema-old-worker-job",
                             tenant_id="future-schema-tenant",
                             operation="upgrade_schema",
-                            target_revision="20260730_0005",
+                            target_revision="20260801_0006",
                             status="pending",
                         )
                     )

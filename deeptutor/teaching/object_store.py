@@ -110,6 +110,11 @@ class ClassroomArtifactStore(Protocol):
 
     async def exists(self, key: str) -> bool: ...
 
+    async def confirmed_publish(
+        self,
+        manifest: ClassroomArtifactManifest,
+    ) -> tuple[StoredArtifact, ...] | None: ...
+
     async def acquire_publish_claim(
         self,
         manifest: ClassroomArtifactManifest,
@@ -604,6 +609,66 @@ class _TenantScopedStore:
             None,
         )
         return await self._validate_published_artifact(marker) is not None
+
+    async def confirmed_publish(
+        self,
+        manifest: ClassroomArtifactManifest,
+    ) -> tuple[StoredArtifact, ...] | None:
+        """Return an exact, marker-authorized publication for ``manifest``."""
+
+        manifest.validate_for_tenant(self.tenant_id)
+        marker_key = _version_internal_key(
+            manifest.tenant_id,
+            manifest.asset_id,
+            manifest.version,
+            _COMMIT_NAME,
+        )
+        payload = await self._read_raw_bytes(marker_key, _MAX_COMMIT_MARKER_SIZE)
+        if payload is None:
+            return None
+        attempt, artifacts = _parse_commit_payload(
+            payload,
+            marker_key=marker_key,
+            tenant_id=self.tenant_id,
+        )
+        expected = tuple(
+            (
+                classroom_artifact_key(
+                    manifest.tenant_id,
+                    manifest.asset_id,
+                    manifest.version,
+                    entry.relative_name,
+                ),
+                entry.sha256,
+                entry.size,
+                entry.content_type,
+            )
+            for entry in manifest.entries
+        )
+        actual = tuple(
+            (artifact.key, artifact.sha256, artifact.size, artifact.content_type)
+            for artifact in artifacts
+        )
+        if actual != expected:
+            raise ObjectStoreConflictError("publication marker does not match the manifest")
+
+        marker = _stored_artifact(
+            marker_key,
+            hashlib.sha256(payload).hexdigest(),
+            len(payload),
+            _JSON_CONTENT_TYPE,
+            attempt,
+            None,
+        )
+        if await self._validate_published_artifact(marker) is None:
+            raise ObjectStoreIntegrityError("publication marker is not durable")
+        confirmed: list[StoredArtifact] = []
+        for artifact in artifacts:
+            validated = await self._validate_published_artifact(artifact)
+            if validated is None:
+                raise ObjectStoreIntegrityError("published artifact is not durable")
+            confirmed.append(validated)
+        return tuple(confirmed)
 
     async def _published_artifacts_for(self, key: str) -> dict[str, StoredArtifact]:
         marker_key = _internal_key_for(key, self.tenant_id, _COMMIT_NAME)
@@ -1906,6 +1971,10 @@ class ClassroomArtifactPromotionService:
         declared_names = {entry.relative_name for entry in manifest.entries}
         if set(bodies) != declared_names:
             raise ArtifactManifestError("uploaded files must exactly match the manifest")
+
+        confirmed = await self._store.confirmed_publish(manifest)
+        if confirmed is not None:
+            return confirmed
 
         destination_keys = [
             classroom_artifact_key(
