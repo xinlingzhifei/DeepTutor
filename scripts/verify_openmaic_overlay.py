@@ -21,15 +21,46 @@ EXPECTED_UPSTREAM = {
     "appVersion": "0.3.1",
 }
 REQUIRED_OVERLAY_FILES = {
+    Path("app/api/yfeistai/v1/artifacts/[jobId]/[...path]/route.ts"),
+    Path("app/api/yfeistai/v1/classrooms/[jobId]/route.ts"),
+    Path("app/api/yfeistai/v1/classrooms/route.ts"),
+    Path("app/api/yfeistai/v1/exports/[jobId]/route.ts"),
+    Path("app/api/yfeistai/v1/exports/route.ts"),
     Path("app/api/yfeistai/v1/outlines/[jobId]/route.ts"),
     Path("app/api/yfeistai/v1/outlines/route.ts"),
     Path("app/api/yfeistai/v1/health/route.ts"),
+    Path("app/api/yfeistai/v1/jobs/[jobId]/cancel/route.ts"),
+    Path("lib/yfeistai/artifact-manifest.ts"),
+    Path("lib/yfeistai/content-generation.ts"),
     Path("lib/yfeistai/contracts.ts"),
+    Path("lib/yfeistai/durable-state.ts"),
+    Path("lib/yfeistai/export-generation.ts"),
     Path("lib/yfeistai/job-store.ts"),
     Path("lib/yfeistai/outline-generation.ts"),
+    Path("lib/yfeistai/portable-classroom.ts"),
+    Path("lib/yfeistai/service-boundary.ts"),
     Path("lib/yfeistai/service-auth.ts"),
+    Path("tests/yfeistai/artifact-manifest.test.ts"),
+    Path("tests/yfeistai/cancel.test.ts"),
+    Path("tests/yfeistai/content-generation.test.ts"),
+    Path("tests/yfeistai/export-generation.test.ts"),
     Path("tests/yfeistai/outline-generation.test.ts"),
     Path("tests/yfeistai/service-auth.test.ts"),
+}
+TASK4_SOURCE_FILES = {
+    Path("app/api/yfeistai/v1/artifacts/[jobId]/[...path]/route.ts"),
+    Path("app/api/yfeistai/v1/classrooms/[jobId]/route.ts"),
+    Path("app/api/yfeistai/v1/classrooms/route.ts"),
+    Path("app/api/yfeistai/v1/exports/[jobId]/route.ts"),
+    Path("app/api/yfeistai/v1/exports/route.ts"),
+    Path("app/api/yfeistai/v1/jobs/[jobId]/cancel/route.ts"),
+    Path("lib/yfeistai/artifact-manifest.ts"),
+    Path("lib/yfeistai/content-generation.ts"),
+    Path("lib/yfeistai/durable-state.ts"),
+    Path("lib/yfeistai/export-generation.ts"),
+    Path("lib/yfeistai/job-store.ts"),
+    Path("lib/yfeistai/portable-classroom.ts"),
+    Path("lib/yfeistai/service-boundary.ts"),
 }
 JAVASCRIPT_SUFFIXES = {".cjs", ".cts", ".js", ".jsx", ".mjs", ".mts", ".ts", ".tsx"}
 FORBIDDEN_CLIENT_PARAMETER_PATTERNS = (
@@ -379,7 +410,10 @@ def _verify_outline_generation(overlay_root: Path) -> None:
             "outline GET route is missing authenticated polling: " + ", ".join(missing)
         )
     required_store_tokens = (
-        "idempotencyBindings",
+        "claimDurableLease(",
+        "renewDurableLease(",
+        "durableLeaseMatches(",
+        "writeDurableJsonExclusive(",
         "submission.tenantId",
         "submission.jobId",
         "submission.idempotencyKey",
@@ -396,6 +430,326 @@ def _verify_outline_generation(overlay_root: Path) -> None:
     verify_outline_contract_hash(source)
 
 
+def _require_tokens(source: str, label: str, tokens: tuple[str, ...]) -> None:
+    missing = [token for token in tokens if token not in source]
+    if missing:
+        raise OverlayVerificationError(
+            f"{label} is missing required controls: " + ", ".join(missing)
+        )
+
+
+def verify_task4_sources(overlay_root: Path) -> None:
+    """Verify content, export, cancellation, artifact, and signed-route controls."""
+
+    content = _strip_javascript_comments(
+        _read_text(overlay_root / "lib/yfeistai/content-generation.ts")
+    )
+    artifact = _strip_javascript_comments(
+        _read_text(overlay_root / "lib/yfeistai/artifact-manifest.ts")
+    )
+    export = _strip_javascript_comments(
+        _read_text(overlay_root / "lib/yfeistai/export-generation.ts")
+    )
+    durable = _strip_javascript_comments(_read_text(overlay_root / "lib/yfeistai/durable-state.ts"))
+    portable = _strip_javascript_comments(
+        _read_text(overlay_root / "lib/yfeistai/portable-classroom.ts")
+    )
+    boundary = _strip_javascript_comments(
+        _read_text(overlay_root / "lib/yfeistai/service-boundary.ts")
+    )
+    classroom_post = _strip_javascript_comments(
+        _read_text(overlay_root / "app/api/yfeistai/v1/classrooms/route.ts")
+    )
+    classroom_get = _strip_javascript_comments(
+        _read_text(overlay_root / "app/api/yfeistai/v1/classrooms/[jobId]/route.ts")
+    )
+    export_post = _strip_javascript_comments(
+        _read_text(overlay_root / "app/api/yfeistai/v1/exports/route.ts")
+    )
+    export_get = _strip_javascript_comments(
+        _read_text(overlay_root / "app/api/yfeistai/v1/exports/[jobId]/route.ts")
+    )
+    cancel_route = _strip_javascript_comments(
+        _read_text(overlay_root / "app/api/yfeistai/v1/jobs/[jobId]/cancel/route.ts")
+    )
+    artifact_route = _strip_javascript_comments(
+        _read_text(overlay_root / "app/api/yfeistai/v1/artifacts/[jobId]/[...path]/route.ts")
+    )
+
+    _require_tokens(
+        content,
+        "content-generation.ts",
+        (
+            "canonicalConfirmedOutlineJson(request.confirmedOutline)",
+            "actual !== request.confirmedOutlineSha256",
+            'confirmationMetadata?.status !== "confirmed"',
+            "for (const [order, outlineScene] of outline.scenes.entries())",
+            "await dependencies.generateScenes(",
+            "await assertNotCanceled(dependencies.isCanceled)",
+            'dslVersion: "0.1.0"',
+            'bridgeVersion = "1.0"',
+            "allowSameOrigin: false",
+            "mediaManifest",
+            "fileSha256",
+            'relativePath: "classroom/classroom.json"',
+            "claimExecution(",
+            "persistTerminal(terminal, claim, publishSucceeded)",
+            "configuredOpenMaicStateRoot()",
+            "asPortableDocument(classroomDocumentCandidate)",
+            "generated media writer integrity binding failed",
+            "dependencies.store.isCanceled(parsed.tenantId, parsed.jobId)",
+            "hasSignedBodyBinding(signed, parsed)",
+            'validateGenerationRequest(value, "classroom")',
+            "buildMicroOutline(",
+            "contentOutputRegistry",
+            "generated media reference is missing from the artifact manifest",
+            "classroomDocumentSha256",
+            "mediaManifestSha256",
+            "resultFailure(result)",
+            "assertPublicationActive",
+            "publishSucceeded(job.result)",
+            "sceneTypeFor(",
+            "sourceFragments: request.teachingBrief.sourceFragments.map",
+        ),
+    )
+    if content.count("await assertNotCanceled(dependencies.isCanceled)") < 4:
+        raise OverlayVerificationError(
+            "content-generation.ts must check cancellation around every scene and publication"
+        )
+    if content.index("actual !== request.confirmedOutlineSha256") > content.index(
+        "await dependencies.generateScenes("
+    ):
+        raise OverlayVerificationError(
+            "content generation must verify the confirmed outline before generating scenes"
+        )
+    if "generateOutlines(" in content or "generateClassroom(" in content:
+        raise OverlayVerificationError(
+            "content generation must not regenerate an outline or invoke the full pipeline"
+        )
+    if content.index("authenticateServiceRequest(request, body") > content.index(
+        "JSON.parse(body)"
+    ):
+        raise OverlayVerificationError(
+            "classroom POST must authenticate before parsing its request body"
+        )
+
+    _require_tokens(
+        durable,
+        "durable-state.ts",
+        (
+            "YFEISTAI_OPENMAIC_STATE_ROOT",
+            "linkSync(temporary, target)",
+            "fsyncSync(",
+            "const owner = randomUUID()",
+            'path.join(lockPath, "owner")',
+            "fstatSync(ownerDescriptor)",
+            "claimDurableLease(",
+            "renewDurableLease(",
+            "durableLeaseMatches(",
+            "syncParentDirectory(target)",
+            "PROCESS_INSTANCE_ID",
+            'record.hostname === hostname()',
+        ),
+    )
+    _require_tokens(
+        portable,
+        "portable-classroom.ts",
+        (
+            'exactKeys(content, "slide content"',
+            "validateQuiz(content)",
+            "interactive sandbox contract is invalid",
+            "PBL content shape is invalid",
+            'sha256(document.fileSha256, "classroom file hash")',
+            "assertOfflineHtmlSelfContained(",
+            "srcset|action|poster",
+            'document.contentMode === "source_grounded"',
+            "source-grounded classroom requires at least one source ref",
+        ),
+    )
+
+    _require_tokens(
+        artifact,
+        "artifact-manifest.ts",
+        (
+            "/%[0-9A-Fa-f]{2}/.test(value)",
+            'value.includes("\\\\")',
+            'value.startsWith("/")',
+            "path.relative(root, target)",
+            "manifestEntry",
+            "parseExpiry(manifestEntry.expiresAt)",
+            "for (const segment of relativePath.split",
+            "if (stat.isSymbolicLink())",
+            'createHash("sha256").update(input.bytes).digest("hex")',
+            "bytes.byteLength !== stored.entry.bytes",
+            'createHash("sha256").update(bytes).digest("hex") !==',
+            "dependencies.store.read(",
+            "readArtifactFromSameHandle(",
+            "fsConstants.O_NOFOLLOW",
+            "handle.readFile()",
+            '".yfeistai-manifest"',
+            "assertArtifactWriteTarget(",
+            "artifact write path contains an unsafe parent",
+            "WINDOWS_DEVICE_NAME",
+        ),
+    )
+
+    _require_tokens(
+        export,
+        "export-generation.ts",
+        (
+            "digest(input.classroomDocument)",
+            "classroom document hash mismatch",
+            "digest(input.mediaManifest)",
+            "media manifest hash mismatch",
+            "validateArchiveEntries(",
+            "MAX_ARCHIVE_ENTRIES",
+            "MAX_ARCHIVE_UNCOMPRESSED_BYTES",
+            "MAX_ARCHIVE_COMPRESSION_RATIO",
+            'entry.kind === "symlink"',
+            "archive external links are forbidden",
+            "FORBIDDEN_RUNTIME_INPUT_KEYS",
+            "assertNoExternalLocations(request",
+            'endpoint.protocol === "http:"',
+            'endpoint.hostname === "openmaic-render"',
+            "MP4_RENDER_UNAVAILABLE",
+            "MP4_RENDER_UNTRUSTED",
+            "MP4_RENDER_TIMEOUT",
+            'case "classroom_zip"',
+            'case "pptx"',
+            'case "offline_html"',
+            'case "mp4"',
+            "hasSignedBodyBinding(signed, parsed)",
+            "controlled export inputs are required",
+            'exactKeys(record, "export request"',
+            "contentOutputRegistry",
+            "validateExportOutput(",
+            "MP4_RENDER_INVALID_ARTIFACT",
+            "controlledArtifactDownloadPath(",
+            "inspectAndValidateZipArchive(",
+            "createInflateRaw(",
+            "archive entry CRC validation failed",
+            "PPTX OOXML package is missing required entries",
+            "validateMp4Artifact(",
+            "readResponseBytesLimited(",
+            "cancelRemoteRenderIfRequested(",
+            "createOfflineHtmlArtifact(",
+            "Content-Security-Policy",
+            "connect-src 'none'",
+            "assertPublicationActive: publication.assertActive",
+        ),
+    )
+    if "dependencies.fetchExternal(" in export:
+        raise OverlayVerificationError(
+            "controlled exports must never fetch client-selected locations"
+        )
+    if export.index("authenticateServiceRequest(request, body") > export.index("JSON.parse(body)"):
+        raise OverlayVerificationError(
+            "export POST must authenticate before parsing its request body"
+        )
+
+    _require_tokens(
+        boundary,
+        "service-boundary.ts",
+        (
+            "verifyServiceRequest(signed",
+            'request.headers.get("x-yfeistai-tenant-id")',
+            'request.headers.get("x-yfeistai-job-id")',
+            'request.headers.get("x-yfeistai-idempotency-key")',
+            "body.tenantId === signed.tenantId",
+            "body.jobId === signed.jobId",
+            "body.idempotencyKey === signed.idempotencyKey",
+        ),
+    )
+    _require_tokens(
+        classroom_post,
+        "classroom POST route",
+        (
+            "@/lib/generation/scene-generator",
+            "@/lib/server/resolve-model",
+            "generateSceneContent(",
+            "generateSceneActions(",
+            "materializeEmbeddedMedia(",
+            "buildOpenMaicSourcePrompt(",
+            "toPortableOpenMaicSceneContent(",
+            "type: context.sceneType",
+            "createClassroomPostHandler(",
+            "readServiceSecret",
+            "return postClassroom(request)",
+        ),
+    )
+    if "generateClassroom(" in classroom_post or "generateOutlines(" in classroom_post:
+        raise OverlayVerificationError(
+            "classroom POST route must consume the confirmed outline without regenerating it"
+        )
+    _require_tokens(
+        classroom_get,
+        "classroom GET route",
+        ("createClassroomGetHandler(", "readServiceSecret", "return getClassroom("),
+    )
+    _require_tokens(
+        export_post,
+        "export POST route",
+        (
+            'from "jszip"',
+            'from "pptxgenjs"',
+            "artifactStore.read(",
+            "request.sourceJobId",
+            "YFEISTAI_OPENMAIC_RENDER_ENDPOINT",
+            "/yfeistai/v1/render",
+            'redirect: "error"',
+            "await assertRenderActive(context)",
+            "MP4_RENDER_INVALID_ARTIFACT",
+            "createOfflineHtmlArtifact(",
+            "readResponseBytesLimited(",
+            "validateMp4Artifact(",
+            "cancelRemoteRenderIfRequested(",
+            "isMp4MediaType(",
+            "createExportPostHandler(",
+            "readServiceSecret",
+            "return postExport(request)",
+        ),
+    )
+    forbidden_export_adapter_tokens = (
+        '"use client"',
+        "'use client'",
+        "useStageStore",
+        "indexedDB",
+        "db.",
+        "file-saver",
+    )
+    present = [token for token in forbidden_export_adapter_tokens if token in export_post]
+    if present:
+        raise OverlayVerificationError(
+            "export POST route reads browser/client state: " + ", ".join(present)
+        )
+    _require_tokens(
+        export_get,
+        "export GET route",
+        ("createExportGetHandler(", "readServiceSecret", "return getExport("),
+    )
+    _require_tokens(
+        cancel_route,
+        "cancel route",
+        (
+            "createJobCancelHandler(",
+            "contentJobStore",
+            "exportJobStore",
+            "readServiceSecret",
+            "return cancelJob(",
+        ),
+    )
+    _require_tokens(
+        artifact_route,
+        "artifact route",
+        (
+            "createArtifactGetHandler(",
+            "artifactStore",
+            "readServiceSecret",
+            "return getArtifact(",
+        ),
+    )
+
+
 def verify_overlay(integration_root: Path = DEFAULT_INTEGRATION_ROOT) -> None:
     integration_root = integration_root.resolve()
     overlay_root = integration_root / "overlay"
@@ -410,6 +764,7 @@ def verify_overlay(integration_root: Path = DEFAULT_INTEGRATION_ROOT) -> None:
     verify_service_auth_source(_read_text(overlay_root / "lib/yfeistai/service-auth.ts"))
     _verify_health_contract(overlay_root)
     _verify_outline_generation(overlay_root)
+    verify_task4_sources(overlay_root)
 
 
 def resolve_package_runner() -> list[str]:
@@ -462,13 +817,63 @@ def _run_outline_generation_tests(integration_root: Path) -> int:
     return completed.returncode
 
 
+def _run_task4_tests(integration_root: Path, test_name: str) -> int:
+    try:
+        runner = resolve_package_runner()
+    except OverlayVerificationError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    command = [
+        *runner,
+        "dlx",
+        VITEST_PACKAGE,
+        "run",
+        f"tests/yfeistai/{test_name}.test.ts",
+        "--environment",
+        "node",
+    ]
+    completed = subprocess.run(command, cwd=integration_root / "overlay", check=False)
+    return completed.returncode
+
+
+def _run_pinned_image_build(integration_root: Path) -> int:
+    docker = shutil.which("docker")
+    if not docker:
+        print("docker is required to build the pinned OpenMAIC image", file=sys.stderr)
+        return 2
+    command = [
+        docker,
+        "build",
+        "--file",
+        str(integration_root / "Dockerfile"),
+        "--tag",
+        f"yfeistai/openmaic:verify-{EXPECTED_UPSTREAM['commit'][:12]}",
+        str(ROOT),
+    ]
+    completed = subprocess.run(command, cwd=ROOT, check=False)
+    return completed.returncode
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--test",
-        choices=("service-auth", "outline-generation", "static"),
+        choices=(
+            "service-auth",
+            "outline-generation",
+            "content-generation",
+            "cancel",
+            "artifact-manifest",
+            "export-generation",
+            "static",
+        ),
         default="static",
         help="verification surface to run",
+    )
+    parser.add_argument(
+        "--build",
+        action="store_true",
+        help="build the pinned OpenMAIC image after static verification",
     )
     args = parser.parse_args(argv)
     try:
@@ -482,6 +887,19 @@ def main(argv: list[str] | None = None) -> int:
             return result
     if args.test == "outline-generation":
         result = _run_outline_generation_tests(DEFAULT_INTEGRATION_ROOT)
+        if result:
+            return result
+    if args.test in {
+        "content-generation",
+        "cancel",
+        "artifact-manifest",
+        "export-generation",
+    }:
+        result = _run_task4_tests(DEFAULT_INTEGRATION_ROOT, args.test)
+        if result:
+            return result
+    if args.build:
+        result = _run_pinned_image_build(DEFAULT_INTEGRATION_ROOT)
         if result:
             return result
     print("OpenMAIC overlay verified.")

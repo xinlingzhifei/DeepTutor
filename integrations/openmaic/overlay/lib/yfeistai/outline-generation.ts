@@ -592,7 +592,10 @@ function validateTeachingBrief(value: unknown): TeachingBrief {
   return brief as unknown as TeachingBrief;
 }
 
-export function validateGenerationRequest(value: unknown): GenerationRequest {
+export function validateGenerationRequest(
+  value: unknown,
+  endpoint: "outline" | "classroom" = "outline",
+): GenerationRequest {
   assertNoClientRoutingAliases(value);
   const request = asRecord(value, "generation request");
   const required = [
@@ -643,9 +646,6 @@ export function validateGenerationRequest(value: unknown): GenerationRequest {
     request.dataPlaneRouteId,
     "generation request.dataPlaneRouteId",
   );
-  if (request.phase !== "outline" || request.classroomMode !== "full") {
-    throw new Error("outline endpoint accepts only full outline requests");
-  }
   sha256(request.teachingBriefSha256, "generation request.teachingBriefSha256");
   positiveInteger(request.sceneBudget, "generation request.sceneBudget");
   positiveInteger(
@@ -679,15 +679,6 @@ export function validateGenerationRequest(value: unknown): GenerationRequest {
   ) {
     throw new Error("generation request priority is unsupported");
   }
-  if (
-    (request.confirmedOutline !== undefined &&
-      request.confirmedOutline !== null) ||
-    (request.confirmedOutlineSha256 !== undefined &&
-      request.confirmedOutlineSha256 !== null)
-  ) {
-    throw new Error("outline requests cannot include a confirmed outline");
-  }
-
   const teachingBrief = validateTeachingBrief(request.teachingBrief);
   if (
     teachingBrief.tenantId !== request.tenantId ||
@@ -697,7 +688,59 @@ export function validateGenerationRequest(value: unknown): GenerationRequest {
   ) {
     throw new Error("generation request teaching brief binding is invalid");
   }
-  return request as unknown as GenerationRequest;
+  const generationRequest = request as unknown as GenerationRequest;
+  const outlineFieldDeclared = "confirmedOutline" in request;
+  const hashFieldDeclared = "confirmedOutlineSha256" in request;
+  if (outlineFieldDeclared !== hashFieldDeclared) {
+    throw new Error(
+      "generation request confirmed outline and hash must be declared together",
+    );
+  }
+  const outlinePresent =
+    request.confirmedOutline !== undefined &&
+    request.confirmedOutline !== null;
+  const hashPresent =
+    request.confirmedOutlineSha256 !== undefined &&
+    request.confirmedOutlineSha256 !== null;
+  if (outlinePresent !== hashPresent) {
+    throw new Error(
+      "generation request confirmed outline and hash must be provided together",
+    );
+  }
+
+  if (endpoint === "outline") {
+    if (request.phase !== "outline" || request.classroomMode !== "full") {
+      throw new Error("outline endpoint accepts only full outline requests");
+    }
+    if (outlinePresent) {
+      throw new Error("outline requests cannot include a confirmed outline");
+    }
+    return generationRequest;
+  }
+
+  if (
+    !(
+      (request.phase === "content" && request.classroomMode === "full") ||
+      (request.phase === "micro" && request.classroomMode === "micro")
+    )
+  ) {
+    throw new Error(
+      "classroom endpoint accepts only full content or micro requests",
+    );
+  }
+  if (request.phase === "content" && !outlinePresent) {
+    throw new Error("content requests require a confirmed outline");
+  }
+  if (outlinePresent) {
+    sha256(
+      request.confirmedOutlineSha256,
+      "generation request.confirmedOutlineSha256",
+    );
+    validateOutlineBundle(request.confirmedOutline, generationRequest, {
+      confirmationStatus: "confirmed",
+    });
+  }
+  return generationRequest;
 }
 
 function sameReferenceSet(
@@ -715,6 +758,7 @@ function sameReferenceSet(
 export function validateOutlineBundle(
   value: unknown,
   request: GenerationRequest,
+  options: { confirmationStatus?: "draft" | "confirmed" } = {},
 ): OutlineBundle {
   const outline = asRecord(value, "outline");
   exactKeys(outline, "outline", [
@@ -752,14 +796,29 @@ export function validateOutlineBundle(
     ["status", "confirmedAt", "confirmedBy"],
     ["status"],
   );
-  if (
-    confirmation.status !== "draft" ||
-    (confirmation.confirmedAt !== undefined &&
-      confirmation.confirmedAt !== null) ||
-    (confirmation.confirmedBy !== undefined &&
-      confirmation.confirmedBy !== null)
-  ) {
-    throw new Error("generated outline must be an unconfirmed draft");
+  const confirmationStatus = options.confirmationStatus ?? "draft";
+  if (confirmation.status !== confirmationStatus) {
+    throw new Error(
+      confirmationStatus === "draft"
+        ? "generated outline must be an unconfirmed draft"
+        : "content generation requires a confirmed outline",
+    );
+  }
+  if (confirmationStatus === "draft") {
+    if (
+      (confirmation.confirmedAt !== undefined &&
+        confirmation.confirmedAt !== null) ||
+      (confirmation.confirmedBy !== undefined &&
+        confirmation.confirmedBy !== null)
+    ) {
+      throw new Error("generated outline must be an unconfirmed draft");
+    }
+  } else {
+    dateTime(confirmation.confirmedAt, "outline.confirmationMetadata.confirmedAt");
+    nonEmptyString(
+      confirmation.confirmedBy,
+      "outline.confirmationMetadata.confirmedBy",
+    );
   }
 
   const expectedKnowledgeIds = request.teachingBrief.knowledgePoints.map(
