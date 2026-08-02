@@ -1675,10 +1675,12 @@ async def list_knowledge_bases():
         for name in kb_names:
             try:
                 info = manager.get_info(name)
+                generation = str((info.get("metadata") or {}).get("generation_id") or "")
+                resource_id = f"{own_prefix}{generation}"
                 logger.debug(f"Successfully got info for KB '{name}': {info.get('statistics', {})}")
                 result.append(
                     KnowledgeBaseInfo(
-                        id=f"{own_prefix}{info['name']}",
+                        id=resource_id,
                         name=info["name"],
                         is_default=info["is_default"],
                         statistics=info.get("statistics", {}),
@@ -1689,9 +1691,7 @@ async def list_knowledge_bases():
                         source="admin" if get_current_user().is_admin else "user",
                         assigned=False,
                         read_only=False,
-                        provenance_label=access_by_id.get(f"{own_prefix}{info['name']}", {}).get(
-                            "provenance_label"
-                        ),
+                        provenance_label=access_by_id.get(resource_id, {}).get("provenance_label"),
                     )
                 )
             except Exception as e:

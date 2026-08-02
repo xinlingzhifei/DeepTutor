@@ -75,6 +75,7 @@ class KnowledgeResource:
     assigned: bool = False
     read_only: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
+    generation_id: str = ""
 
     @property
     def physical_name(self) -> str:

@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+import uuid
 
 from fastapi import HTTPException
 
@@ -51,18 +52,82 @@ def _strip_resource_prefix(value: str) -> tuple[str | None, str]:
     return None, raw
 
 
-def _assigned_admin_names() -> set[str]:
+def _is_generation_id(value: str) -> bool:
+    try:
+        parsed = uuid.UUID(value)
+    except (ValueError, AttributeError):
+        return False
+    return parsed.version == 4 and str(parsed) == value.lower()
+
+
+def _entry_generation(manager: KnowledgeBaseManager, name: str) -> str:
+    entry = manager.get_kb_entry(name)
+    generation = str((entry or {}).get("generation_id") or "")
+    if not _is_generation_id(generation):
+        raise HTTPException(status_code=404, detail=f"Knowledge base '{name}' not found")
+    return generation
+
+
+def _name_for_generation(manager: KnowledgeBaseManager, generation: str) -> str | None:
+    for name in manager.list_knowledge_bases():
+        if _entry_generation(manager, name) == generation:
+            return name
+    return None
+
+
+def _resolve_reference(
+    manager: KnowledgeBaseManager,
+    value: str,
+    *,
+    prefixed: bool,
+) -> tuple[str, str]:
+    if prefixed and _is_generation_id(value):
+        name = _name_for_generation(manager, value)
+        if name is None:
+            raise HTTPException(status_code=404, detail="Knowledge base identity is stale")
+        return name, value
+    name = _resolve_default_or_name(manager, value)
+    return name, _entry_generation(manager, name)
+
+
+def _resource(
+    manager: KnowledgeBaseManager,
+    *,
+    name: str,
+    generation_id: str,
+    base_dir: Path,
+    source: Literal["admin", "user"],
+    assigned: bool,
+    read_only: bool,
+) -> KnowledgeResource:
+    return KnowledgeResource(
+        id=f"{source}:kb:{generation_id}",
+        name=name,
+        base_dir=base_dir,
+        source=source,
+        assigned=assigned,
+        read_only=read_only,
+        metadata=manager.get_metadata(name),
+        generation_id=generation_id,
+    )
+
+
+def _assigned_admin_resources(manager: KnowledgeBaseManager) -> dict[str, str]:
     user = get_current_user()
     if user.is_admin:
-        return set()
-    out: set[str] = set()
+        return {}
+    by_generation = {
+        _entry_generation(manager, name): name for name in manager.list_knowledge_bases()
+    }
+    out: dict[str, str] = {}
     for item in load_grant(user.id).get("knowledge_bases", []) or []:
-        name = str(item.get("name") or item.get("kb_name") or "").strip()
         resource_id = str(item.get("resource_id") or item.get("id") or "")
-        if resource_id.startswith(ADMIN_PREFIX):
-            name = resource_id[len(ADMIN_PREFIX) :]
-        if name:
-            out.add(name)
+        if not resource_id.startswith(ADMIN_PREFIX):
+            continue
+        generation = resource_id[len(ADMIN_PREFIX) :]
+        name = by_generation.get(generation)
+        if name is not None:
+            out[name] = generation
     return out
 
 
@@ -71,11 +136,18 @@ def resolve_kb(kb_ref: str, *, require_write: bool = False) -> KnowledgeResource
     requested_source, name = _strip_resource_prefix(kb_ref)
 
     if user.is_admin:
+        if requested_source == "user":
+            raise HTTPException(status_code=404, detail="Knowledge base not found")
         manager = admin_kb_manager()
-        resolved = _resolve_default_or_name(manager, name)
-        return KnowledgeResource(
-            id=f"admin:kb:{resolved}",
+        resolved, generation = _resolve_reference(
+            manager,
+            name,
+            prefixed=requested_source is not None,
+        )
+        return _resource(
+            manager,
             name=resolved,
+            generation_id=generation,
             base_dir=admin_kb_base_dir(),
             source="admin",
             assigned=False,
@@ -83,18 +155,21 @@ def resolve_kb(kb_ref: str, *, require_write: bool = False) -> KnowledgeResource
         )
 
     user_manager = current_kb_manager()
-    assigned_names = _assigned_admin_names()
+    admin_manager = admin_kb_manager()
+    assigned_resources = _assigned_admin_resources(admin_manager)
 
     if requested_source == "admin":
-        if name not in assigned_names:
+        resolved, generation = _resolve_reference(admin_manager, name, prefixed=True)
+        if assigned_resources.get(resolved) != generation:
             raise HTTPException(status_code=403, detail="Knowledge base is not assigned to you")
         if require_write:
             raise HTTPException(
                 status_code=403, detail="Assigned admin knowledge bases are read-only"
             )
-        return KnowledgeResource(
-            id=f"admin:kb:{name}",
-            name=name,
+        return _resource(
+            admin_manager,
+            name=resolved,
+            generation_id=generation,
             base_dir=admin_kb_base_dir(),
             source="admin",
             assigned=True,
@@ -102,10 +177,11 @@ def resolve_kb(kb_ref: str, *, require_write: bool = False) -> KnowledgeResource
         )
 
     if requested_source == "user":
-        resolved = _resolve_default_or_name(user_manager, name)
-        return KnowledgeResource(
-            id=f"user:kb:{resolved}",
+        resolved, generation = _resolve_reference(user_manager, name, prefixed=True)
+        return _resource(
+            user_manager,
             name=resolved,
+            generation_id=generation,
             base_dir=current_kb_base_dir(),
             source="user",
             assigned=False,
@@ -113,10 +189,11 @@ def resolve_kb(kb_ref: str, *, require_write: bool = False) -> KnowledgeResource
         )
 
     if name.lower() in DEFAULT_KB_ALIASES:
-        resolved = _resolve_default_or_name(user_manager, name)
-        return KnowledgeResource(
-            id=f"user:kb:{resolved}",
+        resolved, generation = _resolve_reference(user_manager, name, prefixed=False)
+        return _resource(
+            user_manager,
             name=resolved,
+            generation_id=generation,
             base_dir=current_kb_base_dir(),
             source="user",
             assigned=False,
@@ -125,23 +202,25 @@ def resolve_kb(kb_ref: str, *, require_write: bool = False) -> KnowledgeResource
 
     user_names = set(user_manager.list_knowledge_bases())
     if name in user_names:
-        return KnowledgeResource(
-            id=f"user:kb:{name}",
+        return _resource(
+            user_manager,
             name=name,
+            generation_id=_entry_generation(user_manager, name),
             base_dir=current_kb_base_dir(),
             source="user",
             assigned=False,
             read_only=False,
         )
 
-    if name in assigned_names:
+    if name in assigned_resources:
         if require_write:
             raise HTTPException(
                 status_code=403, detail="Assigned admin knowledge bases are read-only"
             )
-        return KnowledgeResource(
-            id=f"admin:kb:{name}",
+        return _resource(
+            admin_manager,
             name=name,
+            generation_id=assigned_resources[name],
             base_dir=admin_kb_base_dir(),
             source="admin",
             assigned=True,
@@ -173,10 +252,14 @@ def list_visible_knowledge_bases() -> list[dict[str, Any]]:
     manager = current_kb_manager()
     items: list[dict[str, Any]] = []
     for name in manager.list_knowledge_bases():
+        generation = _entry_generation(manager, name)
         items.append(
             {
-                "id": f"admin:kb:{name}" if user.is_admin else f"user:kb:{name}",
+                "id": (
+                    f"admin:kb:{generation}" if user.is_admin else f"user:kb:{generation}"
+                ),
                 "name": name,
+                "generation_id": generation,
                 "source": "admin" if user.is_admin else "user",
                 "assigned": False,
                 "read_only": False,
@@ -188,26 +271,31 @@ def list_visible_knowledge_bases() -> list[dict[str, Any]]:
         return items
 
     admin_manager = admin_kb_manager()
-    admin_names = set(admin_manager.list_knowledge_bases())
+    admin_by_generation = {
+        _entry_generation(admin_manager, name): name
+        for name in admin_manager.list_knowledge_bases()
+    }
     existing_ids = {item["id"] for item in items}
     for item in load_grant(user.id).get("knowledge_bases", []) or []:
         name = str(item.get("name") or item.get("kb_name") or "").strip()
         resource_id = str(item.get("resource_id") or item.get("id") or "")
-        if resource_id.startswith(ADMIN_PREFIX):
-            name = resource_id[len(ADMIN_PREFIX) :]
-        if not name:
+        if not resource_id.startswith(ADMIN_PREFIX):
             continue
-        rid = f"admin:kb:{name}"
-        if rid in existing_ids:
+        generation = resource_id[len(ADMIN_PREFIX) :]
+        current_name = admin_by_generation.get(generation)
+        if current_name is not None:
+            name = current_name
+        if not name or resource_id in existing_ids:
             continue
         items.append(
             {
-                "id": rid,
+                "id": resource_id,
                 "name": name,
+                "generation_id": generation,
                 "source": "admin",
                 "assigned": True,
                 "read_only": True,
-                "available": name in admin_names,
+                "available": current_name is not None,
                 "provenance_label": "Assigned by admin",
                 "needs_admin_reindex": bool(item.get("needs_admin_reindex", False)),
                 "embedding_signature": item.get("embedding_signature", ""),

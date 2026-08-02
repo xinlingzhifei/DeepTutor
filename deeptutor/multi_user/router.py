@@ -69,14 +69,19 @@ def _admin_catalog_summary() -> dict[str, list[dict[str, Any]]]:
 
 def _admin_kb_summary() -> list[dict[str, Any]]:
     manager = KnowledgeBaseManager(base_dir=str(admin_kb_base_dir()))
-    return [
-        {
-            "resource_id": f"admin:kb:{name}",
-            "name": name,
-            "source": "admin",
-        }
-        for name in manager.list_knowledge_bases()
-    ]
+    result: list[dict[str, Any]] = []
+    for name in manager.list_knowledge_bases():
+        entry = manager.get_kb_entry(name) or {}
+        generation = str(entry.get("generation_id") or "")
+        if generation:
+            result.append(
+                {
+                    "resource_id": f"admin:kb:{generation}",
+                    "name": name,
+                    "source": "admin",
+                }
+            )
+    return result
 
 
 def _admin_skill_summary() -> list[dict[str, Any]]:

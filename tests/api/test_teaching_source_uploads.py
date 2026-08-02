@@ -231,6 +231,7 @@ class _KnowledgeResolver:
         self.resource_id = "admin:kb:math"
         self.resource_name = "math"
         self.source = "admin"
+        self.generation_id = ""
 
     def __call__(self, reference: str, *, require_write: bool):
         self.calls.append((reference, require_write))
@@ -243,6 +244,7 @@ class _KnowledgeResolver:
             source=self.source,
             assigned=self.source == "admin",
             read_only=self.source == "admin",
+            generation_id=self.generation_id,
         )
 
 
@@ -778,6 +780,40 @@ def test_personal_knowledge_entitlement_is_scoped_to_resource_owner() -> None:
     ]
     assert len(repository.records) == 1
     assert [snapshot.resource_owner_id for snapshot in repository.knowledge_snapshots] == ["alice"]
+
+
+def test_recreated_kb_does_not_inherit_old_generation_entitlement() -> None:
+    first_generation = "11111111-1111-4111-8111-111111111111"
+    second_generation = "22222222-2222-4222-8222-222222222222"
+    first_id = f"user:kb:{first_generation}"
+    second_id = f"user:kb:{second_generation}"
+    repository = _SourceRepository()
+    repository.knowledge_entitlements = {(first_id, "alice")}
+    resolver = _KnowledgeResolver()
+    resolver.resource_id = first_id
+    resolver.resource_name = "course-a"
+    resolver.source = "user"
+    resolver.generation_id = first_generation
+    client, _, _ = _client(
+        _context(user_id="alice"),
+        repository,
+        resolver=resolver,
+    )
+
+    first = client.post(
+        "/api/v1/teaching/sources/bind",
+        json={"knowledgeResourceId": "user:kb:course-a", "courseId": "course-a"},
+    )
+    resolver.resource_id = second_id
+    resolver.generation_id = second_generation
+    recreated = client.post(
+        "/api/v1/teaching/sources/bind",
+        json={"knowledgeResourceId": "user:kb:course-a", "courseId": "course-a"},
+    )
+
+    assert first.status_code == 201
+    assert recreated.status_code == 403
+    assert repository.entitlement_calls == [(first_id, "alice"), (second_id, "alice")]
 
 
 def test_admin_knowledge_entitlement_uses_shared_workspace_owner() -> None:

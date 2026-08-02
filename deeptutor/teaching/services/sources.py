@@ -8,15 +8,23 @@ from dataclasses import dataclass
 import hashlib
 import multiprocessing
 import os
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 import tempfile
 import threading
 from typing import Any, BinaryIO, Protocol
+from urllib.parse import urlparse
 import uuid
 
 from pypdf import PdfReader
 from pypdf.generic import ArrayObject, DictionaryObject, IndirectObject
 
+from deeptutor.knowledge.kb_types import (
+    LIGHTRAG_SERVER_KB_TYPE,
+    LINKED_KB_TYPE,
+    OBSIDIAN_KB_TYPE,
+    SUBAGENT_KB_TYPE,
+    external_root_of,
+)
 from deeptutor.multi_user.knowledge_access import manager_for_resource
 from deeptutor.multi_user.models import ADMIN_KNOWLEDGE_OWNER_ID, KnowledgeResource
 from deeptutor.teaching.artifacts import StoredArtifact, source_upload_key
@@ -220,7 +228,42 @@ def _safe_filename(value: str | None) -> str:
 def knowledge_resource_exists(resource: KnowledgeResource) -> bool:
     """Check the resolved resource against its authoritative KB manager."""
 
-    return resource.name in manager_for_resource(resource).list_knowledge_bases()
+    generation = resource.generation_id
+    if not generation or resource.id != f"{resource.source}:kb:{generation}":
+        return False
+    manager = manager_for_resource(resource)
+    entry = manager.get_kb_entry(resource.name)
+    if entry is None or entry.get("generation_id") != generation:
+        return False
+
+    kb_type = entry.get("type")
+    if kb_type in {LINKED_KB_TYPE, OBSIDIAN_KB_TYPE}:
+        external = external_root_of(entry)
+        return bool(external and Path(external).expanduser().is_dir())
+    if kb_type == SUBAGENT_KB_TYPE:
+        agent_kind = str(entry.get("agent_kind") or "").strip()
+        if not agent_kind:
+            return False
+        if agent_kind == "partner":
+            return bool(str(entry.get("partner_id") or "").strip())
+        cwd = str(entry.get("cwd") or "").strip()
+        return not cwd or Path(cwd).expanduser().is_dir()
+    if kb_type == LIGHTRAG_SERVER_KB_TYPE:
+        parsed = urlparse(str(entry.get("server_url") or "").strip())
+        return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+    if kb_type:
+        return False
+
+    relative = Path(str(entry.get("path") or resource.name))
+    if relative.is_absolute():
+        return False
+    base_dir = manager.base_dir.resolve()
+    candidate = (base_dir / relative).resolve()
+    try:
+        candidate.relative_to(base_dir)
+    except ValueError:
+        return False
+    return candidate.is_dir()
 
 
 def _has_permission(

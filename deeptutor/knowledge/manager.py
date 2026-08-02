@@ -16,6 +16,7 @@ import shutil
 import stat
 import sys
 from typing import Any
+import uuid
 
 from deeptutor.knowledge.kb_types import (
     LIGHTRAG_SERVER_KB_TYPE,
@@ -51,6 +52,31 @@ logger = logging.getLogger(__name__)
 # let a list-call mid-creation racy-delete the entry. 60s is comfortably longer
 # than the create handshake while still keeping multi-day zombies out.
 _ORPHAN_PRUNE_GRACE_SECONDS = 60
+KB_GENERATION_ID_KEY = "generation_id"
+
+
+def _ensure_kb_generation_id(entry: dict[str, Any]) -> bool:
+    raw = str(entry.get(KB_GENERATION_ID_KEY) or "").strip()
+    try:
+        parsed = uuid.UUID(raw)
+    except (ValueError, AttributeError):
+        parsed = None
+    if parsed is not None and parsed.version == 4 and str(parsed) == raw.lower():
+        return False
+    entry[KB_GENERATION_ID_KEY] = str(uuid.uuid4())
+    return True
+
+
+def _ensure_config_generation_ids(config: dict[str, Any]) -> bool:
+    knowledge_bases = config.setdefault("knowledge_bases", {})
+    if not isinstance(knowledge_bases, dict):
+        config["knowledge_bases"] = {}
+        return True
+    changed = False
+    for entry in knowledge_bases.values():
+        if isinstance(entry, dict) and _ensure_kb_generation_id(entry):
+            changed = True
+    return changed
 
 
 def _entry_updated_after(kb_entry: dict | None, cutoff: datetime) -> bool:
@@ -273,17 +299,19 @@ class KnowledgeBaseManager:
                 if "knowledge_bases" not in config:
                     config["knowledge_bases"] = {}
 
+                config_changed = False
+
                 # Migration: remove old "default" field if present
                 if "default" in config:
                     del config["default"]
-                    # Note: Don't save during load to avoid recursion issues
-                    # The next _save_config() call will persist this change
+                    config_changed = True
 
                 # Migration: normalize unknown/removed providers to the default
                 # and mark them for rebuild. Known non-default providers are
                 # first-class engines and must be preserved.
                 knowledge_bases = config.get("knowledge_bases", {})
-                config_changed = False
+                if _ensure_config_generation_ids(config):
+                    config_changed = True
                 for kb_name, kb_entry in knowledge_bases.items():
                     if not isinstance(kb_entry, dict):
                         continue
@@ -345,6 +373,7 @@ class KnowledgeBaseManager:
         ever see the previous or the new file — ``open(..., "w")`` used to
         truncate the config before the lock was even acquired.
         """
+        _ensure_config_generation_ids(self.config)
         atomic_write_json(self.config_file, self.config)
 
     def _sync_kb_to_pb(self, name: str, kb_entry: dict) -> None:
@@ -1008,6 +1037,7 @@ class KnowledgeBaseManager:
             # Build metadata from config
             metadata = {
                 "name": kb_name,
+                "generation_id": kb_config.get(KB_GENERATION_ID_KEY),
                 "description": kb_config.get("description", f"Knowledge base: {kb_name}"),
                 "rag_provider": normalize_provider_name(kb_config.get("rag_provider")),
                 "needs_reindex": bool(kb_config.get("needs_reindex", False)),
@@ -1124,6 +1154,7 @@ class KnowledgeBaseManager:
         # Build metadata from kb_config.json (authoritative source)
         metadata = {
             "name": kb_name,
+            "generation_id": kb_config.get(KB_GENERATION_ID_KEY),
             "description": description,
             "rag_provider": rag_provider,
             "needs_reindex": effective_needs_reindex,
