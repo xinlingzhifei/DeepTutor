@@ -242,7 +242,7 @@ function assertElementWithinSlide(element: PPTElement, slide: Slide): void {
     throw new ClassroomEditError("INVALID_ELEMENT", `element ${element.id} has non-finite geometry`);
   }
   const canvasWidth = slide.viewportSize;
-  const canvasHeight = slide.viewportSize / slide.viewportRatio;
+  const canvasHeight = slide.viewportSize * slide.viewportRatio;
   const height = element.type === "line" ? 0 : element.height;
   const minimumWidth = element.type === "line" ? 0 : Number.EPSILON;
   const minimumHeight = element.type === "line" ? 0 : Number.EPSILON;
@@ -329,7 +329,7 @@ function selectSlide(
     viewportRatio:
       finite(canvas.viewportRatio) && canvas.viewportRatio > 0
         ? canvas.viewportRatio
-        : 16 / 9,
+        : 9 / 16,
     theme: record(canvas.theme) ?? mapClassroomTheme("snow"),
     elements: Array.isArray(canvas.elements) ? canvas.elements : [],
   } as unknown as Slide;

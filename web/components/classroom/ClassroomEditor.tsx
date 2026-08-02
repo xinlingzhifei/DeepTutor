@@ -2,6 +2,8 @@
 
 import dynamic from "next/dynamic";
 import { useMemo, useRef, useState } from "react";
+import type { TFunction } from "i18next";
+import { useTranslation } from "react-i18next";
 
 import type {
   ClassroomDocument,
@@ -75,13 +77,14 @@ function createScene(
   type: ClassroomScene["type"],
   stageId: string,
   order: number,
+  t: TFunction,
 ): ClassroomScene {
   const id = editorId(type);
   if (type === "slide") {
     return {
       id,
       stageId,
-      title: "New slide",
+      title: t("classroom.editor.newSlide"),
       order,
       type,
       content: {
@@ -89,7 +92,7 @@ function createScene(
         canvas: {
           id,
           viewportSize: 1_000,
-          viewportRatio: 16 / 9,
+          viewportRatio: 9 / 16,
           elements: [],
         },
       },
@@ -101,7 +104,7 @@ function createScene(
     return {
       id,
       stageId,
-      title: "New quiz",
+      title: t("classroom.editor.newQuiz"),
       order,
       type,
       content: {
@@ -109,14 +112,14 @@ function createScene(
         questions: [
           {
             id: questionId,
-            prompt: "New question",
+            prompt: t("classroom.editor.newQuestion"),
             questionType: "single_choice",
             options: [
-              { id: `${questionId}-yes`, label: "Yes" },
-              { id: `${questionId}-no`, label: "No" },
+              { id: `${questionId}-yes`, label: t("classroom.editor.yes") },
+              { id: `${questionId}-no`, label: t("classroom.editor.no") },
             ],
             correctOptionIds: [`${questionId}-yes`],
-            explanation: "Explain the answer",
+            explanation: t("classroom.editor.explainAnswer"),
           },
         ],
       },
@@ -127,12 +130,12 @@ function createScene(
     return {
       id,
       stageId,
-      title: "New interaction",
+      title: t("classroom.editor.newInteraction"),
       order,
       type,
       content: {
         type,
-        html: "<main><p>Interactive content</p></main>",
+        html: `<main><p>${t("classroom.editor.interactiveContent")}</p></main>`,
         bridgeVersion: "1.0",
         sandbox: { allowScripts: true, allowSameOrigin: false },
       },
@@ -142,15 +145,25 @@ function createScene(
   return {
     id,
     stageId,
-    title: "New PBL scene",
+    title: t("classroom.editor.newPblScene"),
     order,
     type,
     content: {
       type,
-      scenario: "Describe the problem scenario",
-      roles: [{ id: editorId("role"), name: "Learner", brief: "Investigate the problem" }],
+      scenario: t("classroom.editor.describeProblemScenario"),
+      roles: [
+        {
+          id: editorId("role"),
+          name: t("classroom.editor.learner"),
+          brief: t("classroom.editor.investigateProblem"),
+        },
+      ],
       milestones: [
-        { id: editorId("milestone"), title: "Plan", rubric: "The plan is clear and evidence based" },
+        {
+          id: editorId("milestone"),
+          title: t("classroom.editor.plan"),
+          rubric: t("classroom.editor.planRubric"),
+        },
       ],
     },
     actions: [],
@@ -161,8 +174,10 @@ function fingerprint(document: ClassroomDocument): string {
   return JSON.stringify(document);
 }
 
-function message(error: unknown): string {
-  return error instanceof Error ? error.message : "Classroom edit failed";
+function message(error: unknown, t: TFunction): string {
+  return error instanceof Error
+    ? error.message
+    : t("classroom.editor.editFailed");
 }
 
 function retainedSelection(
@@ -190,6 +205,7 @@ export function ClassroomEditor({
   onSaved,
   onConflict,
 }: ClassroomEditorProps) {
+  const { t } = useTranslation();
   const [history, setHistory] = useState(() => createHistory(initialDocument));
   const historyRef = useRef<EditorHistory<ClassroomDocument>>(history);
   const [selectedSceneId, setSelectedSceneId] = useState(
@@ -253,7 +269,7 @@ export function ClassroomEditor({
       commitDocument(next);
       return next;
     } catch (error) {
-      setSaveState({ status: "error", message: message(error) });
+      setSaveState({ status: "error", message: message(error, t) });
       return null;
     }
   };
@@ -269,7 +285,7 @@ export function ClassroomEditor({
       commitDocument(next);
       setSelection(current => retainedSelection(current, next, currentScene.id));
     } catch (error) {
-      setSaveState({ status: "error", message: message(error) });
+      setSaveState({ status: "error", message: message(error, t) });
     }
   };
 
@@ -306,14 +322,18 @@ export function ClassroomEditor({
       setSaveState({ status: "saved" });
       onSaved?.(result.document, result.revision);
     } catch (error) {
-      setSaveState({ status: "error", message: message(error) });
+      setSaveState({ status: "error", message: message(error, t) });
     } finally {
       saveInFlight.current = false;
     }
   };
 
   if (!currentScene) {
-    return <p className="p-4 text-sm text-[var(--destructive)]">The classroom has no scenes.</p>;
+    return (
+      <p className="p-4 text-sm text-[var(--destructive)]">
+        {t("classroom.editor.noScenes")}
+      </p>
+    );
   }
 
   return (
@@ -340,7 +360,10 @@ export function ClassroomEditor({
       {saveState.status === "conflict" && "serverDocument" in saveState && (
         <details className="border-b border-[var(--destructive)]/40 bg-[var(--destructive)]/5 px-4 py-2 text-xs">
           <summary className="cursor-pointer font-semibold">
-            Compare local {saveState.clientRevision} with server {saveState.serverRevision}
+            {t("classroom.editor.compareConflict", {
+              local: saveState.clientRevision,
+              server: saveState.serverRevision,
+            })}
           </summary>
           <div className="mt-2 grid max-h-72 grid-cols-2 gap-2 overflow-auto">
             <pre className="whitespace-pre-wrap rounded bg-[var(--background)] p-2">
@@ -352,7 +375,7 @@ export function ClassroomEditor({
           </div>
         </details>
       )}
-      <div className="flex min-h-0 flex-1">
+      <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
         <SceneNavigator
           scenes={scenes}
           selectedSceneId={currentScene.id}
@@ -386,6 +409,7 @@ export function ClassroomEditor({
               type,
               currentDocument.openmaic.stage.id,
               currentDocument.openmaic.scenes.length,
+              t,
             );
             const next = commitSceneOperations([{ type: "scene.add", scene }]);
             if (next) {
@@ -394,24 +418,28 @@ export function ClassroomEditor({
             }
           }}
         />
-        <main className="min-w-0 flex-1 overflow-auto bg-[var(--muted)]/25 p-4">
+        <main className="min-h-[22rem] min-w-0 flex-1 overflow-auto bg-[var(--muted)]/25 p-4">
           {editableSlide ? (
-            <EditableSlideCanvas
-              slide={editableSlide}
-              selection={selection}
-              onSelectionChange={setSelection}
-              onElementsChange={handleEditIntents}
-              snapping={{ toCanvas: true, toElements: true, range: 5 }}
-              grid={25}
-              ruler
-              className="mx-auto"
-              style={{ pointerEvents: disabled ? "none" : undefined }}
-            />
+            <div className="h-[22rem] w-full lg:h-full">
+              <EditableSlideCanvas
+                slide={editableSlide}
+                selection={selection}
+                onSelectionChange={setSelection}
+                onElementsChange={handleEditIntents}
+                snapping={{ toCanvas: true, toElements: true, range: 5 }}
+                grid={25}
+                ruler
+                className="mx-auto"
+                style={{ pointerEvents: disabled ? "none" : undefined }}
+              />
+            </div>
           ) : (
             <div className="mx-auto max-w-3xl rounded-xl border border-[var(--border)] bg-[var(--card)] p-6">
               <h1 className="text-lg font-semibold">{currentScene.title}</h1>
               <p className="mt-1 text-sm capitalize text-[var(--muted-foreground)]">
-                {currentScene.type} scene properties are edited in the panel.
+                {t("classroom.editor.scenePropertiesHint", {
+                  type: t(`classroom.sceneType.${currentScene.type}`),
+                })}
               </p>
             </div>
           )}
@@ -425,7 +453,12 @@ export function ClassroomEditor({
         />
       </div>
       <footer className="border-t border-[var(--border)] px-4 py-1 text-xs text-[var(--muted-foreground)]">
-        Revision {revision} · {theme} theme · scene {currentScene.order + 1}/{scenes.length}
+        {t("classroom.editor.footer", {
+          revision,
+          theme: t(`classroom.theme.${theme}`),
+          current: currentScene.order + 1,
+          total: scenes.length,
+        })}
       </footer>
     </section>
   );

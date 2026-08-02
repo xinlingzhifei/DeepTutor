@@ -1,5 +1,7 @@
 "use client";
 
+import { useTranslation } from "react-i18next";
+
 import type { PblMilestone, PblRole, PblScene } from "@/lib/openmaic-adapter/contracts";
 import type { PblUpdateOperation } from "@/lib/openmaic-adapter/scene-operations";
 
@@ -15,6 +17,7 @@ function newId(prefix: string): string {
 }
 
 export function PblEditor({ scene, disabled = false, onOperation }: PblEditorProps) {
+  const { t } = useTranslation();
   const updateRole = (index: number, patch: Partial<PblRole>) => {
     const roles = scene.content.roles.map((role, roleIndex) =>
       roleIndex === index ? { ...role, ...patch } : role,
@@ -31,7 +34,7 @@ export function PblEditor({ scene, disabled = false, onOperation }: PblEditorPro
   return (
     <div className="space-y-5">
       <label className="block text-xs font-medium text-[var(--muted-foreground)]">
-        Scenario
+        {t("classroom.editor.scenario")}
         <textarea
           key={`${scene.id}:scenario:${scene.content.scenario}`}
           defaultValue={scene.content.scenario}
@@ -51,7 +54,9 @@ export function PblEditor({ scene, disabled = false, onOperation }: PblEditorPro
 
       <section className="space-y-2">
         <div className="flex items-center justify-between">
-          <h3 className="text-sm font-semibold">Roles</h3>
+          <h3 className="text-sm font-semibold">
+            {t("classroom.editor.roles")}
+          </h3>
           <button
             type="button"
             disabled={disabled}
@@ -61,20 +66,26 @@ export function PblEditor({ scene, disabled = false, onOperation }: PblEditorPro
                 sceneId: scene.id,
                 roles: [
                   ...scene.content.roles,
-                  { id: newId("role"), name: "New role", brief: "Describe this role" },
+                  {
+                    id: newId("role"),
+                    name: t("classroom.editor.newRole"),
+                    brief: t("classroom.editor.describeRole"),
+                  },
                 ],
               })
             }
             className="rounded border border-[var(--border)] px-2 py-1 text-xs disabled:opacity-40"
           >
-            Add role
+            {t("classroom.editor.addRole")}
           </button>
         </div>
         {scene.content.roles.map((role, index) => (
           <div key={role.id} className="space-y-2 rounded-lg border border-[var(--border)] p-3">
             <input
               key={`${role.id}:name:${role.name}`}
-              aria-label={`Role ${index + 1} name`}
+              aria-label={t("classroom.editor.roleName", {
+                number: index + 1,
+              })}
               defaultValue={role.name}
               disabled={disabled}
               onBlur={event => {
@@ -86,7 +97,9 @@ export function PblEditor({ scene, disabled = false, onOperation }: PblEditorPro
             />
             <textarea
               key={`${role.id}:brief:${role.brief}`}
-              aria-label={`Role ${index + 1} brief`}
+              aria-label={t("classroom.editor.roleBrief", {
+                number: index + 1,
+              })}
               defaultValue={role.brief}
               disabled={disabled}
               onBlur={event => {
@@ -108,7 +121,7 @@ export function PblEditor({ scene, disabled = false, onOperation }: PblEditorPro
               }
               className="text-xs text-[var(--destructive)] disabled:opacity-40"
             >
-              Remove role
+              {t("classroom.editor.removeRole")}
             </button>
           </div>
         ))}
@@ -116,7 +129,9 @@ export function PblEditor({ scene, disabled = false, onOperation }: PblEditorPro
 
       <section className="space-y-2">
         <div className="flex items-center justify-between">
-          <h3 className="text-sm font-semibold">Milestones and rubrics</h3>
+          <h3 className="text-sm font-semibold">
+            {t("classroom.editor.milestonesAndRubrics")}
+          </h3>
           <button
             type="button"
             disabled={disabled}
@@ -126,20 +141,26 @@ export function PblEditor({ scene, disabled = false, onOperation }: PblEditorPro
                 sceneId: scene.id,
                 milestones: [
                   ...scene.content.milestones,
-                  { id: newId("milestone"), title: "New milestone", rubric: "Define success" },
+                  {
+                    id: newId("milestone"),
+                    title: t("classroom.editor.newMilestone"),
+                    rubric: t("classroom.editor.defineSuccess"),
+                  },
                 ],
               })
             }
             className="rounded border border-[var(--border)] px-2 py-1 text-xs disabled:opacity-40"
           >
-            Add milestone
+            {t("classroom.editor.addMilestone")}
           </button>
         </div>
         {scene.content.milestones.map((milestone, index) => (
           <div key={milestone.id} className="space-y-2 rounded-lg border border-[var(--border)] p-3">
             <input
               key={`${milestone.id}:title:${milestone.title}`}
-              aria-label={`Milestone ${index + 1} title`}
+              aria-label={t("classroom.editor.milestoneTitle", {
+                number: index + 1,
+              })}
               defaultValue={milestone.title}
               disabled={disabled}
               onBlur={event => {
@@ -151,7 +172,9 @@ export function PblEditor({ scene, disabled = false, onOperation }: PblEditorPro
             />
             <textarea
               key={`${milestone.id}:rubric:${milestone.rubric}`}
-              aria-label={`Milestone ${index + 1} rubric`}
+              aria-label={t("classroom.editor.milestoneRubric", {
+                number: index + 1,
+              })}
               defaultValue={milestone.rubric}
               disabled={disabled}
               onBlur={event => {
@@ -175,7 +198,7 @@ export function PblEditor({ scene, disabled = false, onOperation }: PblEditorPro
               }
               className="text-xs text-[var(--destructive)] disabled:opacity-40"
             >
-              Remove milestone
+              {t("classroom.editor.removeMilestone")}
             </button>
           </div>
         ))}

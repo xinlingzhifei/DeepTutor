@@ -35,7 +35,7 @@ function classroomWithOneSlide(): ClassroomDocument {
             canvas: {
               id: "canvas-1",
               viewportSize: 1000,
-              viewportRatio: 2,
+              viewportRatio: 0.5,
               elements: [
                 {
                   id: "title",
@@ -208,6 +208,22 @@ test("unknown ids and invalid batches fail without mutating the document", () =>
     ]),
   );
   assert.deepEqual(initial, before);
+});
+
+test("viewport ratio is height divided by width at the edit boundary", () => {
+  const initial = classroomWithOneSlide();
+  const touchingBottomEdge = applyEditIntents(initial, [
+    { type: "element.update", id: "shape", props: { top: 380 } },
+  ]);
+
+  assert.equal(elements(touchingBottomEdge)[1]?.top, 380);
+  assert.throws(
+    () =>
+      applyEditIntents(initial, [
+        { type: "element.update", id: "shape", props: { top: 381 } },
+      ]),
+    /inside 1000x500/,
+  );
 });
 
 test("add, index and id validation reject ambiguous element edits", () => {

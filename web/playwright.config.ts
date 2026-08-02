@@ -46,7 +46,10 @@ export default defineConfig({
     },
     {
       name: "tailwind-migration-baseline",
-      testMatch: "**/tailwind-migration-baseline.spec.ts",
+      testMatch: [
+        "**/tailwind-migration-baseline.spec.ts",
+        "**/classroom-*.visual.spec.ts",
+      ],
       use: {
         ...devices["Desktop Chrome"],
         channel: "chromium",

@@ -219,7 +219,7 @@ function slideFromScene(scene: SlideScene, theme: ClassroomThemeId): Slide {
     viewportSize: finitePositive(source.viewportSize) ? source.viewportSize : 1_000,
     viewportRatio: finitePositive(source.viewportRatio)
       ? source.viewportRatio
-      : 16 / 9,
+      : 9 / 16,
     theme: mapClassroomTheme(theme),
     elements: Array.isArray(source.elements) ? source.elements : [],
   };

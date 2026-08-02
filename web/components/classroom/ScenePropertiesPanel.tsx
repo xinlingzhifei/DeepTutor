@@ -1,5 +1,7 @@
 "use client";
 
+import { useTranslation } from "react-i18next";
+
 import type { ClassroomScene } from "@/lib/openmaic-adapter/contracts";
 import type { SceneOperation } from "@/lib/openmaic-adapter/scene-operations";
 
@@ -22,10 +24,11 @@ export function ScenePropertiesPanel({
   selectedElementCount = 0,
   onOperation,
 }: ScenePropertiesPanelProps) {
+  const { t } = useTranslation();
   return (
-    <aside className="min-h-0 w-80 shrink-0 overflow-y-auto border-l border-[var(--border)] bg-[var(--card)] p-4">
+    <aside className="max-h-[28rem] min-h-0 w-full shrink-0 overflow-y-auto border-t border-[var(--border)] bg-[var(--card)] p-4 lg:max-h-none lg:w-80 lg:border-t-0 lg:border-l">
       <label className="block text-xs font-medium text-[var(--muted-foreground)]">
-        Scene title
+        {t("classroom.editor.sceneTitle")}
         <input
           key={`${scene.id}:title:${scene.title}`}
           defaultValue={scene.title}
@@ -45,9 +48,13 @@ export function ScenePropertiesPanel({
       <div className="my-4 border-t border-[var(--border)]" />
       {scene.type === "slide" && (
         <div className="space-y-2 text-sm">
-          <h2 className="font-semibold">Slide elements</h2>
+          <h2 className="font-semibold">
+            {t("classroom.editor.slideElements")}
+          </h2>
           <p className="text-xs text-[var(--muted-foreground)]">
-            The canvas emits one intent batch per completed gesture. {selectedElementCount} element(s) selected.
+            {t("classroom.editor.selectedElements", {
+              count: selectedElementCount,
+            })}
           </p>
         </div>
       )}

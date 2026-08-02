@@ -113,7 +113,7 @@ export function ImportClassroomDialog({
             onClick={close}
             className="rounded-lg border border-[var(--border)] px-4 py-2 text-sm font-medium text-[var(--foreground)] hover:bg-[var(--muted)]"
           >
-            {t("common.cancel")}
+            {t("Cancel")}
           </button>
           <button
             type="button"

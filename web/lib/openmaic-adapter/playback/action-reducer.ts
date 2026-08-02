@@ -32,7 +32,7 @@ export function createWhiteboardState(id: string): WhiteboardState {
   if (!id) throw new Error('whiteboard id is required')
   return {
     open: false,
-    slide: { id, viewportSize: 1_000, viewportRatio: 16 / 9, theme, elements: [] },
+    slide: { id, viewportSize: 1_000, viewportRatio: 9 / 16, theme, elements: [] },
   }
 }
 

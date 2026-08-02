@@ -1,5 +1,7 @@
 "use client";
 
+import { useTranslation } from "react-i18next";
+
 import type { QuizScene } from "@/lib/openmaic-adapter/contracts";
 import type { QuizUpdateOperation } from "@/lib/openmaic-adapter/scene-operations";
 
@@ -20,6 +22,7 @@ export function QuizEditor({
   disabled = false,
   onOperation,
 }: QuizEditorProps) {
+  const { t } = useTranslation();
   return (
     <div className="space-y-5">
       {scene.content.questions.map(question => {
@@ -30,9 +33,11 @@ export function QuizEditor({
             disabled={disabled}
             className="space-y-3 rounded-lg border border-[var(--border)] p-3 disabled:opacity-60"
           >
-            <legend className="px-1 text-sm font-semibold">Question {question.id}</legend>
+            <legend className="px-1 text-sm font-semibold">
+              {t("classroom.editor.question", { id: question.id })}
+            </legend>
             <label className="block text-xs font-medium text-[var(--muted-foreground)]">
-              Prompt
+              {t("classroom.editor.prompt")}
               <textarea
                 key={`${question.id}:prompt:${question.prompt}`}
                 defaultValue={question.prompt}
@@ -51,7 +56,7 @@ export function QuizEditor({
             </label>
             {question.questionType !== "short_answer" && (
               <label className="block text-xs font-medium text-[var(--muted-foreground)]">
-                Options, one per line
+                {t("classroom.editor.optionsOnePerLine")}
                 <textarea
                   key={`${question.id}:options:${optionLabels.join("\u0000")}`}
                   defaultValue={optionLabels.join("\n")}
@@ -75,7 +80,7 @@ export function QuizEditor({
             )}
             {question.questionType === "single_choice" && (
               <label className="block text-xs font-medium text-[var(--muted-foreground)]">
-                Correct answer
+                {t("classroom.editor.correctAnswer")}
                 <select
                   value={Math.max(
                     0,
@@ -103,7 +108,7 @@ export function QuizEditor({
             )}
             {question.questionType === "multiple_choice" && (
               <label className="block text-xs font-medium text-[var(--muted-foreground)]">
-                Correct option IDs, comma separated
+                {t("classroom.editor.correctOptionIds")}
                 <input
                   key={`${question.id}:answers:${question.correctOptionIds.join(",")}`}
                   defaultValue={question.correctOptionIds.join(", ")}
@@ -126,7 +131,7 @@ export function QuizEditor({
               </label>
             )}
             <label className="block text-xs font-medium text-[var(--muted-foreground)]">
-              Explanation
+              {t("classroom.editor.explanation")}
               <textarea
                 key={`${question.id}:explanation:${question.explanation}`}
                 defaultValue={question.explanation}
@@ -147,7 +152,7 @@ export function QuizEditor({
         );
       })}
       <label className="block text-xs font-medium text-[var(--muted-foreground)]">
-        Knowledge point IDs, comma separated
+        {t("classroom.editor.knowledgePointIds")}
         <input
           key={`${scene.id}:knowledge:${knowledgePointIds.join(",")}`}
           defaultValue={knowledgePointIds.join(", ")}

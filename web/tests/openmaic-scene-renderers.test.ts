@@ -307,7 +307,7 @@ test('renderer slide sanitizer rejects CSS URLs in persisted backgrounds', () =>
   const slide = sanitizeRendererSlide({
     id: 'slide-1',
     viewportSize: 1_000,
-    viewportRatio: 16 / 9,
+    viewportRatio: 9 / 16,
     theme: {
       backgroundColor: '#ffffff',
       themeColors: ['#2563eb'],
@@ -337,7 +337,7 @@ test('renderer slide sanitizer removes URL-bearing image filters and paint field
   const slide = sanitizeRendererSlide({
     id: 'slide-filter',
     viewportSize: 1_000,
-    viewportRatio: 16 / 9,
+    viewportRatio: 9 / 16,
     theme: {
       backgroundColor: '#ffffff',
       themeColors: ['#2563eb'],
@@ -394,6 +394,25 @@ test('renderer slide sanitizer removes URL-bearing image filters and paint field
   if (shape?.type === 'shape') {
     assert.equal(shape.fill, '#5b9bd5')
     assert.equal(shape.outline?.color, undefined)
+  }
+})
+
+test('renderer slide defaults use height divided by width', () => {
+  const scene: SlideScene = {
+    id: 'scene-default-ratio',
+    stageId: 'stage-1',
+    title: 'Default ratio',
+    order: 0,
+    type: 'slide',
+    content: { type: 'slide', canvas: { elements: [] } },
+    actions: [],
+  }
+
+  const renderable = toRenderableClassroomScene(scene)
+  assert.equal(renderable.type, 'slide')
+  if (renderable.type === 'slide') {
+    assert.equal(renderable.content.canvas.viewportSize, 1_000)
+    assert.equal(renderable.content.canvas.viewportRatio, 9 / 16)
   }
 })
 

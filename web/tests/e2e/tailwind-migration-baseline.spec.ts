@@ -4,24 +4,11 @@ import {
   FIXED_NOW,
   type StoredTheme,
 } from "./support/baseline-api-fixtures";
+import { installVisualStability } from "./support/visual-stability";
 const LOCAL_WEB_PORT = process.env.PW_WEB_PORT || "3000";
 const BASE_URL =
   process.env.WEB_BASE_URL || `http://127.0.0.1:${LOCAL_WEB_PORT}`;
 const READY_TIMEOUT_MS = 30_000;
-const STABILITY_CSS = `
-  *, *::before, *::after {
-    animation-delay: 0s !important;
-    animation-duration: 0s !important;
-    animation-iteration-count: 1 !important;
-    caret-color: transparent !important;
-    scroll-behavior: auto !important;
-    transition: none !important;
-  }
-
-  nextjs-portal {
-    display: none !important;
-  }
-`;
 
 const ROUTES = [
   { path: "/login", snapshot: "login", ready: "form", readyImage: null },
@@ -172,7 +159,7 @@ async function waitForStablePage(
 ) {
   await page.waitForLoadState("domcontentloaded");
   await page.waitForFunction(() => document.documentElement.lang === "zh");
-  await page.addStyleTag({ content: STABILITY_CSS });
+  await installVisualStability(page);
   await expect(page.locator(ready).first()).toBeVisible({
     timeout: READY_TIMEOUT_MS,
   });

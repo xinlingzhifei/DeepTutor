@@ -24,8 +24,14 @@ const BASELINE_ROUTES = [
   "/settings/appearance",
   "/settings/llm",
   "/space/learning",
+  "/visual-baseline/classroom?host=editor&scene=slide&theme=snow",
 ] as const;
 const SERVER_ENTRYPOINT = path.join(__dirname, "managed-next-server.mjs");
+const IMPORTER_SYNC_ENTRYPOINT = path.join(
+  WEB_ROOT,
+  "scripts",
+  "sync-openmaic-importer.mjs",
+);
 const FONT_MOCKS_PATH = path.join(__dirname, "google-font-mocks.cjs");
 const FONT_FIXTURES: ReadonlyArray<{
   path: string;
@@ -68,6 +74,24 @@ function verifyFontFixtures(): void {
         `Font fixture checksum mismatch for ${fixture.path}: expected ${fixture.sha256}, received ${actual}.`,
       );
     }
+  }
+}
+
+function syncOpenMaicImporter(): void {
+  const result = spawnSync(process.execPath, [IMPORTER_SYNC_ENTRYPOINT], {
+    cwd: WEB_ROOT,
+    encoding: "utf8",
+    timeout: 120_000,
+    windowsHide: true,
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    throw new Error(
+      `OpenMAIC importer sync failed (${result.status}): ${result.stderr.trim()}`,
+    );
+  }
+  if (result.stdout.trim()) {
+    console.log(`[baseline-web-server] ${result.stdout.trim()}`);
   }
 }
 
@@ -364,6 +388,7 @@ export default async function setupManagedWebServer(): Promise<
   };
 
   verifyFontFixtures();
+  syncOpenMaicImporter();
   const child = fork(SERVER_ENTRYPOINT, [LOCAL_WEB_PORT], {
     cwd: WEB_ROOT,
     env: {

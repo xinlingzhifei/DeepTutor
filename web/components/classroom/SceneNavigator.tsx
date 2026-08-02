@@ -1,5 +1,7 @@
 "use client";
 
+import { useTranslation } from "react-i18next";
+
 import type { ClassroomScene } from "@/lib/openmaic-adapter/contracts";
 
 export interface SceneNavigatorProps {
@@ -23,11 +25,12 @@ export function SceneNavigator({
   onDelete,
   onAdd,
 }: SceneNavigatorProps) {
+  const { t } = useTranslation();
   return (
-    <aside className="flex min-h-0 w-64 shrink-0 flex-col border-r border-[var(--border)] bg-[var(--card)]">
+    <aside className="flex max-h-56 min-h-0 w-full shrink-0 flex-col border-b border-[var(--border)] bg-[var(--card)] lg:max-h-none lg:w-64 lg:border-r lg:border-b-0">
       <div className="border-b border-[var(--border)] p-3">
         <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-[var(--muted-foreground)]">
-          Add scene
+          {t("classroom.editor.addScene")}
         </p>
         <div className="grid grid-cols-2 gap-1">
           {(["slide", "quiz", "interactive", "pbl"] as const).map(type => (
@@ -38,7 +41,7 @@ export function SceneNavigator({
               onClick={() => onAdd(type)}
               className="rounded border border-[var(--border)] px-2 py-1 text-xs capitalize disabled:opacity-40"
             >
-              {type}
+              {t(`classroom.sceneType.${type}`)}
             </button>
           ))}
         </div>
@@ -60,13 +63,15 @@ export function SceneNavigator({
             >
               <span className="block truncate text-sm font-medium">{scene.title}</span>
               <span className="text-xs capitalize text-[var(--muted-foreground)]">
-                {index + 1}. {scene.type}
+                {index + 1}. {t(`classroom.sceneType.${scene.type}`)}
               </span>
             </button>
             <div className="mt-2 flex gap-1">
               <button
                 type="button"
-                aria-label={`Move ${scene.title} up`}
+                aria-label={t("classroom.editor.moveSceneUp", {
+                  title: scene.title,
+                })}
                 disabled={disabled || index === 0}
                 onClick={() => onMove(scene.id, index - 1)}
                 className="rounded border border-[var(--border)] px-1.5 text-xs disabled:opacity-30"
@@ -75,7 +80,9 @@ export function SceneNavigator({
               </button>
               <button
                 type="button"
-                aria-label={`Move ${scene.title} down`}
+                aria-label={t("classroom.editor.moveSceneDown", {
+                  title: scene.title,
+                })}
                 disabled={disabled || index === scenes.length - 1}
                 onClick={() => onMove(scene.id, index + 1)}
                 className="rounded border border-[var(--border)] px-1.5 text-xs disabled:opacity-30"
@@ -88,7 +95,7 @@ export function SceneNavigator({
                 onClick={() => onDuplicate(scene.id)}
                 className="rounded border border-[var(--border)] px-1.5 text-xs disabled:opacity-30"
               >
-                Copy
+                {t("classroom.editor.copyScene")}
               </button>
               <button
                 type="button"
@@ -96,7 +103,7 @@ export function SceneNavigator({
                 onClick={() => onDelete(scene.id)}
                 className="rounded border border-[var(--border)] px-1.5 text-xs disabled:opacity-30"
               >
-                Delete
+                {t("classroom.editor.deleteScene")}
               </button>
             </div>
           </li>

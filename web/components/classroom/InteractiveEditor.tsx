@@ -1,5 +1,7 @@
 "use client";
 
+import { useTranslation } from "react-i18next";
+
 import type { InteractiveScene } from "@/lib/openmaic-adapter/contracts";
 import type { InteractiveUpdateOperation } from "@/lib/openmaic-adapter/scene-operations";
 
@@ -14,14 +16,15 @@ export function InteractiveEditor({
   disabled = false,
   onOperation,
 }: InteractiveEditorProps) {
+  const { t } = useTranslation();
   return (
     <div className="space-y-3">
       <p className="text-xs text-[var(--muted-foreground)]">
-        Interactions use data-yfeistai-event attributes. Scripts, external links, and nested frames are rejected before save.
+        {t("classroom.editor.interactiveSafety")}
       </p>
       <textarea
         key={`${scene.id}:${scene.content.html}`}
-        aria-label="Interactive HTML"
+        aria-label={t("classroom.editor.interactiveHtml")}
         defaultValue={scene.content.html}
         disabled={disabled}
         spellCheck={false}
@@ -41,10 +44,14 @@ export function InteractiveEditor({
         className="min-h-80 w-full rounded-md border border-[var(--border)] bg-[var(--background)] p-3 font-mono text-xs disabled:opacity-60"
       />
       <dl className="grid grid-cols-2 gap-2 text-xs">
-        <dt className="text-[var(--muted-foreground)]">Bridge</dt>
+        <dt className="text-[var(--muted-foreground)]">
+          {t("classroom.editor.bridge")}
+        </dt>
         <dd>{scene.content.bridgeVersion}</dd>
-        <dt className="text-[var(--muted-foreground)]">Sandbox</dt>
-        <dd>scripts; no same-origin</dd>
+        <dt className="text-[var(--muted-foreground)]">
+          {t("classroom.editor.sandbox")}
+        </dt>
+        <dd>{t("classroom.editor.sandboxPolicy")}</dd>
       </dl>
     </div>
   );

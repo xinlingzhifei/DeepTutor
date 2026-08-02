@@ -265,6 +265,7 @@ test('whiteboard actions update immutable slide state in order', () => {
   const cleared = applyWhiteboardAction(drawn, { id: 'clear', type: 'wb_clear' })
 
   assert.equal(initial.open, false)
+  assert.equal(initial.slide.viewportRatio, 9 / 16)
   assert.equal(opened.open, true)
   assert.equal(drawn.slide.elements.length, 1)
   assert.equal(drawn.slide.elements[0]?.id, 'equation')
