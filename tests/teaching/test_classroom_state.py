@@ -12,6 +12,7 @@ from deeptutor.teaching.models.classrooms import (
     ClassroomVersion,
     InvalidClassroomTransition,
     Publication,
+    SourceSnapshot,
     transition,
 )
 from deeptutor.teaching.models.jobs import GenerationJob
@@ -97,6 +98,24 @@ def test_classroom_version_is_unique_per_asset_version_number() -> None:
 
     assert ("tenant_id", "classroom_id", "version_number") in unique_columns
     assert ("id", "classroom_id", "tenant_id") in unique_columns
+
+
+def test_source_snapshot_identity_includes_resource_owner() -> None:
+    table = SourceSnapshot.__table__
+    unique_columns = {
+        tuple(constraint.columns.keys())
+        for constraint in table.constraints
+        if isinstance(constraint, UniqueConstraint)
+    }
+
+    assert table.c.resource_owner_id.nullable is False
+    assert (
+        "tenant_id",
+        "source_type",
+        "source_id",
+        "resource_owner_id",
+        "source_revision",
+    ) in unique_columns
 
 
 def test_classroom_version_has_exactly_one_immutable_provenance() -> None:

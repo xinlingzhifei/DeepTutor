@@ -22,6 +22,8 @@ from deeptutor.teaching.models.platform import Tenant, TenantKnowledgeEntitlemen
 from deeptutor.teaching.models.tenant import Course, TeachingClass
 from deeptutor.teaching.schema_names import tenant_schema_name
 
+TENANT_SOURCE_OWNER_ID = "tenant-workspace"
+
 
 class SourceRepositoryError(RuntimeError):
     """Base class for safe source persistence errors."""
@@ -72,6 +74,7 @@ class NewUpload:
 class NewKnowledgeSnapshot:
     snapshot_id: str
     resource_id: str
+    resource_owner_id: str
     revision: str
     content_sha256: str
     permission_sha256: str
@@ -146,7 +149,11 @@ class SqlAlchemySourceRepository:
                 class_id=class_id,
             )
 
-    async def is_knowledge_resource_entitled(self, resource_id: str) -> bool:
+    async def is_knowledge_resource_entitled(
+        self,
+        resource_id: str,
+        resource_owner_id: str,
+    ) -> bool:
         async with self._session_factory() as session:
             entitled = await session.scalar(
                 select(TenantKnowledgeEntitlement.knowledge_resource_id)
@@ -154,6 +161,7 @@ class SqlAlchemySourceRepository:
                 .where(
                     TenantKnowledgeEntitlement.tenant_id == self._tenant_id,
                     TenantKnowledgeEntitlement.knowledge_resource_id == resource_id,
+                    TenantKnowledgeEntitlement.resource_owner_id == resource_owner_id,
                     TenantKnowledgeEntitlement.status == "active",
                     Tenant.status == "active",
                 )
@@ -389,6 +397,7 @@ class SqlAlchemySourceRepository:
                             tenant_id=self._tenant_id,
                             source_type="pdf",
                             source_id=upload.upload_id,
+                            resource_owner_id=TENANT_SOURCE_OWNER_ID,
                             source_revision=upload.sha256,
                             content_sha256=upload.sha256,
                             permission_sha256=permission_sha256,
@@ -466,6 +475,7 @@ class SqlAlchemySourceRepository:
                             tenant_id=self._tenant_id,
                             source_type="knowledge_base",
                             source_id=snapshot.resource_id,
+                            resource_owner_id=snapshot.resource_owner_id,
                             source_revision=snapshot.revision,
                             content_sha256=snapshot.content_sha256,
                             permission_sha256=snapshot.permission_sha256,
@@ -479,6 +489,7 @@ class SqlAlchemySourceRepository:
                         existing.tenant_id != self._tenant_id
                         or existing.source_type != "knowledge_base"
                         or existing.source_id != snapshot.resource_id
+                        or existing.resource_owner_id != snapshot.resource_owner_id
                         or existing.source_revision != snapshot.revision
                         or existing.content_sha256 != snapshot.content_sha256
                         or existing.permission_sha256 != snapshot.permission_sha256

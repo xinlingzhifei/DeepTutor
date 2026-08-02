@@ -61,6 +61,7 @@ class SourceSnapshot(TenantBase):
     tenant_id: Mapped[str] = mapped_column(String(64))
     source_type: Mapped[str] = mapped_column(String(32))
     source_id: Mapped[str] = mapped_column(String(128))
+    resource_owner_id: Mapped[str] = mapped_column(String(128))
     source_revision: Mapped[str] = mapped_column(String(128))
     content_sha256: Mapped[str] = mapped_column(String(64))
     permission_sha256: Mapped[str] = mapped_column(String(64))
@@ -76,6 +77,7 @@ class SourceSnapshot(TenantBase):
             "tenant_id",
             "source_type",
             "source_id",
+            "resource_owner_id",
             "source_revision",
             name="uq_source_snapshots_tenant_source_revision",
         ),

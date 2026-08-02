@@ -9,6 +9,8 @@ from typing import Any, Literal
 Role = Literal["admin", "user"]
 ScopeKind = Literal["admin", "user"]
 
+ADMIN_KNOWLEDGE_OWNER_ID = "admin-workspace"
+
 
 @dataclass(frozen=True, slots=True)
 class UserRecord:

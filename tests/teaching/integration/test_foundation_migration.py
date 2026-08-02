@@ -1941,11 +1941,13 @@ def test_knowledge_entitlement_downgrade_refuses_data_without_mutation(
                         INSERT INTO platform.tenant_knowledge_entitlements (
                             tenant_id,
                             knowledge_resource_id,
+                            resource_owner_id,
                             status,
                             granted_by
                         ) VALUES (
                             :tenant_id,
                             'admin:kb:math',
+                            'admin-workspace',
                             'active',
                             'admin-a'
                         )
@@ -2021,6 +2023,261 @@ def test_knowledge_entitlement_downgrade_refuses_data_without_mutation(
         migration_database,
         _run_alembic(migration_database, "scope=platform"),
     )
+
+
+def test_source_owner_migration_backfills_and_guards_owner_collisions(
+    migration_database,
+) -> None:
+    tenant_id = "source-owner-migration"
+    schema_name = tenant_schema_name(tenant_id)
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(migration_database, "scope=platform"),
+    )
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(
+            migration_database,
+            "scope=tenant",
+            f"tenant_schema={schema_name}",
+            revision="20260802_0008",
+        ),
+    )
+
+    async def seed_legacy_sources() -> None:
+        engine = create_async_engine(migration_database.url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        f"""
+                        INSERT INTO "{schema_name}".source_snapshots (
+                            id, tenant_id, source_type, source_id, source_revision,
+                            content_sha256, permission_sha256, citation_manifest,
+                            created_by
+                        ) VALUES
+                            (
+                                'admin-source', :tenant_id, 'knowledge_base',
+                                'admin:kb:math', 'binding-v1', :admin_content,
+                                :admin_permission, '[]', 'teacher-a'
+                            ),
+                            (
+                                'alice-source', :tenant_id, 'knowledge_base',
+                                'user:kb:course-a', 'binding-v1', :alice_content,
+                                :alice_permission, '[]', 'alice'
+                            ),
+                            (
+                                'pdf-source', :tenant_id, 'pdf', 'upload-a',
+                                'pdf-v1', :pdf_content, :pdf_permission, '[]',
+                                'alice'
+                            )
+                        """
+                    ),
+                    {
+                        "tenant_id": tenant_id,
+                        "admin_content": "1" * 64,
+                        "admin_permission": "2" * 64,
+                        "alice_content": "3" * 64,
+                        "alice_permission": "4" * 64,
+                        "pdf_content": "5" * 64,
+                        "pdf_permission": "6" * 64,
+                    },
+                )
+        finally:
+            await engine.dispose()
+
+    async def inspect_head() -> tuple[str, dict[str, str], bool, tuple[str, ...], int]:
+        engine = create_async_engine(migration_database.url)
+        try:
+            async with engine.connect() as connection:
+                revision = await connection.scalar(
+                    text(f'SELECT version_num FROM "{schema_name}".alembic_version')
+                )
+                owners = dict(
+                    (
+                        await connection.execute(
+                            text(
+                                f'SELECT id, resource_owner_id FROM "{schema_name}".'
+                                "source_snapshots ORDER BY id"
+                            )
+                        )
+                    ).all()
+                )
+                owner_is_required = (
+                    await connection.scalar(
+                        text(
+                            """
+                            SELECT is_nullable = 'NO'
+                            FROM information_schema.columns
+                            WHERE table_schema = :schema_name
+                              AND table_name = 'source_snapshots'
+                              AND column_name = 'resource_owner_id'
+                            """
+                        ),
+                        {"schema_name": schema_name},
+                    )
+                    is True
+                )
+                unique_columns = tuple(
+                    (
+                        await connection.execute(
+                            text(
+                                """
+                                SELECT column_name
+                                FROM information_schema.key_column_usage
+                                WHERE constraint_schema = :schema_name
+                                  AND constraint_name =
+                                      'uq_source_snapshots_tenant_source_revision'
+                                ORDER BY ordinal_position
+                                """
+                            ),
+                            {"schema_name": schema_name},
+                        )
+                    ).scalars()
+                )
+                count = await connection.scalar(
+                    text(f'SELECT count(*) FROM "{schema_name}".source_snapshots')
+                )
+                return (
+                    str(revision),
+                    owners,
+                    owner_is_required,
+                    unique_columns,
+                    int(count or 0),
+                )
+        finally:
+            await engine.dispose()
+
+    async def insert_bob_collision() -> None:
+        engine = create_async_engine(migration_database.url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        f"""
+                        INSERT INTO "{schema_name}".source_snapshots (
+                            id, tenant_id, source_type, source_id,
+                            resource_owner_id, source_revision, content_sha256,
+                            permission_sha256, citation_manifest, created_by
+                        ) VALUES (
+                            'bob-source', :tenant_id, 'knowledge_base',
+                            'user:kb:course-a', 'bob', 'binding-v1',
+                            :content_sha256, :permission_sha256, '[]', 'bob'
+                        )
+                        """
+                    ),
+                    {
+                        "tenant_id": tenant_id,
+                        "content_sha256": "7" * 64,
+                        "permission_sha256": "8" * 64,
+                    },
+                )
+        finally:
+            await engine.dispose()
+
+    async def delete_bob_collision() -> None:
+        engine = create_async_engine(migration_database.url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(f"DELETE FROM \"{schema_name}\".source_snapshots WHERE id = 'bob-source'")
+                )
+        finally:
+            await engine.dispose()
+
+    async def inspect_0008() -> tuple[str, bool, int]:
+        engine = create_async_engine(migration_database.url)
+        try:
+            async with engine.connect() as connection:
+                revision = await connection.scalar(
+                    text(f'SELECT version_num FROM "{schema_name}".alembic_version')
+                )
+                owner_column_exists = await connection.scalar(
+                    text(
+                        """
+                        SELECT EXISTS (
+                            SELECT 1
+                            FROM information_schema.columns
+                            WHERE table_schema = :schema_name
+                              AND table_name = 'source_snapshots'
+                              AND column_name = 'resource_owner_id'
+                        )
+                        """
+                    ),
+                    {"schema_name": schema_name},
+                )
+                count = await connection.scalar(
+                    text(f'SELECT count(*) FROM "{schema_name}".source_snapshots')
+                )
+                return str(revision), bool(owner_column_exists), int(count or 0)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(seed_legacy_sources())
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(
+            migration_database,
+            "scope=tenant",
+            f"tenant_schema={schema_name}",
+        ),
+    )
+    assert asyncio.run(inspect_head()) == (
+        HEAD_REVISION,
+        {
+            "admin-source": "admin-workspace",
+            "alice-source": "alice",
+            "pdf-source": "tenant-workspace",
+        },
+        True,
+        (
+            "tenant_id",
+            "source_type",
+            "source_id",
+            "resource_owner_id",
+            "source_revision",
+        ),
+        3,
+    )
+
+    asyncio.run(insert_bob_collision())
+    refused = _run_alembic(
+        migration_database,
+        "scope=tenant",
+        f"tenant_schema={schema_name}",
+        action="downgrade",
+        revision="20260802_0008",
+    )
+    safe_output = _assert_secret_safe_output(migration_database, refused)
+    assert refused.returncode != 0, safe_output
+    assert "owner-scoped snapshots would collide" in safe_output
+    assert asyncio.run(inspect_head())[-1] == 4
+
+    asyncio.run(delete_bob_collision())
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(
+            migration_database,
+            "scope=tenant",
+            f"tenant_schema={schema_name}",
+            action="downgrade",
+            revision="20260802_0008",
+        ),
+    )
+    assert asyncio.run(inspect_0008()) == ("20260802_0008", False, 3)
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(
+            migration_database,
+            "scope=tenant",
+            f"tenant_schema={schema_name}",
+        ),
+    )
+    assert asyncio.run(inspect_head())[1] == {
+        "admin-source": "admin-workspace",
+        "alice-source": "alice",
+        "pdf-source": "tenant-workspace",
+    }
 
 
 def test_active_0007_tenant_schema_upgrade_is_idempotent_and_recoverable(
@@ -2717,10 +2974,12 @@ def test_classroom_lifecycle_downgrade_refuses_source_data_without_mutation(
                         f"""
                         INSERT INTO "{schema_name}".source_snapshots (
                             id, tenant_id, source_type, source_id, source_revision,
+                            resource_owner_id,
                             content_sha256, permission_sha256, citation_manifest,
                             created_by
                         ) VALUES (
                             'source-1', :tenant_id, 'upload', 'document-1', 'v1',
+                            'tenant-workspace',
                             :content_sha256, :permission_sha256, '{{}}', 'teacher-1'
                         )
                         """
@@ -2837,11 +3096,13 @@ def test_classroom_lifecycle_downgrade_waits_for_concurrent_writer_then_refuses(
                     f"""
                     INSERT INTO "{schema_name}".source_snapshots (
                         id, tenant_id, source_type, source_id, source_revision,
+                        resource_owner_id,
                         content_sha256, permission_sha256, citation_manifest,
                         created_by
                     ) VALUES (
                         'source-concurrent', :tenant_id, 'upload', 'document-1',
-                        'v1', :content_sha256, :permission_sha256, '{{}}',
+                        'v1', 'tenant-workspace', :content_sha256,
+                        :permission_sha256, '{{}}',
                         'teacher-1'
                     )
                     """
@@ -3064,11 +3325,12 @@ def test_classroom_lifecycle_downgrade_blocks_writer_started_after_guard(
                             f"""
                             INSERT INTO "{schema_name}".source_snapshots (
                                 id, tenant_id, source_type, source_id,
-                                source_revision, content_sha256,
+                                source_revision, resource_owner_id, content_sha256,
                                 permission_sha256, citation_manifest, created_by
                             ) VALUES (
                                 'source-late', :tenant_id, 'upload', 'document-1',
-                                'v1', :content_sha256, :permission_sha256, '{{}}',
+                                'v1', 'tenant-workspace', :content_sha256,
+                                :permission_sha256, '{{}}',
                                 'teacher-1'
                             )
                             """

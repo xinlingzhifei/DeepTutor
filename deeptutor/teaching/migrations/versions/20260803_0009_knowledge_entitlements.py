@@ -11,6 +11,9 @@ down_revision: str | None = "20260802_0008"
 branch_labels: str | None = None
 depends_on: str | None = None
 
+_ADMIN_KNOWLEDGE_OWNER_ID = "admin-workspace"
+_TENANT_SOURCE_OWNER_ID = "tenant-workspace"
+
 
 def _migration_scope() -> str:
     return context.get_x_argument(as_dictionary=True)["scope"]
@@ -67,6 +70,7 @@ def _upgrade_platform() -> None:
         "tenant_knowledge_entitlements",
         sa.Column("tenant_id", sa.String(length=64), nullable=False),
         sa.Column("knowledge_resource_id", sa.String(length=128), nullable=False),
+        sa.Column("resource_owner_id", sa.String(length=128), nullable=False),
         sa.Column(
             "status",
             sa.String(length=32),
@@ -99,23 +103,79 @@ def _upgrade_platform() -> None:
         sa.PrimaryKeyConstraint(
             "tenant_id",
             "knowledge_resource_id",
+            "resource_owner_id",
             name="pk_tenant_knowledge_entitlements",
         ),
         schema="platform",
     )
     op.create_index(
-        "ix_tenant_knowledge_entitlements_resource_status",
+        "ix_tenant_knowledge_entitlements_resource_owner_status",
         "tenant_knowledge_entitlements",
-        ["knowledge_resource_id", "status"],
+        ["knowledge_resource_id", "resource_owner_id", "status"],
         schema="platform",
     )
+
+
+def _upgrade_tenant() -> None:
+    tenant_schema = _tenant_schema()
+    quoted_schema = f'"{tenant_schema}"'
+    op.add_column(
+        "source_snapshots",
+        sa.Column("resource_owner_id", sa.String(length=128), nullable=True),
+        schema=tenant_schema,
+    )
+    op.get_bind().execute(
+        sa.text(
+            f"""
+            UPDATE {quoted_schema}.source_snapshots
+            SET resource_owner_id = CASE
+                WHEN source_type = 'knowledge_base'
+                 AND source_id LIKE 'admin:kb:%'
+                    THEN :admin_owner_id
+                WHEN source_type = 'knowledge_base'
+                    THEN created_by
+                ELSE :tenant_owner_id
+            END
+            """
+        ),
+        {
+            "admin_owner_id": _ADMIN_KNOWLEDGE_OWNER_ID,
+            "tenant_owner_id": _TENANT_SOURCE_OWNER_ID,
+        },
+    )
+    op.alter_column(
+        "source_snapshots",
+        "resource_owner_id",
+        existing_type=sa.String(length=128),
+        nullable=False,
+        schema=tenant_schema,
+    )
+    op.drop_constraint(
+        "uq_source_snapshots_tenant_source_revision",
+        "source_snapshots",
+        type_="unique",
+        schema=tenant_schema,
+    )
+    op.create_unique_constraint(
+        "uq_source_snapshots_tenant_source_revision",
+        "source_snapshots",
+        [
+            "tenant_id",
+            "source_type",
+            "source_id",
+            "resource_owner_id",
+            "source_revision",
+        ],
+        schema=tenant_schema,
+    )
+    _sync_tenant_schema_revision("20260802_0008", "20260803_0009")
 
 
 def upgrade() -> None:
     if _migration_scope() == "platform":
         _upgrade_platform()
     else:
-        _sync_tenant_schema_revision("20260802_0008", "20260803_0009")
+        _upgrade_tenant()
 
 
 def _downgrade_platform() -> None:
@@ -133,8 +193,69 @@ def _downgrade_platform() -> None:
     op.drop_table("tenant_knowledge_entitlements", schema="platform")
 
 
+def _downgrade_tenant() -> None:
+    tenant_schema = _tenant_schema()
+    quoted_schema = f'"{tenant_schema}"'
+    connection = op.get_bind()
+    connection.execute(
+        sa.text(f"LOCK TABLE {quoted_schema}.source_snapshots IN ACCESS EXCLUSIVE MODE")
+    )
+    owner_mismatch = connection.execute(
+        sa.text(
+            f"""
+            SELECT EXISTS (
+                SELECT 1
+                FROM {quoted_schema}.source_snapshots
+                WHERE resource_owner_id <> CASE
+                    WHEN source_type = 'knowledge_base'
+                     AND source_id LIKE 'admin:kb:%'
+                        THEN :admin_owner_id
+                    WHEN source_type = 'knowledge_base'
+                        THEN created_by
+                    ELSE :tenant_owner_id
+                END
+            )
+            """
+        ),
+        {
+            "admin_owner_id": _ADMIN_KNOWLEDGE_OWNER_ID,
+            "tenant_owner_id": _TENANT_SOURCE_OWNER_ID,
+        },
+    ).scalar()
+    if owner_mismatch:
+        raise CommandError("cannot downgrade source owners: owner evidence is not reconstructible")
+    duplicate_legacy_identity = connection.execute(
+        sa.text(
+            f"""
+            SELECT EXISTS (
+                SELECT 1
+                FROM {quoted_schema}.source_snapshots
+                GROUP BY tenant_id, source_type, source_id, source_revision
+                HAVING count(*) > 1
+            )
+            """
+        )
+    ).scalar()
+    if duplicate_legacy_identity:
+        raise CommandError("cannot downgrade source owners: owner-scoped snapshots would collide")
+    op.drop_constraint(
+        "uq_source_snapshots_tenant_source_revision",
+        "source_snapshots",
+        type_="unique",
+        schema=tenant_schema,
+    )
+    op.create_unique_constraint(
+        "uq_source_snapshots_tenant_source_revision",
+        "source_snapshots",
+        ["tenant_id", "source_type", "source_id", "source_revision"],
+        schema=tenant_schema,
+    )
+    op.drop_column("source_snapshots", "resource_owner_id", schema=tenant_schema)
+    _sync_tenant_schema_revision("20260803_0009", "20260802_0008")
+
+
 def downgrade() -> None:
     if _migration_scope() == "platform":
         _downgrade_platform()
     else:
-        _sync_tenant_schema_revision("20260803_0009", "20260802_0008")
+        _downgrade_tenant()

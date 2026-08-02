@@ -51,6 +51,7 @@ def test_model_metadata_uses_only_platform_and_logical_tenant_schemas():
         "platform.provider_profiles",
         "platform.role_grants",
         "platform.tenant_default_policy_states",
+        "platform.tenant_knowledge_entitlements",
         "platform.tenant_memberships",
         "platform.tenant_provisioning_jobs",
         "platform.tenant_scheduler_state",
@@ -101,6 +102,18 @@ def test_model_metadata_uses_only_platform_and_logical_tenant_schemas():
             "platform.tenants.id",
         )
     }
+
+
+def test_knowledge_entitlement_identity_includes_resource_owner() -> None:
+    from deeptutor.teaching.models import TenantKnowledgeEntitlement
+
+    table = TenantKnowledgeEntitlement.__table__
+
+    assert tuple(table.primary_key.columns.keys()) == (
+        "tenant_id",
+        "knowledge_resource_id",
+        "resource_owner_id",
+    )
 
 
 def test_tenant_storage_credentials_metadata_excludes_plaintext_secrets():

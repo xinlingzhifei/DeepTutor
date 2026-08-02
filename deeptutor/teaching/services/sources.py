@@ -15,7 +15,7 @@ from pypdf import PdfReader
 from pypdf.generic import ArrayObject, DictionaryObject, IndirectObject
 
 from deeptutor.multi_user.knowledge_access import manager_for_resource
-from deeptutor.multi_user.models import KnowledgeResource
+from deeptutor.multi_user.models import ADMIN_KNOWLEDGE_OWNER_ID, KnowledgeResource
 from deeptutor.teaching.artifacts import StoredArtifact, source_upload_key
 from deeptutor.teaching.object_store import ClassroomArtifactStore
 from deeptutor.teaching.permissions import ResourceScope
@@ -97,7 +97,11 @@ class UploadFileLike(Protocol):
 class SourceRepository(Protocol):
     async def validate_target(self, course_id: str, class_id: str | None) -> None: ...
 
-    async def is_knowledge_resource_entitled(self, resource_id: str) -> bool: ...
+    async def is_knowledge_resource_entitled(
+        self,
+        resource_id: str,
+        resource_owner_id: str,
+    ) -> bool: ...
 
     async def list_bindings(
         self,
@@ -161,6 +165,25 @@ class _StagedPdf:
 def _digest_id(prefix: str, *values: str) -> str:
     payload = "\0".join(values).encode()
     return f"{prefix}-{hashlib.sha256(payload).hexdigest()}"
+
+
+def _knowledge_resource_owner_id(
+    context: TenantContext,
+    resource: KnowledgeResource,
+) -> str:
+    if resource.source == "admin":
+        owner_id = ADMIN_KNOWLEDGE_OWNER_ID
+    elif resource.source == "user":
+        owner_id = context.user_id
+    else:
+        raise InvalidSourceBindingError("knowledge resource owner is invalid")
+    if (
+        not owner_id
+        or len(owner_id) > 128
+        or any(character in owner_id for character in "\x00\r\n")
+    ):
+        raise InvalidSourceBindingError("knowledge resource owner is invalid")
+    return owner_id
 
 
 def _target_permission_sha256(tenant_id: str, course_id: str, class_id: str | None) -> str:
@@ -413,10 +436,20 @@ class SourceService:
             raise InvalidSourceBindingError("knowledge resource identity is invalid")
         if not self._knowledge_exists(resource):
             raise SourceNotFoundError("knowledge resource not found")
-        if not await self._repository.is_knowledge_resource_entitled(stable_id):
+        resource_owner_id = _knowledge_resource_owner_id(context, resource)
+        if not await self._repository.is_knowledge_resource_entitled(
+            stable_id,
+            resource_owner_id,
+        ):
             raise SourceAccessDeniedError("knowledge resource is not entitled to this tenant")
-        content_sha256 = hashlib.sha256(stable_id.encode()).hexdigest()
-        snapshot_id = _digest_id("kb-source", context.tenant_id, stable_id, "binding-v1")
+        content_sha256 = hashlib.sha256(f"{resource_owner_id}\0{stable_id}".encode()).hexdigest()
+        snapshot_id = _digest_id(
+            "kb-source",
+            context.tenant_id,
+            resource_owner_id,
+            stable_id,
+            "binding-v1",
+        )
         binding_id = source_binding_id(
             context.tenant_id,
             snapshot_id,
@@ -424,12 +457,13 @@ class SourceService:
             class_id,
         )
         permission_sha256 = hashlib.sha256(
-            f"{context.tenant_id}\0{stable_id}\0source.use".encode()
+            f"{context.tenant_id}\0{resource_owner_id}\0{stable_id}\0source.use".encode()
         ).hexdigest()
         return await self._repository.bind_knowledge_resource(
             NewKnowledgeSnapshot(
                 snapshot_id=snapshot_id,
                 resource_id=stable_id,
+                resource_owner_id=resource_owner_id,
                 revision="binding-v1",
                 content_sha256=content_sha256,
                 permission_sha256=permission_sha256,

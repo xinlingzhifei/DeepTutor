@@ -46,6 +46,8 @@ class _SourceRepository:
         self.create_calls = 0
         self.valid_classes = {"class-a": "course-a", "class-b": "course-b"}
         self.knowledge_entitled = True
+        self.knowledge_entitlements: set[tuple[str, str]] | None = None
+        self.entitlement_calls: list[tuple[str, str | None]] = []
 
     def _validate_target(self, course_id: str, class_id: str | None) -> None:
         if course_id not in {"course-a", "course-b"}:
@@ -56,7 +58,14 @@ class _SourceRepository:
     async def validate_target(self, course_id: str, class_id: str | None) -> None:
         self._validate_target(course_id, class_id)
 
-    async def is_knowledge_resource_entitled(self, resource_id: str) -> bool:
+    async def is_knowledge_resource_entitled(
+        self,
+        resource_id: str,
+        resource_owner_id: str | None = None,
+    ) -> bool:
+        self.entitlement_calls.append((resource_id, resource_owner_id))
+        if self.knowledge_entitlements is not None:
+            return (resource_id, resource_owner_id) in self.knowledge_entitlements
         return self.knowledge_entitled
 
     async def list_bindings(self, course_ids, class_ids):
@@ -214,6 +223,8 @@ class _KnowledgeResolver:
         self.calls: list[tuple[str, bool]] = []
         self.error: HTTPException | None = None
         self.resource_id = "admin:kb:math"
+        self.resource_name = "math"
+        self.source = "admin"
 
     def __call__(self, reference: str, *, require_write: bool):
         self.calls.append((reference, require_write))
@@ -221,11 +232,11 @@ class _KnowledgeResolver:
             raise self.error
         return KnowledgeResource(
             id=self.resource_id,
-            name="math",
+            name=self.resource_name,
             base_dir=Path("unused"),
-            source="admin",
-            assigned=True,
-            read_only=True,
+            source=self.source,
+            assigned=self.source == "admin",
+            read_only=self.source == "admin",
         )
 
 
@@ -643,6 +654,118 @@ def test_same_user_requires_independent_knowledge_entitlement_per_tenant() -> No
     assert entitled.status_code == 201
     assert denied.status_code == 403
     assert denied_repository.knowledge_snapshots == []
+
+
+def test_personal_knowledge_entitlement_is_scoped_to_resource_owner() -> None:
+    repository = _SourceRepository()
+    repository.knowledge_entitlements = {("user:kb:course-a", "alice")}
+    alice_resolver = _KnowledgeResolver()
+    alice_resolver.resource_id = "user:kb:course-a"
+    alice_resolver.resource_name = "course-a"
+    alice_resolver.source = "user"
+    bob_resolver = _KnowledgeResolver()
+    bob_resolver.resource_id = "user:kb:course-a"
+    bob_resolver.resource_name = "course-a"
+    bob_resolver.source = "user"
+    alice_client, _, _ = _client(
+        _context(user_id="alice"),
+        repository,
+        resolver=alice_resolver,
+    )
+    bob_client, _, _ = _client(
+        _context(user_id="bob"),
+        repository,
+        resolver=bob_resolver,
+    )
+
+    alice = alice_client.post(
+        "/api/v1/teaching/sources/bind",
+        json={"knowledgeResourceId": "course-a", "courseId": "course-a"},
+    )
+    bob = bob_client.post(
+        "/api/v1/teaching/sources/bind",
+        json={"knowledgeResourceId": "course-a", "courseId": "course-a"},
+    )
+
+    assert alice.status_code == 201
+    assert bob.status_code == 403
+    assert repository.entitlement_calls == [
+        ("user:kb:course-a", "alice"),
+        ("user:kb:course-a", "bob"),
+    ]
+    assert len(repository.records) == 1
+    assert [snapshot.resource_owner_id for snapshot in repository.knowledge_snapshots] == ["alice"]
+
+
+def test_admin_knowledge_entitlement_uses_shared_workspace_owner() -> None:
+    repository = _SourceRepository()
+    repository.knowledge_entitlements = {("admin:kb:math", "admin-workspace")}
+    alice_client, _, _ = _client(_context(user_id="alice"), repository)
+    bob_client, _, _ = _client(_context(user_id="bob"), repository)
+
+    alice = alice_client.post(
+        "/api/v1/teaching/sources/bind",
+        json={"knowledgeResourceId": "math", "courseId": "course-a"},
+    )
+    bob = bob_client.post(
+        "/api/v1/teaching/sources/bind",
+        json={"knowledgeResourceId": "math", "courseId": "course-a"},
+    )
+
+    assert alice.status_code == bob.status_code == 201
+    assert repository.entitlement_calls == [
+        ("admin:kb:math", "admin-workspace"),
+        ("admin:kb:math", "admin-workspace"),
+    ]
+    assert {snapshot.resource_owner_id for snapshot in repository.knowledge_snapshots} == {
+        "admin-workspace"
+    }
+    assert len({snapshot.snapshot_id for snapshot in repository.knowledge_snapshots}) == 1
+    assert len({snapshot.content_sha256 for snapshot in repository.knowledge_snapshots}) == 1
+    assert len({snapshot.permission_sha256 for snapshot in repository.knowledge_snapshots}) == 1
+
+
+def test_personal_knowledge_owner_partitions_snapshot_identity() -> None:
+    repository = _SourceRepository()
+    repository.knowledge_entitlements = {
+        ("user:kb:course-a", "alice"),
+        ("user:kb:course-a", "bob"),
+    }
+    alice_resolver = _KnowledgeResolver()
+    alice_resolver.resource_id = "user:kb:course-a"
+    alice_resolver.resource_name = "course-a"
+    alice_resolver.source = "user"
+    bob_resolver = _KnowledgeResolver()
+    bob_resolver.resource_id = "user:kb:course-a"
+    bob_resolver.resource_name = "course-a"
+    bob_resolver.source = "user"
+    alice_client, _, _ = _client(
+        _context(user_id="alice"),
+        repository,
+        resolver=alice_resolver,
+    )
+    bob_client, _, _ = _client(
+        _context(user_id="bob"),
+        repository,
+        resolver=bob_resolver,
+    )
+
+    alice = alice_client.post(
+        "/api/v1/teaching/sources/bind",
+        json={"knowledgeResourceId": "course-a", "courseId": "course-a"},
+    )
+    bob = bob_client.post(
+        "/api/v1/teaching/sources/bind",
+        json={"knowledgeResourceId": "course-a", "courseId": "course-a"},
+    )
+
+    assert alice.status_code == bob.status_code == 201
+    assert alice.json()["bindingId"] != bob.json()["bindingId"]
+    snapshots = repository.knowledge_snapshots
+    assert {snapshot.resource_owner_id for snapshot in snapshots} == {"alice", "bob"}
+    assert len({snapshot.snapshot_id for snapshot in snapshots}) == 2
+    assert len({snapshot.content_sha256 for snapshot in snapshots}) == 2
+    assert len({snapshot.permission_sha256 for snapshot in snapshots}) == 2
 
 
 def test_stale_assigned_knowledge_resource_fails_closed() -> None:

@@ -4,10 +4,11 @@ import asyncio
 import uuid
 
 import pytest
-from sqlalchemy import insert
+from sqlalchemy import insert, text
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
+from deeptutor.multi_user.models import ADMIN_KNOWLEDGE_OWNER_ID
 from deeptutor.teaching.models.platform import (
     Tenant,
     TenantKnowledgeEntitlement,
@@ -25,6 +26,7 @@ from deeptutor.teaching.repositories.sources import (
     SqlAlchemySourceRepository,
     source_binding_id,
 )
+from deeptutor.teaching.schema_names import tenant_schema_name
 
 
 async def _seed_memberships(engine, *rows: tuple[str, str, str]) -> None:
@@ -77,6 +79,7 @@ async def test_catalog_and_sources_are_isolated_and_upload_dedupe_is_atomic(
         knowledge_snapshot = NewKnowledgeSnapshot(
             snapshot_id=f"kb-source-{suffix}",
             resource_id="admin:kb:math",
+            resource_owner_id=ADMIN_KNOWLEDGE_OWNER_ID,
             revision="binding-v1",
             content_sha256="a" * 64,
             permission_sha256="b" * 64,
@@ -95,6 +98,28 @@ async def test_catalog_and_sources_are_isolated_and_upload_dedupe_is_atomic(
             actor_id="teacher-a",
         )
         assert knowledge_record.source_id == "admin:kb:math"
+        async with engine.connect() as connection:
+            owner_and_audit = (
+                await connection.execute(
+                    text(
+                        f"""
+                        SELECT snapshot.resource_owner_id,
+                               snapshot.created_by,
+                               binding.bound_by
+                        FROM "{tenant_schema_name(tenant_a)}".source_snapshots snapshot
+                        JOIN "{tenant_schema_name(tenant_a)}".tenant_source_bindings binding
+                          ON binding.source_snapshot_id = snapshot.id
+                        WHERE snapshot.id = :snapshot_id
+                        """
+                    ),
+                    {"snapshot_id": knowledge_snapshot.snapshot_id},
+                )
+            ).one()
+        assert tuple(owner_and_audit) == (
+            ADMIN_KNOWLEDGE_OWNER_ID,
+            "teacher-a",
+            "teacher-a",
+        )
         assert await source_b.list_bindings(None, None) == ()
         with pytest.raises(SourceNotFoundError):
             await source_b.get_binding(knowledge_binding_id)
@@ -231,12 +256,14 @@ async def test_knowledge_entitlement_is_active_and_tenant_scoped(generation_data
                     {
                         "tenant_id": tenant_a,
                         "knowledge_resource_id": resource_id,
+                        "resource_owner_id": ADMIN_KNOWLEDGE_OWNER_ID,
                         "status": "active",
                         "granted_by": "admin-a",
                     },
                     {
                         "tenant_id": tenant_b,
                         "knowledge_resource_id": resource_id,
+                        "resource_owner_id": ADMIN_KNOWLEDGE_OWNER_ID,
                         "status": "disabled",
                         "granted_by": "admin-b",
                     },
@@ -246,8 +273,57 @@ async def test_knowledge_entitlement_is_active_and_tenant_scoped(generation_data
         source_a = SqlAlchemySourceRepository(tenant_a, engine)
         source_b = SqlAlchemySourceRepository(tenant_b, engine)
 
-        assert await source_a.is_knowledge_resource_entitled(resource_id) is True
-        assert await source_b.is_knowledge_resource_entitled(resource_id) is False
-        assert await source_b.is_knowledge_resource_entitled("admin:kb:other") is False
+        assert (
+            await source_a.is_knowledge_resource_entitled(
+                resource_id,
+                ADMIN_KNOWLEDGE_OWNER_ID,
+            )
+            is True
+        )
+        assert (
+            await source_b.is_knowledge_resource_entitled(
+                resource_id,
+                ADMIN_KNOWLEDGE_OWNER_ID,
+            )
+            is False
+        )
+        assert (
+            await source_b.is_knowledge_resource_entitled(
+                "admin:kb:other",
+                ADMIN_KNOWLEDGE_OWNER_ID,
+            )
+            is False
+        )
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_personal_knowledge_entitlement_is_owner_scoped(generation_database) -> None:
+    suffix = uuid.uuid4().hex[:12]
+    tenant_id = f"personal-entitlement-{suffix}"
+    resource_id = "user:kb:course-a"
+    engine = create_async_engine(generation_database.url, poolclass=NullPool)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                insert(Tenant),
+                {"id": tenant_id, "name": tenant_id, "status": "active"},
+            )
+            await connection.execute(
+                insert(TenantKnowledgeEntitlement),
+                {
+                    "tenant_id": tenant_id,
+                    "knowledge_resource_id": resource_id,
+                    "resource_owner_id": "alice",
+                    "status": "active",
+                    "granted_by": "admin-a",
+                },
+            )
+
+        source = SqlAlchemySourceRepository(tenant_id, engine)
+
+        assert await source.is_knowledge_resource_entitled(resource_id, "alice") is True
+        assert await source.is_knowledge_resource_entitled(resource_id, "bob") is False
     finally:
         await engine.dispose()
