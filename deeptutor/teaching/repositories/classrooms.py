@@ -60,7 +60,7 @@ class PublishedClassroomVersion:
     id: str
     classroom_id: str
     version_number: int
-    generation_job_id: str
+    source_version_id: str
     document: ClassroomDocumentReference
     publication_id: str
     actor_id: str
@@ -70,7 +70,7 @@ class PublishedClassroomVersion:
     def __post_init__(self) -> None:
         _required(self.id, "id", 128)
         _required(self.classroom_id, "classroom_id", 128)
-        _required(self.generation_job_id, "generation_job_id", 64)
+        _required(self.source_version_id, "source_version_id", 128)
         _required(self.publication_id, "publication_id", 128)
         _required(self.actor_id, "actor_id", 128)
         if self.version_number <= 0:
@@ -135,12 +135,27 @@ class SqlAlchemyClassroomRepository:
                     raise ClassroomAssetNotFoundError(published.classroom_id)
 
                 next_state = transition(asset.lifecycle_state, "published")
+                source_version = await session.scalar(
+                    select(ClassroomVersion)
+                    .where(
+                        ClassroomVersion.id == published.source_version_id,
+                        ClassroomVersion.tenant_id == self._tenant_id,
+                    )
+                    .with_for_update()
+                )
+                if source_version is None:
+                    raise ValueError("source classroom version does not exist")
+                if source_version.classroom_id != published.classroom_id:
+                    raise ValueError("source classroom version belongs to another asset")
+                if source_version.generation_job_id is None:
+                    raise ValueError("source classroom version is not a materialized result")
                 version = ClassroomVersion(
                     id=published.id,
                     tenant_id=self._tenant_id,
                     classroom_id=published.classroom_id,
                     version_number=published.version_number,
-                    generation_job_id=published.generation_job_id,
+                    generation_job_id=None,
+                    source_version_id=source_version.id,
                     document_sha256=published.document.sha256,
                     media_manifest_sha256=published.document.media_manifest_sha256,
                     document_object_key=published.document.object_key,

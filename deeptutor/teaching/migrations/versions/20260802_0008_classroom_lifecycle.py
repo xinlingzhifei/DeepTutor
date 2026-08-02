@@ -65,6 +65,36 @@ def _upgrade_tenant() -> None:
     tenant_schema = _tenant_schema()
     quoted_schema = f'"{tenant_schema}"'
 
+    op.add_column(
+        "classroom_versions",
+        sa.Column("source_version_id", sa.String(length=128), nullable=True),
+        schema=tenant_schema,
+    )
+    op.alter_column(
+        "classroom_versions",
+        "generation_job_id",
+        existing_type=sa.String(length=64),
+        nullable=True,
+        schema=tenant_schema,
+    )
+    op.create_foreign_key(
+        "fk_classroom_versions_source_version_classroom_versions",
+        "classroom_versions",
+        "classroom_versions",
+        ["source_version_id"],
+        ["id"],
+        source_schema=tenant_schema,
+        referent_schema=tenant_schema,
+        ondelete="RESTRICT",
+    )
+    op.create_check_constraint(
+        "ck_classroom_versions_provenance",
+        "classroom_versions",
+        "(generation_job_id IS NOT NULL AND source_version_id IS NULL) OR "
+        "(generation_job_id IS NULL AND source_version_id IS NOT NULL)",
+        schema=tenant_schema,
+    )
+
     op.create_table(
         "source_snapshots",
         sa.Column("id", sa.String(length=128), nullable=False),
@@ -672,6 +702,26 @@ def _downgrade_tenant() -> None:
     op.drop_table("tenant_source_bindings", schema=tenant_schema)
     op.drop_table("source_uploads", schema=tenant_schema)
     op.drop_table("source_snapshots", schema=tenant_schema)
+    op.drop_constraint(
+        "ck_classroom_versions_provenance",
+        "classroom_versions",
+        type_="check",
+        schema=tenant_schema,
+    )
+    op.drop_constraint(
+        "fk_classroom_versions_source_version_classroom_versions",
+        "classroom_versions",
+        type_="foreignkey",
+        schema=tenant_schema,
+    )
+    op.alter_column(
+        "classroom_versions",
+        "generation_job_id",
+        existing_type=sa.String(length=64),
+        nullable=False,
+        schema=tenant_schema,
+    )
+    op.drop_column("classroom_versions", "source_version_id", schema=tenant_schema)
 
 
 def downgrade() -> None:

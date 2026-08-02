@@ -238,7 +238,15 @@ class ClassroomVersion(TenantBase):
     tenant_id: Mapped[str] = mapped_column(String(64))
     classroom_id: Mapped[str] = mapped_column(String(128))
     version_number: Mapped[int] = mapped_column(Integer)
-    generation_job_id: Mapped[str] = mapped_column(String(64))
+    generation_job_id: Mapped[str | None] = mapped_column(String(64))
+    source_version_id: Mapped[str | None] = mapped_column(
+        String(128),
+        ForeignKey(
+            "tenant.classroom_versions.id",
+            name="fk_classroom_versions_source_version_classroom_versions",
+            ondelete="RESTRICT",
+        ),
+    )
     document_sha256: Mapped[str] = mapped_column(String(64))
     media_manifest_sha256: Mapped[str] = mapped_column(String(64))
     document_object_key: Mapped[str] = mapped_column(String(512))
@@ -249,6 +257,11 @@ class ClassroomVersion(TenantBase):
 
     __table_args__ = (
         CheckConstraint("version_number > 0", name="version_number"),
+        CheckConstraint(
+            "(generation_job_id IS NOT NULL AND source_version_id IS NULL) OR "
+            "(generation_job_id IS NULL AND source_version_id IS NOT NULL)",
+            name="provenance",
+        ),
         ForeignKeyConstraint(
             ["classroom_id", "tenant_id"],
             [

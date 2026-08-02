@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import pytest
-from sqlalchemy import UniqueConstraint
+from sqlalchemy import CheckConstraint, UniqueConstraint
 
 from deeptutor.teaching.models.classrooms import (
     ALLOWED_TRANSITIONS,
@@ -100,6 +100,27 @@ def test_classroom_version_is_unique_per_asset_version_number() -> None:
     } == {"tenant.classroom_assets.id"}
 
 
+def test_classroom_version_has_exactly_one_immutable_provenance() -> None:
+    table = ClassroomVersion.__table__
+    provenance_constraints = {
+        str(constraint.sqltext)
+        for constraint in table.constraints
+        if isinstance(constraint, CheckConstraint)
+        and constraint.name == "ck_classroom_versions_provenance"
+    }
+
+    assert table.c.generation_job_id.nullable is True
+    assert table.c.source_version_id.nullable is True
+    assert {
+        foreign_key.target_fullname
+        for foreign_key in table.c.source_version_id.foreign_keys
+    } == {"tenant.classroom_versions.id"}
+    assert provenance_constraints == {
+        "(generation_job_id IS NOT NULL AND source_version_id IS NULL) OR "
+        "(generation_job_id IS NULL AND source_version_id IS NOT NULL)"
+    }
+
+
 def test_assignment_directly_references_an_immutable_version() -> None:
     assert {
         foreign_key.target_fullname for foreign_key in Assignment.__table__.foreign_keys
@@ -110,4 +131,3 @@ def test_generation_status_is_separate_from_classroom_lifecycle() -> None:
     assert "status" in GenerationJob.__table__.columns
     assert "lifecycle_state" not in GenerationJob.__table__.columns
     assert "lifecycle_state" in ClassroomAsset.__table__.columns
-
