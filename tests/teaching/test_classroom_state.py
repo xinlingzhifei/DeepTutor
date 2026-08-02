@@ -13,10 +13,13 @@ from deeptutor.teaching.models.classrooms import (
     InvalidClassroomTransition,
     Publication,
     SourceSnapshot,
+    SourceUpload,
+    TeachingBrief,
+    TenantSourceBinding,
     transition,
 )
 from deeptutor.teaching.models.jobs import GenerationJob
-from deeptutor.teaching.models.tenant import TenantBase
+from deeptutor.teaching.models.tenant import TeachingClass, TenantBase
 
 
 def test_draft_cannot_publish_before_validation() -> None:
@@ -115,7 +118,142 @@ def test_source_snapshot_identity_includes_resource_owner() -> None:
         "source_id",
         "resource_owner_id",
         "source_revision",
+        "permission_sha256",
     ) in unique_columns
+
+
+def test_source_storage_identity_and_foreign_keys_are_tenant_composite() -> None:
+    snapshot = SourceSnapshot.__table__
+    upload = SourceUpload.__table__
+    binding = TenantSourceBinding.__table__
+    teaching_class = TeachingClass.__table__
+
+    def unique_columns(table) -> set[tuple[str, ...]]:
+        return {
+            tuple(constraint.columns.keys())
+            for constraint in table.constraints
+            if isinstance(constraint, UniqueConstraint)
+        }
+
+    def foreign_key_columns(table) -> set[tuple[tuple[str, ...], tuple[str, ...]]]:
+        return {
+            (
+                tuple(constraint.columns.keys()),
+                tuple(element.target_fullname for element in constraint.elements),
+            )
+            for constraint in table.constraints
+            if isinstance(constraint, ForeignKeyConstraint)
+        }
+
+    assert ("id", "tenant_id") in unique_columns(snapshot)
+    assert ("id", "tenant_id") in unique_columns(upload)
+    assert ("tenant_id", "sha256") in unique_columns(upload)
+    assert ("id", "course_id") in unique_columns(teaching_class)
+    assert (
+        ("source_upload_id", "tenant_id"),
+        ("tenant.source_uploads.id", "tenant.source_uploads.tenant_id"),
+    ) in foreign_key_columns(snapshot)
+    assert (
+        ("source_snapshot_id", "tenant_id"),
+        ("tenant.source_snapshots.id", "tenant.source_snapshots.tenant_id"),
+    ) in foreign_key_columns(binding)
+    assert (
+        ("class_id", "course_id"),
+        ("tenant.classes.id", "tenant.classes.course_id"),
+    ) in foreign_key_columns(binding)
+
+    assert "source_snapshot_id" not in upload.c
+    assert "filename" not in upload.c
+    assert snapshot.c.source_upload_id.nullable is True
+    assert snapshot.c.display_name.nullable is True
+    assert {
+        "ownership_token",
+        "object_revision",
+        "object_version_id",
+        "last_error_code",
+        "updated_at",
+    }.issubset(upload.c.keys())
+    status_constraints = {
+        str(constraint.sqltext)
+        for constraint in upload.constraints
+        if isinstance(constraint, CheckConstraint)
+        and constraint.name == "ck_source_uploads_status"
+    }
+    assert status_constraints == {
+        "status IN ('writing', 'uploaded', 'cleanup_pending', 'failed')"
+    }
+
+
+def test_source_and_brief_scope_columns_are_constrained_as_tuples() -> None:
+    snapshot = SourceSnapshot.__table__
+    binding = TenantSourceBinding.__table__
+    brief = TeachingBrief.__table__
+
+    def foreign_key_columns(table) -> set[tuple[tuple[str, ...], tuple[str, ...]]]:
+        return {
+            (
+                tuple(constraint.columns.keys()),
+                tuple(element.target_fullname for element in constraint.elements),
+            )
+            for constraint in table.constraints
+            if isinstance(constraint, ForeignKeyConstraint)
+        }
+
+    snapshot_checks = {
+        constraint.name: str(constraint.sqltext)
+        for constraint in snapshot.constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+    binding_checks = {
+        constraint.name: str(constraint.sqltext)
+        for constraint in binding.constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+    upload_checks = {
+        constraint.name: str(constraint.sqltext)
+        for constraint in SourceUpload.__table__.constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+
+    assert (
+        ("source_snapshot_id", "tenant_id"),
+        ("tenant.source_snapshots.id", "tenant.source_snapshots.tenant_id"),
+    ) in foreign_key_columns(brief)
+    assert (
+        ("class_id", "course_id"),
+        ("tenant.classes.id", "tenant.classes.course_id"),
+    ) in foreign_key_columns(brief)
+    assert binding_checks["ck_tenant_source_bindings_class_requires_course"] == (
+        "class_id IS NULL OR course_id IS NOT NULL"
+    )
+    brief_checks = {
+        constraint.name: str(constraint.sqltext)
+        for constraint in brief.constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+    assert brief_checks["ck_teaching_briefs_class_requires_course"] == (
+        "class_id IS NULL OR course_id IS NOT NULL"
+    )
+    assert snapshot_checks["ck_source_snapshots_pdf_upload"] == (
+        "(source_type = 'pdf' AND source_upload_id IS NOT NULL AND display_name IS NOT NULL) "
+        "OR (source_type <> 'pdf' AND source_upload_id IS NULL)"
+    )
+    assert snapshot_checks["ck_source_snapshots_knowledge_generation"] == (
+        "source_type <> 'knowledge_base' OR source_id ~ "
+        "'^(admin|user):kb:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+        "[0-9a-f]{4}-[0-9a-f]{12}$'"
+    )
+    assert upload_checks["ck_source_uploads_sha256"] == (
+        "sha256 ~ '^[0-9a-f]{64}$'"
+    )
+    assert upload_checks["ck_source_uploads_ownership_token"] == (
+        "ownership_token ~ '^[0-9a-f]{32}$'"
+    )
+    assert upload_checks["ck_source_uploads_receipt_state"] == (
+        "(status = 'writing' AND object_revision IS NULL AND last_error_code IS NULL) OR "
+        "(status = 'uploaded' AND object_revision IS NOT NULL AND last_error_code IS NULL) OR "
+        "(status IN ('cleanup_pending', 'failed') AND last_error_code IS NOT NULL)"
+    )
 
 
 def test_classroom_version_has_exactly_one_immutable_provenance() -> None:

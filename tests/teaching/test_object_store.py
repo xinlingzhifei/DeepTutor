@@ -380,6 +380,81 @@ async def test_local_store_persists_exact_source_key_create_only(tmp_path) -> No
     assert await store.list_prefix("tenants/tenant-a/sources/") == ()
 
 
+@pytest.mark.asyncio
+async def test_local_source_reconcile_requires_the_persisted_owner_token(tmp_path) -> None:
+    payload = b"%PDF-durable-owner"
+    digest = hashlib.sha256(payload).hexdigest()
+    key = "tenants/tenant-a/sources/upload-owner/source.pdf"
+    owner_token = "a" * 32
+    store = LocalClassroomArtifactStore(tmp_path, "tenant-a")
+
+    stored = await store.put_verified(
+        key,
+        _body(payload),
+        digest,
+        len(payload),
+        content_type="application/pdf",
+        ownership_token=owner_token,
+    )
+    reconciled = await store.reconcile_verified(
+        key,
+        digest,
+        len(payload),
+        content_type="application/pdf",
+        ownership_token=owner_token,
+    )
+
+    assert reconciled is not None
+    assert reconciled.ownership_token == owner_token
+    assert reconciled.revision == stored.revision
+    with pytest.raises(ObjectStoreConflictError, match="owned"):
+        await store.reconcile_verified(
+            key,
+            digest,
+            len(payload),
+            content_type="application/pdf",
+            ownership_token="b" * 32,
+        )
+
+
+@pytest.mark.asyncio
+async def test_s3_source_reconcile_requires_the_persisted_owner_token(monkeypatch) -> None:
+    payload = b"%PDF-durable-owner"
+    digest = hashlib.sha256(payload).hexdigest()
+    key = "tenants/tenant-a/sources/upload-owner/source.pdf"
+    owner_token = "a" * 32
+    store = _s3_store(monkeypatch, _MemoryS3Client())
+
+    stored = await store.put_verified(
+        key,
+        _body(payload),
+        digest,
+        len(payload),
+        content_type="application/pdf",
+        ownership_token=owner_token,
+    )
+    reconciled = await store.reconcile_verified(
+        key,
+        digest,
+        len(payload),
+        content_type="application/pdf",
+        ownership_token=owner_token,
+    )
+
+    assert reconciled is not None
+    assert reconciled.ownership_token == owner_token
+    assert reconciled.revision == stored.revision
+    assert reconciled.version_id == stored.version_id
+    with pytest.raises(ObjectStoreConflictError, match="owned"):
+        await store.reconcile_verified(
+            key,
+            digest,
+            len(payload),
+            content_type="application/pdf",
+            ownership_token="b" * 32,
+        )
+
+
 @pytest.mark.parametrize(
     "unsafe_key",
     [

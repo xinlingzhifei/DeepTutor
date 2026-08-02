@@ -10,11 +10,12 @@ import uuid
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
+from sqlalchemy.schema import DropSchema
 
 from deeptutor.teaching.contracts import ExportRequest, canonical_json_bytes
 from deeptutor.teaching.dispatcher import OutboxDispatcher
@@ -243,7 +244,35 @@ async def repository_context(generation_database) -> RepositoryContext:
     try:
         yield context
     finally:
-        await engine.dispose()
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "DELETE FROM platform.generation_slots "
+                        "WHERE worker_pool_ref = :worker_pool_ref"
+                    ),
+                    {"worker_pool_ref": WORKER_POOL},
+                )
+                await connection.execute(
+                    DropSchema(tenant_schema_name(tenant_id), cascade=True)
+                )
+                await connection.execute(
+                    text("DELETE FROM platform.tenants WHERE id = :tenant_id"),
+                    {"tenant_id": tenant_id},
+                )
+                await connection.execute(
+                    text("DELETE FROM platform.data_plane_routes WHERE id = :route_id"),
+                    {"route_id": ROUTE_ID},
+                )
+                await connection.execute(
+                    text(
+                        "DELETE FROM platform.provider_profiles "
+                        "WHERE id = :provider_profile_id"
+                    ),
+                    {"provider_profile_id": PROVIDER_ID},
+                )
+        finally:
+            await engine.dispose()
 
 
 def valid_version(context: RepositoryContext) -> PublishedClassroomVersion:
@@ -465,7 +494,17 @@ async def test_plan02_versions_are_backfilled_to_stable_assets(generation_databa
         assert version is not None
         assert version.classroom_id == asset.id
     finally:
-        await engine.dispose()
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    DropSchema(tenant_schema_name(tenant_id), cascade=True)
+                )
+                await connection.execute(
+                    text("DELETE FROM platform.tenants WHERE id = :tenant_id"),
+                    {"tenant_id": tenant_id},
+                )
+        finally:
+            await engine.dispose()
 
 
 @pytest.mark.asyncio

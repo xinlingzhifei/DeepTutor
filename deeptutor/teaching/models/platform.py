@@ -112,6 +112,12 @@ class TenantKnowledgeEntitlement(PlatformBase):
 
     __table_args__ = (
         CheckConstraint("status IN ('active', 'disabled')", name="status"),
+        CheckConstraint(
+            "knowledge_resource_id ~ "
+            "'^(admin|user):kb:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+            "[0-9a-f]{4}-[0-9a-f]{12}$'",
+            name="resource_id",
+        ),
         Index(
             "ix_tenant_knowledge_entitlements_resource_owner_status",
             "knowledge_resource_id",

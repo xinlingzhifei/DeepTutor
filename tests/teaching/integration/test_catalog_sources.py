@@ -5,11 +5,17 @@ import uuid
 
 import pytest
 from sqlalchemy import insert, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
 from deeptutor.multi_user.models import ADMIN_KNOWLEDGE_OWNER_ID
-from deeptutor.teaching.models.classrooms import SourceSnapshot, TenantSourceBinding
+from deeptutor.teaching.artifacts import StoredArtifact
+from deeptutor.teaching.models.classrooms import (
+    SourceSnapshot,
+    SourceUpload,
+    TenantSourceBinding,
+)
 from deeptutor.teaching.models.platform import (
     Tenant,
     TenantKnowledgeEntitlement,
@@ -22,7 +28,8 @@ from deeptutor.teaching.repositories.catalog import (
 )
 from deeptutor.teaching.repositories.sources import (
     NewKnowledgeSnapshot,
-    NewUpload,
+    NewPdfSnapshot,
+    NewUploadReceipt,
     SourceConflictError,
     SourceNotFoundError,
     SqlAlchemySourceRepository,
@@ -140,76 +147,371 @@ async def test_catalog_and_sources_are_isolated_and_upload_dedupe_is_atomic(
 
         digest = "c" * 64
         with pytest.raises(SourceConflictError, match="outside the tenant"):
-            await source_a.create_upload_binding(
-                NewUpload(
+            await source_a.reserve_upload(
+                NewUploadReceipt(
                     upload_id=f"foreign-{suffix}",
-                    snapshot_id=f"foreign-pdf-{suffix}",
-                    filename="foreign.pdf",
                     object_key=(f"tenants/{tenant_b}/sources/foreign-{suffix}/source.pdf"),
                     sha256="e" * 64,
                     size_bytes=1,
-                ),
-                binding_id=source_binding_id(
-                    tenant_a,
-                    f"foreign-pdf-{suffix}",
-                    "course-a",
-                    "class-a",
-                ),
-                course_id="course-a",
-                class_id="class-a",
-                actor_id="teacher-a",
-                permission_sha256="f" * 64,
+                    uploaded_by="teacher-a",
+                    ownership_token=uuid.uuid4().hex,
+                )
             )
-        upload_one = NewUpload(
-            upload_id=f"upload-one-{suffix}",
-            snapshot_id=f"pdf-one-{suffix}",
-            filename="one.pdf",
-            object_key=f"tenants/{tenant_a}/sources/upload-one-{suffix}/source.pdf",
+        upload_id = f"upload-{suffix}"
+        ownership_token = uuid.uuid4().hex
+        receipt = NewUploadReceipt(
+            upload_id=upload_id,
+            object_key=f"tenants/{tenant_a}/sources/{upload_id}/source.pdf",
             sha256=digest,
             size_bytes=123,
+            uploaded_by="teacher-a",
+            ownership_token=ownership_token,
         )
-        upload_two = NewUpload(
-            upload_id=f"upload-two-{suffix}",
-            snapshot_id=f"pdf-two-{suffix}",
-            filename="two.pdf",
-            object_key=f"tenants/{tenant_a}/sources/upload-two-{suffix}/source.pdf",
-            sha256=digest,
-            size_bytes=123,
+        reserved = await asyncio.gather(
+            source_a.reserve_upload(receipt),
+            source_a.reserve_upload(receipt),
         )
+        assert {item.upload_id for item in reserved} == {upload_id}
+        assert {item.status for item in reserved} == {"writing"}
 
+        artifact = StoredArtifact(
+            key=receipt.object_key,
+            sha256=digest,
+            size=123,
+            content_type="application/pdf",
+            ownership_token=ownership_token,
+            revision="revision-1",
+        )
+        completed = await source_a.complete_upload(upload_id, artifact)
+        snapshot_id = f"pdf-{suffix}"
+        snapshot = NewPdfSnapshot(
+            snapshot_id=snapshot_id,
+            upload_id=upload_id,
+            display_name="one.pdf",
+            permission_sha256="d" * 64,
+        )
         results = await asyncio.gather(
-            source_a.create_upload_binding(
-                upload_one,
+            source_a.bind_uploaded_pdf(
+                completed,
+                snapshot,
                 binding_id=source_binding_id(
                     tenant_a,
-                    upload_one.snapshot_id,
+                    snapshot_id,
                     "course-a",
                     "class-a",
                 ),
                 course_id="course-a",
                 class_id="class-a",
                 actor_id="teacher-a",
-                permission_sha256="d" * 64,
             ),
-            source_a.create_upload_binding(
-                upload_two,
+            source_a.bind_uploaded_pdf(
+                completed,
+                snapshot,
                 binding_id=source_binding_id(
                     tenant_a,
-                    upload_two.snapshot_id,
+                    snapshot_id,
                     "course-a",
                     "class-a",
                 ),
                 course_id="course-a",
                 class_id="class-a",
                 actor_id="teacher-a",
-                permission_sha256="d" * 64,
             ),
         )
 
-        assert {retained for _, retained in results} == {False, True}
-        assert results[0][0].binding_id == results[1][0].binding_id
+        assert results[0].binding_id == results[1].binding_id
         assert len(await source_a.list_bindings(None, None)) == 2
         assert await source_b.list_bindings(None, None) == ()
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_source_upload_receipt_state_rejects_illegal_terminals(
+    generation_database,
+) -> None:
+    suffix = uuid.uuid4().hex[:12]
+    tenant_id = f"receipt-state-{suffix}"
+    generation_database.migrate_tenant(tenant_id)
+    engine = create_async_engine(generation_database.url, poolclass=NullPool)
+    tenant_engine = engine.execution_options(
+        schema_translate_map={"tenant": tenant_schema_name(tenant_id)}
+    )
+
+    def row(index: int, **overrides) -> dict[str, object]:
+        values: dict[str, object] = {
+            "id": f"upload-{index}",
+            "tenant_id": tenant_id,
+            "uploaded_by": "teacher-a",
+            "object_key": (
+                f"tenants/{tenant_id}/sources/upload-{index}/source.pdf"
+            ),
+            "sha256": format(index, "x") * 64,
+            "size_bytes": 1,
+            "status": "writing",
+            "ownership_token": format(index, "x") * 32,
+            "object_revision": None,
+            "object_version_id": None,
+            "last_error_code": None,
+        }
+        values.update(overrides)
+        return values
+
+    invalid_rows = (
+        row(1, status="uploaded"),
+        row(2, status="failed"),
+        row(3, status="writing", last_error_code="write_failed"),
+        row(
+            4,
+            status="uploaded",
+            object_revision="revision-4",
+            last_error_code="unexpected_error",
+        ),
+        row(5, status="cleanup_pending"),
+        row(6, status="unknown"),
+    )
+    valid_rows = (
+        row(10),
+        row(11, status="uploaded", object_revision="revision-11"),
+        row(12, status="failed", last_error_code="write_failed"),
+        row(13, status="cleanup_pending", last_error_code="cleanup_requested"),
+    )
+    try:
+        for invalid in invalid_rows:
+            with pytest.raises(IntegrityError):
+                async with tenant_engine.begin() as connection:
+                    await connection.execute(insert(SourceUpload), invalid)
+        async with tenant_engine.begin() as connection:
+            await connection.execute(insert(SourceUpload), valid_rows)
+        async with tenant_engine.connect() as connection:
+            statuses = tuple(
+                await connection.scalars(
+                    text(
+                        f'SELECT status FROM "{tenant_schema_name(tenant_id)}".'
+                        "source_uploads ORDER BY id"
+                    )
+                )
+            )
+        assert statuses == ("writing", "uploaded", "failed", "cleanup_pending")
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_source_upload_sha256_is_unique_only_within_each_tenant(
+    generation_database,
+) -> None:
+    suffix = uuid.uuid4().hex[:12]
+    schema_owner = f"receipt-dedupe-{suffix}"
+    schema_name = tenant_schema_name(schema_owner)
+    generation_database.migrate_tenant(schema_owner)
+    engine = create_async_engine(generation_database.url, poolclass=NullPool)
+
+    def row(upload_id: str, tenant_id: str, token: str) -> dict[str, object]:
+        return {
+            "id": upload_id,
+            "tenant_id": tenant_id,
+            "uploaded_by": "teacher-a",
+            "object_key": f"tenants/{tenant_id}/sources/{upload_id}/source.pdf",
+            "sha256": "a" * 64,
+            "size_bytes": 1,
+            "status": "writing",
+            "ownership_token": token * 32,
+            "object_revision": None,
+            "object_version_id": None,
+            "last_error_code": None,
+        }
+
+    tenant_engine = engine.execution_options(
+        schema_translate_map={"tenant": schema_name}
+    )
+    try:
+        async with tenant_engine.begin() as connection:
+            await connection.execute(
+                insert(SourceUpload),
+                row("upload-a", "tenant-a", "a"),
+            )
+        with pytest.raises(IntegrityError):
+            async with tenant_engine.begin() as connection:
+                await connection.execute(
+                    insert(SourceUpload),
+                    row("upload-b", "tenant-a", "b"),
+                )
+        async with tenant_engine.begin() as connection:
+            await connection.execute(
+                insert(SourceUpload),
+                row("upload-c", "tenant-b", "c"),
+            )
+        async with tenant_engine.connect() as connection:
+            identities = tuple(
+                (
+                    await connection.execute(
+                        text(
+                            f'SELECT tenant_id, sha256 FROM "{schema_name}".'
+                            "source_uploads ORDER BY tenant_id"
+                        )
+                    )
+                ).all()
+            )
+        assert identities == (("tenant-a", "a" * 64), ("tenant-b", "a" * 64))
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_source_scope_composite_constraints_reject_cross_resource_tuples(
+    generation_database,
+) -> None:
+    suffix = uuid.uuid4().hex[:12]
+    tenant_id = f"source-scope-{suffix}"
+    schema_name = tenant_schema_name(tenant_id)
+    generation_database.migrate_tenant(tenant_id)
+    engine = create_async_engine(generation_database.url, poolclass=NullPool)
+
+    async def execute(statement: str, parameters: dict[str, object]) -> None:
+        async with engine.begin() as connection:
+            await connection.execute(text(statement), parameters)
+
+    try:
+        await execute(
+            f"""
+            INSERT INTO "{schema_name}".courses (id, title)
+            VALUES ('course-a', 'Course A'), ('course-b', 'Course B')
+            """,
+            {},
+        )
+        await execute(
+            f"""
+            INSERT INTO "{schema_name}".classes (id, course_id, name)
+            VALUES ('class-a', 'course-a', 'Class A')
+            """,
+            {},
+        )
+        await execute(
+            f"""
+            INSERT INTO "{schema_name}".source_uploads (
+                id, tenant_id, uploaded_by, object_key, sha256, size_bytes,
+                status, ownership_token, object_revision
+            ) VALUES (
+                'upload-a', :tenant_id, 'teacher-a', :object_key, :sha256, 1,
+                'uploaded', :ownership_token, 'revision-a'
+            )
+            """,
+            {
+                "tenant_id": tenant_id,
+                "object_key": f"tenants/{tenant_id}/sources/upload-a/source.pdf",
+                "sha256": "a" * 64,
+                "ownership_token": "a" * 32,
+            },
+        )
+        await execute(
+            f"""
+            INSERT INTO "{schema_name}".source_snapshots (
+                id, tenant_id, source_type, source_id, resource_owner_id,
+                source_upload_id, display_name, source_revision,
+                content_sha256, permission_sha256, citation_manifest, created_by
+            ) VALUES (
+                'snapshot-a', :tenant_id, 'pdf', 'upload-a', 'tenant-workspace',
+                'upload-a', 'book.pdf', :sha256, :sha256, :permission_sha256,
+                '[]', 'teacher-a'
+            )
+            """,
+            {
+                "tenant_id": tenant_id,
+                "sha256": "a" * 64,
+                "permission_sha256": "b" * 64,
+            },
+        )
+
+        invalid_statements = (
+            f"""
+            INSERT INTO "{schema_name}".source_snapshots (
+                id, tenant_id, source_type, source_id, resource_owner_id,
+                source_upload_id, display_name, source_revision,
+                content_sha256, permission_sha256, citation_manifest, created_by
+            ) VALUES (
+                'snapshot-cross-tenant', 'other-tenant', 'pdf', 'upload-a',
+                'tenant-workspace', 'upload-a', 'book.pdf', :sha256, :sha256,
+                :permission_sha256, '[]', 'teacher-a'
+            )
+            """,
+            f"""
+            INSERT INTO "{schema_name}".tenant_source_bindings (
+                id, tenant_id, source_snapshot_id, course_id, class_id, bound_by
+            ) VALUES (
+                'binding-cross-tenant', 'other-tenant', 'snapshot-a',
+                'course-a', NULL, 'teacher-a'
+            )
+            """,
+            f"""
+            INSERT INTO "{schema_name}".tenant_source_bindings (
+                id, tenant_id, source_snapshot_id, course_id, class_id, bound_by
+            ) VALUES (
+                'binding-cross-course', :tenant_id, 'snapshot-a',
+                'course-b', 'class-a', 'teacher-a'
+            )
+            """,
+            f"""
+            INSERT INTO "{schema_name}".teaching_briefs (
+                id, tenant_id, source_snapshot_id, course_id, class_id,
+                brief_version, document, document_sha256, created_by
+            ) VALUES (
+                'brief-cross-tenant', 'other-tenant', 'snapshot-a',
+                'course-a', NULL, 1, '{{}}', :sha256, 'teacher-a'
+            )
+            """,
+            f"""
+            INSERT INTO "{schema_name}".teaching_briefs (
+                id, tenant_id, source_snapshot_id, course_id, class_id,
+                brief_version, document, document_sha256, created_by
+            ) VALUES (
+                'brief-cross-course', :tenant_id, NULL,
+                'course-b', 'class-a', 1, '{{}}', :sha256, 'teacher-a'
+            )
+            """,
+        )
+        for statement in invalid_statements:
+            with pytest.raises(IntegrityError):
+                await execute(
+                    statement,
+                    {
+                        "tenant_id": tenant_id,
+                        "sha256": "c" * 64,
+                        "permission_sha256": "d" * 64,
+                    },
+                )
+
+        await execute(
+            f"""
+            INSERT INTO "{schema_name}".tenant_source_bindings (
+                id, tenant_id, source_snapshot_id, course_id, class_id, bound_by
+            ) VALUES (
+                'binding-valid', :tenant_id, 'snapshot-a',
+                'course-a', 'class-a', 'teacher-a'
+            )
+            """,
+            {"tenant_id": tenant_id},
+        )
+        await execute(
+            f"""
+            INSERT INTO "{schema_name}".teaching_briefs (
+                id, tenant_id, source_snapshot_id, course_id, class_id,
+                brief_version, document, document_sha256, created_by
+            ) VALUES (
+                'brief-valid', :tenant_id, 'snapshot-a',
+                'course-a', 'class-a', 1, '{{}}', :sha256, 'teacher-a'
+            )
+            """,
+            {"tenant_id": tenant_id, "sha256": "e" * 64},
+        )
+        async with engine.connect() as connection:
+            binding_count = await connection.scalar(
+                text(f'SELECT count(*) FROM "{schema_name}".tenant_source_bindings')
+            )
+            brief_count = await connection.scalar(
+                text(f'SELECT count(*) FROM "{schema_name}".teaching_briefs')
+            )
+        assert (int(binding_count or 0), int(brief_count or 0)) == (1, 1)
     finally:
         await engine.dispose()
 
@@ -253,7 +555,7 @@ async def test_knowledge_entitlement_is_active_and_tenant_scoped(generation_data
     suffix = uuid.uuid4().hex[:12]
     tenant_a = f"entitled-a-{suffix}"
     tenant_b = f"entitled-b-{suffix}"
-    resource_id = "admin:kb:math"
+    resource_id = f"admin:kb:{uuid.uuid4()}"
     engine = create_async_engine(generation_database.url, poolclass=NullPool)
     try:
         async with engine.begin() as connection:
@@ -303,7 +605,7 @@ async def test_knowledge_entitlement_is_active_and_tenant_scoped(generation_data
         )
         assert (
             await source_b.is_knowledge_resource_entitled(
-                "admin:kb:other",
+                f"admin:kb:{uuid.uuid4()}",
                 ADMIN_KNOWLEDGE_OWNER_ID,
             )
             is False
@@ -316,7 +618,7 @@ async def test_knowledge_entitlement_is_active_and_tenant_scoped(generation_data
 async def test_personal_knowledge_entitlement_is_owner_scoped(generation_database) -> None:
     suffix = uuid.uuid4().hex[:12]
     tenant_id = f"personal-entitlement-{suffix}"
-    resource_id = "user:kb:course-a"
+    resource_id = f"user:kb:{uuid.uuid4()}"
     engine = create_async_engine(generation_database.url, poolclass=NullPool)
     try:
         async with engine.begin() as connection:

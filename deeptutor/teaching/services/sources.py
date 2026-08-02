@@ -32,8 +32,8 @@ from deeptutor.teaching.object_store import ClassroomArtifactStore
 from deeptutor.teaching.permissions import ResourceScope
 from deeptutor.teaching.repositories.sources import (
     NewKnowledgeSnapshot,
-    NewUpload,
-    SourceConflictError,
+    NewPdfSnapshot,
+    NewUploadReceipt,
     SourceEntitlementDeniedError,
     SourceNotFoundError,
     SourceRecord,
@@ -129,26 +129,39 @@ class SourceRepository(Protocol):
 
     async def find_upload_by_sha256(self, sha256: str) -> UploadRecord | None: ...
 
-    async def bind_existing_upload(
+    async def reserve_upload(
+        self,
+        upload: NewUploadReceipt,
+    ) -> UploadRecord: ...
+
+    async def complete_upload(
+        self,
+        upload_id: str,
+        artifact: StoredArtifact,
+    ) -> UploadRecord: ...
+
+    async def mark_upload_failed(
+        self,
+        upload_id: str,
+        error_code: str,
+        *,
+        cleanup_pending: bool = False,
+    ) -> None: ...
+
+    async def list_reconcilable_uploads(self, limit: int) -> tuple[UploadRecord, ...]: ...
+
+    async def delete_reconciled_upload(self, upload_id: str) -> None: ...
+
+    async def bind_uploaded_pdf(
         self,
         upload: UploadRecord,
+        snapshot: NewPdfSnapshot,
         *,
         binding_id: str,
         course_id: str,
         class_id: str | None,
         actor_id: str,
     ) -> SourceRecord: ...
-
-    async def create_upload_binding(
-        self,
-        upload: NewUpload,
-        *,
-        binding_id: str,
-        course_id: str,
-        class_id: str | None,
-        actor_id: str,
-        permission_sha256: str,
-    ) -> tuple[SourceRecord, bool]: ...
 
     async def bind_knowledge_resource(
         self,
@@ -207,6 +220,21 @@ def _knowledge_resource_owner_id(
     return owner_id
 
 
+def _has_stable_knowledge_generation(resource: KnowledgeResource) -> bool:
+    generation = resource.generation_id
+    if not isinstance(generation, str):
+        return False
+    try:
+        canonical_generation = str(uuid.UUID(generation))
+    except (ValueError, AttributeError):
+        return False
+    return (
+        generation == canonical_generation
+        and resource.source in {"admin", "user"}
+        and resource.id == f"{resource.source}:kb:{generation}"
+    )
+
+
 def _target_permission_sha256(tenant_id: str, course_id: str, class_id: str | None) -> str:
     return hashlib.sha256(
         f"{tenant_id}\0{course_id}\0{class_id or ''}\0source.use".encode()
@@ -223,9 +251,9 @@ def _safe_filename(value: str | None) -> str:
 def knowledge_resource_exists(resource: KnowledgeResource) -> bool:
     """Check the resolved resource against its authoritative KB manager."""
 
-    generation = resource.generation_id
-    if not generation or resource.id != f"{resource.source}:kb:{generation}":
+    if not _has_stable_knowledge_generation(resource):
         return False
+    generation = resource.generation_id
     manager = manager_for_resource(resource)
     entry = manager.get_kb_entry(resource.name)
     if entry is None or entry.get("generation_id") != generation:
@@ -702,6 +730,24 @@ async def _file_chunks(handle: BinaryIO) -> AsyncIterator[bytes]:
         yield chunk
 
 
+async def _await_upload_completion(task: asyncio.Task[UploadRecord]) -> UploadRecord:
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+    try:
+        result = task.result()
+    except BaseException:
+        if cancelled:
+            raise asyncio.CancelledError from None
+        raise
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
+
+
 class SourceService:
     def __init__(
         self,
@@ -718,6 +764,132 @@ class SourceService:
     async def list_sources(self, context: TenantContext) -> tuple[SourceRecord, ...]:
         course_ids, class_ids = _scopes_for_source_list(context)
         return await self._repository.list_bindings(course_ids, class_ids)
+
+    async def _materialize_upload(
+        self,
+        store: ClassroomArtifactStore,
+        receipt: UploadRecord,
+        staged: _StagedPdf,
+    ) -> UploadRecord:
+        try:
+            artifact = await store.reconcile_verified(
+                receipt.object_key,
+                receipt.sha256,
+                receipt.size_bytes,
+                content_type="application/pdf",
+                ownership_token=receipt.ownership_token,
+            )
+        except BaseException:
+            await self._repository.mark_upload_failed(
+                receipt.upload_id,
+                "object_reconcile_failed",
+            )
+            raise
+        if artifact is None:
+            try:
+                artifact = await store.put_verified(
+                    receipt.object_key,
+                    _file_chunks(staged.handle),
+                    receipt.sha256,
+                    receipt.size_bytes,
+                    content_type="application/pdf",
+                    ownership_token=receipt.ownership_token,
+                )
+            except BaseException as write_error:
+                try:
+                    artifact = await store.reconcile_verified(
+                        receipt.object_key,
+                        receipt.sha256,
+                        receipt.size_bytes,
+                        content_type="application/pdf",
+                        ownership_token=receipt.ownership_token,
+                    )
+                except BaseException:
+                    artifact = None
+                if artifact is None:
+                    await self._repository.mark_upload_failed(
+                        receipt.upload_id,
+                        "object_write_failed",
+                    )
+                    raise write_error
+        try:
+            return await self._repository.complete_upload(receipt.upload_id, artifact)
+        except BaseException as finalize_error:
+            refreshed = await self._repository.find_upload_by_sha256(receipt.sha256)
+            if (
+                refreshed is not None
+                and refreshed.status == "uploaded"
+                and refreshed.upload_id == receipt.upload_id
+                and refreshed.object_key == artifact.key
+                and refreshed.sha256 == artifact.sha256
+                and refreshed.size_bytes == artifact.size
+                and refreshed.ownership_token == artifact.ownership_token
+                and refreshed.object_revision == artifact.revision
+                and refreshed.object_version_id == artifact.version_id
+            ):
+                return refreshed
+            await self._repository.mark_upload_failed(
+                receipt.upload_id,
+                "receipt_finalize_failed",
+            )
+            raise finalize_error
+
+    async def _reconcile_pending_with_store(
+        self,
+        store: ClassroomArtifactStore,
+        *,
+        limit: int,
+    ) -> int:
+        receipts = await self._repository.list_reconcilable_uploads(limit)
+        for receipt in receipts:
+            try:
+                artifact = await store.reconcile_verified(
+                    receipt.object_key,
+                    receipt.sha256,
+                    receipt.size_bytes,
+                    content_type="application/pdf",
+                    ownership_token=receipt.ownership_token,
+                )
+                if receipt.status == "cleanup_pending":
+                    cleanup_artifact = artifact or StoredArtifact(
+                        key=receipt.object_key,
+                        sha256=receipt.sha256,
+                        size=receipt.size_bytes,
+                        content_type="application/pdf",
+                        ownership_token=receipt.ownership_token,
+                        revision=receipt.object_revision,
+                        version_id=receipt.object_version_id,
+                    )
+                    await store.delete_owned(cleanup_artifact)
+                    await self._repository.delete_reconciled_upload(receipt.upload_id)
+                elif artifact is not None:
+                    await self._repository.complete_upload(receipt.upload_id, artifact)
+                else:
+                    await self._repository.mark_upload_failed(
+                        receipt.upload_id,
+                        "object_missing",
+                    )
+            except Exception:
+                try:
+                    await self._repository.mark_upload_failed(
+                        receipt.upload_id,
+                        "cleanup_failed"
+                        if receipt.status == "cleanup_pending"
+                        else "reconcile_failed",
+                        cleanup_pending=receipt.status == "cleanup_pending",
+                    )
+                except Exception:
+                    pass
+        return len(receipts)
+
+    async def reconcile_pending_uploads(
+        self,
+        context: TenantContext,
+        *,
+        limit: int = 8,
+    ) -> int:
+        store = await self._store_provider.store_for_tenant(context.tenant_id)
+        return await self._reconcile_pending_with_store(store, limit=limit)
 
     async def bind_knowledge_resource(
         self,
@@ -737,6 +909,7 @@ class SourceService:
             or not stable_id
             or len(stable_id) > 128
             or any(character in stable_id for character in "\x00\r\n")
+            or not _has_stable_knowledge_generation(resource)
         ):
             raise InvalidSourceBindingError("knowledge resource identity is invalid")
         if not self._knowledge_exists(resource):
@@ -793,67 +966,63 @@ class SourceService:
         except BaseException:
             await upload.close()
             raise
+        try:
+            store = await self._store_provider.store_for_tenant(context.tenant_id)
+            await self._reconcile_pending_with_store(store, limit=8)
+        except BaseException:
+            await upload.close()
+            raise
         staged = await _stage_pdf(upload)
         try:
-            existing = await self._repository.find_upload_by_sha256(staged.sha256)
-            if existing is not None:
-                binding_id = source_binding_id(
-                    context.tenant_id,
-                    existing.snapshot_id,
-                    course_id,
-                    class_id,
-                )
-                return await self._repository.bind_existing_upload(
-                    existing,
-                    binding_id=binding_id,
-                    course_id=course_id,
-                    class_id=class_id,
-                    actor_id=context.user_id,
-                )
-
-            upload_id = f"upload-{uuid.uuid4().hex}"
-            snapshot_id = f"pdf-source-{uuid.uuid4().hex}"
-            object_key = source_upload_key(context.tenant_id, upload_id)
-            store = await self._store_provider.store_for_tenant(context.tenant_id)
-            artifact = await store.put_verified(
-                object_key,
-                _file_chunks(staged.handle),
+            upload_id = _digest_id(
+                "upload",
+                context.tenant_id,
                 staged.sha256,
-                staged.size_bytes,
-                content_type="application/pdf",
             )
-            try:
-                binding_id = source_binding_id(
-                    context.tenant_id,
-                    snapshot_id,
-                    course_id,
-                    class_id,
+            object_key = source_upload_key(context.tenant_id, upload_id)
+            receipt = await self._repository.reserve_upload(
+                NewUploadReceipt(
+                    upload_id=upload_id,
+                    object_key=object_key,
+                    sha256=staged.sha256,
+                    size_bytes=staged.size_bytes,
+                    uploaded_by=context.user_id,
+                    ownership_token=uuid.uuid4().hex,
                 )
-                record, retained = await self._repository.create_upload_binding(
-                    NewUpload(
-                        upload_id=upload_id,
-                        snapshot_id=snapshot_id,
-                        filename=staged.filename,
-                        object_key=artifact.key,
-                        sha256=staged.sha256,
-                        size_bytes=staged.size_bytes,
-                    ),
-                    binding_id=binding_id,
-                    course_id=course_id,
-                    class_id=class_id,
-                    actor_id=context.user_id,
+            )
+            completed = await _await_upload_completion(
+                asyncio.create_task(self._materialize_upload(store, receipt, staged))
+            )
+            snapshot_id = _digest_id(
+                "pdf-source",
+                context.tenant_id,
+                completed.upload_id,
+                course_id,
+                class_id or "",
+            )
+            binding_id = source_binding_id(
+                context.tenant_id,
+                snapshot_id,
+                course_id,
+                class_id,
+            )
+            return await self._repository.bind_uploaded_pdf(
+                completed,
+                NewPdfSnapshot(
+                    snapshot_id=snapshot_id,
+                    upload_id=completed.upload_id,
+                    display_name=staged.filename,
                     permission_sha256=_target_permission_sha256(
                         context.tenant_id,
                         course_id,
                         class_id,
                     ),
-                )
-                if not retained:
-                    await asyncio.shield(_cleanup_owned(store, artifact))
-                return record
-            except (SourceConflictError, SourceNotFoundError):
-                await asyncio.shield(_cleanup_owned(store, artifact))
-                raise
+                ),
+                binding_id=binding_id,
+                course_id=course_id,
+                class_id=class_id,
+                actor_id=context.user_id,
+            )
         finally:
             staged.close()
 
@@ -865,14 +1034,6 @@ class SourceService:
             class_id=record.class_id,
         )
         await self._repository.delete_binding(binding_id)
-
-
-async def _cleanup_owned(store: ClassroomArtifactStore, artifact: StoredArtifact) -> None:
-    try:
-        await store.delete_owned(artifact)
-    except Exception:
-        # The original domain/storage failure is authoritative; ownership-bound cleanup is best effort.
-        return
 
 
 __all__ = [

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Index, MetaData, String, func
+from sqlalchemy import DateTime, ForeignKey, Index, MetaData, String, UniqueConstraint, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 _NAMING_CONVENTION = {
@@ -59,7 +59,10 @@ class TeachingClass(TenantBase):
         server_default=func.now(),
     )
 
-    __table_args__ = (Index("ix_classes_course_id", "course_id"),)
+    __table_args__ = (
+        UniqueConstraint("id", "course_id", name="uq_classes_id_course"),
+        Index("ix_classes_course_id", "course_id"),
+    )
 
 
 class Enrollment(TenantBase):

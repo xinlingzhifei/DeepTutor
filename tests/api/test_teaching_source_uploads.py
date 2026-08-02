@@ -20,11 +20,12 @@ from starlette.datastructures import Headers, UploadFile
 from deeptutor.api.routers import teaching_catalog as teaching_router
 from deeptutor.multi_user.models import KnowledgeResource
 from deeptutor.teaching.artifacts import StoredArtifact
-from deeptutor.teaching.object_store import ObjectStoreConfigurationError
+from deeptutor.teaching.object_store import ObjectStoreConfigurationError, ObjectStoreError
 from deeptutor.teaching.permissions import permissions_for_roles
 from deeptutor.teaching.repositories.sources import (
     NewKnowledgeSnapshot,
-    NewUpload,
+    NewPdfSnapshot,
+    NewUploadReceipt,
     SourceConflictError,
     SourceEntitlementDeniedError,
     SourceNotFoundError,
@@ -33,6 +34,11 @@ from deeptutor.teaching.repositories.sources import (
 )
 from deeptutor.teaching.services import sources as source_service_module
 from deeptutor.teaching.tenant_context import TenantContext, require_tenant
+
+_ADMIN_GENERATION = "00000000-0000-4000-8000-000000000001"
+_ADMIN_RESOURCE_ID = f"admin:kb:{_ADMIN_GENERATION}"
+_PERSONAL_GENERATION = "00000000-0000-4000-8000-000000000002"
+_PERSONAL_RESOURCE_ID = f"user:kb:{_PERSONAL_GENERATION}"
 
 
 def _binding_id(snapshot_id: str, course_id: str, class_id: str | None) -> str:
@@ -48,7 +54,9 @@ class _SourceRepository:
         self.uploads: dict[str, UploadRecord] = {}
         self.snapshot_sources: dict[str, tuple[str, str]] = {}
         self.knowledge_snapshots: list[NewKnowledgeSnapshot] = []
+        self.pdf_snapshots: list[NewPdfSnapshot] = []
         self.fail_create: Exception | None = None
+        self.fail_before_persist: BaseException | None = None
         self.fail_after_persist: BaseException | None = None
         self.create_calls = 0
         self.valid_classes = {"class-a": "course-a", "class-b": "course-b"}
@@ -93,13 +101,109 @@ class _SourceRepository:
     async def find_upload_by_sha256(self, sha256):
         return self.uploads.get(sha256)
 
-    async def bind_existing_upload(self, upload, *, binding_id, course_id, class_id, actor_id):
+    async def reserve_upload(self, upload: NewUploadReceipt) -> UploadRecord:
+        self.create_calls += 1
+        existing = self.uploads.get(upload.sha256)
+        if existing is not None:
+            return existing
+        saved = UploadRecord(
+            upload_id=upload.upload_id,
+            object_key=upload.object_key,
+            sha256=upload.sha256,
+            size_bytes=upload.size_bytes,
+            status="writing",
+            ownership_token=upload.ownership_token,
+            object_revision=None,
+            object_version_id=None,
+            last_error_code=None,
+        )
+        self.uploads[upload.sha256] = saved
+        return saved
+
+    async def complete_upload(
+        self,
+        upload_id: str,
+        artifact: StoredArtifact,
+    ) -> UploadRecord:
+        if self.fail_before_persist is not None:
+            raise self.fail_before_persist
+        current = next(
+            upload for upload in self.uploads.values() if upload.upload_id == upload_id
+        )
+        saved = UploadRecord(
+            upload_id=current.upload_id,
+            object_key=current.object_key,
+            sha256=current.sha256,
+            size_bytes=current.size_bytes,
+            status="uploaded",
+            ownership_token=current.ownership_token,
+            object_revision=artifact.revision,
+            object_version_id=artifact.version_id,
+            last_error_code=None,
+        )
+        self.uploads[current.sha256] = saved
+        if self.fail_after_persist is not None:
+            raise self.fail_after_persist
+        return saved
+
+    async def mark_upload_failed(
+        self,
+        upload_id: str,
+        error_code: str,
+        *,
+        cleanup_pending: bool = False,
+    ) -> None:
+        current = next(
+            upload for upload in self.uploads.values() if upload.upload_id == upload_id
+        )
+        self.uploads[current.sha256] = UploadRecord(
+            upload_id=current.upload_id,
+            object_key=current.object_key,
+            sha256=current.sha256,
+            size_bytes=current.size_bytes,
+            status="cleanup_pending" if cleanup_pending else "failed",
+            ownership_token=current.ownership_token,
+            object_revision=current.object_revision,
+            object_version_id=current.object_version_id,
+            last_error_code=error_code,
+        )
+
+    async def list_reconcilable_uploads(self, limit: int):
+        return tuple(
+            upload
+            for upload in self.uploads.values()
+            if upload.status in {"writing", "cleanup_pending", "failed"}
+        )[:limit]
+
+    async def delete_reconciled_upload(self, upload_id: str) -> None:
+        digest = next(
+            digest
+            for digest, upload in self.uploads.items()
+            if upload.upload_id == upload_id
+        )
+        del self.uploads[digest]
+
+    async def bind_uploaded_pdf(
+        self,
+        upload: UploadRecord,
+        snapshot: NewPdfSnapshot,
+        *,
+        binding_id,
+        course_id,
+        class_id,
+        actor_id,
+    ):
+        if self.fail_create is not None:
+            raise self.fail_create
         self._validate_target(course_id, class_id)
+        if all(item.snapshot_id != snapshot.snapshot_id for item in self.pdf_snapshots):
+            self.pdf_snapshots.append(snapshot)
+        self.snapshot_sources[snapshot.snapshot_id] = ("pdf", upload.upload_id)
         record = SourceRecord(
             binding_id=binding_id,
             source_type="pdf",
             source_id=upload.upload_id,
-            filename=upload.filename,
+            filename=snapshot.display_name,
             sha256=upload.sha256,
             size_bytes=upload.size_bytes,
             course_id=course_id,
@@ -107,58 +211,6 @@ class _SourceRepository:
         )
         self.records.setdefault(binding_id, record)
         return self.records[binding_id]
-
-    async def create_upload_binding(
-        self,
-        upload: NewUpload,
-        *,
-        binding_id,
-        course_id,
-        class_id,
-        actor_id,
-        permission_sha256,
-    ):
-        self.create_calls += 1
-        if self.fail_create is not None:
-            raise self.fail_create
-        self._validate_target(course_id, class_id)
-        existing = self.uploads.get(upload.sha256)
-        if existing is not None:
-            actual_binding_id = _binding_id(existing.snapshot_id, course_id, class_id)
-            return (
-                await self.bind_existing_upload(
-                    existing,
-                    binding_id=actual_binding_id,
-                    course_id=course_id,
-                    class_id=class_id,
-                    actor_id=actor_id,
-                ),
-                False,
-            )
-        saved = UploadRecord(
-            upload_id=upload.upload_id,
-            snapshot_id=upload.snapshot_id,
-            filename=upload.filename,
-            object_key=upload.object_key,
-            sha256=upload.sha256,
-            size_bytes=upload.size_bytes,
-        )
-        self.uploads[upload.sha256] = saved
-        self.snapshot_sources[upload.snapshot_id] = ("pdf", upload.upload_id)
-        record = SourceRecord(
-            binding_id=binding_id,
-            source_type="pdf",
-            source_id=upload.upload_id,
-            filename=upload.filename,
-            sha256=upload.sha256,
-            size_bytes=upload.size_bytes,
-            course_id=course_id,
-            class_id=class_id,
-        )
-        self.records[binding_id] = record
-        if self.fail_after_persist is not None:
-            raise self.fail_after_persist
-        return record, True
 
     async def bind_knowledge_resource(
         self,
@@ -207,24 +259,55 @@ class _Store:
     def __init__(self) -> None:
         self.put_calls: list[tuple[str, bytes, str, int, str]] = []
         self.deleted: list[StoredArtifact] = []
+        self.artifacts: dict[str, StoredArtifact] = {}
         self.fail_put = False
 
-    async def put_verified(self, key, body, sha256, size, *, content_type):
+    async def put_verified(
+        self,
+        key,
+        body,
+        sha256,
+        size,
+        *,
+        content_type,
+        ownership_token=None,
+    ):
         if self.fail_put:
             raise ObjectStoreConfigurationError("private storage/key detail")
         payload = b"".join([chunk async for chunk in body])
         self.put_calls.append((key, payload, sha256, size, content_type))
-        return StoredArtifact(
+        artifact = StoredArtifact(
             key=key,
             sha256=sha256,
             size=size,
             content_type=content_type,
-            ownership_token="owned",
+            ownership_token=ownership_token,
             revision="revision-1",
         )
+        self.artifacts[key] = artifact
+        return artifact
+
+    async def reconcile_verified(
+        self,
+        key,
+        sha256,
+        size,
+        *,
+        content_type,
+        ownership_token,
+    ):
+        artifact = self.artifacts.get(key)
+        if artifact is None:
+            return None
+        assert artifact.sha256 == sha256
+        assert artifact.size == size
+        assert artifact.content_type == content_type
+        assert artifact.ownership_token == ownership_token
+        return artifact
 
     async def delete_owned(self, artifact):
         self.deleted.append(artifact)
+        self.artifacts.pop(artifact.key, None)
 
 
 class _StoreProvider:
@@ -241,10 +324,10 @@ class _KnowledgeResolver:
     def __init__(self) -> None:
         self.calls: list[tuple[str, bool]] = []
         self.error: HTTPException | None = None
-        self.resource_id = "admin:kb:math"
+        self.resource_id = _ADMIN_RESOURCE_ID
         self.resource_name = "math"
         self.source = "admin"
-        self.generation_id = ""
+        self.generation_id = _ADMIN_GENERATION
 
     def __call__(self, reference: str, *, require_write: bool):
         self.calls.append((reference, require_write))
@@ -391,6 +474,7 @@ def _upload(
     content_type: str = "application/pdf",
     course_id: str = "course-a",
     class_id: str | None = None,
+    filename: str = "book.pdf",
 ):
     data = {"courseId": course_id}
     if class_id is not None:
@@ -398,7 +482,7 @@ def _upload(
     return client.post(
         "/api/v1/teaching/sources/pdf",
         data=data,
-        files={"file": ("book.pdf", payload, content_type)},
+        files={"file": (filename, payload, content_type)},
     )
 
 
@@ -558,7 +642,38 @@ def test_pdf_sha256_deduplicates_storage_and_binding() -> None:
     assert len(repository.uploads) == 1
 
 
-def test_storage_failure_creates_no_database_rows_and_hides_details() -> None:
+def test_pdf_dedupe_reuses_blob_but_isolates_target_snapshot_name_and_permission() -> None:
+    repository = _SourceRepository()
+    client, store, _ = _client(
+        _context(role="org_admin", scope_type="tenant", scope_id="tenant-a"),
+        repository,
+    )
+    payload = _pdf_bytes()
+
+    first = _upload(
+        client,
+        payload,
+        course_id="course-a",
+        filename="algebra.pdf",
+    )
+    second = _upload(
+        client,
+        payload,
+        course_id="course-b",
+        filename="geometry.pdf",
+    )
+
+    assert first.status_code == second.status_code == 201
+    assert first.json()["bindingId"] != second.json()["bindingId"]
+    assert first.json()["filename"] == "algebra.pdf"
+    assert second.json()["filename"] == "geometry.pdf"
+    assert len(store.put_calls) == 1
+    assert len(repository.uploads) == 1
+    assert len(repository.pdf_snapshots) == 2
+    assert len({snapshot.permission_sha256 for snapshot in repository.pdf_snapshots}) == 2
+
+
+def test_storage_failure_retains_retryable_receipt_and_hides_details() -> None:
     repository = _SourceRepository()
     store = _Store()
     store.fail_put = True
@@ -569,10 +684,222 @@ def test_storage_failure_creates_no_database_rows_and_hides_details() -> None:
     assert response.status_code == 503
     assert "private storage/key detail" not in response.text
     assert repository.records == {}
-    assert repository.create_calls == 0
+    assert repository.create_calls == 1
+    assert {upload.status for upload in repository.uploads.values()} == {"failed"}
 
 
-def test_database_failure_cleans_up_owned_object_and_hides_object_key() -> None:
+def test_upload_receipt_is_durable_before_object_write() -> None:
+    repository = _SourceRepository()
+
+    class _ReceiptObservingStore(_Store):
+        def __init__(self) -> None:
+            super().__init__()
+            self.receipt_observed = False
+
+        async def put_verified(self, key, body, sha256, size, **kwargs):
+            self.receipt_observed = bool(repository.uploads)
+            return await super().put_verified(key, body, sha256, size, **kwargs)
+
+    store = _ReceiptObservingStore()
+    client, _, _ = _client(_context(), repository, store)
+
+    response = _upload(client, _pdf_bytes())
+
+    assert response.status_code == 201
+    assert store.receipt_observed
+
+
+def test_ambiguous_object_write_is_reconciled_from_durable_receipt() -> None:
+    repository = _SourceRepository()
+
+    class _AmbiguousStore(_Store):
+        def __init__(self) -> None:
+            super().__init__()
+            self.created: StoredArtifact | None = None
+            self.reconcile_calls = 0
+
+        async def put_verified(self, key, body, sha256, size, **kwargs):
+            self.created = await super().put_verified(key, body, sha256, size, **kwargs)
+            raise ObjectStoreError("write outcome is ambiguous")
+
+        async def reconcile_verified(self, *args, **kwargs):
+            self.reconcile_calls += 1
+            return self.created
+
+    store = _AmbiguousStore()
+    client, _, _ = _client(_context(), repository, store)
+
+    response = _upload(client, _pdf_bytes())
+
+    assert response.status_code == 201
+    assert len(store.put_calls) == 1
+    assert store.reconcile_calls >= 1
+    assert len(repository.uploads) == 1
+
+
+@pytest.mark.asyncio
+async def test_upload_cancellation_waits_for_receipt_completion() -> None:
+    repository = _SourceRepository()
+
+    class _BlockingStore(_Store):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+            self.was_cancelled = False
+
+        async def put_verified(self, key, body, sha256, size, **kwargs):
+            self.entered.set()
+            try:
+                await self.release.wait()
+            except asyncio.CancelledError:
+                self.was_cancelled = True
+                raise
+            return await super().put_verified(key, body, sha256, size, **kwargs)
+
+    store = _BlockingStore()
+    service = source_service_module.SourceService(
+        repository,
+        _StoreProvider(store),
+        _KnowledgeResolver(),
+        lambda _resource: True,
+    )
+    upload = UploadFile(
+        BytesIO(_pdf_bytes()),
+        filename="book.pdf",
+        headers=Headers({"content-type": "application/pdf"}),
+    )
+    task = asyncio.create_task(
+        service.upload_pdf(
+            _context(),
+            upload=upload,
+            course_id="course-a",
+            class_id=None,
+        )
+    )
+    await asyncio.wait_for(store.entered.wait(), timeout=30)
+
+    task.cancel()
+    store.release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert not store.was_cancelled
+    assert len(repository.uploads) == 1
+    assert {upload.status for upload in repository.uploads.values()} == {"uploaded"}
+    assert repository.records == {}
+
+
+@pytest.mark.asyncio
+async def test_bounded_reconciler_processes_other_sha_and_keeps_failures_retryable() -> None:
+    repository = _SourceRepository()
+    receipts = [
+        UploadRecord(
+            upload_id=f"upload-{index}",
+            object_key=f"tenants/tenant-a/sources/upload-{index}/source.pdf",
+            sha256=str(index) * 64,
+            size_bytes=1,
+            status="writing",
+            ownership_token=f"{index}" * 32,
+            object_revision=None,
+            object_version_id=None,
+            last_error_code=None,
+        )
+        for index in (1, 2, 3)
+    ]
+    repository.uploads = {receipt.sha256: receipt for receipt in receipts}
+
+    class _RecoveryStore(_Store):
+        async def reconcile_verified(self, key, *args, **kwargs):
+            if "upload-2/" in key:
+                raise ObjectStoreError("temporary reconciliation outage")
+            return await super().reconcile_verified(key, *args, **kwargs)
+
+    store = _RecoveryStore()
+    first = receipts[0]
+    store.artifacts[first.object_key] = StoredArtifact(
+        key=first.object_key,
+        sha256=first.sha256,
+        size=first.size_bytes,
+        content_type="application/pdf",
+        ownership_token=first.ownership_token,
+        revision="revision-1",
+    )
+    service = source_service_module.SourceService(
+        repository,
+        _StoreProvider(store),
+        _KnowledgeResolver(),
+        lambda _resource: True,
+    )
+
+    attempted = await service.reconcile_pending_uploads(_context(), limit=2)
+
+    assert attempted == 2
+    assert repository.uploads[receipts[0].sha256].status == "uploaded"
+    failed = repository.uploads[receipts[1].sha256]
+    assert failed.status == "failed"
+    assert failed.last_error_code == "reconcile_failed"
+    assert repository.uploads[receipts[2].sha256].status == "writing"
+
+
+@pytest.mark.asyncio
+async def test_cleanup_pending_receipt_deletes_owned_object_and_receipt() -> None:
+    repository = _SourceRepository()
+    receipt = UploadRecord(
+        upload_id="upload-cleanup",
+        object_key="tenants/tenant-a/sources/upload-cleanup/source.pdf",
+        sha256="a" * 64,
+        size_bytes=1,
+        status="cleanup_pending",
+        ownership_token="a" * 32,
+        object_revision="revision-1",
+        object_version_id=None,
+        last_error_code="cleanup_requested",
+    )
+    repository.uploads = {receipt.sha256: receipt}
+    artifact = StoredArtifact(
+        key=receipt.object_key,
+        sha256=receipt.sha256,
+        size=receipt.size_bytes,
+        content_type="application/pdf",
+        ownership_token=receipt.ownership_token,
+        revision=receipt.object_revision,
+    )
+    store = _Store()
+    store.artifacts[receipt.object_key] = artifact
+    service = source_service_module.SourceService(
+        repository,
+        _StoreProvider(store),
+        _KnowledgeResolver(),
+        lambda _resource: True,
+    )
+
+    attempted = await service.reconcile_pending_uploads(_context(), limit=1)
+
+    assert attempted == 1
+    assert repository.uploads == {}
+    assert store.deleted == [artifact]
+
+
+def test_definitive_receipt_commit_failure_is_retryable_and_never_looks_uploaded() -> None:
+    repository = _SourceRepository()
+    repository.fail_before_persist = RuntimeError("private database detail")
+    client, store, _ = _client(
+        _context(),
+        repository,
+        raise_server_exceptions=False,
+    )
+
+    response = _upload(client, _pdf_bytes())
+
+    assert response.status_code == 500
+    assert "private database detail" not in response.text
+    assert repository.records == {}
+    assert {upload.status for upload in repository.uploads.values()} == {"failed"}
+    assert len(store.artifacts) == 1
+
+
+def test_binding_failure_retains_durable_object_receipt_and_hides_object_key() -> None:
     repository = _SourceRepository()
     repository.fail_create = SourceConflictError("private DB/object key detail")
     client, store, _ = _client(_context(), repository)
@@ -580,12 +907,12 @@ def test_database_failure_cleans_up_owned_object_and_hides_object_key() -> None:
     response = _upload(client, _pdf_bytes())
 
     assert response.status_code == 409
-    assert len(store.deleted) == 1
-    assert store.deleted[0].key.startswith("tenants/tenant-a/")
+    assert store.deleted == []
+    assert {upload.status for upload in repository.uploads.values()} == {"uploaded"}
     assert "private DB/object key detail" not in response.text
 
 
-def test_unknown_post_commit_failure_does_not_delete_retained_source_object() -> None:
+def test_unknown_receipt_commit_outcome_is_reconciled_without_deleting_object() -> None:
     repository = _SourceRepository()
     repository.fail_after_persist = RuntimeError("post-commit read failed")
     client, store, _ = _client(
@@ -596,13 +923,14 @@ def test_unknown_post_commit_failure_does_not_delete_retained_source_object() ->
 
     response = _upload(client, _pdf_bytes())
 
-    assert response.status_code == 500
+    assert response.status_code == 201
     assert repository.records
     assert repository.uploads
+    assert {upload.status for upload in repository.uploads.values()} == {"uploaded"}
     assert store.deleted == []
 
 
-def test_cancelled_commit_outcome_does_not_delete_retained_source_object() -> None:
+def test_cancelled_receipt_commit_outcome_is_reconciled_without_deleting_object() -> None:
     repository = _SourceRepository()
     repository.fail_after_persist = asyncio.CancelledError()
     store = _Store()
@@ -618,18 +946,19 @@ def test_cancelled_commit_outcome_does_not_delete_retained_source_object() -> No
         headers=Headers({"content-type": "application/pdf"}),
     )
 
-    with pytest.raises(asyncio.CancelledError):
-        asyncio.run(
-            service.upload_pdf(
-                _context(),
-                upload=upload,
-                course_id="course-a",
-                class_id=None,
-            )
+    record = asyncio.run(
+        service.upload_pdf(
+            _context(),
+            upload=upload,
+            course_id="course-a",
+            class_id=None,
         )
+    )
 
+    assert record.source_type == "pdf"
     assert repository.records
     assert repository.uploads
+    assert {upload.status for upload in repository.uploads.values()} == {"uploaded"}
     assert store.deleted == []
 
 
@@ -756,15 +1085,17 @@ def test_same_user_requires_independent_knowledge_entitlement_per_tenant() -> No
 
 def test_personal_knowledge_entitlement_is_scoped_to_resource_owner() -> None:
     repository = _SourceRepository()
-    repository.knowledge_entitlements = {("user:kb:course-a", "alice")}
+    repository.knowledge_entitlements = {(_PERSONAL_RESOURCE_ID, "alice")}
     alice_resolver = _KnowledgeResolver()
-    alice_resolver.resource_id = "user:kb:course-a"
+    alice_resolver.resource_id = _PERSONAL_RESOURCE_ID
     alice_resolver.resource_name = "course-a"
     alice_resolver.source = "user"
+    alice_resolver.generation_id = _PERSONAL_GENERATION
     bob_resolver = _KnowledgeResolver()
-    bob_resolver.resource_id = "user:kb:course-a"
+    bob_resolver.resource_id = _PERSONAL_RESOURCE_ID
     bob_resolver.resource_name = "course-a"
     bob_resolver.source = "user"
+    bob_resolver.generation_id = _PERSONAL_GENERATION
     alice_client, _, _ = _client(
         _context(user_id="alice"),
         repository,
@@ -788,8 +1119,8 @@ def test_personal_knowledge_entitlement_is_scoped_to_resource_owner() -> None:
     assert alice.status_code == 201
     assert bob.status_code == 403
     assert repository.entitlement_calls == [
-        ("user:kb:course-a", "alice"),
-        ("user:kb:course-a", "bob"),
+        (_PERSONAL_RESOURCE_ID, "alice"),
+        (_PERSONAL_RESOURCE_ID, "bob"),
     ]
     assert len(repository.records) == 1
     assert [snapshot.resource_owner_id for snapshot in repository.knowledge_snapshots] == ["alice"]
@@ -831,7 +1162,7 @@ def test_recreated_kb_does_not_inherit_old_generation_entitlement() -> None:
 
 def test_admin_knowledge_entitlement_uses_shared_workspace_owner() -> None:
     repository = _SourceRepository()
-    repository.knowledge_entitlements = {("admin:kb:math", "admin-workspace")}
+    repository.knowledge_entitlements = {(_ADMIN_RESOURCE_ID, "admin-workspace")}
     alice_client, _, _ = _client(_context(user_id="alice"), repository)
     bob_client, _, _ = _client(_context(user_id="bob"), repository)
 
@@ -846,8 +1177,8 @@ def test_admin_knowledge_entitlement_uses_shared_workspace_owner() -> None:
 
     assert alice.status_code == bob.status_code == 201
     assert repository.entitlement_calls == [
-        ("admin:kb:math", "admin-workspace"),
-        ("admin:kb:math", "admin-workspace"),
+        (_ADMIN_RESOURCE_ID, "admin-workspace"),
+        (_ADMIN_RESOURCE_ID, "admin-workspace"),
     ]
     assert {snapshot.resource_owner_id for snapshot in repository.knowledge_snapshots} == {
         "admin-workspace"
@@ -860,17 +1191,19 @@ def test_admin_knowledge_entitlement_uses_shared_workspace_owner() -> None:
 def test_personal_knowledge_owner_partitions_snapshot_identity() -> None:
     repository = _SourceRepository()
     repository.knowledge_entitlements = {
-        ("user:kb:course-a", "alice"),
-        ("user:kb:course-a", "bob"),
+        (_PERSONAL_RESOURCE_ID, "alice"),
+        (_PERSONAL_RESOURCE_ID, "bob"),
     }
     alice_resolver = _KnowledgeResolver()
-    alice_resolver.resource_id = "user:kb:course-a"
+    alice_resolver.resource_id = _PERSONAL_RESOURCE_ID
     alice_resolver.resource_name = "course-a"
     alice_resolver.source = "user"
+    alice_resolver.generation_id = _PERSONAL_GENERATION
     bob_resolver = _KnowledgeResolver()
-    bob_resolver.resource_id = "user:kb:course-a"
+    bob_resolver.resource_id = _PERSONAL_RESOURCE_ID
     bob_resolver.resource_name = "course-a"
     bob_resolver.source = "user"
+    bob_resolver.generation_id = _PERSONAL_GENERATION
     alice_client, _, _ = _client(
         _context(user_id="alice"),
         repository,
@@ -930,10 +1263,10 @@ def test_knowledge_binding_stores_only_resolved_stable_resource_id() -> None:
     )
 
     assert response.status_code == 201
-    assert response.json()["sourceId"] == "admin:kb:math"
+    assert response.json()["sourceId"] == _ADMIN_RESOURCE_ID
     assert resolver.calls == [("math-alias", False)]
     snapshot = repository.knowledge_snapshots[0]
-    assert snapshot.resource_id == "admin:kb:math"
+    assert snapshot.resource_id == _ADMIN_RESOURCE_ID
     assert not hasattr(snapshot, "content")
 
 
@@ -946,6 +1279,22 @@ def test_invalid_resolved_knowledge_identity_is_rejected_without_database_write(
     response = client.post(
         "/api/v1/teaching/sources/bind",
         json={"knowledgeResourceId": "math-alias", "courseId": "course-a"},
+    )
+
+    assert response.status_code == 422
+    assert repository.knowledge_snapshots == []
+
+
+def test_name_based_resolved_knowledge_identity_fails_before_database_write() -> None:
+    repository = _SourceRepository()
+    resolver = _KnowledgeResolver()
+    resolver.resource_id = "admin:kb:math"
+    resolver.generation_id = ""
+    client, _, _ = _client(_context(), repository, resolver=resolver)
+
+    response = client.post(
+        "/api/v1/teaching/sources/bind",
+        json={"knowledgeResourceId": "math", "courseId": "course-a"},
     )
 
     assert response.status_code == 422

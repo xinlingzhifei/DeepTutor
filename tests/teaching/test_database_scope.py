@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
 
 import pytest
+from sqlalchemy import CheckConstraint
 
 
 class FakeEngine:
@@ -113,6 +114,17 @@ def test_knowledge_entitlement_identity_includes_resource_owner() -> None:
         "tenant_id",
         "knowledge_resource_id",
         "resource_owner_id",
+    )
+    resource_id_check = next(
+        constraint
+        for constraint in table.constraints
+        if isinstance(constraint, CheckConstraint)
+        and constraint.name == "ck_tenant_knowledge_entitlements_resource_id"
+    )
+    assert str(resource_id_check.sqltext) == (
+        "knowledge_resource_id ~ "
+        "'^(admin|user):kb:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+        "[0-9a-f]{4}-[0-9a-f]{12}$'"
     )
 
 

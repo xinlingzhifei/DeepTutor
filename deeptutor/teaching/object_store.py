@@ -43,6 +43,8 @@ _CLAIM_NAME = ".deeptutor-publish-claim.json"
 _COMMIT_NAME = ".deeptutor-commit.json"
 _INTERNAL_NAMES = frozenset({_CLAIM_NAME, _COMMIT_NAME})
 _LOCAL_SCRATCH_PREFIX = ".deeptutor-scratch-"
+_LOCAL_SOURCE_RECEIPT_DIRECTORY = ".deeptutor-source-receipts"
+_MAX_SOURCE_RECEIPT_SIZE = 2048
 
 
 class ObjectStoreError(Exception):
@@ -82,7 +84,18 @@ class ClassroomArtifactStore(Protocol):
         size: int,
         *,
         content_type: str = "application/octet-stream",
+        ownership_token: str | None = None,
     ) -> StoredArtifact: ...
+
+    async def reconcile_verified(
+        self,
+        key: str,
+        sha256: str,
+        size: int,
+        *,
+        content_type: str,
+        ownership_token: str,
+    ) -> StoredArtifact | None: ...
 
     async def open(self, key: str) -> AsyncIterator[bytes]: ...
 
@@ -193,9 +206,37 @@ def _is_owner_token(value: object) -> bool:
     )
 
 
+def _owner_token(value: str | None) -> str:
+    token = uuid.uuid4().hex if value is None else value
+    if not _is_owner_token(token):
+        raise ObjectStoreIntegrityError("ownership token is invalid")
+    return token
+
+
 def _claim_payload(owner_token: str) -> bytes:
     return json.dumps(
         {"attempt": owner_token, "schema": 1},
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _source_receipt_payload(
+    key: str,
+    sha256: str,
+    size: int,
+    content_type: str,
+    owner_token: str,
+) -> bytes:
+    return json.dumps(
+        {
+            "contentType": content_type,
+            "key": key,
+            "owner": owner_token,
+            "schema": 1,
+            "sha256": sha256,
+            "size": size,
+        },
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
@@ -916,6 +957,59 @@ def _atomic_local_create(
         scratch.unlink(missing_ok=True)
 
 
+def _read_local_source_receipt(path: Path) -> bytes | None:
+    if path.is_symlink():
+        raise ObjectStoreAccessDenied("local source receipt contains a symlink")
+    try:
+        with path.open("rb") as handle:
+            payload = handle.read(_MAX_SOURCE_RECEIPT_SIZE + 1)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise ObjectStoreError("local source receipt could not be read") from None
+    if len(payload) > _MAX_SOURCE_RECEIPT_SIZE:
+        raise ObjectStoreIntegrityError("local source receipt is too large")
+    return payload
+
+
+def _require_local_source_receipt(path: Path, expected: bytes) -> bool:
+    actual = _read_local_source_receipt(path)
+    if actual is None:
+        return False
+    if not hmac.compare_digest(actual, expected):
+        raise ObjectStoreConflictError("source object is not owned by this upload receipt")
+    return True
+
+
+def _ensure_local_source_receipt(path: Path, payload: bytes) -> None:
+    if _require_local_source_receipt(path, payload):
+        return
+    try:
+        _atomic_local_create(
+            path,
+            payload,
+            hashlib.sha256(payload).hexdigest(),
+            len(payload),
+            _JSON_CONTENT_TYPE,
+        )
+    except ObjectStoreConflictError:
+        if not _require_local_source_receipt(path, payload):
+            raise ObjectStoreConflictError(
+                "source object ownership receipt was not created"
+            ) from None
+
+
+def _remove_local_source_receipt(path: Path, expected: bytes) -> None:
+    if not _require_local_source_receipt(path, expected):
+        return
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError:
+        raise ObjectStoreError("local source receipt could not be removed") from None
+
+
 class LocalClassroomArtifactStore(_TenantScopedStore):
     """Filesystem adapter intended only for explicit development/test use."""
 
@@ -949,6 +1043,23 @@ class LocalClassroomArtifactStore(_TenantScopedStore):
         self._assert_no_symlink(candidate)
         _ensure_within_local_root(self._root, candidate)
         return candidate
+
+    def _source_receipt_path(self, key: str) -> Path:
+        safe_key = self._require_scoped_key(key)
+        if _canonical_artifact_kind(safe_key, self.tenant_id) != "source":
+            raise ObjectStoreAccessDenied("ownership receipts require a source key")
+        directory = self._root / _LOCAL_SOURCE_RECEIPT_DIRECTORY
+        if directory.is_symlink():
+            raise ObjectStoreAccessDenied("local source receipt path contains a symlink")
+        try:
+            directory.mkdir(exist_ok=True)
+        except OSError:
+            raise ObjectStoreError("local source receipt directory is unavailable") from None
+        self._assert_no_symlink(directory)
+        path = directory / f"{hashlib.sha256(safe_key.encode()).hexdigest()}.json"
+        self._assert_no_symlink(path)
+        _ensure_within_local_root(self._root, path)
+        return path
 
     async def _read_raw_bytes(self, key: str, max_size: int) -> bytes | None:
         path = self._path_for(key)
@@ -995,6 +1106,7 @@ class LocalClassroomArtifactStore(_TenantScopedStore):
         size: int,
         *,
         content_type: str = "application/octet-stream",
+        ownership_token: str | None = None,
     ) -> StoredArtifact:
         safe_key = self._require_direct_upload_key(key)
         create_only = _canonical_artifact_kind(safe_key, self.tenant_id) == "source"
@@ -1004,7 +1116,20 @@ class LocalClassroomArtifactStore(_TenantScopedStore):
         safe_content_type = _validate_content_type(content_type)
         await asyncio.to_thread(destination.parent.mkdir, parents=True, exist_ok=True)
         destination = self._path_for(safe_key)
-        owner_token = uuid.uuid4().hex
+        owner_token = _owner_token(ownership_token)
+        if create_only:
+            receipt_payload = _source_receipt_payload(
+                safe_key,
+                expected_sha256,
+                expected_size,
+                safe_content_type,
+                owner_token,
+            )
+            await asyncio.to_thread(
+                _ensure_local_source_receipt,
+                self._source_receipt_path(safe_key),
+                receipt_payload,
+            )
 
         temporary_handle = tempfile.NamedTemporaryFile(
             mode="w+b",
@@ -1040,6 +1165,68 @@ class LocalClassroomArtifactStore(_TenantScopedStore):
             await asyncio.to_thread(temporary_handle.close)
             await asyncio.to_thread(temporary_path.unlink, missing_ok=True)
             raise
+        return _stored_artifact(
+            safe_key,
+            expected_sha256,
+            expected_size,
+            safe_content_type,
+            owner_token,
+            revision,
+        )
+
+    async def reconcile_verified(
+        self,
+        key: str,
+        sha256: str,
+        size: int,
+        *,
+        content_type: str,
+        ownership_token: str,
+    ) -> StoredArtifact | None:
+        safe_key = self._require_direct_upload_key(key)
+        expected_sha256 = _validate_sha256(sha256)
+        expected_size = _validate_size(size)
+        safe_content_type = _validate_content_type(content_type)
+        owner_token = _owner_token(ownership_token)
+        source_receipt_path: Path | None = None
+        source_receipt_payload: bytes | None = None
+        if _canonical_artifact_kind(safe_key, self.tenant_id) == "source":
+            source_receipt_path = self._source_receipt_path(safe_key)
+            source_receipt_payload = _source_receipt_payload(
+                safe_key,
+                expected_sha256,
+                expected_size,
+                safe_content_type,
+                owner_token,
+            )
+            receipt_exists = await asyncio.to_thread(
+                _require_local_source_receipt,
+                source_receipt_path,
+                source_receipt_payload,
+            )
+            if not receipt_exists:
+                if await asyncio.to_thread(self._path_for(safe_key).is_file):
+                    raise ObjectStoreConflictError(
+                        "source object has no matching ownership receipt"
+                    )
+                return None
+        artifact = _stored_artifact(
+            safe_key,
+            expected_sha256,
+            expected_size,
+            safe_content_type,
+            owner_token,
+            None,
+        )
+        try:
+            spool, revision = await asyncio.to_thread(
+                _verified_local_spool,
+                self._path_for(safe_key),
+                artifact,
+            )
+        except ObjectStoreNotFound:
+            return None
+        await asyncio.to_thread(spool.close)
         return _stored_artifact(
             safe_key,
             expected_sha256,
@@ -1231,13 +1418,57 @@ class LocalClassroomArtifactStore(_TenantScopedStore):
 
     async def delete_owned(self, artifact: StoredArtifact) -> None:
         path = self._path_for(artifact.key)
+        receipt_path: Path | None = None
+        receipt_payload: bytes | None = None
+        if _canonical_artifact_kind(artifact.key, self.tenant_id) == "source":
+            if not _is_owner_token(artifact.ownership_token):
+                raise ObjectStoreError("object ownership could not be verified")
+            receipt_path = self._source_receipt_path(artifact.key)
+            receipt_payload = _source_receipt_payload(
+                artifact.key,
+                artifact.sha256,
+                artifact.size,
+                artifact.content_type,
+                artifact.ownership_token,
+            )
+            receipt_exists = await asyncio.to_thread(
+                _require_local_source_receipt,
+                receipt_path,
+                receipt_payload,
+            )
+            if not receipt_exists and await asyncio.to_thread(path.is_file):
+                raise ObjectStoreError("object ownership could not be verified")
         try:
             revision = await asyncio.to_thread(_local_revision, path)
         except FileNotFoundError:
+            if receipt_path is not None and receipt_payload is not None:
+                await asyncio.to_thread(
+                    _remove_local_source_receipt,
+                    receipt_path,
+                    receipt_payload,
+                )
             return
-        if artifact.revision is None or revision != artifact.revision:
+        if artifact.revision is not None and revision != artifact.revision:
             raise ObjectStoreError("object ownership could not be verified")
-        await asyncio.to_thread(_quarantine_owned_local, path, artifact)
+        verified_artifact = artifact
+        if artifact.revision is None and receipt_path is not None:
+            verified_artifact = _stored_artifact(
+                artifact.key,
+                artifact.sha256,
+                artifact.size,
+                artifact.content_type,
+                artifact.ownership_token,
+                revision,
+            )
+        if verified_artifact.revision is None:
+            raise ObjectStoreError("object ownership could not be verified")
+        await asyncio.to_thread(_quarantine_owned_local, path, verified_artifact)
+        if receipt_path is not None and receipt_payload is not None:
+            await asyncio.to_thread(
+                _remove_local_source_receipt,
+                receipt_path,
+                receipt_payload,
+            )
 
     async def exists(self, key: str) -> bool:
         path = self._path_for(key)
@@ -1457,13 +1688,14 @@ class S3ClassroomArtifactStore(_TenantScopedStore):
         size: int,
         *,
         content_type: str = "application/octet-stream",
+        ownership_token: str | None = None,
     ) -> StoredArtifact:
         safe_key = self._require_direct_upload_key(key)
         create_only = _canonical_artifact_kind(safe_key, self.tenant_id) == "source"
         expected_sha256 = _validate_sha256(sha256)
         expected_size = _validate_size(size)
         safe_content_type = _validate_content_type(content_type)
-        owner_token = uuid.uuid4().hex
+        owner_token = _owner_token(ownership_token)
         spool = tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode="w+b")
         try:
             await _write_verified(
@@ -1485,6 +1717,25 @@ class S3ClassroomArtifactStore(_TenantScopedStore):
             )
         finally:
             await asyncio.to_thread(spool.close)
+
+    async def reconcile_verified(
+        self,
+        key: str,
+        sha256: str,
+        size: int,
+        *,
+        content_type: str,
+        ownership_token: str,
+    ) -> StoredArtifact | None:
+        safe_key = self._require_direct_upload_key(key)
+        return await self._reconcile_s3_created(
+            safe_key,
+            _validate_sha256(sha256),
+            _validate_size(size),
+            _validate_content_type(content_type),
+            _owner_token(ownership_token),
+            None,
+        )
 
     async def open(self, key: str) -> AsyncIterator[bytes]:
         safe_key, artifact = await self._require_visible_artifact(key)
@@ -1906,11 +2157,7 @@ class S3ClassroomArtifactStore(_TenantScopedStore):
 
     async def delete_owned(self, artifact: StoredArtifact) -> None:
         safe_key = self._require_key(artifact.key)
-        if (
-            artifact.ownership_token is None
-            or artifact.revision is None
-            or artifact.version_id is None
-        ):
+        if artifact.ownership_token is None:
             raise ObjectStoreError("object ownership could not be verified")
         reconciled = await self._reconcile_s3_created(
             safe_key,
@@ -1921,18 +2168,20 @@ class S3ClassroomArtifactStore(_TenantScopedStore):
             None,
             version_id=artifact.version_id,
         )
-        if (
-            reconciled is None
-            or reconciled.revision != artifact.revision
-            or reconciled.version_id != artifact.version_id
-        ):
+        if reconciled is None:
+            return
+        if artifact.revision is not None and reconciled.revision != artifact.revision:
+            raise ObjectStoreError("object ownership could not be verified")
+        if artifact.version_id is not None and reconciled.version_id != artifact.version_id:
+            raise ObjectStoreError("object ownership could not be verified")
+        if reconciled.version_id is None:
             raise ObjectStoreError("object ownership could not be verified")
         try:
             await asyncio.to_thread(
                 self._client.delete_object,
                 Bucket=self._bucket,
                 Key=safe_key,
-                VersionId=artifact.version_id,
+                VersionId=reconciled.version_id,
             )
         except (BotoCoreError, ClientError) as exc:
             _raise_s3_error(exc)

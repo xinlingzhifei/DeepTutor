@@ -14,6 +14,7 @@ import pytest
 from sqlalchemy import func, make_url, select, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.schema import DropSchema
 from testcontainers.community.postgres import PostgresContainer
 
 from deeptutor.teaching.models import PlatformBase, TenantBase
@@ -1946,7 +1947,7 @@ def test_knowledge_entitlement_downgrade_refuses_data_without_mutation(
                             granted_by
                         ) VALUES (
                             :tenant_id,
-                            'admin:kb:math',
+                            'admin:kb:00000000-0000-4000-8000-000000000001',
                             'admin-workspace',
                             'active',
                             'admin-a'
@@ -2025,6 +2026,207 @@ def test_knowledge_entitlement_downgrade_refuses_data_without_mutation(
     )
 
 
+def test_source_receipt_migration_builds_durable_tenant_scoped_schema(
+    migration_database,
+) -> None:
+    tenant_id = "source-receipt-schema"
+    schema_name = tenant_schema_name(tenant_id)
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(migration_database, "scope=platform"),
+    )
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(
+            migration_database,
+            "scope=tenant",
+            f"tenant_schema={schema_name}",
+        ),
+    )
+
+    async def inspect() -> tuple[set[str], set[str], set[str]]:
+        engine = create_async_engine(migration_database.url)
+        try:
+            async with engine.connect() as connection:
+                upload_columns = set(
+                    (
+                        await connection.execute(
+                            text(
+                                """
+                                SELECT column_name
+                                FROM information_schema.columns
+                                WHERE table_schema = :schema_name
+                                  AND table_name = 'source_uploads'
+                                """
+                            ),
+                            {"schema_name": schema_name},
+                        )
+                    ).scalars()
+                )
+                tenant_constraints = set(
+                    (
+                        await connection.execute(
+                            text(
+                                """
+                                SELECT constraint_name
+                                FROM information_schema.table_constraints
+                                WHERE constraint_schema = :schema_name
+                                  AND table_name IN (
+                                      'classes', 'source_snapshots',
+                                      'source_uploads', 'tenant_source_bindings',
+                                      'teaching_briefs'
+                                  )
+                                """
+                            ),
+                            {"schema_name": schema_name},
+                        )
+                    ).scalars()
+                )
+                platform_constraints = set(
+                    (
+                        await connection.execute(
+                            text(
+                                """
+                                SELECT constraint_name
+                                FROM information_schema.table_constraints
+                                WHERE constraint_schema = 'platform'
+                                  AND table_name = 'tenant_knowledge_entitlements'
+                                """
+                            )
+                        )
+                    ).scalars()
+                )
+                return upload_columns, tenant_constraints, platform_constraints
+        finally:
+            await engine.dispose()
+
+    upload_columns, tenant_constraints, platform_constraints = asyncio.run(inspect())
+    assert {"source_snapshot_id", "filename"}.isdisjoint(upload_columns)
+    assert {
+        "ownership_token",
+        "object_revision",
+        "object_version_id",
+        "last_error_code",
+        "updated_at",
+    }.issubset(upload_columns)
+    assert {
+        "uq_classes_id_course",
+        "uq_source_snapshots_id_tenant",
+        "uq_source_uploads_id_tenant",
+        "uq_source_uploads_tenant_sha256",
+        "fk_source_snapshots_upload_tenant",
+        "fk_tenant_source_bindings_snapshot_tenant",
+        "fk_tenant_source_bindings_class_course",
+        "fk_teaching_briefs_snapshot_tenant",
+        "fk_teaching_briefs_class_course",
+        "ck_source_snapshots_pdf_upload",
+        "ck_source_snapshots_knowledge_generation",
+        "ck_source_uploads_receipt_state",
+    }.issubset(tenant_constraints)
+    assert "ck_tenant_knowledge_entitlements_resource_id" in platform_constraints
+
+
+def test_source_receipt_migration_refuses_unverifiable_legacy_upload_without_mutation(
+    migration_database,
+) -> None:
+    tenant_id = "source-receipt-legacy-guard"
+    schema_name = tenant_schema_name(tenant_id)
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(migration_database, "scope=platform"),
+    )
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(
+            migration_database,
+            "scope=tenant",
+            f"tenant_schema={schema_name}",
+            revision="20260802_0008",
+        ),
+    )
+
+    async def seed_and_inspect() -> tuple[str, bool, bool, int]:
+        engine = create_async_engine(migration_database.url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        f"""
+                        INSERT INTO "{schema_name}".source_uploads (
+                            id, tenant_id, uploaded_by, filename, object_key,
+                            sha256, size_bytes, status
+                        ) VALUES (
+                            'legacy-upload', :tenant_id, 'teacher-a', 'legacy.pdf',
+                            :object_key, :sha256, 4, 'uploaded'
+                        )
+                        """
+                    ),
+                    {
+                        "tenant_id": tenant_id,
+                        "object_key": (
+                            f"tenants/{tenant_id}/sources/legacy-upload/source.pdf"
+                        ),
+                        "sha256": "a" * 64,
+                    },
+                )
+            refused = _run_alembic(
+                migration_database,
+                "scope=tenant",
+                f"tenant_schema={schema_name}",
+            )
+            safe_output = _assert_secret_safe_output(migration_database, refused)
+            assert refused.returncode != 0, safe_output
+            assert (
+                "cannot upgrade durable source uploads: legacy object receipts "
+                "cannot be ownership-verified" in safe_output
+            )
+            async with engine.connect() as connection:
+                revision = await connection.scalar(
+                    text(f'SELECT version_num FROM "{schema_name}".alembic_version')
+                )
+                owner_column = bool(
+                    await connection.scalar(
+                        text(
+                            """
+                            SELECT EXISTS (
+                                SELECT 1 FROM information_schema.columns
+                                WHERE table_schema = :schema_name
+                                  AND table_name = 'source_snapshots'
+                                  AND column_name = 'resource_owner_id'
+                            )
+                            """
+                        ),
+                        {"schema_name": schema_name},
+                    )
+                )
+                token_column = bool(
+                    await connection.scalar(
+                        text(
+                            """
+                            SELECT EXISTS (
+                                SELECT 1 FROM information_schema.columns
+                                WHERE table_schema = :schema_name
+                                  AND table_name = 'source_uploads'
+                                  AND column_name = 'ownership_token'
+                            )
+                            """
+                        ),
+                        {"schema_name": schema_name},
+                    )
+                )
+                count = int(
+                    await connection.scalar(
+                        text(f'SELECT count(*) FROM "{schema_name}".source_uploads')
+                    )
+                    or 0
+                )
+                return str(revision), owner_column, token_column, count
+        finally:
+            await engine.dispose()
+
+    assert asyncio.run(seed_and_inspect()) == ("20260802_0008", False, False, 1)
+
+
 def test_source_owner_migration_backfills_and_guards_owner_collisions(
     migration_database,
 ) -> None:
@@ -2058,18 +2260,15 @@ def test_source_owner_migration_backfills_and_guards_owner_collisions(
                         ) VALUES
                             (
                                 'admin-source', :tenant_id, 'knowledge_base',
-                                'admin:kb:math', 'binding-v1', :admin_content,
+                                'admin:kb:00000000-0000-4000-8000-000000000001',
+                                'binding-v1', :admin_content,
                                 :admin_permission, '[]', 'teacher-a'
                             ),
                             (
                                 'alice-source', :tenant_id, 'knowledge_base',
-                                'user:kb:course-a', 'binding-v1', :alice_content,
+                                'user:kb:00000000-0000-4000-8000-000000000002',
+                                'binding-v1', :alice_content,
                                 :alice_permission, '[]', 'alice'
-                            ),
-                            (
-                                'pdf-source', :tenant_id, 'pdf', 'upload-a',
-                                'pdf-v1', :pdf_content, :pdf_permission, '[]',
-                                'alice'
                             )
                         """
                     ),
@@ -2079,8 +2278,6 @@ def test_source_owner_migration_backfills_and_guards_owner_collisions(
                         "admin_permission": "2" * 64,
                         "alice_content": "3" * 64,
                         "alice_permission": "4" * 64,
-                        "pdf_content": "5" * 64,
-                        "pdf_permission": "6" * 64,
                     },
                 )
         finally:
@@ -2161,7 +2358,8 @@ def test_source_owner_migration_backfills_and_guards_owner_collisions(
                             permission_sha256, citation_manifest, created_by
                         ) VALUES (
                             'bob-source', :tenant_id, 'knowledge_base',
-                            'user:kb:course-a', 'bob', 'binding-v1',
+                            'user:kb:00000000-0000-4000-8000-000000000002',
+                            'bob', 'binding-v1',
                             :content_sha256, :permission_sha256, '[]', 'bob'
                         )
                         """
@@ -2227,7 +2425,6 @@ def test_source_owner_migration_backfills_and_guards_owner_collisions(
         {
             "admin-source": "admin-workspace",
             "alice-source": "alice",
-            "pdf-source": "tenant-workspace",
         },
         True,
         (
@@ -2236,8 +2433,9 @@ def test_source_owner_migration_backfills_and_guards_owner_collisions(
             "source_id",
             "resource_owner_id",
             "source_revision",
+            "permission_sha256",
         ),
-        3,
+        2,
     )
 
     asyncio.run(insert_bob_collision())
@@ -2251,7 +2449,7 @@ def test_source_owner_migration_backfills_and_guards_owner_collisions(
     safe_output = _assert_secret_safe_output(migration_database, refused)
     assert refused.returncode != 0, safe_output
     assert "owner-scoped snapshots would collide" in safe_output
-    assert asyncio.run(inspect_head())[-1] == 4
+    assert asyncio.run(inspect_head())[-1] == 3
 
     asyncio.run(delete_bob_collision())
     _assert_migration_succeeded(
@@ -2264,7 +2462,7 @@ def test_source_owner_migration_backfills_and_guards_owner_collisions(
             revision="20260802_0008",
         ),
     )
-    assert asyncio.run(inspect_0008()) == ("20260802_0008", False, 3)
+    assert asyncio.run(inspect_0008()) == ("20260802_0008", False, 2)
     _assert_migration_succeeded(
         migration_database,
         _run_alembic(
@@ -2276,7 +2474,6 @@ def test_source_owner_migration_backfills_and_guards_owner_collisions(
     assert asyncio.run(inspect_head())[1] == {
         "admin-source": "admin-workspace",
         "alice-source": "alice",
-        "pdf-source": "tenant-workspace",
     }
 
 
@@ -3405,18 +3602,51 @@ def test_classroom_lifecycle_downgrade_blocks_writer_started_after_guard(
             await blocker.close()
             await engine.dispose()
 
-    completed, writer_waited, writer_error, state_revision, alembic_revision, table_exists = (
-        asyncio.run(race_downgrade())
-    )
-    _assert_migration_succeeded(migration_database, completed)
-    assert writer_waited
-    assert isinstance(writer_error, DBAPIError)
-    assert getattr(writer_error.orig, "sqlstate", None) == "42P01"
-    assert (state_revision, alembic_revision, table_exists) == (
-        "20260801_0007",
-        "20260801_0007",
-        False,
-    )
+    async def cleanup_platform_residue() -> None:
+        engine = create_async_engine(migration_database.url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "DELETE FROM platform.tenant_provisioning_jobs "
+                        "WHERE tenant_id = :tenant_id"
+                    ),
+                    {"tenant_id": tenant_id},
+                )
+                await connection.execute(
+                    text(
+                        "DELETE FROM platform.tenant_schema_states "
+                        "WHERE tenant_id = :tenant_id"
+                    ),
+                    {"tenant_id": tenant_id},
+                )
+                await connection.execute(
+                    text("DELETE FROM platform.tenants WHERE id = :tenant_id"),
+                    {"tenant_id": tenant_id},
+                )
+        finally:
+            await engine.dispose()
+
+    try:
+        (
+            completed,
+            writer_waited,
+            writer_error,
+            state_revision,
+            alembic_revision,
+            table_exists,
+        ) = asyncio.run(race_downgrade())
+        _assert_migration_succeeded(migration_database, completed)
+        assert writer_waited
+        assert isinstance(writer_error, DBAPIError)
+        assert getattr(writer_error.orig, "sqlstate", None) == "42P01"
+        assert (state_revision, alembic_revision, table_exists) == (
+            "20260801_0007",
+            "20260801_0007",
+            False,
+        )
+    finally:
+        asyncio.run(cleanup_platform_residue())
 
 
 @pytest.mark.parametrize(
@@ -3776,26 +4006,60 @@ def test_classroom_lifecycle_downgrade_allows_reconstructible_plan02_backfill(
         finally:
             await engine.dispose()
 
-    asyncio.run(seed_plan02_version())
-    _assert_migration_succeeded(
-        migration_database,
-        _run_alembic(
+    async def cleanup() -> None:
+        engine = create_async_engine(migration_database.url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(DropSchema(schema_name, cascade=True))
+                await connection.execute(
+                    text(
+                        "DELETE FROM platform.tenant_provisioning_jobs "
+                        "WHERE tenant_id = :tenant_id"
+                    ),
+                    {"tenant_id": tenant_id},
+                )
+                await connection.execute(
+                    text(
+                        "DELETE FROM platform.tenant_schema_states "
+                        "WHERE tenant_id = :tenant_id"
+                    ),
+                    {"tenant_id": tenant_id},
+                )
+                await connection.execute(
+                    text("DELETE FROM platform.tenants WHERE id = :tenant_id"),
+                    {"tenant_id": tenant_id},
+                )
+        finally:
+            await engine.dispose()
+
+    try:
+        asyncio.run(seed_plan02_version())
+        _assert_migration_succeeded(
             migration_database,
-            "scope=tenant",
-            f"tenant_schema={schema_name}",
-        ),
-    )
-    _assert_migration_succeeded(
-        migration_database,
-        _run_alembic(
+            _run_alembic(
+                migration_database,
+                "scope=tenant",
+                f"tenant_schema={schema_name}",
+            ),
+        )
+        _assert_migration_succeeded(
             migration_database,
-            "scope=tenant",
-            f"tenant_schema={schema_name}",
-            action="downgrade",
-            revision="20260801_0007",
-        ),
-    )
-    assert asyncio.run(inspect()) == ("20260801_0007", "20260801_0007", 1, False)
+            _run_alembic(
+                migration_database,
+                "scope=tenant",
+                f"tenant_schema={schema_name}",
+                action="downgrade",
+                revision="20260801_0007",
+            ),
+        )
+        assert asyncio.run(inspect()) == (
+            "20260801_0007",
+            "20260801_0007",
+            1,
+            False,
+        )
+    finally:
+        asyncio.run(cleanup())
 
 
 def test_postgres_claims_are_unique_and_stale_same_owner_token_is_fenced(

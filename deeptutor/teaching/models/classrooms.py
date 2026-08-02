@@ -62,6 +62,8 @@ class SourceSnapshot(TenantBase):
     source_type: Mapped[str] = mapped_column(String(32))
     source_id: Mapped[str] = mapped_column(String(128))
     resource_owner_id: Mapped[str] = mapped_column(String(128))
+    source_upload_id: Mapped[str | None] = mapped_column(String(128))
+    display_name: Mapped[str | None] = mapped_column(String(512))
     source_revision: Mapped[str] = mapped_column(String(128))
     content_sha256: Mapped[str] = mapped_column(String(64))
     permission_sha256: Mapped[str] = mapped_column(String(64))
@@ -73,12 +75,36 @@ class SourceSnapshot(TenantBase):
     )
 
     __table_args__ = (
+        CheckConstraint(
+            "(source_type = 'pdf' AND source_upload_id IS NOT NULL "
+            "AND display_name IS NOT NULL) OR "
+            "(source_type <> 'pdf' AND source_upload_id IS NULL)",
+            name="pdf_upload",
+        ),
+        CheckConstraint(
+            "source_type <> 'knowledge_base' OR source_id ~ "
+            "'^(admin|user):kb:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+            "[0-9a-f]{4}-[0-9a-f]{12}$'",
+            name="knowledge_generation",
+        ),
+        ForeignKeyConstraint(
+            ["source_upload_id", "tenant_id"],
+            ["tenant.source_uploads.id", "tenant.source_uploads.tenant_id"],
+            name="fk_source_snapshots_upload_tenant",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint(
+            "id",
+            "tenant_id",
+            name="uq_source_snapshots_id_tenant",
+        ),
         UniqueConstraint(
             "tenant_id",
             "source_type",
             "source_id",
             "resource_owner_id",
             "source_revision",
+            "permission_sha256",
             name="uq_source_snapshots_tenant_source_revision",
         ),
     )
@@ -93,16 +119,12 @@ class TenantSourceBinding(TenantBase):
     tenant_id: Mapped[str] = mapped_column(String(64))
     source_snapshot_id: Mapped[str] = mapped_column(
         String(128),
-        ForeignKey("tenant.source_snapshots.id", ondelete="RESTRICT"),
     )
     course_id: Mapped[str | None] = mapped_column(
         String(64),
         ForeignKey("tenant.courses.id", ondelete="CASCADE"),
     )
-    class_id: Mapped[str | None] = mapped_column(
-        String(64),
-        ForeignKey("tenant.classes.id", ondelete="CASCADE"),
-    )
+    class_id: Mapped[str | None] = mapped_column(String(64))
     bound_by: Mapped[str] = mapped_column(String(128))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -113,6 +135,22 @@ class TenantSourceBinding(TenantBase):
         CheckConstraint(
             "course_id IS NOT NULL OR class_id IS NOT NULL",
             name="resource_scope",
+        ),
+        CheckConstraint(
+            "class_id IS NULL OR course_id IS NOT NULL",
+            name="class_requires_course",
+        ),
+        ForeignKeyConstraint(
+            ["source_snapshot_id", "tenant_id"],
+            ["tenant.source_snapshots.id", "tenant.source_snapshots.tenant_id"],
+            name="fk_tenant_source_bindings_snapshot_tenant",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["class_id", "course_id"],
+            ["tenant.classes.id", "tenant.classes.course_id"],
+            name="fk_tenant_source_bindings_class_course",
+            ondelete="CASCADE",
         ),
         Index("ix_tenant_source_bindings_snapshot", "source_snapshot_id"),
     )
@@ -125,23 +163,47 @@ class SourceUpload(TenantBase):
 
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
     tenant_id: Mapped[str] = mapped_column(String(64))
-    source_snapshot_id: Mapped[str | None] = mapped_column(
-        String(128),
-        ForeignKey("tenant.source_snapshots.id", ondelete="RESTRICT"),
-    )
     uploaded_by: Mapped[str] = mapped_column(String(128))
-    filename: Mapped[str] = mapped_column(String(512))
     object_key: Mapped[str] = mapped_column(String(512))
     sha256: Mapped[str] = mapped_column(String(64))
     size_bytes: Mapped[int] = mapped_column(BigInteger)
-    status: Mapped[str] = mapped_column(String(32), server_default="uploaded")
+    status: Mapped[str] = mapped_column(String(32), server_default="writing")
+    ownership_token: Mapped[str] = mapped_column(String(32))
+    object_revision: Mapped[str | None] = mapped_column(String(256))
+    object_version_id: Mapped[str | None] = mapped_column(String(256))
+    last_error_code: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
     )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
 
     __table_args__ = (
         CheckConstraint("size_bytes >= 0", name="size_bytes"),
+        CheckConstraint("sha256 ~ '^[0-9a-f]{64}$'", name="sha256"),
+        CheckConstraint(
+            "ownership_token ~ '^[0-9a-f]{32}$'",
+            name="ownership_token",
+        ),
+        CheckConstraint(
+            "status IN ('writing', 'uploaded', 'cleanup_pending', 'failed')",
+            name="status",
+        ),
+        CheckConstraint(
+            "(status = 'writing' AND object_revision IS NULL "
+            "AND last_error_code IS NULL) OR "
+            "(status = 'uploaded' AND object_revision IS NOT NULL "
+            "AND last_error_code IS NULL) OR "
+            "(status IN ('cleanup_pending', 'failed') "
+            "AND last_error_code IS NOT NULL)",
+            name="receipt_state",
+        ),
+        UniqueConstraint("id", "tenant_id", name="uq_source_uploads_id_tenant"),
+        UniqueConstraint("tenant_id", "sha256", name="uq_source_uploads_tenant_sha256"),
         UniqueConstraint(
             "tenant_id",
             "object_key",
@@ -159,16 +221,12 @@ class TeachingBrief(TenantBase):
     tenant_id: Mapped[str] = mapped_column(String(64))
     source_snapshot_id: Mapped[str | None] = mapped_column(
         String(128),
-        ForeignKey("tenant.source_snapshots.id", ondelete="RESTRICT"),
     )
     course_id: Mapped[str | None] = mapped_column(
         String(64),
         ForeignKey("tenant.courses.id", ondelete="RESTRICT"),
     )
-    class_id: Mapped[str | None] = mapped_column(
-        String(64),
-        ForeignKey("tenant.classes.id", ondelete="RESTRICT"),
-    )
+    class_id: Mapped[str | None] = mapped_column(String(64))
     brief_version: Mapped[int] = mapped_column(Integer)
     document: Mapped[str] = mapped_column(Text)
     document_sha256: Mapped[str] = mapped_column(String(64))
@@ -178,7 +236,25 @@ class TeachingBrief(TenantBase):
         server_default=func.now(),
     )
 
-    __table_args__ = (CheckConstraint("brief_version > 0", name="brief_version"),)
+    __table_args__ = (
+        CheckConstraint("brief_version > 0", name="brief_version"),
+        CheckConstraint(
+            "class_id IS NULL OR course_id IS NOT NULL",
+            name="class_requires_course",
+        ),
+        ForeignKeyConstraint(
+            ["source_snapshot_id", "tenant_id"],
+            ["tenant.source_snapshots.id", "tenant.source_snapshots.tenant_id"],
+            name="fk_teaching_briefs_snapshot_tenant",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["class_id", "course_id"],
+            ["tenant.classes.id", "tenant.classes.course_id"],
+            name="fk_teaching_briefs_class_course",
+            ondelete="RESTRICT",
+        ),
+    )
 
 
 class ClassroomAsset(TenantBase):
