@@ -1,0 +1,13 @@
+.openmaic-surface {
+  --openmaic-font-sans:
+    var(--font-sans), "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  --openmaic-font-serif:
+    var(--font-serif), "Songti SC", "STSong", serif;
+
+  font-family: var(--openmaic-font-sans);
+}
+
+.openmaic-surface :where(code, kbd, pre, samp) {
+  font-family:
+    ui-monospace, "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+}

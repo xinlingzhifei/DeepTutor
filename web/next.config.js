@@ -56,6 +56,7 @@ const NEXT_PUBLIC_AUTH_ENABLED = normalizeBoolean(
     "false",
   ),
 );
+const IS_VISUAL_BASELINE = process.env.PW_VISUAL_BASELINE === "1";
 
 process.env.NEXT_PUBLIC_API_BASE = NEXT_PUBLIC_API_BASE;
 process.env.NEXT_PUBLIC_AUTH_ENABLED = NEXT_PUBLIC_AUTH_ENABLED;
@@ -76,6 +77,15 @@ const APP_VERSION = (() => {
 })();
 
 const nextConfig = {
+  ...(IS_VISUAL_BASELINE
+    ? {
+        onDemandEntries: {
+          maxInactiveAge: 30 * 60 * 1000,
+          pagesBufferLength: 10,
+        },
+      }
+    : {}),
+
   // Expose the build-time version to the browser so the sidebar badge
   // can compare it against GitHub's latest release.
   env: {

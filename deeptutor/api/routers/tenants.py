@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from deeptutor.api.routers.auth import (
     _COOKIE_MAX_AGE,
@@ -16,8 +18,10 @@ from deeptutor.api.routers.auth import (
 from deeptutor.multi_user.context import get_current_user
 from deeptutor.services.auth import TokenPayload
 from deeptutor.services.config import load_platform_settings
-from deeptutor.teaching.permissions import DEFAULT_ROLE_PERMISSIONS
+from deeptutor.teaching.permissions import DEFAULT_ROLE_PERMISSIONS, RoleGrant
 from deeptutor.teaching.repositories.tenants import (
+    GrantResourceNotFoundError,
+    InvalidGrantScopeError,
     ProvisioningSummary,
     TenantAccessDeniedError,
     TenantConflictError,
@@ -96,11 +100,12 @@ class ProvisioningStatusResponse(BaseModel):
     attempt_count: int
 
 
-class AddMemberRequest(BaseModel):
-    user_id: str = Field(min_length=1, max_length=128)
-    role: str = "student"
+class MemberRoleGrant(BaseModel):
+    role: str = Field(min_length=1, max_length=64)
+    scope_type: Literal["tenant", "course", "class"]
+    scope_id: str = Field(min_length=1, max_length=64)
 
-    @field_validator("user_id", "role")
+    @field_validator("role", "scope_id")
     @classmethod
     def normalize_fields(cls, value: str) -> str:
         normalized = value.strip()
@@ -116,12 +121,47 @@ class AddMemberRequest(BaseModel):
         return value
 
 
+class AddMemberRequest(BaseModel):
+    user_id: str = Field(min_length=1, max_length=128)
+    role: str | None = None
+    grants: list[MemberRoleGrant] | None = Field(default=None, min_length=1)
+
+    @field_validator("user_id")
+    @classmethod
+    def normalize_user_id(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("value is required")
+        return normalized
+
+    @field_validator("role")
+    @classmethod
+    def normalize_role(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if normalized not in DEFAULT_ROLE_PERMISSIONS:
+            raise ValueError("unknown role")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_grant_shape(self) -> AddMemberRequest:
+        if self.grants is not None and self.role is not None:
+            raise ValueError("provide exactly one of role or grants")
+        if self.grants is None and self.role is None:
+            self.role = "student"
+        return self
+
+
 class ReplaceGrantsRequest(BaseModel):
-    roles: list[str] = Field(min_length=1)
+    roles: list[str] | None = Field(default=None, min_length=1)
+    grants: list[MemberRoleGrant] | None = Field(default=None, min_length=1)
 
     @field_validator("roles")
     @classmethod
-    def validate_roles(cls, values: list[str]) -> list[str]:
+    def validate_roles(cls, values: list[str] | None) -> list[str] | None:
+        if values is None:
+            return None
         normalized = [value.strip() for value in values]
         if (
             not normalized
@@ -131,11 +171,42 @@ class ReplaceGrantsRequest(BaseModel):
             raise ValueError("unknown role")
         return list(dict.fromkeys(normalized))
 
+    @model_validator(mode="after")
+    def validate_one_grant_shape(self) -> ReplaceGrantsRequest:
+        if (self.roles is None) == (self.grants is None):
+            raise ValueError("provide exactly one of roles or grants")
+        return self
+
 
 class MemberGrantsResponse(BaseModel):
     tenant_id: str
     user_id: str
     roles: list[str]
+    grants: list[MemberRoleGrant]
+
+
+def _member_grants_response(
+    tenant_id: str,
+    user_id: str,
+    grants: frozenset[RoleGrant],
+) -> MemberGrantsResponse:
+    ordered_grants = sorted(
+        grants,
+        key=lambda grant: (grant.role, grant.scope_type, grant.scope_id),
+    )
+    return MemberGrantsResponse(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        roles=sorted({grant.role for grant in grants}),
+        grants=[
+            MemberRoleGrant(
+                role=grant.role,
+                scope_type=grant.scope_type,
+                scope_id=grant.scope_id,
+            )
+            for grant in ordered_grants
+        ],
+    )
 
 
 def _raise_repository_http(error: Exception) -> None:
@@ -153,6 +224,16 @@ def _raise_repository_http(error: Exception) -> None:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="No active membership for tenant",
+        ) from error
+    if isinstance(error, GrantResourceNotFoundError):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Scoped grant resource not found",
+        ) from error
+    if isinstance(error, InvalidGrantScopeError):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Invalid scoped grant",
         ) from error
     if isinstance(error, (TenantConflictError, UnknownRoleError)):
         raise HTTPException(
@@ -324,21 +405,42 @@ async def add_member(
     repository: TenantRepository = Depends(get_tenant_repository),
 ) -> MemberGrantsResponse:
     _require_tenant_management(context, tenant_id)
-    roles = frozenset({body.role})
+    if body.grants is not None:
+        grants = frozenset(
+            RoleGrant(
+                role=grant.role,
+                scope_type=grant.scope_type,
+                scope_id=grant.scope_id,
+            )
+            for grant in body.grants
+        )
+    else:
+        assert body.role is not None
+        grants = frozenset(
+            {
+                RoleGrant(
+                    role=body.role,
+                    scope_type="tenant",
+                    scope_id=tenant_id,
+                )
+            }
+        )
     try:
-        await repository.upsert_member(tenant_id, body.user_id, roles)
+        await repository.upsert_member_with_scoped_grants(
+            tenant_id,
+            body.user_id,
+            grants,
+        )
     except (
+        GrantResourceNotFoundError,
+        InvalidGrantScopeError,
         TenantAccessDeniedError,
         TenantConflictError,
         TenantNotFoundError,
         UnknownRoleError,
     ) as exc:
         _raise_repository_http(exc)
-    return MemberGrantsResponse(
-        tenant_id=tenant_id,
-        user_id=body.user_id,
-        roles=sorted(roles),
-    )
+    return _member_grants_response(tenant_id, body.user_id, grants)
 
 
 @router.put(
@@ -360,22 +462,45 @@ async def replace_member_grants(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Invalid user_id",
         )
-    roles = frozenset(body.roles)
-    try:
-        await repository.replace_grants(
-            tenant_id,
-            normalized_user_id,
-            roles,
+    if body.grants is not None:
+        grants = frozenset(
+            RoleGrant(
+                role=grant.role,
+                scope_type=grant.scope_type,
+                scope_id=grant.scope_id,
+            )
+            for grant in body.grants
         )
+    else:
+        roles = frozenset(body.roles or ())
+        grants = frozenset(
+            RoleGrant(
+                role=role,
+                scope_type="tenant",
+                scope_id=tenant_id,
+            )
+            for role in roles
+        )
+    try:
+        if body.grants is not None:
+            await repository.replace_scoped_grants(
+                tenant_id,
+                normalized_user_id,
+                grants,
+            )
+        else:
+            await repository.replace_grants(
+                tenant_id,
+                normalized_user_id,
+                roles,
+            )
     except (
+        GrantResourceNotFoundError,
+        InvalidGrantScopeError,
         TenantAccessDeniedError,
         TenantConflictError,
         TenantNotFoundError,
         UnknownRoleError,
     ) as exc:
         _raise_repository_http(exc)
-    return MemberGrantsResponse(
-        tenant_id=tenant_id,
-        user_id=normalized_user_id,
-        roles=sorted(roles),
-    )
+    return _member_grants_response(tenant_id, normalized_user_id, grants)

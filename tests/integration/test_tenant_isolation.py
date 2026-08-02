@@ -28,12 +28,12 @@ from deeptutor.teaching.artifacts import temporary_artifact_key, tenant_artifact
 from deeptutor.teaching.models import (
     AuditLog,
     Course,
-    DataPlaneRoute,
     PlatformBase,
     Tenant,
     TenantBase,
     TenantMembership,
     TenantProvisioningJob,
+    TenantSchemaState,
     TenantStorageCredential,
 )
 from deeptutor.teaching.object_store import (
@@ -207,14 +207,16 @@ async def _initialize_database(database_url: str) -> None:
                             user_id=USER_B,
                             status="active",
                         ),
-                        DataPlaneRoute(
+                        TenantSchemaState(
                             tenant_id=TENANT_A,
                             schema_name=tenant_schema_name(TENANT_A),
+                            revision="20260730_0005",
                             status="active",
                         ),
-                        DataPlaneRoute(
+                        TenantSchemaState(
                             tenant_id=TENANT_B,
                             schema_name=tenant_schema_name(TENANT_B),
+                            revision="20260730_0005",
                             status="active",
                         ),
                         TenantStorageCredential(

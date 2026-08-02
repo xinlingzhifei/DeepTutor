@@ -6,14 +6,28 @@ from dataclasses import dataclass, field
 from pathlib import Path, PureWindowsPath
 
 _CONTENT_TYPES_BY_SUFFIX = {
+    ".gif": frozenset({"image/gif"}),
     ".css": frozenset({"text/css"}),
     ".html": frozenset({"text/html"}),
     ".htm": frozenset({"text/html"}),
     ".js": frozenset({"application/javascript", "text/javascript"}),
     ".json": frozenset({"application/json"}),
+    ".jpeg": frozenset({"image/jpeg"}),
+    ".jpg": frozenset({"image/jpeg"}),
     ".mermaid": frozenset({"text/vnd.mermaid"}),
     ".mmd": frozenset({"text/vnd.mermaid"}),
+    ".mp3": frozenset({"audio/mpeg"}),
+    ".mp4": frozenset({"video/mp4"}),
+    ".png": frozenset({"image/png"}),
+    ".pptx": frozenset(
+        {
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        }
+    ),
     ".svg": frozenset({"image/svg+xml"}),
+    ".wav": frozenset({"audio/wav", "audio/x-wav"}),
+    ".webp": frozenset({"image/webp"}),
+    ".zip": frozenset({"application/zip"}),
 }
 
 

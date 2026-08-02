@@ -1,0 +1,1235 @@
+{
+  "$comment": "confirmedOutlineSha256 is the SHA-256 of the canonical UTF-8 JSON serialization of the entire confirmed OutlineBundle: camelCase keys, omitted nulls, schema-declared RFC 3339 timestamps normalized to UTC with a Z suffix, sorted keys, compact separators, and UTF-8 bytes.",
+  "$defs": {
+    "AssessmentPlan": {
+      "additionalProperties": false,
+      "properties": {
+        "methods": {
+          "items": {
+            "enum": [
+              "quiz",
+              "discussion",
+              "project",
+              "observation",
+              "self_assessment"
+            ],
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Methods",
+          "type": "array"
+        },
+        "successCriteria": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Successcriteria",
+          "type": "array"
+        }
+      },
+      "required": [
+        "methods",
+        "successCriteria"
+      ],
+      "title": "AssessmentPlan",
+      "type": "object"
+    },
+    "ExportFormat": {
+      "enum": [
+        "classroom_zip",
+        "pptx",
+        "offline_html",
+        "mp4"
+      ],
+      "title": "ExportFormat",
+      "type": "string"
+    },
+    "GenerationMetadata": {
+      "additionalProperties": false,
+      "properties": {
+        "generatedAt": {
+          "format": "date-time",
+          "title": "Generatedat",
+          "type": "string"
+        },
+        "generator": {
+          "minLength": 1,
+          "title": "Generator",
+          "type": "string"
+        },
+        "generatorVersion": {
+          "minLength": 1,
+          "title": "Generatorversion",
+          "type": "string"
+        },
+        "modelId": {
+          "minLength": 1,
+          "title": "Modelid",
+          "type": "string"
+        },
+        "teachingBriefId": {
+          "minLength": 1,
+          "title": "Teachingbriefid",
+          "type": "string"
+        },
+        "teachingBriefSha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Teachingbriefsha256",
+          "type": "string"
+        },
+        "templateId": {
+          "minLength": 1,
+          "title": "Templateid",
+          "type": "string"
+        },
+        "templateVersion": {
+          "minLength": 1,
+          "title": "Templateversion",
+          "type": "string"
+        }
+      },
+      "required": [
+        "generator",
+        "generatorVersion",
+        "modelId",
+        "generatedAt",
+        "teachingBriefId",
+        "teachingBriefSha256",
+        "templateId",
+        "templateVersion"
+      ],
+      "title": "GenerationMetadata",
+      "type": "object"
+    },
+    "KnowledgeCoverage": {
+      "additionalProperties": false,
+      "properties": {
+        "knowledgePointId": {
+          "minLength": 1,
+          "title": "Knowledgepointid",
+          "type": "string"
+        },
+        "sceneIds": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Sceneids",
+          "type": "array"
+        }
+      },
+      "required": [
+        "knowledgePointId",
+        "sceneIds"
+      ],
+      "title": "KnowledgeCoverage",
+      "type": "object"
+    },
+    "KnowledgePoint": {
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "minLength": 1,
+          "title": "Description",
+          "type": "string"
+        },
+        "knowledgePointId": {
+          "minLength": 1,
+          "title": "Knowledgepointid",
+          "type": "string"
+        },
+        "title": {
+          "minLength": 1,
+          "title": "Title",
+          "type": "string"
+        }
+      },
+      "required": [
+        "knowledgePointId",
+        "title",
+        "description"
+      ],
+      "title": "KnowledgePoint",
+      "type": "object"
+    },
+    "KnowledgePrerequisite": {
+      "additionalProperties": false,
+      "properties": {
+        "knowledgePointId": {
+          "minLength": 1,
+          "title": "Knowledgepointid",
+          "type": "string"
+        },
+        "prerequisiteKnowledgePointIds": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Prerequisiteknowledgepointids",
+          "type": "array"
+        }
+      },
+      "required": [
+        "knowledgePointId",
+        "prerequisiteKnowledgePointIds"
+      ],
+      "title": "KnowledgePrerequisite",
+      "type": "object"
+    },
+    "MediaPolicy": {
+      "additionalProperties": false,
+      "properties": {
+        "allowGeneration": {
+          "title": "Allowgeneration",
+          "type": "boolean"
+        },
+        "allowedMimeTypes": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Allowedmimetypes",
+          "type": "array"
+        }
+      },
+      "required": [
+        "allowGeneration",
+        "allowedMimeTypes"
+      ],
+      "title": "MediaPolicy",
+      "type": "object"
+    },
+    "NetworkPolicy": {
+      "additionalProperties": false,
+      "properties": {
+        "allowWebAccess": {
+          "title": "Allowwebaccess",
+          "type": "boolean"
+        },
+        "allowedDomains": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Alloweddomains",
+          "type": "array"
+        }
+      },
+      "required": [
+        "allowWebAccess",
+        "allowedDomains"
+      ],
+      "title": "NetworkPolicy",
+      "type": "object"
+    },
+    "OutlineBundle": {
+      "additionalProperties": false,
+      "properties": {
+        "confirmationMetadata": {
+          "$ref": "#/$defs/OutlineConfirmationMetadata"
+        },
+        "contractSha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Contractsha256",
+          "type": "string"
+        },
+        "estimatedSceneCount": {
+          "minimum": 1,
+          "title": "Estimatedscenecount",
+          "type": "integer"
+        },
+        "generationMetadata": {
+          "$ref": "#/$defs/GenerationMetadata"
+        },
+        "knowledgeCoverage": {
+          "items": {
+            "$ref": "#/$defs/KnowledgeCoverage"
+          },
+          "minItems": 1,
+          "title": "Knowledgecoverage",
+          "type": "array"
+        },
+        "language": {
+          "minLength": 1,
+          "title": "Language",
+          "type": "string"
+        },
+        "outlineId": {
+          "minLength": 1,
+          "title": "Outlineid",
+          "type": "string"
+        },
+        "outlineVersion": {
+          "minimum": 1,
+          "title": "Outlineversion",
+          "type": "integer"
+        },
+        "scenes": {
+          "items": {
+            "$ref": "#/$defs/OutlineScene"
+          },
+          "minItems": 1,
+          "title": "Scenes",
+          "type": "array"
+        },
+        "schemaVersion": {
+          "const": "1.0",
+          "title": "Schemaversion",
+          "type": "string"
+        },
+        "sourceRefs": {
+          "items": {
+            "$ref": "#/$defs/SourceReference"
+          },
+          "title": "Sourcerefs",
+          "type": "array"
+        },
+        "title": {
+          "minLength": 1,
+          "title": "Title",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "outlineId",
+        "outlineVersion",
+        "confirmationMetadata",
+        "title",
+        "language",
+        "scenes",
+        "knowledgeCoverage",
+        "sourceRefs",
+        "estimatedSceneCount",
+        "generationMetadata",
+        "contractSha256"
+      ],
+      "title": "OutlineBundle",
+      "type": "object"
+    },
+    "OutlineConfirmationMetadata": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "confirmed"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "confirmedAt": {
+                "format": "date-time",
+                "type": "string"
+              },
+              "confirmedBy": {
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "confirmedAt",
+              "confirmedBy"
+            ]
+          }
+        }
+      ],
+      "properties": {
+        "confirmedAt": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Confirmedat"
+        },
+        "confirmedBy": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Confirmedby"
+        },
+        "status": {
+          "enum": [
+            "draft",
+            "confirmed"
+          ],
+          "title": "Status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "title": "OutlineConfirmationMetadata",
+      "type": "object"
+    },
+    "OutlineScene": {
+      "additionalProperties": false,
+      "properties": {
+        "knowledgePointIds": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Knowledgepointids",
+          "type": "array"
+        },
+        "sceneId": {
+          "minLength": 1,
+          "title": "Sceneid",
+          "type": "string"
+        },
+        "sourceRefs": {
+          "items": {
+            "$ref": "#/$defs/SourceReference"
+          },
+          "title": "Sourcerefs",
+          "type": "array"
+        },
+        "summary": {
+          "minLength": 1,
+          "title": "Summary",
+          "type": "string"
+        },
+        "title": {
+          "minLength": 1,
+          "title": "Title",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sceneId",
+        "title",
+        "summary",
+        "knowledgePointIds",
+        "sourceRefs"
+      ],
+      "title": "OutlineScene",
+      "type": "object"
+    },
+    "PermissionSummary": {
+      "additionalProperties": false,
+      "properties": {
+        "allowedFragmentIds": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Allowedfragmentids",
+          "type": "array"
+        },
+        "allowedSourceIds": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Allowedsourceids",
+          "type": "array"
+        },
+        "attributionRequired": {
+          "title": "Attributionrequired",
+          "type": "boolean"
+        },
+        "usageScope": {
+          "minLength": 1,
+          "title": "Usagescope",
+          "type": "string"
+        }
+      },
+      "required": [
+        "allowedSourceIds",
+        "allowedFragmentIds",
+        "usageScope",
+        "attributionRequired"
+      ],
+      "title": "PermissionSummary",
+      "type": "object"
+    },
+    "SafetyPolicy": {
+      "additionalProperties": false,
+      "properties": {
+        "blockedCategories": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Blockedcategories",
+          "type": "array"
+        },
+        "policyId": {
+          "minLength": 1,
+          "title": "Policyid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "policyId",
+        "blockedCategories"
+      ],
+      "title": "SafetyPolicy",
+      "type": "object"
+    },
+    "SourceCitation": {
+      "additionalProperties": false,
+      "properties": {
+        "citationId": {
+          "minLength": 1,
+          "title": "Citationid",
+          "type": "string"
+        },
+        "fragmentId": {
+          "minLength": 1,
+          "title": "Fragmentid",
+          "type": "string"
+        },
+        "label": {
+          "minLength": 1,
+          "title": "Label",
+          "type": "string"
+        },
+        "sourceId": {
+          "minLength": 1,
+          "title": "Sourceid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "citationId",
+        "sourceId",
+        "fragmentId",
+        "label"
+      ],
+      "title": "SourceCitation",
+      "type": "object"
+    },
+    "SourceFragment": {
+      "additionalProperties": false,
+      "properties": {
+        "contentSha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Contentsha256",
+          "type": "string"
+        },
+        "fragmentId": {
+          "minLength": 1,
+          "title": "Fragmentid",
+          "type": "string"
+        },
+        "sourceId": {
+          "minLength": 1,
+          "title": "Sourceid",
+          "type": "string"
+        },
+        "text": {
+          "minLength": 1,
+          "title": "Text",
+          "type": "string"
+        }
+      },
+      "required": [
+        "fragmentId",
+        "sourceId",
+        "text",
+        "contentSha256"
+      ],
+      "title": "SourceFragment",
+      "type": "object"
+    },
+    "SourceReference": {
+      "additionalProperties": false,
+      "properties": {
+        "citationId": {
+          "minLength": 1,
+          "title": "Citationid",
+          "type": "string"
+        },
+        "fragmentId": {
+          "minLength": 1,
+          "title": "Fragmentid",
+          "type": "string"
+        },
+        "sourceId": {
+          "minLength": 1,
+          "title": "Sourceid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "citationId",
+        "sourceId",
+        "fragmentId"
+      ],
+      "title": "SourceReference",
+      "type": "object"
+    },
+    "SourceSnapshot": {
+      "additionalProperties": false,
+      "properties": {
+        "contentSha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Contentsha256",
+          "type": "string"
+        },
+        "createdAt": {
+          "format": "date-time",
+          "title": "Createdat",
+          "type": "string"
+        },
+        "snapshotId": {
+          "minLength": 1,
+          "title": "Snapshotid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "snapshotId",
+        "createdAt",
+        "contentSha256"
+      ],
+      "title": "SourceSnapshot",
+      "type": "object"
+    },
+    "TeachingBrief": {
+      "$comment": "Draft 2020-12 enforces non-empty source structures for source_grounded. SourceFragment fragmentId, SourceCitation citationId, and SourceReference triple uniqueness plus cross-array lineage require semantic validation against permissionSummary allowlists.",
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "contentMode": {
+                "const": "source_grounded"
+              }
+            },
+            "required": [
+              "contentMode"
+            ]
+          },
+          "then": {
+            "properties": {
+              "citations": {
+                "minItems": 1
+              },
+              "permissionSummary": {
+                "properties": {
+                  "allowedFragmentIds": {
+                    "minItems": 1,
+                    "uniqueItems": true
+                  },
+                  "allowedSourceIds": {
+                    "minItems": 1,
+                    "uniqueItems": true
+                  }
+                }
+              },
+              "sourceFragments": {
+                "minItems": 1
+              },
+              "sourceRefs": {
+                "minItems": 1
+              },
+              "sourceSnapshot": {
+                "not": {
+                  "type": "null"
+                }
+              }
+            }
+          }
+        }
+      ],
+      "properties": {
+        "assessment": {
+          "$ref": "#/$defs/AssessmentPlan"
+        },
+        "audienceLevel": {
+          "minLength": 1,
+          "title": "Audiencelevel",
+          "type": "string"
+        },
+        "briefId": {
+          "minLength": 1,
+          "title": "Briefid",
+          "type": "string"
+        },
+        "briefVersion": {
+          "minimum": 1,
+          "title": "Briefversion",
+          "type": "integer"
+        },
+        "citations": {
+          "items": {
+            "$ref": "#/$defs/SourceCitation"
+          },
+          "title": "Citations",
+          "type": "array"
+        },
+        "classroomMode": {
+          "enum": [
+            "micro",
+            "full"
+          ],
+          "title": "Classroommode",
+          "type": "string"
+        },
+        "contentMode": {
+          "enum": [
+            "source_grounded",
+            "open_creation"
+          ],
+          "title": "Contentmode",
+          "type": "string"
+        },
+        "contentSha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Contentsha256",
+          "type": "string"
+        },
+        "courseId": {
+          "minLength": 1,
+          "title": "Courseid",
+          "type": "string"
+        },
+        "durationMinutes": {
+          "minimum": 1,
+          "title": "Durationminutes",
+          "type": "integer"
+        },
+        "gradeBand": {
+          "minLength": 1,
+          "title": "Gradeband",
+          "type": "string"
+        },
+        "knowledgePoints": {
+          "items": {
+            "$ref": "#/$defs/KnowledgePoint"
+          },
+          "minItems": 1,
+          "title": "Knowledgepoints",
+          "type": "array"
+        },
+        "mediaPolicy": {
+          "$ref": "#/$defs/MediaPolicy"
+        },
+        "networkPolicy": {
+          "$ref": "#/$defs/NetworkPolicy"
+        },
+        "objectives": {
+          "items": {
+            "$ref": "#/$defs/TeachingObjective"
+          },
+          "minItems": 1,
+          "title": "Objectives",
+          "type": "array"
+        },
+        "permissionSummary": {
+          "$ref": "#/$defs/PermissionSummary"
+        },
+        "prerequisites": {
+          "items": {
+            "$ref": "#/$defs/KnowledgePrerequisite"
+          },
+          "title": "Prerequisites",
+          "type": "array"
+        },
+        "safetyPolicy": {
+          "$ref": "#/$defs/SafetyPolicy"
+        },
+        "schemaVersion": {
+          "const": "1.0",
+          "title": "Schemaversion",
+          "type": "string"
+        },
+        "sourceFragments": {
+          "items": {
+            "$ref": "#/$defs/SourceFragment"
+          },
+          "title": "Sourcefragments",
+          "type": "array"
+        },
+        "sourceRefs": {
+          "items": {
+            "$ref": "#/$defs/SourceReference"
+          },
+          "title": "Sourcerefs",
+          "type": "array"
+        },
+        "sourceSnapshot": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SourceSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "targetClassId": {
+          "minLength": 1,
+          "title": "Targetclassid",
+          "type": "string"
+        },
+        "templatePolicy": {
+          "$ref": "#/$defs/TemplatePolicy"
+        },
+        "tenantId": {
+          "minLength": 1,
+          "title": "Tenantid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "briefId",
+        "briefVersion",
+        "tenantId",
+        "courseId",
+        "targetClassId",
+        "gradeBand",
+        "audienceLevel",
+        "classroomMode",
+        "objectives",
+        "durationMinutes",
+        "knowledgePoints",
+        "prerequisites",
+        "assessment",
+        "sourceSnapshot",
+        "sourceFragments",
+        "citations",
+        "sourceRefs",
+        "permissionSummary",
+        "contentMode",
+        "networkPolicy",
+        "mediaPolicy",
+        "templatePolicy",
+        "safetyPolicy",
+        "contentSha256"
+      ],
+      "title": "TeachingBrief",
+      "type": "object"
+    },
+    "TeachingObjective": {
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "minLength": 1,
+          "title": "Description",
+          "type": "string"
+        },
+        "knowledgePointIds": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Knowledgepointids",
+          "type": "array"
+        },
+        "objectiveId": {
+          "minLength": 1,
+          "title": "Objectiveid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "objectiveId",
+        "description",
+        "knowledgePointIds"
+      ],
+      "title": "TeachingObjective",
+      "type": "object"
+    },
+    "TemplatePolicy": {
+      "additionalProperties": false,
+      "properties": {
+        "templateId": {
+          "minLength": 1,
+          "title": "Templateid",
+          "type": "string"
+        },
+        "templateVersion": {
+          "minLength": 1,
+          "title": "Templateversion",
+          "type": "string"
+        }
+      },
+      "required": [
+        "templateId",
+        "templateVersion"
+      ],
+      "title": "TemplatePolicy",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "not": {
+            "anyOf": [
+              {
+                "required": [
+                  "confirmedOutline"
+                ]
+              },
+              {
+                "required": [
+                  "confirmedOutlineSha256"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "properties": {
+            "confirmedOutline": {
+              "type": "null"
+            },
+            "confirmedOutlineSha256": {
+              "type": "null"
+            }
+          },
+          "required": [
+            "confirmedOutline",
+            "confirmedOutlineSha256"
+          ]
+        },
+        {
+          "properties": {
+            "confirmedOutline": {
+              "not": {
+                "type": "null"
+              }
+            },
+            "confirmedOutlineSha256": {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "confirmedOutline",
+            "confirmedOutlineSha256"
+          ]
+        }
+      ]
+    },
+    {
+      "if": {
+        "properties": {
+          "phase": {
+            "const": "content"
+          }
+        },
+        "required": [
+          "phase"
+        ]
+      },
+      "then": {
+        "properties": {
+          "confirmedOutline": {
+            "not": {
+              "type": "null"
+            }
+          },
+          "confirmedOutlineSha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "confirmedOutline",
+          "confirmedOutlineSha256"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "phase": {
+            "const": "content"
+          }
+        },
+        "required": [
+          "phase"
+        ]
+      },
+      "then": {
+        "properties": {
+          "confirmedOutline": {
+            "properties": {
+              "confirmationMetadata": {
+                "properties": {
+                  "status": {
+                    "const": "confirmed"
+                  }
+                },
+                "required": [
+                  "status"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "oneOf": [
+        {
+          "properties": {
+            "classroomMode": {
+              "const": "micro"
+            },
+            "phase": {
+              "const": "micro"
+            }
+          },
+          "required": [
+            "phase",
+            "classroomMode"
+          ]
+        },
+        {
+          "properties": {
+            "classroomMode": {
+              "const": "full"
+            },
+            "phase": {
+              "enum": [
+                "outline",
+                "content"
+              ]
+            }
+          },
+          "required": [
+            "phase",
+            "classroomMode"
+          ]
+        }
+      ]
+    },
+    {
+      "if": {
+        "properties": {
+          "classroomMode": {
+            "const": "micro"
+          }
+        },
+        "required": [
+          "classroomMode"
+        ]
+      },
+      "then": {
+        "properties": {
+          "teachingBrief": {
+            "properties": {
+              "classroomMode": {
+                "const": "micro"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "classroomMode": {
+            "const": "full"
+          }
+        },
+        "required": [
+          "classroomMode"
+        ]
+      },
+      "then": {
+        "properties": {
+          "teachingBrief": {
+            "properties": {
+              "classroomMode": {
+                "const": "full"
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "properties": {
+    "callbackContext": {
+      "minLength": 1,
+      "pattern": "^[^:\\s]+$",
+      "title": "Callbackcontext",
+      "type": "string"
+    },
+    "classroomMode": {
+      "enum": [
+        "micro",
+        "full"
+      ],
+      "title": "Classroommode",
+      "type": "string"
+    },
+    "confirmedOutline": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/OutlineBundle"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "confirmedOutlineSha256": {
+      "anyOf": [
+        {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "SHA-256 of the canonical UTF-8 JSON serialization of the entire confirmed OutlineBundle.",
+      "title": "Confirmedoutlinesha256"
+    },
+    "dataPlaneRouteId": {
+      "description": "opaque control-plane routing key resolved by server configuration; not a provider identifier, secret, URL, or client-selectable model route.",
+      "minLength": 1,
+      "pattern": "^[^:\\s]+$",
+      "title": "Dataplanerouteid",
+      "type": "string"
+    },
+    "durationMinutes": {
+      "minimum": 1,
+      "title": "Durationminutes",
+      "type": "integer"
+    },
+    "idempotencyKey": {
+      "minLength": 1,
+      "title": "Idempotencykey",
+      "type": "string"
+    },
+    "jobId": {
+      "minLength": 1,
+      "title": "Jobid",
+      "type": "string"
+    },
+    "phase": {
+      "enum": [
+        "outline",
+        "content",
+        "micro"
+      ],
+      "title": "Phase",
+      "type": "string"
+    },
+    "priority": {
+      "enum": [
+        "student_micro",
+        "interaction",
+        "teacher",
+        "full",
+        "batch"
+      ],
+      "title": "Priority",
+      "type": "string"
+    },
+    "requestId": {
+      "minLength": 1,
+      "title": "Requestid",
+      "type": "string"
+    },
+    "requestedExports": {
+      "items": {
+        "$ref": "#/$defs/ExportFormat"
+      },
+      "minItems": 1,
+      "title": "Requestedexports",
+      "type": "array"
+    },
+    "sceneBudget": {
+      "minimum": 1,
+      "title": "Scenebudget",
+      "type": "integer"
+    },
+    "schemaVersion": {
+      "const": "1.0",
+      "title": "Schemaversion",
+      "type": "string"
+    },
+    "teachingBrief": {
+      "$ref": "#/$defs/TeachingBrief"
+    },
+    "teachingBriefId": {
+      "minLength": 1,
+      "title": "Teachingbriefid",
+      "type": "string"
+    },
+    "teachingBriefSha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Teachingbriefsha256",
+      "type": "string"
+    },
+    "templateId": {
+      "minLength": 1,
+      "title": "Templateid",
+      "type": "string"
+    },
+    "templateVersion": {
+      "minLength": 1,
+      "title": "Templateversion",
+      "type": "string"
+    },
+    "tenantId": {
+      "minLength": 1,
+      "title": "Tenantid",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "tenantId",
+    "requestId",
+    "jobId",
+    "idempotencyKey",
+    "phase",
+    "classroomMode",
+    "teachingBriefId",
+    "teachingBriefSha256",
+    "teachingBrief",
+    "templateId",
+    "templateVersion",
+    "sceneBudget",
+    "durationMinutes",
+    "requestedExports",
+    "callbackContext",
+    "dataPlaneRouteId",
+    "priority"
+  ],
+  "title": "GenerationRequest",
+  "type": "object"
+}

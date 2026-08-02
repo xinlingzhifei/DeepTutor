@@ -77,6 +77,7 @@ dependencies = [
 [project.scripts]
 deeptutor = "deeptutor_cli.main:main"
 deeptutor-migrate = "deeptutor.teaching.migrations.cli:main"
+deeptutor-provisioner = "deeptutor.teaching.provisioning_cli:main"
 
 [project.optional-dependencies]
 # Compatibility extra for source installs and older docs. These packages are
@@ -223,6 +224,7 @@ dev = [
     "deeptutor[server]",
     "pytest>=7.0.0",
     "pytest-asyncio>=0.23.0",
+    "jsonschema>=4.23.0,<5.0.0",
     "testcontainers[postgres]>=4.9.0,<5.0.0",
     "pre-commit>=3.0.0",
     "safety<3.0.0",

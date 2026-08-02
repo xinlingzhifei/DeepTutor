@@ -11,6 +11,7 @@ from deeptutor.services.config import (
     ensure_runtime_settings_files,
     export_runtime_settings_to_env,
     load_auth_settings,
+    load_platform_settings,
     load_system_settings,
 )
 from deeptutor.services.config.origins import normalize_origins
@@ -352,6 +353,32 @@ _auth = [Depends(require_auth)]
 # process-wide, so management is admin-gated in multi-user deployments
 # (single-user local runs are implicitly admin — no behaviour change there).
 _admin = [Depends(require_admin)]
+
+
+def _register_classroom_job_routes(
+    application: FastAPI,
+    *,
+    enabled: bool,
+    dependencies: list[object],
+) -> bool:
+    if not enabled:
+        return False
+    from deeptutor.api.routers import classroom_jobs
+
+    application.include_router(
+        classroom_jobs.router,
+        prefix="/api/v1",
+        tags=["classroom-jobs"],
+        dependencies=dependencies,
+    )
+    return True
+
+
+_register_classroom_job_routes(
+    app,
+    enabled=load_platform_settings().enabled,
+    dependencies=_auth,
+)
 
 app.include_router(
     multi_user_router,

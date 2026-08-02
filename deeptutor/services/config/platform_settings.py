@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 from pydantic import (
     BaseModel,
@@ -43,6 +44,7 @@ class PlatformSettings(BaseModel):
     object_store_bucket: str = "yfeistai-classrooms"
     object_store_region: str = "us-east-1"
     object_store_tenant_credentials_dir: Path | None = None
+    object_store_public_download_origins: tuple[str, ...] = ()
     classroom_ticket_secret_file: Path | None = None
     openmaic_service_secret_file: Path | None = None
     shared_generation_limit: int = 20
@@ -50,11 +52,7 @@ class PlatformSettings(BaseModel):
 
     @model_validator(mode="after")
     def validate_enabled_runtime(self) -> "PlatformSettings":
-        if (
-            self.enabled
-            and self.database_url is None
-            and self.database_password_file is None
-        ):
+        if self.enabled and self.database_url is None and self.database_password_file is None:
             raise ValueError(
                 "platform database_url or database_password_file is required when enabled"
             )
@@ -72,6 +70,18 @@ class PlatformSettings(BaseModel):
                 raise ValueError(
                     "S3 endpoint, bucket, and absolute tenant credentials directory are required"
                 )
+        for origin in self.object_store_public_download_origins:
+            parsed = urlsplit(origin)
+            if (
+                parsed.scheme != "https"
+                or not parsed.hostname
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.path not in {"", "/"}
+                or parsed.query
+                or parsed.fragment
+            ):
+                raise ValueError("object store public download origins must be HTTPS origins")
         return self
 
 
@@ -137,9 +147,7 @@ def _safe_validation_error_message(error: ValidationError) -> str:
         if "database_url or database_password_file" in message:
             issues.append("database_url or database_password_file")
         elif "S3 endpoint" in message:
-            issues.append(
-                "S3 endpoint, bucket, and absolute tenant credentials directory"
-            )
+            issues.append("S3 endpoint, bucket, and absolute tenant credentials directory")
         else:
             issues.append("model")
 
@@ -257,7 +265,5 @@ def load_platform_settings(path: Path | None = None) -> PlatformSettings:
         and settings.database_url is not None
         and not _is_valid_database_url(settings.database_url)
     ):
-        raise ValueError(
-            "platform database_url must be a valid postgresql+asyncpg URL"
-        )
+        raise ValueError("platform database_url must be a valid postgresql+asyncpg URL")
     return settings

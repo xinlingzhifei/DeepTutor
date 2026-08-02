@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from datetime import UTC, datetime
 import sys
 from types import SimpleNamespace
 from typing import Any
@@ -21,6 +22,7 @@ from deeptutor.teaching import tenant_context as tenant_context_module
 from deeptutor.teaching.permissions import ScopedPermission
 from deeptutor.teaching.repositories import tenants as tenant_repositories
 from deeptutor.teaching.repositories.tenants import (
+    GrantResourceNotFoundError,
     ProvisioningSummary,
     TenantAccess,
     TenantAccessDeniedError,
@@ -62,6 +64,7 @@ class FakeTenantRepository:
         self.tenants: dict[str, TenantSummary] = {}
         self.memberships: dict[tuple[str, str], str] = {}
         self.roles: dict[tuple[str, str], frozenset[str]] = {}
+        self.scoped_access_grants: dict[tuple[str, str], tuple[Any, ...]] = {}
         self.provisioning: dict[str, ProvisioningSummary] = {}
         self.created_provisioning = 0
         self.create_calls = 0
@@ -70,7 +73,10 @@ class FakeTenantRepository:
         self.list_admin_flags: list[bool] = []
         self.access_calls: list[tuple[str, str, bool]] = []
         self.member_calls: list[tuple[str, str, frozenset[str]]] = []
+        self.scoped_member_calls: list[tuple[str, str, frozenset[tuple[str, str, str]]]] = []
         self.grant_calls: list[tuple[str, str, frozenset[str]]] = []
+        self.scoped_grant_calls: list[tuple[str, str, frozenset[tuple[str, str, str]]]] = []
+        self.scoped_grant_error: Exception | None = None
         self.activation_calls: list[tuple[str, str, int]] = []
         self.failure_calls: list[tuple[str, str, int]] = []
         self.policy_calls: list[tuple[str, str, int]] = []
@@ -159,10 +165,19 @@ class FakeTenantRepository:
             raise TenantAccessDeniedError(tenant_id)
         if summary.status != "active":
             raise TenantNotActiveError(tenant_id)
+        roles = self.roles.get((tenant_id, user_id), frozenset())
+        grants = self.scoped_access_grants.get((tenant_id, user_id))
+        if grants is not None:
+            return SimpleNamespace(
+                summary=summary,
+                schema_name=tenant_schema_name(tenant_id),
+                roles=roles,
+                grants=grants,
+            )
         return TenantAccess(
             summary=summary,
             schema_name=tenant_schema_name(tenant_id),
-            roles=self.roles.get((tenant_id, user_id), frozenset()),
+            roles=roles,
         )
 
     async def create_provisioning(
@@ -287,6 +302,20 @@ class FakeTenantRepository:
         self.member_calls.append((tenant_id, user_id, roles))
         self.add_member(tenant_id, user_id, roles=roles)
 
+    async def upsert_member_with_scoped_grants(
+        self,
+        tenant_id: str,
+        user_id: str,
+        grants: frozenset[Any],
+    ) -> None:
+        normalized = frozenset((grant.role, grant.scope_type, grant.scope_id) for grant in grants)
+        self.scoped_member_calls.append((tenant_id, user_id, normalized))
+        self.add_member(
+            tenant_id,
+            user_id,
+            roles=frozenset(role for role, _scope_type, _scope_id in normalized),
+        )
+
     async def replace_grants(
         self,
         tenant_id: str,
@@ -297,6 +326,20 @@ class FakeTenantRepository:
             raise TenantAccessDeniedError(tenant_id)
         self.grant_calls.append((tenant_id, user_id, roles))
         self.roles[(tenant_id, user_id)] = roles
+
+    async def replace_scoped_grants(
+        self,
+        tenant_id: str,
+        user_id: str,
+        grants: frozenset[Any],
+    ) -> None:
+        if self.scoped_grant_error is not None:
+            raise self.scoped_grant_error
+        normalized = frozenset((grant.role, grant.scope_type, grant.scope_id) for grant in grants)
+        self.scoped_grant_calls.append((tenant_id, user_id, normalized))
+        self.roles[(tenant_id, user_id)] = frozenset(
+            role for role, _scope_type, _scope_id in normalized
+        )
 
 
 def _set_platform_enabled(monkeypatch: Any, enabled: bool) -> None:
@@ -341,6 +384,14 @@ def _authenticated_app(
             "tenant_id": context.tenant_id,
             "schema_name": context.schema_name,
             "permissions": sorted(item.permission for item in context.permissions),
+            "permission_scopes": sorted(
+                (
+                    item.permission,
+                    item.scope_type,
+                    item.scope_id,
+                )
+                for item in context.permissions
+            ),
         }
 
     app.dependency_overrides[auth_router.require_auth] = fake_auth
@@ -646,6 +697,35 @@ def test_single_active_membership_is_selected_automatically_despite_header(
     assert response.json()["tenant_id"] == "tenant-a"
     assert "classroom.edit" in response.json()["permissions"]
     assert repository.access_calls == [("tenant-a", "u-alice", False)]
+
+
+def test_context_expands_persisted_grants_at_their_real_resource_scope(
+    monkeypatch,
+) -> None:
+    repository = FakeTenantRepository()
+    repository.add_tenant("tenant-a")
+    repository.add_member("tenant-a", "u-teacher", roles=frozenset({"teacher"}))
+    repository.scoped_access_grants[("tenant-a", "u-teacher")] = (
+        SimpleNamespace(role="teacher", scope_type="class", scope_id="class-a"),
+    )
+    app = _authenticated_app(
+        monkeypatch,
+        repository,
+        user_id="u-teacher",
+    )
+
+    response = TestClient(app).get(
+        "/context",
+        headers={"Cookie": "dt_tenant=tenant-a"},
+    )
+
+    assert response.status_code == 200
+    edit_scopes = {
+        tuple(scope)
+        for scope in response.json()["permission_scopes"]
+        if scope[0] == "classroom.edit"
+    }
+    assert edit_scopes == {("classroom.edit", "class", "class-a")}
 
 
 def test_header_only_with_multiple_memberships_requires_controlled_switch(
@@ -1133,7 +1213,7 @@ def test_member_and_grant_writes_require_matching_tenant_manage_scope(
     repository.add_member(
         "tenant-a",
         "u-manager",
-        roles=frozenset({"platform_admin"}),
+        roles=frozenset({"org_admin"}),
     )
     app = _authenticated_app(
         monkeypatch,
@@ -1147,10 +1227,82 @@ def test_member_and_grant_writes_require_matching_tenant_manage_scope(
             headers={"Cookie": "dt_tenant=tenant-a"},
             json={"user_id": "u-student"},
         )
+        scoped_added = client.post(
+            "/api/v1/tenants/tenant-a/members",
+            headers={"Cookie": "dt_tenant=tenant-a"},
+            json={
+                "user_id": "u-class-teacher",
+                "grants": [
+                    {
+                        "role": "teacher",
+                        "scope_type": "class",
+                        "scope_id": "class-a",
+                    }
+                ],
+            },
+        )
+        ambiguous_add = client.post(
+            "/api/v1/tenants/tenant-a/members",
+            headers={"Cookie": "dt_tenant=tenant-a"},
+            json={
+                "user_id": "u-ambiguous",
+                "role": "teacher",
+                "grants": [
+                    {
+                        "role": "teacher",
+                        "scope_type": "class",
+                        "scope_id": "class-a",
+                    }
+                ],
+            },
+        )
         replaced = client.put(
             "/api/v1/tenants/tenant-a/members/u-student/grants",
             headers={"Cookie": "dt_tenant=tenant-a"},
             json={"roles": ["teacher"]},
+        )
+        scoped = client.put(
+            "/api/v1/tenants/tenant-a/members/u-student/grants",
+            headers={"Cookie": "dt_tenant=tenant-a"},
+            json={
+                "grants": [
+                    {
+                        "role": "teacher",
+                        "scope_type": "class",
+                        "scope_id": "class-a",
+                    }
+                ]
+            },
+        )
+        ambiguous = client.put(
+            "/api/v1/tenants/tenant-a/members/u-student/grants",
+            headers={"Cookie": "dt_tenant=tenant-a"},
+            json={
+                "roles": ["teacher"],
+                "grants": [
+                    {
+                        "role": "teacher",
+                        "scope_type": "class",
+                        "scope_id": "class-a",
+                    }
+                ],
+            },
+        )
+        repository.scoped_grant_error = GrantResourceNotFoundError(
+            "resource is outside the path tenant"
+        )
+        missing_resource = client.put(
+            "/api/v1/tenants/tenant-a/members/u-student/grants",
+            headers={"Cookie": "dt_tenant=tenant-a"},
+            json={
+                "grants": [
+                    {
+                        "role": "teacher",
+                        "scope_type": "course",
+                        "scope_id": "shared-course-id",
+                    }
+                ]
+            },
         )
         wrong_path = client.post(
             "/api/v1/tenants/tenant-b/members",
@@ -1159,9 +1311,48 @@ def test_member_and_grant_writes_require_matching_tenant_manage_scope(
         )
 
     assert added.status_code == 200
-    assert repository.member_calls == [("tenant-a", "u-student", frozenset({"student"}))]
+    assert added.json()["roles"] == ["student"]
+    assert repository.member_calls == []
+    assert scoped_added.status_code == 200
+    assert scoped_added.json()["grants"] == [
+        {
+            "role": "teacher",
+            "scope_type": "class",
+            "scope_id": "class-a",
+        }
+    ]
+    assert repository.scoped_member_calls == [
+        (
+            "tenant-a",
+            "u-student",
+            frozenset({("student", "tenant", "tenant-a")}),
+        ),
+        (
+            "tenant-a",
+            "u-class-teacher",
+            frozenset({("teacher", "class", "class-a")}),
+        ),
+    ]
+    assert ambiguous_add.status_code == 422
     assert replaced.status_code == 200
     assert repository.grant_calls == [("tenant-a", "u-student", frozenset({"teacher"}))]
+    assert scoped.status_code == 200
+    assert scoped.json()["grants"] == [
+        {
+            "role": "teacher",
+            "scope_type": "class",
+            "scope_id": "class-a",
+        }
+    ]
+    assert repository.scoped_grant_calls == [
+        (
+            "tenant-a",
+            "u-student",
+            frozenset({("teacher", "class", "class-a")}),
+        )
+    ]
+    assert ambiguous.status_code == 422
+    assert missing_resource.status_code == 404
     assert wrong_path.status_code == 403
     assert all(call[0] == "tenant-a" for call in repository.member_calls)
 
@@ -1209,13 +1400,36 @@ def test_repository_selection_statements_pin_tenant_user_and_status_filters() ->
             dialect=postgresql.dialect(),
             compile_kwargs={"literal_binds": True},
         )
-    )
+    ).lower()
 
     for sql in (member_sql, access_sql):
         assert "tenants.status = 'active'" in sql
         assert "tenant_memberships.status = 'active'" in sql
         assert "tenant_memberships.user_id = 'u-alice'" in sql
     assert "tenants.id = 'tenant-a'" in access_sql
+    for fragment in (
+        "join platform.tenant_schema_states",
+        "tenant_schema_states.status = 'active'",
+        "left outer join platform.role_grants",
+        "role_grants.tenant_id = platform.tenant_memberships.tenant_id",
+        "role_grants.user_id = platform.tenant_memberships.user_id",
+    ):
+        assert fragment in access_sql
+
+    admin_access_sql = _compiled_sql(
+        build_tenant_access_statement(
+            "tenant-a",
+            "u-admin",
+            is_platform_admin=True,
+        )
+    )
+    for fragment in (
+        "left outer join platform.tenant_memberships",
+        "tenant_memberships.user_id = 'u-admin'",
+        "tenant_memberships.status = 'active'",
+        "left outer join platform.role_grants",
+    ):
+        assert fragment in admin_access_sql
 
 
 def _compiled_sql(statement: Any) -> str:
@@ -1281,6 +1495,16 @@ def test_write_statements_bind_scope_state_and_conflict_keys() -> None:
         "tenant_provisioning_jobs.status = 'failed'",
         "tenant_provisioning_jobs.attempt_count = 2",
         "attempt_count + 1",
+        "attempt_count + 1 < platform.tenant_provisioning_jobs.max_attempts",
+        "next_attempt_at=now()",
+        "lease_owner=null",
+        "lease_token=null",
+        "lease_expires_at=null",
+        "heartbeat_at=null",
+        "error_category=null",
+        "error_code=null",
+        "started_at=null",
+        "completed_at=null",
     )
     worker_builder = getattr(
         tenant_repositories,
@@ -1301,14 +1525,14 @@ def test_write_statements_bind_scope_state_and_conflict_keys() -> None:
     )
     _assert_sql(
         build_activation_lock_statement("tenant-a", "job-a", 2),
-        "data_plane_routes.tenant_id = 'tenant-a'",
-        "data_plane_routes.status = 'active'",
-        f"data_plane_routes.schema_name = '{tenant_schema_name('tenant-a')}'",
-        "tenant_storage_credentials.tenant_id = 'tenant-a'",
-        "tenant_storage_credentials.status = 'active'",
-        "audit_log.action = 'tenant.provisioning.policy_verified'",
-        "audit_log.resource_type = 'provisioning_job'",
-        "audit_log.resource_id = 'job-a:2'",
+        "tenant_schema_states.tenant_id = 'tenant-a'",
+        "tenant_schema_states.status = 'active'",
+        "tenant_schema_states.revision = '20260801_0007'",
+        f"tenant_schema_states.schema_name = '{tenant_schema_name('tenant-a')}'",
+        "tenant_storage_states.tenant_id = 'tenant-a'",
+        "tenant_storage_states.status = 'active'",
+        "tenant_default_policy_states.tenant_id = 'tenant-a'",
+        "tenant_default_policy_states.status = 'active'",
         "for update",
     )
 
@@ -1323,6 +1547,14 @@ class _Result:
 
     def one_or_none(self) -> Any:
         return self.value
+
+    def scalars(self) -> _Result:
+        return self
+
+    def all(self) -> list[Any]:
+        if self.value is None:
+            return []
+        return list(self.value)
 
 
 class _RecordingSession:
@@ -1362,6 +1594,28 @@ class _RecordingSession:
         self.trace.append(("flush", None))
 
 
+class _AccessRevokedBetweenQueriesSession:
+    def __init__(self) -> None:
+        self.trace: list[tuple[str, Any]] = []
+
+    async def execute(self, statement: Any) -> _Result:
+        self.trace.append(("execute", statement))
+        if "role_grants" in _compiled_sql(statement):
+            return _Result(())
+        return _Result(
+            {
+                "tenant_id": "tenant-a",
+                "name": "Tenant A",
+                "status": "active",
+                "schema_name": tenant_schema_name("tenant-a"),
+            }
+        )
+
+    async def scalar(self, statement: Any) -> None:
+        self.trace.append(("scalar", statement))
+        return None
+
+
 def _install_recording_session(monkeypatch: Any, session: _RecordingSession) -> None:
     @asynccontextmanager
     async def recording_platform_session() -> Any:
@@ -1372,6 +1626,234 @@ def _install_recording_session(monkeypatch: Any, session: _RecordingSession) -> 
         "platform_session",
         recording_platform_session,
     )
+
+
+def _install_recording_tenant_session(
+    monkeypatch: Any,
+    session: _RecordingSession,
+    tenant_calls: list[str],
+) -> None:
+    @asynccontextmanager
+    async def recording_tenant_session(tenant_id: str) -> Any:
+        tenant_calls.append(tenant_id)
+        yield session
+
+    monkeypatch.setattr(
+        tenant_repositories,
+        "tenant_session",
+        recording_tenant_session,
+    )
+
+
+def test_access_revoked_between_selection_and_grant_load_fails_closed(
+    monkeypatch,
+) -> None:
+    session = _AccessRevokedBetweenQueriesSession()
+    _install_recording_session(monkeypatch, session)
+
+    with pytest.raises(TenantAccessDeniedError):
+        asyncio.run(
+            tenant_repositories.TenantRepository().get_tenant_access(
+                "tenant-a",
+                "u-revoked",
+                is_platform_admin=False,
+            )
+        )
+
+
+def test_platform_admin_access_without_membership_remains_available(
+    monkeypatch,
+) -> None:
+    session = _RecordingSession(
+        execute_results=(
+            _Result(
+                (
+                    {
+                        "tenant_id": "tenant-a",
+                        "name": "Tenant A",
+                        "status": "active",
+                        "schema_name": tenant_schema_name("tenant-a"),
+                        "grant_role": None,
+                        "grant_scope_type": None,
+                        "grant_scope_id": None,
+                    },
+                )
+            ),
+        )
+    )
+    _install_recording_session(monkeypatch, session)
+
+    access = asyncio.run(
+        tenant_repositories.TenantRepository().get_tenant_access(
+            "tenant-a",
+            "u-platform-admin",
+            is_platform_admin=True,
+        )
+    )
+
+    assert access.summary.tenant_id == "tenant-a"
+    assert access.grants == frozenset()
+    assert _trace_names(session) == ("execute",)
+
+
+def test_scoped_grant_replacement_validates_resources_before_atomic_replace(
+    monkeypatch,
+) -> None:
+    from deeptutor.teaching.permissions import RoleGrant
+
+    session = _RecordingSession(
+        execute_results=(
+            _Result(("course-a",)),
+            _Result((("class-a", "course-a"),)),
+            _Result(),
+            _Result(),
+        ),
+        scalar_results=("u-teacher",),
+    )
+    tenant_calls: list[str] = []
+    _install_recording_tenant_session(monkeypatch, session, tenant_calls)
+    grants = frozenset(
+        {
+            RoleGrant("teacher", "course", "course-a"),
+            RoleGrant("teacher", "class", "class-a"),
+        }
+    )
+
+    asyncio.run(
+        tenant_repositories.TenantRepository().replace_scoped_grants(
+            "tenant-a",
+            "u-teacher",
+            grants,
+        )
+    )
+
+    assert tenant_calls == ["tenant-a"]
+    assert _trace_names(session)[-2:] == ("flush", "commit")
+    course_sql = _compiled_sql(session.trace[2][1])
+    class_sql = _compiled_sql(session.trace[3][1])
+    delete_sql = _compiled_sql(session.trace[4][1])
+    assert "courses.id in ('course-a')" in course_sql
+    assert "courses.status = 'active'" in course_sql
+    for fragment in (
+        "classes.id in ('class-a')",
+        "classes.course_id",
+        "join tenant.courses",
+        "classes.status = 'active'",
+        "courses.status = 'active'",
+    ):
+        assert fragment in class_sql
+    assert "delete from platform.role_grants" in delete_sql
+
+
+def test_scoped_member_upsert_validates_resources_before_membership_activation(
+    monkeypatch,
+) -> None:
+    from deeptutor.teaching.permissions import RoleGrant
+
+    session = _RecordingSession(
+        execute_results=(
+            _Result(("course-a",)),
+            _Result(),
+            _Result(),
+            _Result(),
+        ),
+        scalar_results=("tenant-a",),
+    )
+    tenant_calls: list[str] = []
+    _install_recording_tenant_session(monkeypatch, session, tenant_calls)
+
+    asyncio.run(
+        tenant_repositories.TenantRepository().upsert_member_with_scoped_grants(
+            "tenant-a",
+            "u-teacher",
+            frozenset({RoleGrant("teacher", "course", "course-a")}),
+        )
+    )
+
+    assert tenant_calls == ["tenant-a"]
+    assert _trace_names(session) == (
+        "begin",
+        "scalar",
+        "execute",
+        "execute",
+        "execute",
+        "execute",
+        "flush",
+        "commit",
+    )
+    assert "courses.id in ('course-a')" in _compiled_sql(session.trace[2][1])
+    assert "insert into platform.tenant_memberships" in _compiled_sql(session.trace[3][1])
+
+
+def test_invalid_scoped_member_resource_does_not_activate_membership(
+    monkeypatch,
+) -> None:
+    from deeptutor.teaching.permissions import RoleGrant
+
+    session = _RecordingSession(
+        execute_results=(_Result(()),),
+        scalar_results=("tenant-a",),
+    )
+    tenant_calls: list[str] = []
+    _install_recording_tenant_session(monkeypatch, session, tenant_calls)
+    operation = tenant_repositories.TenantRepository().upsert_member_with_scoped_grants(
+        "tenant-a",
+        "u-teacher",
+        frozenset({RoleGrant("teacher", "course", "missing-course")}),
+    )
+
+    with pytest.raises(GrantResourceNotFoundError):
+        asyncio.run(operation)
+
+    assert tenant_calls == ["tenant-a"]
+    assert _trace_names(session) == ("begin", "scalar", "execute", "rollback")
+    assert "tenant_memberships" not in _compiled_sql(session.trace[2][1])
+
+
+def test_missing_scoped_resource_rolls_back_before_deleting_existing_grants(
+    monkeypatch,
+) -> None:
+    from deeptutor.teaching.permissions import RoleGrant
+    from deeptutor.teaching.repositories.tenants import (
+        GrantResourceNotFoundError,
+    )
+
+    session = _RecordingSession(
+        execute_results=(_Result(()),),
+        scalar_results=("u-teacher",),
+    )
+    tenant_calls: list[str] = []
+    _install_recording_tenant_session(monkeypatch, session, tenant_calls)
+    operation = tenant_repositories.TenantRepository().replace_scoped_grants(
+        "tenant-a",
+        "u-teacher",
+        frozenset({RoleGrant("teacher", "course", "shared-course-id")}),
+    )
+
+    with pytest.raises(GrantResourceNotFoundError):
+        asyncio.run(operation)
+
+    assert tenant_calls == ["tenant-a"]
+    assert _trace_names(session)[-1] == "rollback"
+    executed_sql = [
+        _compiled_sql(statement) for name, statement in session.trace if name == "execute"
+    ]
+    assert len(executed_sql) == 1
+    assert all("delete from platform.role_grants" not in sql for sql in executed_sql)
+
+
+def test_tenant_scope_mismatch_is_rejected_before_opening_a_transaction() -> None:
+    from deeptutor.teaching.permissions import RoleGrant
+    from deeptutor.teaching.repositories.tenants import InvalidGrantScopeError
+
+    with pytest.raises(InvalidGrantScopeError):
+        asyncio.run(
+            tenant_repositories.TenantRepository().replace_scoped_grants(
+                "tenant-a",
+                "u-teacher",
+                frozenset({RoleGrant("teacher", "tenant", "tenant-b")}),
+            )
+        )
 
 
 def _trace_names(session: _RecordingSession) -> tuple[str, ...]:
@@ -1423,6 +1905,7 @@ def test_write_transactions_order_lock_mutations_flush_and_commit(
     expected_trace: tuple[str, ...],
 ) -> None:
     repository = tenant_repositories.TenantRepository()
+    tenant_calls: list[str] = []
     if case == "membership":
         session = _RecordingSession(
             execute_results=(_Result(), _Result(), _Result()),
@@ -1442,11 +1925,16 @@ def test_write_transactions_order_lock_mutations_flush_and_commit(
         operation = repository.create_provisioning(
             tenant_id="tenant-a", job_id="job-a", name="Tenant A"
         )
-    _install_recording_session(monkeypatch, session)
+    if case == "membership":
+        _install_recording_tenant_session(monkeypatch, session, tenant_calls)
+    else:
+        _install_recording_session(monkeypatch, session)
 
     result = asyncio.run(operation)
 
     assert _trace_names(session) == expected_trace
+    if case == "membership":
+        assert tenant_calls == ["tenant-a"]
     if case == "retry":
         assert result.attempt_count == 3
 
@@ -1506,7 +1994,15 @@ def test_provisioning_transitions_bind_attempt_lock_and_flush_both_rows(
     expected: tuple[str, str],
 ) -> None:
     tenant = SimpleNamespace(status=start[0])
-    job = SimpleNamespace(status=start[1], attempt_count=2)
+    job = SimpleNamespace(
+        status=start[1],
+        attempt_count=2,
+        lease_owner="worker-a",
+        lease_token="lease-a",
+        lease_expires_at=datetime(2026, 7, 30, tzinfo=UTC),
+        heartbeat_at=datetime(2026, 7, 30, tzinfo=UTC),
+        completed_at=None,
+    )
     session = _RecordingSession(execute_results=(_Result((tenant, job)),))
     _install_recording_session(monkeypatch, session)
 
@@ -1516,6 +2012,13 @@ def test_provisioning_transitions_bind_attempt_lock_and_flush_both_rows(
 
     assert transitioned is True
     assert (tenant.status, job.status, job.attempt_count) == (*expected, 2)
+    assert (
+        job.lease_owner,
+        job.lease_token,
+        job.lease_expires_at,
+        job.heartbeat_at,
+    ) == (None, None, None, None)
+    assert job.completed_at is not None
     assert _trace_names(session) == (
         "begin",
         "execute",

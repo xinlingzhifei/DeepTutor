@@ -813,6 +813,34 @@ def test_credential_resolver_rejects_fingerprint_or_tenant_mismatch(
         )
 
 
+def test_credential_resolver_rejects_cross_tenant_secret_reference(
+    tmp_path,
+) -> None:
+    access_key = "tenant-b-access"
+    foreign_directory = tmp_path / "tenant-b" / "object-store"
+    foreign_directory.mkdir(parents=True)
+    (foreign_directory / "object-store-access-key").write_text(
+        access_key,
+        encoding="utf-8",
+    )
+    (foreign_directory / "object-store-secret-key").write_text(
+        "tenant-b-secret",
+        encoding="utf-8",
+    )
+    record = TenantStorageCredentialRecord(
+        tenant_id="tenant-a",
+        secret_ref="tenant-b/object-store",
+        access_key_fingerprint=hashlib.sha256(access_key.encode()).hexdigest(),
+        status="active",
+    )
+
+    with pytest.raises(StorageCredentialError):
+        TenantStorageCredentialResolver(tmp_path).resolve(
+            record,
+            tenant_id="tenant-a",
+        )
+
+
 @pytest.mark.asyncio
 async def test_factory_builds_distinct_explicit_s3_clients_from_secret_refs(
     tmp_path,
@@ -1260,6 +1288,69 @@ async def test_partial_multi_file_promotion_is_invisible_until_commit(
     assert await store.list_prefix(f"{_FORMAL_ROOT}/1/") == tuple(
         sorted(artifact.key for artifact in promoted)
     )
+
+
+@pytest.mark.asyncio
+async def test_uncommitted_formal_objects_are_not_a_confirmed_publish(tmp_path) -> None:
+    payload = b'{"not":"committed"}'
+    manifest = _manifest(payload, "uncommitted-publish")
+    store = LocalClassroomArtifactStore(tmp_path, "tenant-a")
+    claim = await store.acquire_publish_claim(manifest)
+    temporary_key = temporary_artifact_key(
+        "tenant-a",
+        manifest.job_id,
+        f"{claim.ownership_token}/classroom.json",
+    )
+    await store.put_verified(
+        temporary_key,
+        _body(payload),
+        manifest.entries[0].sha256,
+        manifest.entries[0].size,
+        content_type=manifest.entries[0].content_type,
+    )
+    await store.copy(
+        temporary_key,
+        classroom_artifact_key("tenant-a", "asset-1", 1, "classroom.json"),
+        sha256=manifest.entries[0].sha256,
+        size=manifest.entries[0].size,
+        content_type=manifest.entries[0].content_type,
+        claim=claim,
+    )
+
+    assert await store.confirmed_publish(manifest) is None
+
+
+@pytest.mark.asyncio
+async def test_committed_publish_is_confirmed_and_promotion_is_idempotent(tmp_path) -> None:
+    payload = b'{"committed":true}'
+    manifest = _manifest(payload, "confirmed-publish")
+    store = LocalClassroomArtifactStore(tmp_path, "tenant-a")
+    service = ClassroomArtifactPromotionService(store)
+
+    promoted = await service.promote(
+        manifest,
+        {"classroom.json": _body(payload)},
+    )
+
+    assert await store.confirmed_publish(manifest) == promoted
+    assert await service.promote(
+        manifest,
+        {"classroom.json": _body(payload)},
+    ) == promoted
+
+
+@pytest.mark.asyncio
+async def test_confirmed_publish_rejects_a_different_manifest(tmp_path) -> None:
+    payload = b'{"committed":true}'
+    store = LocalClassroomArtifactStore(tmp_path, "tenant-a")
+    await ClassroomArtifactPromotionService(store).promote(
+        _manifest(payload, "original-publish"),
+        {"classroom.json": _body(payload)},
+    )
+    replacement = b'{"committed":false}'
+
+    with pytest.raises(ObjectStoreConflictError):
+        await store.confirmed_publish(_manifest(replacement, "replacement-publish"))
 
 
 @pytest.mark.asyncio
