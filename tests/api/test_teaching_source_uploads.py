@@ -673,6 +673,28 @@ def test_pdf_dedupe_reuses_blob_but_isolates_target_snapshot_name_and_permission
     assert len({snapshot.permission_sha256 for snapshot in repository.pdf_snapshots}) == 2
 
 
+def test_pdf_dedupe_keeps_distinct_names_in_the_same_target() -> None:
+    repository = _SourceRepository()
+    client, store, _ = _client(_context(), repository)
+    payload = _pdf_bytes()
+
+    algebra = _upload(client, payload, filename="algebra.pdf")
+    geometry = _upload(client, payload, filename="geometry.pdf")
+    algebra_replay = _upload(client, payload, filename="algebra.pdf")
+
+    assert algebra.status_code == geometry.status_code == algebra_replay.status_code == 201
+    assert algebra.json()["bindingId"] != geometry.json()["bindingId"]
+    assert algebra_replay.json()["bindingId"] == algebra.json()["bindingId"]
+    assert algebra.json()["filename"] == "algebra.pdf"
+    assert geometry.json()["filename"] == "geometry.pdf"
+    assert len(store.put_calls) == 1
+    assert len(repository.uploads) == 1
+    assert len(repository.pdf_snapshots) == 2
+    assert len({snapshot.snapshot_id for snapshot in repository.pdf_snapshots}) == 2
+    assert len({snapshot.upload_id for snapshot in repository.pdf_snapshots}) == 1
+    assert len(repository.records) == 2
+
+
 def test_storage_failure_retains_retryable_receipt_and_hides_details() -> None:
     repository = _SourceRepository()
     store = _Store()

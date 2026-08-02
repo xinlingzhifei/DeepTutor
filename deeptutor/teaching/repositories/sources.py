@@ -110,6 +110,11 @@ def source_binding_id(
     return f"source-binding-{hashlib.sha256(payload).hexdigest()}"
 
 
+def _pdf_source_revision(content_sha256: str, display_name: str) -> str:
+    payload = "\0".join(("pdf-name-v1", content_sha256, display_name)).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _require_upload_key(tenant_id: str, upload_id: str, object_key: str) -> None:
     try:
         expected = source_upload_key(tenant_id, upload_id)
@@ -535,6 +540,7 @@ class SqlAlchemySourceRepository:
         actor_id: str,
     ) -> SourceRecord:
         _require_upload_key(self._tenant_id, upload.upload_id, upload.object_key)
+        source_revision = _pdf_source_revision(upload.sha256, snapshot.display_name)
         expected_binding_id = source_binding_id(
             self._tenant_id,
             snapshot.snapshot_id,
@@ -574,7 +580,7 @@ class SqlAlchemySourceRepository:
                             resource_owner_id=TENANT_SOURCE_OWNER_ID,
                             source_upload_id=upload.upload_id,
                             display_name=snapshot.display_name,
-                            source_revision=upload.sha256,
+                            source_revision=source_revision,
                             content_sha256=upload.sha256,
                             permission_sha256=snapshot.permission_sha256,
                             citation_manifest="[]",
@@ -590,7 +596,7 @@ class SqlAlchemySourceRepository:
                         or existing.resource_owner_id != TENANT_SOURCE_OWNER_ID
                         or existing.source_upload_id != upload.upload_id
                         or existing.display_name != snapshot.display_name
-                        or existing.source_revision != upload.sha256
+                        or existing.source_revision != source_revision
                         or existing.content_sha256 != upload.sha256
                         or existing.permission_sha256 != snapshot.permission_sha256
                         or existing.citation_manifest != "[]"

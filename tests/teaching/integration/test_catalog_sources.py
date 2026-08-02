@@ -219,8 +219,39 @@ async def test_catalog_and_sources_are_isolated_and_upload_dedupe_is_atomic(
             ),
         )
 
+        renamed_snapshot = NewPdfSnapshot(
+            snapshot_id=f"pdf-renamed-{suffix}",
+            upload_id=upload_id,
+            display_name="two.pdf",
+            permission_sha256=snapshot.permission_sha256,
+        )
+        renamed = await source_a.bind_uploaded_pdf(
+            completed,
+            renamed_snapshot,
+            binding_id=source_binding_id(
+                tenant_a,
+                renamed_snapshot.snapshot_id,
+                "course-a",
+                "class-a",
+            ),
+            course_id="course-a",
+            class_id="class-a",
+            actor_id="teacher-a",
+        )
+
         assert results[0].binding_id == results[1].binding_id
-        assert len(await source_a.list_bindings(None, None)) == 2
+        assert renamed.binding_id != results[0].binding_id
+        bindings = await source_a.list_bindings(None, None)
+        assert len(bindings) == 3
+        assert {record.filename for record in bindings if record.source_type == "pdf"} == {
+            "one.pdf",
+            "two.pdf",
+        }
+        async with engine.connect() as connection:
+            upload_count = await connection.scalar(
+                text(f'SELECT count(*) FROM "{tenant_schema_name(tenant_a)}".source_uploads')
+            )
+        assert upload_count == 1
         assert await source_b.list_bindings(None, None) == ()
     finally:
         await engine.dispose()

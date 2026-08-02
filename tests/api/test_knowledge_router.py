@@ -4,8 +4,12 @@ import asyncio
 import importlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
+
+from deeptutor.knowledge.manager import KnowledgeBaseManager
 
 try:
     from fastapi import FastAPI
@@ -58,6 +62,10 @@ class _FakeKBManager:
     def get_default(self) -> str | None:
         names = self.list_knowledge_bases()
         return names[0] if names else None
+
+    def get_kb_entry(self, name: str) -> dict | None:
+        entry = self.config.get("knowledge_bases", {}).get(name)
+        return dict(entry) if isinstance(entry, dict) else None
 
     def get_knowledge_base_path(self, name: str) -> Path:
         kb_dir = self.base_dir / name
@@ -481,21 +489,113 @@ def test_list_files_accepts_default_alias(monkeypatch, tmp_path: Path) -> None:
 
 def test_list_fallback_reports_error_status(monkeypatch, tmp_path: Path) -> None:
     manager = _FakeKBManager(tmp_path / "knowledge_bases")
+    generation = str(uuid4())
     manager.config["knowledge_bases"]["broken-kb"] = {
         "path": "broken-kb",
         "status": "ready",
+        "generation_id": generation,
     }
     (manager.base_dir / "broken-kb").mkdir(parents=True)
     monkeypatch.setattr(knowledge_router_module, "get_kb_manager", lambda: manager)
+    monkeypatch.setattr(
+        knowledge_router_module,
+        "list_visible_kb_access",
+        lambda: (_ for _ in ()).throw(RuntimeError("corrupt access catalog")),
+    )
 
     with TestClient(_build_app()) as client:
         response = client.get("/api/v1/knowledge/list")
 
     assert response.status_code == 200
     [item] = response.json()
+    assert item["id"].endswith(f":kb:{generation}")
+    assert not item["id"].endswith(":kb:broken-kb")
     assert item["status"] == "error"
     assert item["progress"]["stage"] == "error"
-    assert "get_info" in item["progress"]["error"]
+    assert item["progress"]["error"] == "Failed to load knowledge base info."
+
+
+def test_list_fails_closed_when_fallback_generation_is_corrupt(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    manager = _FakeKBManager(tmp_path / "knowledge_bases")
+    manager.config["knowledge_bases"]["broken-kb"] = {
+        "path": "broken-kb",
+        "status": "ready",
+        "generation_id": "broken-kb",
+    }
+    (manager.base_dir / "broken-kb").mkdir(parents=True)
+    monkeypatch.setattr(knowledge_router_module, "get_kb_manager", lambda: manager)
+    monkeypatch.setattr(knowledge_router_module, "list_visible_kb_access", lambda: [])
+
+    with TestClient(_build_app()) as client:
+        response = client.get("/api/v1/knowledge/list")
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Failed to load knowledge bases."}
+    assert ":kb:broken-kb" not in response.text
+
+
+def test_list_fallback_uses_new_generation_after_same_name_recreation(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    kb_dir = tmp_path / "knowledge_bases" / "recreated"
+    kb_dir.mkdir(parents=True)
+    manager = KnowledgeBaseManager(base_dir=kb_dir.parent)
+    manager.register_knowledge_base("recreated")
+    first_generation = manager.get_kb_entry("recreated")["generation_id"]
+    manager.config["knowledge_bases"].pop("recreated")
+    manager._save_config()
+    manager.register_knowledge_base("recreated")
+    second_generation = manager.get_kb_entry("recreated")["generation_id"]
+    assert second_generation != first_generation
+
+    def fail_get_info(_name: str) -> dict:
+        raise RuntimeError("simulated info failure")
+
+    monkeypatch.setattr(manager, "get_info", fail_get_info)
+    monkeypatch.setattr(knowledge_router_module, "get_kb_manager", lambda: manager)
+    monkeypatch.setattr(knowledge_router_module, "list_visible_kb_access", lambda: [])
+
+    with TestClient(_build_app()) as client:
+        response = client.get("/api/v1/knowledge/list")
+
+    assert response.status_code == 200
+    [item] = response.json()
+    assert item["id"].endswith(f":kb:{second_generation}")
+    assert first_generation not in item["id"]
+
+
+def test_list_omits_legacy_assigned_name_aliases(monkeypatch, tmp_path: Path) -> None:
+    manager = _FakeKBManager(tmp_path / "knowledge_bases")
+    monkeypatch.setattr(knowledge_router_module, "get_kb_manager", lambda: manager)
+    monkeypatch.setattr(
+        knowledge_router_module,
+        "get_current_user",
+        lambda: SimpleNamespace(is_admin=False),
+    )
+    monkeypatch.setattr(
+        knowledge_router_module,
+        "list_visible_kb_access",
+        lambda: [
+            {
+                "id": "admin:kb:legacy-name",
+                "name": "legacy-name",
+                "source": "admin",
+                "assigned": True,
+                "available": False,
+            }
+        ],
+    )
+
+    with TestClient(_build_app()) as client:
+        response = client.get("/api/v1/knowledge/list")
+
+    assert response.status_code == 200
+    assert response.json() == []
+    assert "admin:kb:legacy-name" not in response.text
 
 
 def _ready_kb_manager(tmp_path: Path, name: str = "kb") -> "_FakeKBManager":

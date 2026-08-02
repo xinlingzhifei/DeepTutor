@@ -15,7 +15,7 @@ from pathlib import Path
 import re
 import shutil
 import traceback
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from fastapi import (
     APIRouter,
@@ -98,6 +98,33 @@ def format_bytes_human_readable(size_bytes: int) -> str:
 
 _kb_base_dir = PROJECT_ROOT / "data" / "knowledge_bases"
 DEFAULT_KB_ALIASES = {"", "default", "current", "selected", "默认", "默认知识库", "当前知识库"}
+
+
+def _canonical_generation_id(value: object) -> str:
+    raw = str(value or "").strip()
+    try:
+        parsed = UUID(raw)
+    except (ValueError, AttributeError):
+        parsed = None
+    if parsed is None or parsed.version != 4 or str(parsed) != raw.lower():
+        raise ValueError("Knowledge base generation identity is unavailable.")
+    return raw.lower()
+
+
+def _knowledge_resource_id(prefix: str, generation: object) -> str:
+    return f"{prefix}{_canonical_generation_id(generation)}"
+
+
+def _is_stable_knowledge_resource_id(value: object) -> bool:
+    raw = str(value or "")
+    for prefix in ("admin:kb:", "user:kb:"):
+        if raw.startswith(prefix):
+            try:
+                _canonical_generation_id(raw[len(prefix) :])
+            except ValueError:
+                return False
+            return True
+    return False
 
 # Lazy initialization
 kb_manager = None
@@ -1663,9 +1690,20 @@ async def list_knowledge_bases():
     try:
         manager = get_kb_manager()
         kb_names = manager.list_knowledge_bases()
-        access_items = list_visible_kb_access()
+        try:
+            visible_access = list_visible_kb_access()
+        except Exception as access_error:
+            logger.warning("Failed to load knowledge access catalog: %s", access_error)
+            visible_access = []
+        access_items = [
+            item
+            for item in visible_access
+            if _is_stable_knowledge_resource_id(item.get("id"))
+        ]
         access_by_id = {str(item.get("id") or ""): item for item in access_items}
-        own_prefix = "admin:kb:" if get_current_user().is_admin else "user:kb:"
+        current_user = get_current_user()
+        source = "admin" if current_user.is_admin else "user"
+        own_prefix = f"{source}:kb:"
 
         logger.debug(f"Found {len(kb_names)} knowledge bases: {kb_names}")
 
@@ -1674,9 +1712,14 @@ async def list_knowledge_bases():
 
         for name in kb_names:
             try:
+                entry = manager.get_kb_entry(name)
+                generation = _canonical_generation_id(
+                    (entry or {}).get("generation_id")
+                )
+                resource_id = _knowledge_resource_id(own_prefix, generation)
                 info = manager.get_info(name)
-                generation = str((info.get("metadata") or {}).get("generation_id") or "")
-                resource_id = f"{own_prefix}{generation}"
+                metadata = dict(info.get("metadata") or {})
+                metadata["generation_id"] = generation
                 logger.debug(f"Successfully got info for KB '{name}': {info.get('statistics', {})}")
                 result.append(
                     KnowledgeBaseInfo(
@@ -1684,11 +1727,11 @@ async def list_knowledge_bases():
                         name=info["name"],
                         is_default=info["is_default"],
                         statistics=info.get("statistics", {}),
-                        metadata=info.get("metadata"),
+                        metadata=metadata,
                         path=info.get("path"),
                         status=info.get("status"),
                         progress=info.get("progress"),
-                        source="admin" if get_current_user().is_admin else "user",
+                        source=source,
                         assigned=False,
                         read_only=False,
                         provenance_label=access_by_id.get(resource_id, {}).get("provenance_label"),
@@ -1699,17 +1742,23 @@ async def list_knowledge_bases():
                 errors.append(error_msg)
                 logger.warning(f"{error_msg}\n{traceback.format_exc()}")
                 try:
-                    kb_dir = manager.base_dir / name
+                    entry = manager.get_kb_entry(name)
+                    generation = _canonical_generation_id(
+                        (entry or {}).get("generation_id")
+                    )
+                    resource_id = _knowledge_resource_id(own_prefix, generation)
+                    kb_dir = Path(manager.base_dir) / name
                     if kb_dir.exists():
                         logger.debug(f"KB '{name}' directory exists, creating error fallback info")
+                        client_error = "Failed to load knowledge base info."
                         fallback_progress = {
                             "stage": "error",
-                            "message": "Failed to load knowledge base info.",
-                            "error": error_msg,
+                            "message": client_error,
+                            "error": client_error,
                         }
                         result.append(
                             KnowledgeBaseInfo(
-                                id=f"{own_prefix}{name}",
+                                id=resource_id,
                                 name=name,
                                 is_default=name == manager.get_default(),
                                 statistics={
@@ -1718,11 +1767,11 @@ async def list_knowledge_bases():
                                     "content_lists": 0,
                                     "rag_initialized": False,
                                 },
-                                metadata={"name": name, "last_error": error_msg},
+                                metadata={"name": name, "generation_id": generation},
                                 path=str(kb_dir),
                                 status="error",
                                 progress=fallback_progress,
-                                source="admin" if get_current_user().is_admin else "user",
+                                source=source,
                             )
                         )
                 except Exception as fallback_err:
@@ -1731,7 +1780,7 @@ async def list_knowledge_bases():
         if errors and not result:
             error_detail = f"Failed to load knowledge bases. Errors: {'; '.join(errors)}"
             logger.error(error_detail)
-            raise HTTPException(status_code=500, detail=error_detail)
+            raise HTTPException(status_code=500, detail="Failed to load knowledge bases.")
 
         if errors:
             logger.warning(
@@ -1739,15 +1788,16 @@ async def list_knowledge_bases():
             )
 
         logger.debug(f"Returning {len(result)} knowledge bases")
-        if not get_current_user().is_admin:
+        if not current_user.is_admin:
             own_ids = {item.id for item in result}
             for access in access_items:
-                if access.get("source") != "admin" or access.get("id") in own_ids:
+                access_id = str(access.get("id") or "")
+                if access.get("source") != "admin" or access_id in own_ids:
                     continue
                 if not access.get("available", True):
                     result.append(
                         KnowledgeBaseInfo(
-                            id=str(access.get("id") or ""),
+                            id=access_id,
                             name=str(access.get("name") or ""),
                             is_default=False,
                             statistics={},
@@ -1763,13 +1813,13 @@ async def list_knowledge_bases():
                         )
                     )
                     continue
-                resource = resolve_kb(str(access.get("id") or access.get("name") or ""))
+                resource = resolve_kb(access_id)
                 assigned_manager = manager_for_resource(resource)
                 try:
                     info = assigned_manager.get_info(resource.name)
                     result.append(
                         KnowledgeBaseInfo(
-                            id=resource.id,
+                            id=access_id,
                             name=info["name"],
                             is_default=False,
                             statistics=info.get("statistics", {}),
@@ -1785,18 +1835,19 @@ async def list_knowledge_bases():
                     )
                 except Exception as exc:
                     error_msg = f"Error getting assigned KB '{resource.name}': {exc}"
+                    logger.warning(error_msg)
                     result.append(
                         KnowledgeBaseInfo(
-                            id=resource.id,
+                            id=access_id,
                             name=resource.name,
                             is_default=False,
                             statistics={},
-                            metadata={"name": resource.name, "last_error": error_msg},
+                            metadata={"name": resource.name},
                             status="error",
                             progress={
                                 "stage": "error",
                                 "message": "Failed to load assigned knowledge base info.",
-                                "error": error_msg,
+                                "error": "Failed to load assigned knowledge base info.",
                             },
                             source="admin",
                             assigned=True,

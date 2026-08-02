@@ -6,6 +6,7 @@ Manages multiple knowledge bases and provides utilities for accessing them.
 """
 
 from contextlib import contextmanager
+from copy import deepcopy
 from datetime import datetime, timedelta
 import hashlib
 import json
@@ -113,29 +114,74 @@ def _detect_provider_from_versions(versions: list[dict[str, Any]]) -> str:
     return DEFAULT_PROVIDER
 
 
-# Cross-platform file locking. Writers no longer take locks — every JSON
-# write in this module goes through ``atomic_write_json`` (temp file +
-# ``os.replace``), so readers always see a complete previous or new file.
+# Cross-platform writer locking uses a stable file that is never replaced with
+# the atomically-published JSON config.
 @contextmanager
-def file_lock_shared(file_handle):
-    """Acquire a shared (read) lock on a file - cross-platform."""
-    if sys.platform == "win32":
-        import msvcrt
+def _exclusive_config_lock(lock_path: Path):
+    """Serialize config read-modify-replace cycles on a stable lock inode."""
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    file_handle = lock_path.open("a+b")
+    try:
+        if sys.platform == "win32":
+            import msvcrt
 
-        msvcrt.locking(file_handle.fileno(), msvcrt.LK_NBLCK, 1)
-        try:
-            yield
-        finally:
+            if os.fstat(file_handle.fileno()).st_size == 0:
+                file_handle.write(b"\0")
+                file_handle.flush()
             file_handle.seek(0)
-            msvcrt.locking(file_handle.fileno(), msvcrt.LK_UNLCK, 1)
-    else:
-        import fcntl
+            msvcrt.locking(file_handle.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                file_handle.seek(0)
+                msvcrt.locking(file_handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
 
-        fcntl.flock(file_handle.fileno(), fcntl.LOCK_SH)
-        try:
-            yield
-        finally:
-            fcntl.flock(file_handle.fileno(), fcntl.LOCK_UN)
+            fcntl.flock(file_handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(file_handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        file_handle.close()
+
+
+_MISSING_CONFIG_VALUE = object()
+
+
+def _merge_config_values(base: Any, desired: Any, current: Any, path: str = "config") -> Any:
+    """Three-way merge one stale in-memory config with the latest disk state."""
+
+    def equal(left: Any, right: Any) -> bool:
+        if left is _MISSING_CONFIG_VALUE or right is _MISSING_CONFIG_VALUE:
+            return left is right
+        return bool(left == right)
+
+    if equal(desired, base):
+        return current if current is _MISSING_CONFIG_VALUE else deepcopy(current)
+    if equal(current, base):
+        return desired if desired is _MISSING_CONFIG_VALUE else deepcopy(desired)
+    if equal(desired, current):
+        return desired if desired is _MISSING_CONFIG_VALUE else deepcopy(desired)
+
+    if isinstance(desired, dict) and isinstance(current, dict) and (
+        base is _MISSING_CONFIG_VALUE or isinstance(base, dict)
+    ):
+        base_dict = {} if base is _MISSING_CONFIG_VALUE else base
+        merged: dict[str, Any] = {}
+        for key in set(base_dict) | set(desired) | set(current):
+            value = _merge_config_values(
+                base_dict.get(key, _MISSING_CONFIG_VALUE),
+                desired.get(key, _MISSING_CONFIG_VALUE),
+                current.get(key, _MISSING_CONFIG_VALUE),
+                f"{path}.{key}",
+            )
+            if value is not _MISSING_CONFIG_VALUE:
+                merged[key] = value
+        return merged
+
+    raise RuntimeError(f"Concurrent knowledge-base config conflict at {path}")
 
 
 def _get_embedding_fingerprint() -> tuple[str, int] | None:
@@ -274,6 +320,7 @@ class KnowledgeBaseManager:
 
         # Config file to track knowledge bases
         self.config_file = self.base_dir / "kb_config.json"
+        self._config_lock_file = self.base_dir / ".kb_config.lock"
         self.config = self._load_config()
 
         # PocketBase sync — enabled when integrations.pocketbase_url is set.
@@ -285,15 +332,21 @@ class KnowledgeBaseManager:
 
     def _load_config(self) -> dict:
         """Load knowledge base configuration from the canonical kb_config.json file."""
+        with _exclusive_config_lock(self._config_lock_file):
+            config = self._load_config_locked()
+        self._config_snapshot = deepcopy(config)
+        return config
+
+    def _load_config_locked(self) -> dict:
         if self.config_file.exists():
+            config_changed = False
             try:
                 with open(self.config_file, encoding="utf-8") as f:
-                    with file_lock_shared(f):
-                        content = f.read()
-                        if not content.strip():
-                            # Empty file, return default
-                            return {"knowledge_bases": {}}
-                        config = json.loads(content)
+                    content = f.read()
+                    if not content.strip():
+                        # Empty file, return default
+                        return {"knowledge_bases": {}}
+                    config = json.loads(content)
 
                 # Ensure knowledge_bases key exists
                 if "knowledge_bases" not in config:
@@ -359,22 +412,40 @@ class KnowledgeBaseManager:
                         atomic_write_json(self.config_file, config)
                     except Exception as save_err:
                         logger.warning(f"Failed to persist normalized KB config: {save_err}")
+                        raise
 
                 return config
             except (json.JSONDecodeError, Exception) as e:
+                if config_changed:
+                    raise
                 logger.warning(f"Error loading config: {e}")
                 return {"knowledge_bases": {}}
         return {"knowledge_bases": {}}
 
     def _save_config(self):
-        """Save knowledge base configuration.
+        """Merge pending changes with the latest config and publish atomically."""
+        with _exclusive_config_lock(self._config_lock_file):
+            desired = deepcopy(self.config)
+            base = deepcopy(getattr(self, "_config_snapshot", {}))
+            current = self._load_config_locked()
+            merged = _merge_config_values(base, desired, current)
+            if not isinstance(merged, dict):
+                raise RuntimeError("Knowledge-base config must be a JSON object")
+            _ensure_config_generation_ids(merged)
+            atomic_write_json(self.config_file, merged)
+            self.config = merged
+            self._config_snapshot = deepcopy(merged)
 
-        Written via temp-file + ``os.replace`` so concurrent readers only
-        ever see the previous or the new file — ``open(..., "w")`` used to
-        truncate the config before the lock was even acquired.
-        """
-        _ensure_config_generation_ids(self.config)
-        atomic_write_json(self.config_file, self.config)
+    def _mutate_config(self, mutation):
+        """Apply one config mutation to the latest state under the writer lock."""
+        with _exclusive_config_lock(self._config_lock_file):
+            config = self._load_config_locked()
+            result = mutation(config)
+            _ensure_config_generation_ids(config)
+            atomic_write_json(self.config_file, config)
+            self.config = config
+            self._config_snapshot = deepcopy(config)
+            return result
 
     def _sync_kb_to_pb(self, name: str, kb_entry: dict) -> None:
         """
@@ -704,16 +775,31 @@ class KnowledgeBaseManager:
         if not kb_dir.exists():
             raise ValueError(f"Knowledge base directory does not exist: {kb_dir}")
 
-        if "knowledge_bases" not in self.config:
-            self.config["knowledge_bases"] = {}
+        def register(config: dict) -> None:
+            knowledge_bases = config.setdefault("knowledge_bases", {})
+            previous = knowledge_bases.get(name)
+            entry = {"path": name, "description": description}
+            if isinstance(previous, dict) and previous.get(KB_GENERATION_ID_KEY):
+                entry[KB_GENERATION_ID_KEY] = previous[KB_GENERATION_ID_KEY]
+            knowledge_bases[name] = entry
 
-        self.config["knowledge_bases"][name] = {"path": name, "description": description}
+        self._mutate_config(register)
 
         # Only set default if explicitly requested
         if set_default:
             self.set_default(name)
 
-        self._save_config()
+    def _register_new_entry(self, name: str, entry: dict[str, Any]) -> dict[str, Any]:
+        """Publish a new named entry against the latest config or reject a clash."""
+
+        def register(config: dict) -> dict[str, Any]:
+            knowledge_bases = config.setdefault("knowledge_bases", {})
+            if name in knowledge_bases:
+                raise ValueError(f"A knowledge base named '{name}' already exists.")
+            knowledge_bases[name] = entry
+            return entry
+
+        return self._mutate_config(register)
 
     def register_obsidian_vault(self, name: str, vault_path: str, description: str = "") -> dict:
         """Register a connected Obsidian vault as a pointer-type KB.
@@ -730,11 +816,6 @@ class KnowledgeBaseManager:
         if not vault.is_dir():
             raise ValueError(f"Vault path is not a directory: {vault_path}")
 
-        self.config = self._load_config()
-        knowledge_bases = self.config.setdefault("knowledge_bases", {})
-        if name in knowledge_bases:
-            raise ValueError(f"A knowledge base named '{name}' already exists.")
-
         now = datetime.now().isoformat()
         entry = {
             "path": name,
@@ -745,9 +826,7 @@ class KnowledgeBaseManager:
             "created_at": now,
             "updated_at": now,
         }
-        knowledge_bases[name] = entry
-        self._save_config()
-        return entry
+        return self._register_new_entry(name, entry)
 
     def register_linked_kb(
         self,
@@ -776,11 +855,6 @@ class KnowledgeBaseManager:
         if not folder.is_dir():
             raise ValueError(f"Folder path is not a directory: {external_path}")
 
-        self.config = self._load_config()
-        knowledge_bases = self.config.setdefault("knowledge_bases", {})
-        if name in knowledge_bases:
-            raise ValueError(f"A knowledge base named '{name}' already exists.")
-
         now = datetime.now().isoformat()
         entry: dict[str, Any] = {
             "path": name,
@@ -799,9 +873,7 @@ class KnowledgeBaseManager:
         if stats and stats.get("doc_count") is not None:
             entry["last_indexed_count"] = stats["doc_count"]
             entry["last_indexed_action"] = "link"
-        knowledge_bases[name] = entry
-        self._save_config()
-        return entry
+        return self._register_new_entry(name, entry)
 
     def register_subagent_connection(
         self,
@@ -835,11 +907,6 @@ class KnowledgeBaseManager:
                 raise ValueError(f"Working directory is not a directory: {cwd}")
             resolved_cwd = str(folder.resolve())
 
-        self.config = self._load_config()
-        knowledge_bases = self.config.setdefault("knowledge_bases", {})
-        if name in knowledge_bases:
-            raise ValueError(f"A knowledge base named '{name}' already exists.")
-
         now = datetime.now().isoformat()
         entry = {
             "path": name,
@@ -852,9 +919,7 @@ class KnowledgeBaseManager:
             "created_at": now,
             "updated_at": now,
         }
-        knowledge_bases[name] = entry
-        self._save_config()
-        return entry
+        return self._register_new_entry(name, entry)
 
     def register_lightrag_server_kb(
         self,
@@ -882,11 +947,6 @@ class KnowledgeBaseManager:
         if not server_url:
             raise ValueError("LightRAG server URL is required.")
 
-        self.config = self._load_config()
-        knowledge_bases = self.config.setdefault("knowledge_bases", {})
-        if name in knowledge_bases:
-            raise ValueError(f"A knowledge base named '{name}' already exists.")
-
         now = datetime.now().isoformat()
         entry: dict[str, Any] = {
             "path": name,
@@ -903,9 +963,7 @@ class KnowledgeBaseManager:
         search_mode = (search_mode or "").strip().lower()
         if search_mode:
             entry["search_mode"] = search_mode
-        knowledge_bases[name] = entry
-        self._save_config()
-        return entry
+        return self._register_new_entry(name, entry)
 
     def get_knowledge_base_path(self, name: str | None = None) -> Path:
         """Get path to a knowledge base.

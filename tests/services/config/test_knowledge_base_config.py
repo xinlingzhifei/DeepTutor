@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import threading
+import uuid
 
 import pytest
 
@@ -170,6 +172,56 @@ class TestPayloadNormalizationOnLoad:
 
 
 class TestPersistence:
+    def test_set_kb_config_publishes_generation_identity(self, tmp_path: Path) -> None:
+        config_path = tmp_path / "kb_config.json"
+        service = KnowledgeBaseConfigService(config_path=config_path)
+
+        service.set_kb_config("new-kb", {"rag_provider": "pageindex"})
+
+        on_disk = json.loads(config_path.read_text(encoding="utf-8"))
+        generation = on_disk["knowledge_bases"]["new-kb"]["generation_id"]
+        assert str(uuid.UUID(generation)) == generation
+
+    def test_concurrent_unrelated_updates_are_serialized(self, tmp_path: Path) -> None:
+        config_path = tmp_path / "kb_config.json"
+        services = [
+            KnowledgeBaseConfigService(config_path=config_path),
+            KnowledgeBaseConfigService(config_path=config_path),
+        ]
+        barrier = threading.Barrier(2)
+        errors: list[BaseException] = []
+
+        for service in services:
+            original_refresh = service._refresh
+
+            def synchronized_refresh(original_refresh=original_refresh) -> None:
+                original_refresh()
+                barrier.wait(timeout=5)
+
+            service._refresh = synchronized_refresh
+
+        def update(service: KnowledgeBaseConfigService, name: str) -> None:
+            try:
+                service.set_kb_config(name, {"description": name})
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=update, args=(service, name))
+            for service, name in zip(services, ("alpha", "beta"))
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        assert all(not thread.is_alive() for thread in threads)
+        assert errors == []
+        on_disk = json.loads(config_path.read_text(encoding="utf-8"))
+        assert set(on_disk["knowledge_bases"]) == {"alpha", "beta"}
+        for entry in on_disk["knowledge_bases"].values():
+            assert str(uuid.UUID(entry["generation_id"])) == entry["generation_id"]
+
     def test_set_kb_config_normalizes_on_save(self, tmp_path: Path) -> None:
         config_path = tmp_path / "kb_config.json"
         service = KnowledgeBaseConfigService(config_path=config_path)

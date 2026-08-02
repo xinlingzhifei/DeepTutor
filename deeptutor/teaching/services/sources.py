@@ -999,6 +999,7 @@ class SourceService:
                 completed.upload_id,
                 course_id,
                 class_id or "",
+                staged.filename,
             )
             binding_id = source_binding_id(
                 context.tenant_id,

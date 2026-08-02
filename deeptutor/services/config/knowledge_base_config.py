@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from deeptutor.services.path_service import get_path_service
 from deeptutor.services.rag.factory import (
@@ -105,11 +105,22 @@ class KnowledgeBaseConfigService:
 
         return payload
 
-    def _save(self) -> None:
-        self._config = self._normalize_payload(self._config)
-        self.config_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.config_path, "w", encoding="utf-8") as handle:
-            json.dump(self._config, handle, indent=2, ensure_ascii=False)
+    def _mutate_config(self, mutation: Callable[[dict[str, Any]], None]) -> None:
+        """Apply one update to the latest canonical config under its writer lock."""
+        from deeptutor.knowledge.manager import (
+            _ensure_config_generation_ids,
+            _exclusive_config_lock,
+        )
+        from deeptutor.services.file_io import atomic_write_json
+
+        lock_path = self.config_path.parent / ".kb_config.lock"
+        with _exclusive_config_lock(lock_path):
+            config = self._load_config()
+            mutation(config)
+            config = self._normalize_payload(config)
+            _ensure_config_generation_ids(config)
+            atomic_write_json(self.config_path, config)
+            self._config = config
 
     def _refresh(self) -> None:
         """Re-read kb_config.json so this singleton sees changes made by
@@ -120,15 +131,6 @@ class KnowledgeBaseConfigService:
         cleanup. Read-modify-write keeps the two writers consistent.
         """
         self._config = self._load_config()
-
-    def _ensure_kb(self, kb_name: str) -> dict[str, Any]:
-        knowledge_bases = self._config.setdefault("knowledge_bases", {})
-        if kb_name not in knowledge_bases:
-            knowledge_bases[kb_name] = {
-                "path": kb_name,
-                "description": f"Knowledge base: {kb_name}",
-            }
-        return knowledge_bases[kb_name]
 
     def get_kb_config(self, kb_name: str) -> dict[str, Any]:
         self._refresh()
@@ -145,10 +147,18 @@ class KnowledgeBaseConfigService:
         return merged
 
     def set_kb_config(self, kb_name: str, config: dict[str, Any]) -> None:
-        self._refresh()
-        entry = self._ensure_kb(kb_name)
-        entry.update(config)
-        self._save()
+        def update(payload: dict[str, Any]) -> None:
+            knowledge_bases = payload.setdefault("knowledge_bases", {})
+            entry = knowledge_bases.setdefault(
+                kb_name,
+                {
+                    "path": kb_name,
+                    "description": f"Knowledge base: {kb_name}",
+                },
+            )
+            entry.update(config)
+
+        self._mutate_config(update)
 
     def get_rag_provider(self, kb_name: str) -> str:
         return normalize_provider_name(self.get_kb_config(kb_name).get("rag_provider"))
@@ -169,33 +179,35 @@ class KnowledgeBaseConfigService:
         return str(modes.get(provider, "")) if isinstance(modes, dict) else ""
 
     def set_provider_mode(self, provider: str, mode: str) -> None:
-        self._refresh()
-        defaults = self._config.setdefault("defaults", _default_payload()["defaults"])
-        modes = defaults.setdefault("provider_modes", {})
-        modes[provider] = mode
-        self._save()
+        def update(payload: dict[str, Any]) -> None:
+            defaults = payload.setdefault("defaults", _default_payload()["defaults"])
+            modes = defaults.setdefault("provider_modes", {})
+            modes[provider] = mode
+
+        self._mutate_config(update)
 
     def delete_kb_config(self, kb_name: str) -> None:
-        self._refresh()
-        knowledge_bases = self._config.get("knowledge_bases", {})
-        if kb_name in knowledge_bases:
-            del knowledge_bases[kb_name]
-            self._save()
+        def update(payload: dict[str, Any]) -> None:
+            payload.get("knowledge_bases", {}).pop(kb_name, None)
+
+        self._mutate_config(update)
 
     def get_all_configs(self) -> dict[str, Any]:
         self._refresh()
         return self._config
 
     def set_global_defaults(self, defaults: dict[str, Any]) -> None:
-        self._refresh()
-        current = self._config.setdefault("defaults", _default_payload()["defaults"])
-        current.update(defaults)
-        self._save()
+        def update(payload: dict[str, Any]) -> None:
+            current = payload.setdefault("defaults", _default_payload()["defaults"])
+            current.update(defaults)
+
+        self._mutate_config(update)
 
     def set_default_kb(self, kb_name: str | None) -> None:
-        self._refresh()
-        self._config.setdefault("defaults", _default_payload()["defaults"])["default_kb"] = kb_name
-        self._save()
+        def update(payload: dict[str, Any]) -> None:
+            payload.setdefault("defaults", _default_payload()["defaults"])["default_kb"] = kb_name
+
+        self._mutate_config(update)
 
     def get_default_kb(self) -> str | None:
         self._refresh()
