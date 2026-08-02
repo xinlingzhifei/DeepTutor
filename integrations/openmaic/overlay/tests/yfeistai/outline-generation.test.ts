@@ -1,15 +1,29 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { createHash } from "node:crypto";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  statSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 
 import { describe, expect, test, vi } from "vitest";
 
 import {
   OUTLINE_BUNDLE_CONTRACT_SHA256,
+  canonicalJson,
   createOutlineGetHandler,
   createOutlinePostHandler,
   generateOutlineJob,
+  normalizeUpstreamOutlineBundle,
   validateGenerationRequest,
 } from "../../lib/yfeistai/outline-generation";
+import { runOutlineRouteAdapter } from "../../lib/yfeistai/generation-adapter";
+import {
+  durableFile,
+  writeDurableJsonExclusive,
+} from "../../lib/yfeistai/durable-state";
 import { OutlineJobStore } from "../../lib/yfeistai/job-store";
 import { signServiceRequest } from "../../lib/yfeistai/service-auth";
 import type {
@@ -246,7 +260,114 @@ function handlerDependencies(store = new OutlineJobStore()) {
   };
 }
 
+async function waitForOutlineTerminal(
+  store: OutlineJobStore,
+  tenantId = "tenant-a",
+  jobId = "job-a",
+) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const job = await store.read(tenantId, jobId);
+    if (job && job.status !== "running") {
+      return job;
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  }
+  throw new Error("outline job did not become terminal");
+}
+
 describe("outline-only generation boundary", () => {
+  test.each([
+    ["provider_429", { statusCode: 429 }, "lastError"],
+    ["provider_5xx", { response: { status: 503 } }, "errors"],
+    ["connect_timeout", { code: "UND_ERR_CONNECT_TIMEOUT" }, "lastErrorCause"],
+    ["read_timeout", { code: "UND_ERR_HEADERS_TIMEOUT" }, "errorsCause"],
+    ["read_timeout", { response: { status: 408 } }, "lastError"],
+    ["read_timeout", { code: "ECONNRESET" }, "errorsCause"],
+    ["read_timeout", { code: "UND_ERR_SOCKET" }, "lastErrorCause"],
+  ] as const)(
+    "classifies a swallowed AI RetryError as %s without leaking details",
+    async (expectedCode, providerShape, placement) => {
+      const leaked = `sensitive-outline-route-${expectedCode}`;
+      const providerError = Object.assign(new Error(leaked), providerShape);
+      const neutralError = new Error("retry attempt failed");
+      const retryError = Object.assign(new Error(`retry failed: ${leaked}`), {
+        name: "AI_RetryError",
+        lastError: neutralError as unknown,
+        errors: [] as unknown[],
+      });
+      if (placement === "lastError") {
+        retryError.lastError = providerError;
+        retryError.errors = [neutralError];
+        providerError.cause = retryError;
+      } else if (placement === "errors") {
+        retryError.errors = [providerError];
+        neutralError.cause = retryError;
+      } else if (placement === "lastErrorCause") {
+        retryError.lastError = Object.assign(new Error("last attempt"), {
+          cause: providerError,
+        });
+        providerError.cause = retryError;
+      } else {
+        retryError.errors = [
+          Object.assign(new Error("recorded attempt"), {
+            cause: providerError,
+          }),
+        ];
+        neutralError.cause = retryError;
+      }
+
+      let upstreamLogged = "";
+      const result = await generateOutlineJob(validRequest(), {
+        generateOutlines: async () =>
+          runOutlineRouteAdapter({
+            callProvider: async () => {
+              throw retryError;
+            },
+            generate: async (callProvider) => {
+              try {
+                await callProvider("system", "user");
+              } catch (error) {
+                // The pinned upstream helper converts this to success=false.
+                upstreamLogged = String(error);
+              }
+              return { success: false, data: null };
+            },
+          }),
+        now: () => new Date(GENERATED_AT),
+      });
+
+      expect(result).toMatchObject({
+        status: "failed",
+        error: {
+          code: expectedCode,
+          message: expect.stringMatching(/^Provider/),
+        },
+      });
+      expect(JSON.stringify(result)).not.toContain(leaked);
+      expect(upstreamLogged).toContain("OpenMAIC provider request failed.");
+      expect(upstreamLogged).not.toContain(leaked);
+    },
+  );
+
+  test("keeps an outline route contract failure generic", async () => {
+    const result = await generateOutlineJob(validRequest(), {
+      generateOutlines: async () =>
+        runOutlineRouteAdapter({
+          callProvider: async () => "unused",
+          generate: async () => ({ success: false, data: null }),
+        }),
+      now: () => new Date(GENERATED_AT),
+    });
+
+    expect(result).toMatchObject({
+      status: "failed",
+      error: {
+        code: "OUTLINE_GENERATION_FAILED",
+        message: "Outline generation failed.",
+      },
+    });
+  });
+
   test("uses the frozen GenerationRequest and OutlineBundle field sets", () => {
     const generationSchema = JSON.parse(
       readFileSync(
@@ -276,6 +397,18 @@ describe("outline-only generation boundary", () => {
     );
     expect(Object.keys(validOutlineBundle()).sort()).toEqual(
       [...outlineSchema.required].sort(),
+    );
+    expect(OUTLINE_BUNDLE_CONTRACT_SHA256).toBe(
+      createHash("sha256")
+        .update(
+          readFileSync(
+            resolve(
+              process.cwd(),
+              "../../../contracts/classroom/outline-bundle.schema.json",
+            ),
+          ),
+        )
+        .digest("hex"),
     );
   });
 
@@ -419,30 +552,275 @@ describe("outline-only generation boundary", () => {
 });
 
 describe("outline service API security and idempotency", () => {
+  test("persists a stable public model id without exposing provider routing", async () => {
+    const root = mkdtempSync(join(tmpdir(), "openmaic-outline-public-model-"));
+    const store = new OutlineJobStore(root);
+    const providerRoute = "openai/gpt-4o-mini";
+    const request = validRequest();
+    const handler = createOutlinePostHandler({
+      store,
+      readSecret: () => SECRET,
+      nowSeconds: () => NOW_SECONDS,
+      now: () => new Date(GENERATED_AT),
+      generateOutlines: async (boundRequest) =>
+        normalizeUpstreamOutlineBundle(
+          boundRequest,
+          {
+            languageDirective: "en-US",
+            outlines: [
+              {
+                id: "scene-a",
+                title: "Public scene",
+                description: "Provider-neutral outline.",
+              },
+            ],
+          },
+          { modelId: providerRoute, generatedAt: GENERATED_AT },
+        ),
+    });
+
+    const response = await handler(
+      signedHttpRequest({
+        method: "POST",
+        path: "/api/yfeistai/v1/outlines",
+        body: JSON.stringify(request),
+        idempotencyKey: request.idempotencyKey,
+      }),
+    );
+    const submitted = await response.json();
+    const terminal =
+      submitted.status === "running"
+        ? await waitForOutlineTerminal(store)
+        : submitted;
+
+    expect(terminal.result.outline.generationMetadata).toMatchObject({
+      modelId: "server-selected-model",
+      teachingBriefId: request.teachingBriefId,
+      teachingBriefSha256: request.teachingBriefSha256,
+      templateId: request.templateId,
+      templateVersion: request.templateVersion,
+    });
+    expect(JSON.stringify(terminal)).not.toContain(providerRoute);
+    const restarted = new OutlineJobStore(root);
+    const persisted = await restarted.read(request.tenantId, request.jobId);
+    expect(persisted).toEqual(terminal);
+    expect(JSON.stringify(persisted)).not.toContain(providerRoute);
+  });
+
+  test("keeps legacy outline submission timestamps stable across restarts", async () => {
+    const root = mkdtempSync(join(tmpdir(), "openmaic-outline-legacy-time-"));
+    const tenantId = "tenant-legacy";
+    const jobId = "job-legacy";
+    const submissionPath = durableFile(
+      root,
+      "outline-jobs",
+      "jobs",
+      [tenantId, jobId],
+      "submission.json",
+    );
+    writeDurableJsonExclusive(submissionPath, {
+      version: 1,
+      tenantId,
+      jobId,
+      idempotencyKey: "idem-legacy",
+      action: "outline",
+      bodySha256: createHash("sha256").update("{}", "utf8").digest("hex"),
+    });
+    const expectedCreatedAt = new Date(statSync(submissionPath).mtimeMs).toISOString();
+
+    const first = await new OutlineJobStore(root, 60_000, () => 1_000).read(
+      tenantId,
+      jobId,
+    );
+    const restarted = await new OutlineJobStore(
+      root,
+      60_000,
+      () => 9_000,
+    ).read(tenantId, jobId);
+
+    expect(first?.createdAt).toBe(expectedCreatedAt);
+    expect(restarted?.createdAt).toBe(expectedCreatedAt);
+  });
+
+  test("persists unexpected outline rejection and prevents lease replay after restart", async () => {
+    const root = mkdtempSync(join(tmpdir(), "openmaic-outline-rejection-"));
+    const now = Date.parse("2026-08-02T01:00:00.000Z");
+    const store = new OutlineJobStore(root, 60_000, () => now, false);
+    const leaked = "sensitive-unexpected-outline-rejection";
+    const dependencies = {
+      ...handlerDependencies(store),
+      now: () => {
+        throw new Error(leaked);
+      },
+    };
+    const request = validRequest();
+    const firstResponse = await createOutlinePostHandler(dependencies)(
+      signedHttpRequest({
+        method: "POST",
+        path: "/api/yfeistai/v1/outlines",
+        body: JSON.stringify(request),
+        idempotencyKey: request.idempotencyKey,
+      }),
+    );
+
+    await expect(firstResponse.json()).resolves.toMatchObject({
+      status: "running",
+      createdAt: "2026-08-02T01:00:00.000Z",
+    });
+    const terminal = await waitForOutlineTerminal(store);
+    expect(terminal).toMatchObject({
+      status: "failed",
+      createdAt: "2026-08-02T01:00:00.000Z",
+      error: {
+        code: "OUTLINE_GENERATION_FAILED",
+        message: "Outline generation failed.",
+      },
+    });
+    expect(JSON.stringify(terminal)).not.toContain(leaked);
+
+    const restarted = new OutlineJobStore(root, 60_000, () => now, false);
+    await expect(restarted.read(request.tenantId, request.jobId)).resolves.toEqual(
+      terminal,
+    );
+    const replayDependencies = handlerDependencies(restarted);
+    const replayResponse = await createOutlinePostHandler(replayDependencies)(
+      signedHttpRequest({
+        method: "POST",
+        path: "/api/yfeistai/v1/outlines",
+        body: JSON.stringify(request),
+        idempotencyKey: request.idempotencyKey,
+      }),
+    );
+    await expect(replayResponse.json()).resolves.toEqual(terminal);
+    expect(replayDependencies.generateOutlines).not.toHaveBeenCalled();
+  });
+
+  test("logs a fixed message when rejected outline terminal persistence fails", async () => {
+    const root = mkdtempSync(join(tmpdir(), "openmaic-outline-persist-log-"));
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const store = new OutlineJobStore(root, 60_000, Date.now, false);
+    const request = validRequest();
+    const submission = {
+      tenantId: request.tenantId,
+      jobId: request.jobId,
+      idempotencyKey: request.idempotencyKey,
+      action: "outline" as const,
+      canonicalBody: canonicalJson(request),
+    };
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    store.start(submission, async () => {
+      await blocked;
+      throw new Error("sensitive-persistence-source-error");
+    });
+    mkdirSync(
+      durableFile(
+        root,
+        "outline-jobs",
+        "jobs",
+        [request.tenantId, request.jobId],
+        "terminal.json",
+      ),
+    );
+    release();
+
+    await vi.waitFor(() => {
+      expect(consoleError).toHaveBeenCalledWith(
+        "OpenMAIC outline terminal persistence failed.",
+      );
+    });
+    expect(JSON.stringify(consoleError.mock.calls)).not.toContain("sensitive");
+    consoleError.mockRestore();
+  });
+
+  test("reclaims an expired durable outline lease and fences the old owner", async () => {
+    const root = mkdtempSync(join(tmpdir(), "openmaic-outline-reclaim-"));
+    let now = 1_000;
+    let release!: () => void;
+    const blocked = new Promise<void>((resolveBlocked) => {
+      release = resolveBlocked;
+    });
+    const request = validRequest();
+    const submission = {
+      tenantId: request.tenantId,
+      jobId: request.jobId,
+      idempotencyKey: request.idempotencyKey,
+      action: "outline" as const,
+      canonicalBody: JSON.stringify(request),
+    };
+    const staleOutline = validOutlineBundle();
+    staleOutline.title = "stale";
+    const recoveredOutline = validOutlineBundle();
+    recoveredOutline.title = "recovered";
+    const staleJob = await generateOutlineJob(request, {
+      generateOutlines: async () => staleOutline,
+      now: () => new Date(GENERATED_AT),
+    });
+    const recoveredJob = await generateOutlineJob(request, {
+      generateOutlines: async () => recoveredOutline,
+      now: () => new Date(GENERATED_AT),
+    });
+    const expectedRecoveredJob = {
+      ...recoveredJob,
+      createdAt: "1970-01-01T00:00:01.000Z",
+      updatedAt: "1970-01-01T00:00:01.200Z",
+    };
+    const abandoned = new OutlineJobStore(root, 100, () => now, false);
+    const oldCompletion = abandoned.submit(submission, async () => {
+      await blocked;
+      return staleJob;
+    });
+
+    now = 1_200;
+    const recovered = new OutlineJobStore(root, 100, () => now, false);
+    await expect(
+      recovered.submit(submission, async () => recoveredJob),
+    ).resolves.toEqual(expectedRecoveredJob);
+    release();
+    await expect(oldCompletion).resolves.toEqual(expectedRecoveredJob);
+
+    const restarted = new OutlineJobStore(root, 100, () => now, false);
+    await expect(
+      restarted.read(request.tenantId, request.jobId),
+    ).resolves.toEqual(expectedRecoveredJob);
+  });
+
   test("shares the in-process store across isolated route module loads", async () => {
     const firstModule = await import("../../lib/yfeistai/job-store");
+    const contractSuffix = OUTLINE_BUNDLE_CONTRACT_SHA256.slice(0, 12);
+    const sharedTenantId = `shared-tenant-${contractSuffix}`;
+    const sharedJobId = `shared-job-${contractSuffix}`;
+    const sharedIdempotencyKey = `shared-idempotency-${contractSuffix}`;
     const request = validRequest();
     const job = await generateOutlineJob(request, {
       generateOutlines: async () => validOutlineBundle(),
       now: () => new Date(GENERATED_AT),
     });
+    const sharedJob = {
+      ...job,
+      tenantId: sharedTenantId,
+      jobId: sharedJobId,
+      idempotencyKey: sharedIdempotencyKey,
+    };
     await firstModule.outlineJobStore.submit(
       {
-        tenantId: "shared-tenant",
-        jobId: "shared-job",
-        idempotencyKey: "shared-idempotency",
+        tenantId: sharedTenantId,
+        jobId: sharedJobId,
+        idempotencyKey: sharedIdempotencyKey,
         action: "outline",
         canonicalBody: "{}",
       },
-      async () => job,
+      async () => sharedJob,
     );
 
     vi.resetModules();
     const secondModule = await import("../../lib/yfeistai/job-store");
 
     await expect(
-      secondModule.outlineJobStore.read("shared-tenant", "shared-job"),
-    ).resolves.toEqual(job);
+      secondModule.outlineJobStore.read(sharedTenantId, sharedJobId),
+    ).resolves.toEqual(sharedJob);
   });
 
   test("authenticates before parsing malformed JSON", async () => {
@@ -661,10 +1039,101 @@ describe("outline service API security and idempotency", () => {
     expect(ownJob.status).toBe(200);
   });
 
-  test("returns stable failures without upstream secrets", async () => {
-    const leaked = "sensitive-upstream-credential";
+  test("durably starts outline generation and returns running without awaiting it", async () => {
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const store = new OutlineJobStore();
+    const dependencies = handlerDependencies(store);
+    dependencies.generateOutlines.mockImplementation(async () => {
+      await blocked;
+      return validOutlineBundle();
+    });
+    const handler = createOutlinePostHandler(dependencies);
+    const request = validRequest();
+    const responsePromise = handler(
+      signedHttpRequest({
+        method: "POST",
+        path: "/api/yfeistai/v1/outlines",
+        body: JSON.stringify(request),
+        idempotencyKey: request.idempotencyKey,
+      }),
+    );
+
+    const settledBeforeGeneration = await Promise.race([
+      responsePromise.then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 500)),
+    ]);
+    if (!settledBeforeGeneration) {
+      release();
+    }
+
+    expect(settledBeforeGeneration).toBe(true);
+    const response = await responsePromise;
+    expect(response.status).toBe(202);
+    await expect(response.json()).resolves.toMatchObject({
+      tenantId: request.tenantId,
+      jobId: request.jobId,
+      idempotencyKey: request.idempotencyKey,
+      phase: "outline",
+      status: "running",
+    });
+
+    release();
+    await expect(waitForOutlineTerminal(store)).resolves.toMatchObject({
+      status: "succeeded",
+    });
+  });
+
+  test.each([
+    ["provider_429", { status: 429 }],
+    ["provider_5xx", { response: { status: 503 } }],
+    ["connect_timeout", { code: "UND_ERR_CONNECT_TIMEOUT" }],
+    ["read_timeout", { code: "UND_ERR_HEADERS_TIMEOUT" }],
+  ])(
+    "maps upstream %s failures to stable secret-free codes",
+    async (code, shape) => {
+      const leaked = `sensitive-upstream-credential-${code}`;
+      const store = new OutlineJobStore();
+      const handler = createOutlinePostHandler({
+        ...handlerDependencies(store),
+        generateOutlines: async () => {
+          throw Object.assign(new Error(leaked), shape);
+        },
+      });
+      const request = validRequest();
+      const response = await handler(
+        signedHttpRequest({
+          method: "POST",
+          path: "/api/yfeistai/v1/outlines",
+          body: JSON.stringify(request),
+          idempotencyKey: request.idempotencyKey,
+        }),
+      );
+      const submitted = await response.json();
+      const payload =
+        submitted.status === "running"
+          ? await waitForOutlineTerminal(store)
+          : submitted;
+
+      expect(response.status).toBe(202);
+      expect(payload).toMatchObject({
+        status: "failed",
+        error: {
+          code,
+          message: expect.stringMatching(/^Provider/),
+        },
+      });
+      expect(JSON.stringify(payload)).not.toContain(leaked);
+    },
+  );
+
+  test("keeps outline contract failures non-retryable and secret-free", async () => {
+    const leaked = "sensitive-contract-detail";
+    const store = new OutlineJobStore();
     const handler = createOutlinePostHandler({
-      ...handlerDependencies(),
+      ...handlerDependencies(store),
       generateOutlines: async () => {
         throw new Error(leaked);
       },
@@ -678,9 +1147,12 @@ describe("outline service API security and idempotency", () => {
         idempotencyKey: request.idempotencyKey,
       }),
     );
-    const payload = await response.json();
+    const submitted = await response.json();
+    const payload =
+      submitted.status === "running"
+        ? await waitForOutlineTerminal(store)
+        : submitted;
 
-    expect(response.status).toBe(202);
     expect(payload).toMatchObject({
       status: "failed",
       error: {

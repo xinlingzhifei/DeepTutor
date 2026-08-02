@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from datetime import UTC, datetime
 import sys
 from types import SimpleNamespace
 from typing import Any
@@ -1494,6 +1495,7 @@ def test_write_statements_bind_scope_state_and_conflict_keys() -> None:
         "tenant_provisioning_jobs.status = 'failed'",
         "tenant_provisioning_jobs.attempt_count = 2",
         "attempt_count + 1",
+        "attempt_count + 1 < platform.tenant_provisioning_jobs.max_attempts",
         "next_attempt_at=now()",
         "lease_owner=null",
         "lease_token=null",
@@ -1525,7 +1527,7 @@ def test_write_statements_bind_scope_state_and_conflict_keys() -> None:
         build_activation_lock_statement("tenant-a", "job-a", 2),
         "tenant_schema_states.tenant_id = 'tenant-a'",
         "tenant_schema_states.status = 'active'",
-        "tenant_schema_states.revision = '20260730_0004'",
+        "tenant_schema_states.revision = '20260801_0007'",
         f"tenant_schema_states.schema_name = '{tenant_schema_name('tenant-a')}'",
         "tenant_storage_states.tenant_id = 'tenant-a'",
         "tenant_storage_states.status = 'active'",
@@ -1992,7 +1994,15 @@ def test_provisioning_transitions_bind_attempt_lock_and_flush_both_rows(
     expected: tuple[str, str],
 ) -> None:
     tenant = SimpleNamespace(status=start[0])
-    job = SimpleNamespace(status=start[1], attempt_count=2)
+    job = SimpleNamespace(
+        status=start[1],
+        attempt_count=2,
+        lease_owner="worker-a",
+        lease_token="lease-a",
+        lease_expires_at=datetime(2026, 7, 30, tzinfo=UTC),
+        heartbeat_at=datetime(2026, 7, 30, tzinfo=UTC),
+        completed_at=None,
+    )
     session = _RecordingSession(execute_results=(_Result((tenant, job)),))
     _install_recording_session(monkeypatch, session)
 
@@ -2002,6 +2012,13 @@ def test_provisioning_transitions_bind_attempt_lock_and_flush_both_rows(
 
     assert transitioned is True
     assert (tenant.status, job.status, job.attempt_count) == (*expected, 2)
+    assert (
+        job.lease_owner,
+        job.lease_token,
+        job.lease_expires_at,
+        job.heartbeat_at,
+    ) == (None, None, None, None)
+    assert job.completed_at is not None
     assert _trace_names(session) == (
         "begin",
         "execute",

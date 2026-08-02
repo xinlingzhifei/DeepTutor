@@ -10,6 +10,7 @@ import {
   createOutlinePostHandler,
   normalizeUpstreamOutlineBundle,
 } from "../../../../../lib/yfeistai/outline-generation";
+import { runOutlineRouteAdapter } from "../../../../../lib/yfeistai/generation-adapter";
 import { outlineJobStore } from "../../../../../lib/yfeistai/job-store";
 import { readServiceSecret } from "../../../../../lib/yfeistai/service-auth";
 
@@ -81,6 +82,7 @@ const postOutline = createOutlinePostHandler({
             { role: "user", content: userPrompt },
           ],
           maxOutputTokens: resolved.modelInfo?.outputWindow,
+          maxRetries: 0,
         },
         "generate-classroom",
         undefined,
@@ -88,24 +90,24 @@ const postOutline = createOutlinePostHandler({
       );
       return result.text;
     };
-    const generated = await generateSceneOutlinesFromRequirements(
-      { requirement: buildUpstreamRequirement(request) },
-      buildSourceText(request),
-      undefined,
-      aiCall,
-      {
-        imageGenerationEnabled:
-          request.teachingBrief.mediaPolicy.allowGeneration,
-        videoGenerationEnabled:
-          request.teachingBrief.mediaPolicy.allowGeneration,
-        researchContext: await resolveResearchContext(request),
-      },
-    );
-    if (!generated.success || !generated.data) {
-      throw new Error("upstream outline generation failed");
-    }
-    return normalizeUpstreamOutlineBundle(request, generated.data, {
-      modelId: resolved.modelString,
+    const generated = await runOutlineRouteAdapter({
+      callProvider: aiCall,
+      generate: (trackedProviderCall) =>
+        generateSceneOutlinesFromRequirements(
+          { requirement: buildUpstreamRequirement(request) },
+          buildSourceText(request),
+          undefined,
+          trackedProviderCall,
+          {
+            imageGenerationEnabled:
+              request.teachingBrief.mediaPolicy.allowGeneration,
+            videoGenerationEnabled:
+              request.teachingBrief.mediaPolicy.allowGeneration,
+            researchContext: await resolveResearchContext(request),
+          },
+        ),
+    });
+    return normalizeUpstreamOutlineBundle(request, generated, {
       generatedAt: new Date().toISOString(),
     });
   },

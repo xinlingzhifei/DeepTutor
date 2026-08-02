@@ -13,6 +13,23 @@ class _FakeTty:
         return True
 
 
+def test_teaching_processes_are_spawned_only_when_platform_is_enabled() -> None:
+    assert launcher._teaching_process_commands(False) == ()
+    commands = launcher._teaching_process_commands(True)
+    assert tuple(name for name, _command in commands) == (
+        "teaching-dispatcher",
+        "teaching-worker",
+        "teaching-export-worker",
+        "teaching-reaper",
+    )
+    assert tuple(command[-1] for _name, command in commands) == (
+        "dispatcher",
+        "worker",
+        "export-worker",
+        "reaper",
+    )
+
+
 def test_packaged_web_cache_replaces_next_public_placeholders(tmp_path: Path) -> None:
     packaged = tmp_path / "pkg"
     (packaged / ".next" / "static").mkdir(parents=True)

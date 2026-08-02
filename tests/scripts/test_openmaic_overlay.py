@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -256,8 +259,11 @@ def test_outline_contract_hash_verifier_rejects_a_handwritten_mismatch() -> None
     source = (
         INTEGRATION_ROOT / "overlay" / "lib" / "yfeistai" / "outline-generation.ts"
     ).read_text(encoding="utf-8")
+    expected_hash = hashlib.sha256(
+        (ROOT / "contracts" / "classroom" / "outline-bundle.schema.json").read_bytes()
+    ).hexdigest()
     forged = source.replace(
-        "f8ddb7c11138f402ed048c4af2010714b2bfd456e5c38122920c689e4a2b3ddf",
+        expected_hash,
         "0" * 64,
     )
     assert forged != source
@@ -277,6 +283,143 @@ def test_cli_dispatches_the_outline_generation_suite(monkeypatch: pytest.MonkeyP
     )
 
     assert verifier.main(["--test", "outline-generation"]) == 0
+    assert called == [verifier.DEFAULT_INTEGRATION_ROOT]
+
+
+def test_task4_files_are_mandatory_overlay_inputs() -> None:
+    verifier = _load_verifier()
+    expected = {
+        Path("lib/yfeistai/service-boundary.ts"),
+        Path("lib/yfeistai/content-generation.ts"),
+        Path("lib/yfeistai/export-generation.ts"),
+        Path("lib/yfeistai/artifact-manifest.ts"),
+        Path("app/api/yfeistai/v1/classrooms/route.ts"),
+        Path("app/api/yfeistai/v1/classrooms/[jobId]/route.ts"),
+        Path("app/api/yfeistai/v1/exports/route.ts"),
+        Path("app/api/yfeistai/v1/exports/[jobId]/route.ts"),
+        Path("app/api/yfeistai/v1/jobs/[jobId]/cancel/route.ts"),
+        Path("app/api/yfeistai/v1/artifacts/[jobId]/[...path]/route.ts"),
+        Path("tests/yfeistai/content-generation.test.ts"),
+        Path("tests/yfeistai/export-generation.test.ts"),
+        Path("tests/yfeistai/cancel.test.ts"),
+        Path("tests/yfeistai/artifact-manifest.test.ts"),
+    }
+
+    assert expected <= verifier.REQUIRED_OVERLAY_FILES
+
+
+def test_task4_static_verifier_requires_security_and_lifecycle_controls(
+    tmp_path: Path,
+) -> None:
+    verifier = _load_verifier()
+    source_root = INTEGRATION_ROOT / "overlay"
+    overlay_root = tmp_path / "overlay"
+    for relative in verifier.TASK4_SOURCE_FILES:
+        source = source_root / relative
+        target = overlay_root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+
+    verifier.verify_task4_sources(overlay_root)
+
+    export_library = overlay_root / "lib/yfeistai/export-generation.ts"
+    export_source = export_library.read_text(encoding="utf-8")
+    weakened_csp = export_source.replace("connect-src 'none'", "connect-src *")
+    assert weakened_csp != export_source
+    export_library.write_text(weakened_csp, encoding="utf-8")
+    with pytest.raises(verifier.OverlayVerificationError):
+        verifier.verify_task4_sources(overlay_root)
+    export_library.write_text(export_source, encoding="utf-8")
+
+    artifact = overlay_root / "lib/yfeistai/artifact-manifest.ts"
+    source = artifact.read_text(encoding="utf-8")
+    forged = source.replace(
+        "if (stat.isSymbolicLink())",
+        "if (false && stat.isSymbolicLink())",
+    )
+    assert forged != source
+    artifact.write_text(forged, encoding="utf-8")
+    with pytest.raises(verifier.OverlayVerificationError):
+        verifier.verify_task4_sources(overlay_root)
+
+    artifact.write_text(source, encoding="utf-8")
+    export_route = overlay_root / "app/api/yfeistai/v1/exports/route.ts"
+    route_source = export_route.read_text(encoding="utf-8")
+    unsafe_redirects = route_source.replace('redirect: "error"', 'redirect: "follow"')
+    assert unsafe_redirects != route_source
+    export_route.write_text(unsafe_redirects, encoding="utf-8")
+    with pytest.raises(verifier.OverlayVerificationError):
+        verifier.verify_task4_sources(overlay_root)
+
+
+def test_cli_dispatches_each_task4_suite(monkeypatch: pytest.MonkeyPatch) -> None:
+    verifier = _load_verifier()
+    called: list[tuple[Path, str]] = []
+    monkeypatch.setattr(verifier, "verify_overlay", lambda: None)
+    monkeypatch.setattr(
+        verifier,
+        "_run_task4_tests",
+        lambda root, name: called.append((root, name)) or 0,
+    )
+
+    for name in (
+        "content-generation",
+        "cancel",
+        "artifact-manifest",
+        "export-generation",
+    ):
+        assert verifier.main(["--test", name]) == 0
+
+    assert called == [
+        (verifier.DEFAULT_INTEGRATION_ROOT, "content-generation"),
+        (verifier.DEFAULT_INTEGRATION_ROOT, "cancel"),
+        (verifier.DEFAULT_INTEGRATION_ROOT, "artifact-manifest"),
+        (verifier.DEFAULT_INTEGRATION_ROOT, "export-generation"),
+    ]
+
+
+def test_pinned_image_build_uses_repository_context_and_fixed_dockerfile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    verifier = _load_verifier()
+    calls: list[tuple[list[str], Path, bool]] = []
+    monkeypatch.setattr(verifier.shutil, "which", lambda name: "docker")
+
+    def fake_run(command, *, cwd, check):
+        calls.append((command, cwd, check))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(verifier.subprocess, "run", fake_run)
+
+    assert verifier._run_pinned_image_build(INTEGRATION_ROOT) == 0
+    assert calls == [
+        (
+            [
+                "docker",
+                "build",
+                "--file",
+                str(INTEGRATION_ROOT / "Dockerfile"),
+                "--tag",
+                f"yfeistai/openmaic:verify-{EXPECTED_UPSTREAM['commit'][:12]}",
+                str(ROOT),
+            ],
+            ROOT,
+            False,
+        )
+    ]
+
+
+def test_cli_build_gate_propagates_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    verifier = _load_verifier()
+    called: list[Path] = []
+    monkeypatch.setattr(verifier, "verify_overlay", lambda: None)
+    monkeypatch.setattr(
+        verifier,
+        "_run_pinned_image_build",
+        lambda root: called.append(root) or 23,
+    )
+
+    assert verifier.main(["--build"]) == 23
     assert called == [verifier.DEFAULT_INTEGRATION_ROOT]
 
 

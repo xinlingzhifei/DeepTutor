@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+import hashlib
 import secrets
 from typing import Any
 
-from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.sql import Select
 
@@ -43,6 +44,41 @@ _AUDIT_DEFAULT_POLICY_READY = "tenant.provisioning.default_policy_ready"
 _AUDIT_COMPLETED = "tenant.provisioning.completed"
 _AUDIT_RETRY_SCHEDULED = "tenant.provisioning.retry_scheduled"
 _AUDIT_FAILED = "tenant.provisioning.failed"
+_AUDIT_SCHEMA_UPGRADE_COMPLETED = "tenant.schema_upgrade.completed"
+_PREVIOUS_TENANT_SCHEMA_REVISION = "20260801_0006"
+
+
+def schema_upgrade_job_id(tenant_id: str) -> str:
+    """Return the stable idempotency fence for the current target revision."""
+
+    digest = hashlib.sha256(f"{tenant_id}\0{TENANT_SCHEMA_REVISION}".encode("utf-8")).hexdigest()
+    return f"upg-{digest[:60]}"
+
+
+def build_schema_upgrade_candidate_statement() -> Select[Any]:
+    """Lock one active tenant whose persisted schema revision is behind."""
+
+    target_job_exists = (
+        select(TenantProvisioningJob.id).where(
+            TenantProvisioningJob.tenant_id == Tenant.id,
+            TenantProvisioningJob.operation == "upgrade_schema",
+            TenantProvisioningJob.target_revision == TENANT_SCHEMA_REVISION,
+        )
+    ).exists()
+    return (
+        select(Tenant, TenantSchemaState)
+        .join(TenantSchemaState, TenantSchemaState.tenant_id == Tenant.id)
+        .where(
+            Tenant.status == "active",
+            TenantSchemaState.status == "active",
+            TenantSchemaState.revision.is_not(None),
+            TenantSchemaState.revision == _PREVIOUS_TENANT_SCHEMA_REVISION,
+            ~target_job_exists,
+        )
+        .order_by(TenantSchemaState.updated_at, Tenant.id)
+        .limit(1)
+        .with_for_update(of=(Tenant, TenantSchemaState), skip_locked=True)
+    )
 
 
 async def _database_now(session: Any) -> datetime:
@@ -61,12 +97,31 @@ def _resource_id(claim: ProvisioningClaim) -> str:
 def build_claim_statement(reference_time: datetime) -> Select[Any]:
     """Select one due or stale job with a PostgreSQL skip-locked claim."""
 
+    upgradeable_schema = (
+        select(TenantSchemaState.tenant_id).where(
+            TenantSchemaState.tenant_id == Tenant.id,
+            TenantSchemaState.status == "active",
+            TenantSchemaState.revision.in_(
+                (_PREVIOUS_TENANT_SCHEMA_REVISION, TENANT_SCHEMA_REVISION)
+            ),
+        )
+    ).exists()
     return (
         select(TenantProvisioningJob, Tenant)
         .join(Tenant, Tenant.id == TenantProvisioningJob.tenant_id)
         .where(
-            Tenant.status == "provisioning",
-            TenantProvisioningJob.operation == "provision",
+            or_(
+                and_(
+                    Tenant.status == "provisioning",
+                    TenantProvisioningJob.operation == "provision",
+                ),
+                and_(
+                    Tenant.status == "active",
+                    TenantProvisioningJob.operation == "upgrade_schema",
+                    TenantProvisioningJob.target_revision == TENANT_SCHEMA_REVISION,
+                    upgradeable_schema,
+                ),
+            ),
             or_(
                 and_(
                     TenantProvisioningJob.status == "pending",
@@ -86,7 +141,7 @@ def build_claim_statement(reference_time: datetime) -> Select[Any]:
         )
         .limit(1)
         .with_for_update(
-            of=TenantProvisioningJob,
+            of=(TenantProvisioningJob, Tenant),
             skip_locked=True,
         )
     )
@@ -98,7 +153,20 @@ def build_fenced_attempt_statement(
 ) -> Select[Any]:
     """Lock the exact live lease owner for one tenant/job/attempt."""
 
-    return (
+    tenant_operation = or_(
+        and_(
+            Tenant.status == "provisioning",
+            TenantProvisioningJob.operation == "provision",
+            claim.operation == "provision",
+        ),
+        and_(
+            Tenant.status == "active",
+            TenantProvisioningJob.operation == "upgrade_schema",
+            TenantProvisioningJob.target_revision == TENANT_SCHEMA_REVISION,
+            claim.operation == "upgrade_schema",
+        ),
+    )
+    statement = (
         select(Tenant, TenantProvisioningJob)
         .join(
             TenantProvisioningJob,
@@ -106,10 +174,9 @@ def build_fenced_attempt_statement(
         )
         .where(
             Tenant.id == claim.tenant_id,
-            Tenant.status == "provisioning",
+            tenant_operation,
             TenantProvisioningJob.id == claim.job_id,
             TenantProvisioningJob.tenant_id == claim.tenant_id,
-            TenantProvisioningJob.operation == "provision",
             TenantProvisioningJob.status == "running",
             TenantProvisioningJob.attempt_count == claim.attempt_count,
             TenantProvisioningJob.lease_owner == claim.lease_owner,
@@ -119,6 +186,21 @@ def build_fenced_attempt_statement(
         )
         .with_for_update(of=(Tenant, TenantProvisioningJob))
     )
+    if claim.operation == "upgrade_schema":
+        statement = (
+            statement.join(
+                TenantSchemaState,
+                TenantSchemaState.tenant_id == Tenant.id,
+            )
+            .where(
+                TenantSchemaState.status == "active",
+                TenantSchemaState.revision.in_(
+                    (_PREVIOUS_TENANT_SCHEMA_REVISION, TENANT_SCHEMA_REVISION)
+                ),
+            )
+            .with_for_update(of=(Tenant, TenantProvisioningJob, TenantSchemaState))
+        )
+    return statement
 
 
 def build_worker_activation_statement(
@@ -147,6 +229,7 @@ def build_worker_activation_statement(
             TenantDefaultPolicyState.tenant_id == Tenant.id,
         )
         .where(
+            TenantProvisioningJob.operation == "provision",
             TenantSchemaState.schema_name == tenant_schema_name(claim.tenant_id),
             TenantSchemaState.revision == TENANT_SCHEMA_REVISION,
             TenantSchemaState.status == "active",
@@ -165,8 +248,7 @@ def build_worker_activation_statement(
                     TenantStorageCredential.status == "active",
                     TenantStorageCredential.secret_ref != "",
                     TenantStorageCredential.access_key_fingerprint != "",
-                    TenantStorageState.credential_secret_ref
-                    == TenantStorageCredential.secret_ref,
+                    TenantStorageState.credential_secret_ref == TenantStorageCredential.secret_ref,
                     TenantStorageState.credential_fingerprint
                     == TenantStorageCredential.access_key_fingerprint,
                 ),
@@ -208,6 +290,32 @@ async def _record_audit_once(
 class SqlAlchemyProvisioningRepository:
     """Persist worker claims, prerequisites, retries, and final state."""
 
+    async def enqueue_next_schema_upgrade(self) -> bool:
+        """Idempotently materialize one upgrade job without deactivating its tenant."""
+
+        async with platform_session() as session:
+            async with session.begin():
+                row = (
+                    await session.execute(build_schema_upgrade_candidate_statement())
+                ).one_or_none()
+                if row is None:
+                    return False
+                tenant, _schema_state = row
+                result = await session.execute(
+                    insert(TenantProvisioningJob)
+                    .values(
+                        id=schema_upgrade_job_id(tenant.id),
+                        tenant_id=tenant.id,
+                        operation="upgrade_schema",
+                        target_revision=TENANT_SCHEMA_REVISION,
+                        status="pending",
+                    )
+                    .on_conflict_do_nothing(
+                        index_elements=[TenantProvisioningJob.id],
+                    )
+                )
+                return result.rowcount == 1
+
     async def claim_next(
         self,
         worker_id: str,
@@ -226,6 +334,53 @@ class SqlAlchemyProvisioningRepository:
                 if row is None:
                     return None
                 job, _tenant = row
+                if job.operation == "upgrade_schema":
+                    schema_state = await session.scalar(
+                        select(TenantSchemaState)
+                        .where(
+                            TenantSchemaState.tenant_id == job.tenant_id,
+                            TenantSchemaState.status == "active",
+                            TenantSchemaState.revision.in_(
+                                (
+                                    _PREVIOUS_TENANT_SCHEMA_REVISION,
+                                    TENANT_SCHEMA_REVISION,
+                                )
+                            ),
+                        )
+                        .with_for_update()
+                    )
+                    if schema_state is None:
+                        return None
+                if job.status == "running":
+                    if job.attempt_count + 1 >= job.max_attempts:
+                        exhausted_claim = ProvisioningClaim(
+                            tenant_id=job.tenant_id,
+                            job_id=job.id,
+                            attempt_count=job.attempt_count,
+                            lease_owner=job.lease_owner or "expired-worker",
+                            lease_token=job.lease_token or "expired-lease",
+                            operation=job.operation,
+                        )
+                        if job.operation == "provision":
+                            _tenant.status = "failed"
+                            _tenant.updated_at = now
+                        job.status = "failed"
+                        job.error_category = "worker"
+                        job.error_code = "stale_lease_exhausted"
+                        job.completed_at = now
+                        job.lease_owner = None
+                        job.lease_token = None
+                        job.lease_expires_at = None
+                        job.heartbeat_at = None
+                        job.updated_at = now
+                        await _record_audit_once(
+                            session,
+                            exhausted_claim,
+                            _AUDIT_FAILED,
+                        )
+                        await session.flush()
+                        return None
+                    job.attempt_count += 1
                 lease_token = secrets.token_hex(32)
                 job.status = "running"
                 job.lease_owner = worker_id
@@ -242,6 +397,7 @@ class SqlAlchemyProvisioningRepository:
                     attempt_count=job.attempt_count,
                     lease_owner=worker_id,
                     lease_token=lease_token,
+                    operation=job.operation,
                 )
                 await _record_audit_once(
                     session,
@@ -262,26 +418,15 @@ class SqlAlchemyProvisioningRepository:
         async with platform_session() as session:
             async with session.begin():
                 now = await _database_now(session)
-                result = await session.execute(
-                    update(TenantProvisioningJob)
-                    .where(
-                        TenantProvisioningJob.id == claim.job_id,
-                        TenantProvisioningJob.tenant_id == claim.tenant_id,
-                        TenantProvisioningJob.operation == "provision",
-                        TenantProvisioningJob.status == "running",
-                        TenantProvisioningJob.attempt_count == claim.attempt_count,
-                        TenantProvisioningJob.lease_owner == claim.lease_owner,
-                        TenantProvisioningJob.lease_token == claim.lease_token,
-                        TenantProvisioningJob.lease_expires_at.is_not(None),
-                        TenantProvisioningJob.lease_expires_at > now,
-                    )
-                    .values(
-                        heartbeat_at=now,
-                        lease_expires_at=now + timedelta(seconds=lease_seconds),
-                        updated_at=now,
-                    )
-                )
-                return result.rowcount == 1
+                locked = await self._lock_claim(session, claim, now)
+                if locked is None:
+                    return False
+                _tenant, job = locked
+                job.heartbeat_at = now
+                job.lease_expires_at = now + timedelta(seconds=lease_seconds)
+                job.updated_at = now
+                await session.flush()
+                return True
 
     async def _lock_claim(
         self,
@@ -289,9 +434,7 @@ class SqlAlchemyProvisioningRepository:
         claim: ProvisioningClaim,
         now: datetime,
     ) -> tuple[Tenant, TenantProvisioningJob] | None:
-        result = await session.execute(
-            build_fenced_attempt_statement(claim, now)
-        )
+        result = await session.execute(build_fenced_attempt_statement(claim, now))
         return result.one_or_none()
 
     async def record_schema_ready(
@@ -311,8 +454,10 @@ class SqlAlchemyProvisioningRepository:
         async with platform_session() as session:
             async with session.begin():
                 now = await _database_now(session)
-                if await self._lock_claim(session, claim, now) is None:
+                locked = await self._lock_claim(session, claim, now)
+                if locked is None:
                     return False
+                _tenant, job = locked
                 statement = (
                     insert(TenantSchemaState)
                     .values(
@@ -336,6 +481,19 @@ class SqlAlchemyProvisioningRepository:
                 )
                 await session.execute(statement)
                 await _record_audit_once(session, claim, _AUDIT_SCHEMA_READY)
+                if claim.operation == "upgrade_schema":
+                    job.status = "completed"
+                    job.completed_at = now
+                    job.lease_owner = None
+                    job.lease_token = None
+                    job.lease_expires_at = None
+                    job.heartbeat_at = None
+                    job.updated_at = now
+                    await _record_audit_once(
+                        session,
+                        claim,
+                        _AUDIT_SCHEMA_UPGRADE_COMPLETED,
+                    )
                 await session.flush()
                 return True
 
@@ -344,6 +502,8 @@ class SqlAlchemyProvisioningRepository:
         claim: ProvisioningClaim,
         result: StorageProvisioningResult,
     ) -> bool:
+        if claim.operation != "provision":
+            return False
         result.validate(claim.tenant_id)
         async with platform_session() as session:
             async with session.begin():
@@ -412,6 +572,8 @@ class SqlAlchemyProvisioningRepository:
         claim: ProvisioningClaim,
         result: TenantPolicyProvisioningResult,
     ) -> bool:
+        if claim.operation != "provision":
+            return False
         result.validate()
         async with platform_session() as session:
             async with session.begin():
@@ -451,12 +613,12 @@ class SqlAlchemyProvisioningRepository:
                 return True
 
     async def activate(self, claim: ProvisioningClaim) -> bool:
+        if claim.operation != "provision":
+            return False
         async with platform_session() as session:
             async with session.begin():
                 now = await _database_now(session)
-                result = await session.execute(
-                    build_worker_activation_statement(claim, now)
-                )
+                result = await session.execute(build_worker_activation_statement(claim, now))
                 row = result.one_or_none()
                 if row is None:
                     return False
@@ -468,7 +630,7 @@ class SqlAlchemyProvisioningRepository:
                 job.lease_owner = None
                 job.lease_token = None
                 job.lease_expires_at = None
-                job.heartbeat_at = now
+                job.heartbeat_at = None
                 job.updated_at = now
                 await _record_audit_once(session, claim, _AUDIT_COMPLETED)
                 await session.flush()
@@ -500,10 +662,7 @@ class SqlAlchemyProvisioningRepository:
                 job.lease_expires_at = None
                 job.heartbeat_at = None
                 job.updated_at = now
-                can_retry = (
-                    retryable
-                    and job.attempt_count + 1 < job.max_attempts
-                )
+                can_retry = retryable and job.attempt_count + 1 < job.max_attempts
                 if can_retry:
                     job.status = "pending"
                     job.attempt_count += 1
@@ -512,8 +671,9 @@ class SqlAlchemyProvisioningRepository:
                     job.completed_at = None
                     action = _AUDIT_RETRY_SCHEDULED
                 else:
-                    tenant.status = "failed"
-                    tenant.updated_at = now
+                    if claim.operation == "provision":
+                        tenant.status = "failed"
+                        tenant.updated_at = now
                     job.status = "failed"
                     job.completed_at = now
                     action = _AUDIT_FAILED

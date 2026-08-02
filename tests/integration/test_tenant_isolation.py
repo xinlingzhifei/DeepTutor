@@ -210,13 +210,13 @@ async def _initialize_database(database_url: str) -> None:
                         TenantSchemaState(
                             tenant_id=TENANT_A,
                             schema_name=tenant_schema_name(TENANT_A),
-                            revision="20260730_0004",
+                            revision="20260730_0005",
                             status="active",
                         ),
                         TenantSchemaState(
                             tenant_id=TENANT_B,
                             schema_name=tenant_schema_name(TENANT_B),
-                            revision="20260730_0004",
+                            revision="20260730_0005",
                             status="active",
                         ),
                         TenantStorageCredential(

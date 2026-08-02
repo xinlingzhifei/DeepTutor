@@ -391,6 +391,7 @@ def build_failed_job_retry_statement(
             TenantProvisioningJob.operation == "provision",
             TenantProvisioningJob.status == "failed",
             TenantProvisioningJob.attempt_count == expected_attempt_count,
+            TenantProvisioningJob.attempt_count + 1 < TenantProvisioningJob.max_attempts,
         )
         .values(
             status="pending",
@@ -763,6 +764,11 @@ class TenantRepository:
                 tenant, job = row
                 tenant.status = "active"
                 job.status = "completed"
+                job.lease_owner = None
+                job.lease_token = None
+                job.lease_expires_at = None
+                job.heartbeat_at = None
+                job.completed_at = func.now()
                 await session.flush()
                 return True
 
@@ -789,6 +795,11 @@ class TenantRepository:
                 tenant, job = row
                 tenant.status = "failed"
                 job.status = "failed"
+                job.lease_owner = None
+                job.lease_token = None
+                job.lease_expires_at = None
+                job.heartbeat_at = None
+                job.completed_at = func.now()
                 await session.flush()
                 return True
 

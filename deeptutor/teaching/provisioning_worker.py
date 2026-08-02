@@ -25,7 +25,7 @@ from deeptutor.teaching.migrations.runner import (
 )
 from deeptutor.teaching.schema_names import tenant_schema_name
 
-TENANT_SCHEMA_REVISION = "20260730_0004"
+TENANT_SCHEMA_REVISION = "20260801_0007"
 OBJECT_STORAGE_POLICY_VERSION = "20260730"
 DEFAULT_POLICY_VERSION = "20260730"
 DEFAULT_POLICY_PAYLOAD = (
@@ -39,25 +39,27 @@ DEFAULT_POLICY_PAYLOAD = (
 
 _BASE_BACKOFF_SECONDS = 5
 _MAX_BACKOFF_SECONDS = 300
-FAILURE_CLASSIFICATIONS: Mapping[tuple[str, str], bool] = MappingProxyType({
-    ("schema", "migration_unavailable"): True,
-    ("schema", "migration_failed"): False,
-    ("schema", "verification_unavailable"): True,
-    ("schema", "verification_failed"): False,
-    ("schema", "revision_mismatch"): False,
-    ("schema", "verification_mismatch"): False,
-    ("storage", "admin_temporarily_unavailable"): True,
-    ("storage", "admin_unavailable"): False,
-    ("storage", "admin_result_mode"): False,
-    ("storage", "invalid_credential_metadata"): False,
-    ("storage", "invalid_local_credential"): False,
-    ("storage", "invalid_policy"): False,
-    ("storage", "local_prefix_unsafe"): False,
-    ("storage", "local_unavailable"): True,
-    ("policy", "invalid_default"): False,
-    ("infrastructure", "temporarily_unavailable"): True,
-    ("worker", "unexpected_error"): False,
-})
+FAILURE_CLASSIFICATIONS: Mapping[tuple[str, str], bool] = MappingProxyType(
+    {
+        ("schema", "migration_unavailable"): True,
+        ("schema", "migration_failed"): False,
+        ("schema", "verification_unavailable"): True,
+        ("schema", "verification_failed"): False,
+        ("schema", "revision_mismatch"): False,
+        ("schema", "verification_mismatch"): False,
+        ("storage", "admin_temporarily_unavailable"): True,
+        ("storage", "admin_unavailable"): False,
+        ("storage", "admin_result_mode"): False,
+        ("storage", "invalid_credential_metadata"): False,
+        ("storage", "invalid_local_credential"): False,
+        ("storage", "invalid_policy"): False,
+        ("storage", "local_prefix_unsafe"): False,
+        ("storage", "local_unavailable"): True,
+        ("policy", "invalid_default"): False,
+        ("infrastructure", "temporarily_unavailable"): True,
+        ("worker", "unexpected_error"): False,
+    }
+)
 _StepResult = TypeVar("_StepResult")
 
 
@@ -79,6 +81,7 @@ class ProvisioningClaim:
     attempt_count: int
     lease_owner: str
     lease_token: str = field(repr=False)
+    operation: str = "provision"
 
 
 @dataclass(frozen=True, slots=True)
@@ -254,6 +257,10 @@ class ProvisioningRepository(Protocol):
     ) -> bool: ...
 
 
+class TenantSchemaUpgradeReconciler(Protocol):
+    async def enqueue_next_schema_upgrade(self) -> bool: ...
+
+
 class TenantSchemaProvisioner(Protocol):
     async def provision(self, tenant_id: str) -> SchemaProvisioningResult: ...
 
@@ -308,10 +315,7 @@ class AlembicTenantSchemaProvisioner:
                 tenant_schema=schema_name,
             )
         except Exception as exc:
-            if (
-                isinstance(exc, MigrationUnavailableError)
-                or is_transient_database_error(exc)
-            ):
+            if isinstance(exc, MigrationUnavailableError) or is_transient_database_error(exc):
                 raise ProvisioningStepError(
                     category="schema",
                     code="migration_unavailable",
@@ -464,6 +468,7 @@ class ProvisioningWorker:
         enabled: bool,
         worker_id: str,
         repository: ProvisioningRepository | None = None,
+        schema_upgrade_reconciler: TenantSchemaUpgradeReconciler | None = None,
         schema_provisioner: TenantSchemaProvisioner | None = None,
         storage_provisioner: TenantStorageProvisioner | None = None,
         policy_provisioner: TenantPolicyProvisioner | None = None,
@@ -477,6 +482,7 @@ class ProvisioningWorker:
         self._enabled = enabled
         self._worker_id = worker_id
         self._repository = repository
+        self._schema_upgrade_reconciler = schema_upgrade_reconciler
         self._schema_provisioner = schema_provisioner
         self._storage_provisioner = storage_provisioner
         self._policy_provisioner = policy_provisioner
@@ -557,6 +563,8 @@ class ProvisioningWorker:
         if not self._enabled:
             return False
         repository, schema, storage, policy = self._require_dependencies()
+        if self._schema_upgrade_reconciler is not None:
+            await self._schema_upgrade_reconciler.enqueue_next_schema_upgrade()
         claim = await repository.claim_next(
             self._worker_id,
             lease_seconds=self._lease_seconds,
@@ -576,6 +584,10 @@ class ProvisioningWorker:
                 return True
             if not await repository.record_schema_ready(claim, schema_result):
                 return True
+            if claim.operation == "upgrade_schema":
+                return True
+            if claim.operation != "provision":
+                raise RuntimeError("unknown provisioning operation")
 
             lease_live, storage_result = await self._run_step_with_heartbeat(
                 repository,
@@ -664,10 +676,12 @@ def build_provisioning_worker(
         SqlAlchemyProvisioningRepository,
     )
 
+    repository = SqlAlchemyProvisioningRepository()
     return ProvisioningWorker(
         enabled=True,
         worker_id=resolved_worker_id,
-        repository=SqlAlchemyProvisioningRepository(),
+        repository=repository,
+        schema_upgrade_reconciler=repository,
         schema_provisioner=AlembicTenantSchemaProvisioner(),
         storage_provisioner=build_storage_provisioner(
             runtime_settings,
