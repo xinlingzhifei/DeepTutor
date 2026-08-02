@@ -95,6 +95,14 @@ def temporary_artifact_key(
     return f"tenants/{tenant}/temporary/{job}/{name}"
 
 
+def source_upload_key(tenant_id: str, upload_id: str) -> str:
+    """Derive the immutable object key for one accepted PDF source upload."""
+
+    tenant = _identifier(tenant_id, "tenant_id")
+    upload = _identifier(upload_id, "upload_id")
+    return f"tenants/{tenant}/sources/{upload}/source.pdf"
+
+
 def tenant_artifact_prefix(tenant_id: str) -> str:
     """Return the sole object-store prefix assigned to a tenant."""
 

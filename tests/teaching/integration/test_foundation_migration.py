@@ -23,7 +23,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 FOUNDATION_REVISION = "20260728_0001"
 SCOPED_GRANTS_REVISION = "20260730_0002"
 PROVISIONING_REVISION = "20260730_0003"
-HEAD_REVISION = "20260802_0008"
+HEAD_REVISION = "20260803_0009"
 
 
 @dataclass(frozen=True)
@@ -508,6 +508,7 @@ def test_wheel_packages_migrations_and_full_app_entrypoint(
         "deeptutor/teaching/migrations/versions/20260801_0006_job_recovery.py",
         "deeptutor/teaching/migrations/versions/20260801_0007_trusted_job_inputs.py",
         "deeptutor/teaching/migrations/versions/20260802_0008_classroom_lifecycle.py",
+        "deeptutor/teaching/migrations/versions/20260803_0009_knowledge_entitlements.py",
     }.issubset(names)
     assert "deeptutor-migrate = deeptutor.teaching.migrations.cli:main" in entry_points
     assert "deeptutor-provisioner = deeptutor.teaching.provisioning_cli:main" in entry_points
@@ -563,6 +564,7 @@ def test_packaged_entrypoint_runs_platform_and_tenant_scopes(
         "provider_profiles",
         "role_grants",
         "tenant_default_policy_states",
+        "tenant_knowledge_entitlements",
         "tenant_memberships",
         "tenant_provisioning_jobs",
         "tenant_scheduler_state",
@@ -781,6 +783,7 @@ def test_foundation_migration_is_isolated_and_repeatable(migration_database):
         "provider_profiles",
         "role_grants",
         "tenant_default_policy_states",
+        "tenant_knowledge_entitlements",
         "tenant_memberships",
         "tenant_provisioning_jobs",
         "tenant_scheduler_state",
@@ -1907,6 +1910,117 @@ def test_postgres_data_plane_routing_is_fail_closed_and_owner_bound(
             await database_module.dispose_platform_engine()
 
     asyncio.run(exercise())
+
+
+def test_knowledge_entitlement_downgrade_refuses_data_without_mutation(
+    migration_database,
+) -> None:
+    tenant_id = "knowledge-entitlement-downgrade"
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(migration_database, "scope=platform"),
+    )
+
+    async def seed() -> None:
+        engine = create_async_engine(migration_database.url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO platform.tenants (id, name, status)
+                        VALUES (:tenant_id, 'Entitlement downgrade', 'active')
+                        ON CONFLICT (id) DO NOTHING
+                        """
+                    ),
+                    {"tenant_id": tenant_id},
+                )
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO platform.tenant_knowledge_entitlements (
+                            tenant_id,
+                            knowledge_resource_id,
+                            status,
+                            granted_by
+                        ) VALUES (
+                            :tenant_id,
+                            'admin:kb:math',
+                            'active',
+                            'admin-a'
+                        )
+                        """
+                    ),
+                    {"tenant_id": tenant_id},
+                )
+        finally:
+            await engine.dispose()
+
+    async def inspect() -> tuple[str, int]:
+        engine = create_async_engine(migration_database.url)
+        try:
+            async with engine.connect() as connection:
+                revision = await connection.scalar(
+                    text("SELECT version_num FROM platform.alembic_version")
+                )
+                count = await connection.scalar(
+                    text(
+                        "SELECT count(*) FROM platform.tenant_knowledge_entitlements "
+                        "WHERE tenant_id = :tenant_id"
+                    ),
+                    {"tenant_id": tenant_id},
+                )
+                return str(revision), int(count or 0)
+        finally:
+            await engine.dispose()
+
+    async def cleanup() -> None:
+        engine = create_async_engine(migration_database.url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "DELETE FROM platform.tenant_knowledge_entitlements "
+                        "WHERE tenant_id = :tenant_id"
+                    ),
+                    {"tenant_id": tenant_id},
+                )
+                await connection.execute(
+                    text("DELETE FROM platform.tenants WHERE id = :tenant_id"),
+                    {"tenant_id": tenant_id},
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(seed())
+    refused = _run_alembic(
+        migration_database,
+        "scope=platform",
+        action="downgrade",
+        revision="20260802_0008",
+    )
+    safe_output = _assert_secret_safe_output(migration_database, refused)
+
+    assert refused.returncode != 0, safe_output
+    assert (
+        "cannot downgrade knowledge entitlements: active authorization data exists" in safe_output
+    )
+    assert asyncio.run(inspect()) == (HEAD_REVISION, 1)
+
+    asyncio.run(cleanup())
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(
+            migration_database,
+            "scope=platform",
+            action="downgrade",
+            revision="20260802_0008",
+        ),
+    )
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(migration_database, "scope=platform"),
+    )
 
 
 def test_active_0007_tenant_schema_upgrade_is_idempotent_and_recoverable(
@@ -3673,7 +3787,7 @@ def test_stale_provisioning_claims_stop_at_max_attempts_without_deactivating_upg
                                 tenant_id=tenant_id,
                                 operation=operation,
                                 target_revision=(
-                                    "20260802_0008" if operation == "upgrade_schema" else None
+                                    "20260803_0009" if operation == "upgrade_schema" else None
                                 ),
                                 status="running",
                                 attempt_count=4,
@@ -3757,7 +3871,7 @@ def test_future_tenant_schema_revision_is_not_enqueued_or_claimed(
                         TenantSchemaState(
                             tenant_id="future-schema-tenant",
                             schema_name=tenant_schema_name("future-schema-tenant"),
-                            revision="20260802_0009",
+                            revision="20260803_0010",
                             status="active",
                         )
                     )
@@ -3766,7 +3880,7 @@ def test_future_tenant_schema_revision_is_not_enqueued_or_claimed(
                             id="future-schema-old-worker-job",
                             tenant_id="future-schema-tenant",
                             operation="upgrade_schema",
-                            target_revision="20260802_0008",
+                            target_revision="20260803_0009",
                             status="pending",
                         )
                     )

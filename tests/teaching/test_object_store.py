@@ -20,6 +20,7 @@ from deeptutor.multi_user.context import (
     set_current_tenant,
 )
 from deeptutor.services.config import PlatformSettings
+from deeptutor.teaching import artifacts as artifact_module
 from deeptutor.teaching import object_store as object_store_module
 from deeptutor.teaching.artifacts import (
     ArtifactManifestEntry,
@@ -285,6 +286,19 @@ def test_temporary_key_is_server_derived() -> None:
     )
 
 
+def test_source_upload_key_is_server_derived_and_exact() -> None:
+    source_upload_key = getattr(artifact_module, "source_upload_key", None)
+
+    assert callable(source_upload_key)
+    assert (
+        source_upload_key("tenant-a", "upload-1") == "tenants/tenant-a/sources/upload-1/source.pdf"
+    )
+
+    for unsafe_id in ("../upload", "upload/one", r"upload\one", ""):
+        with pytest.raises(ValueError):
+            source_upload_key("tenant-a", unsafe_id)
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -335,6 +349,86 @@ async def test_local_store_streams_verified_temporary_object(tmp_path) -> None:
     assert stored.sha256 == hashlib.sha256(payload).hexdigest()
     assert stored.size == len(payload)
     assert await _read_all(await store.open(key)) == payload
+
+
+@pytest.mark.asyncio
+async def test_local_store_persists_exact_source_key_create_only(tmp_path) -> None:
+    payload = b"%PDF-source"
+    digest = hashlib.sha256(payload).hexdigest()
+    key = "tenants/tenant-a/sources/upload-1/source.pdf"
+    store = LocalClassroomArtifactStore(tmp_path, "tenant-a")
+
+    stored = await store.put_verified(
+        key,
+        _body(payload),
+        digest,
+        len(payload),
+        content_type="application/pdf",
+    )
+
+    assert await _read_all(await store.open(key)) == payload
+    assert await store.list_prefix("tenants/tenant-a/sources/") == (key,)
+    with pytest.raises(ObjectStoreConflictError):
+        await store.put_verified(
+            key,
+            _body(payload),
+            digest,
+            len(payload),
+            content_type="application/pdf",
+        )
+    await store.delete_owned(stored)
+    assert await store.list_prefix("tenants/tenant-a/sources/") == ()
+
+
+@pytest.mark.parametrize(
+    "unsafe_key",
+    [
+        "tenants/tenant-b/sources/upload-1/source.pdf",
+        "tenants/tenant-a/sources/../upload-1/source.pdf",
+        "tenants/tenant-a/sources/upload-1/other.pdf",
+        "tenants/tenant-a/sources/upload-1/nested/source.pdf",
+    ],
+)
+@pytest.mark.asyncio
+async def test_local_store_rejects_noncanonical_source_keys(tmp_path, unsafe_key: str) -> None:
+    payload = b"%PDF-source"
+    store = LocalClassroomArtifactStore(tmp_path, "tenant-a")
+
+    with pytest.raises(ObjectStoreAccessDenied):
+        await store.put_verified(
+            unsafe_key,
+            _body(payload),
+            hashlib.sha256(payload).hexdigest(),
+            len(payload),
+            content_type="application/pdf",
+        )
+
+
+@pytest.mark.asyncio
+async def test_s3_source_upload_is_create_only(monkeypatch) -> None:
+    payload = b"%PDF-source"
+    digest = hashlib.sha256(payload).hexdigest()
+    key = "tenants/tenant-a/sources/upload-1/source.pdf"
+    client = _MemoryS3Client()
+    store = _s3_store(monkeypatch, client)
+
+    await store.put_verified(
+        key,
+        _body(payload),
+        digest,
+        len(payload),
+        content_type="application/pdf",
+    )
+
+    assert client.put_calls[-1]["IfNoneMatch"] == "*"
+    with pytest.raises(ObjectStoreConflictError):
+        await store.put_verified(
+            key,
+            _body(payload),
+            digest,
+            len(payload),
+            content_type="application/pdf",
+        )
 
 
 @pytest.mark.asyncio

@@ -11,13 +11,14 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-from deeptutor.teaching.artifacts import temporary_artifact_key
+from deeptutor.teaching.artifacts import source_upload_key
 from deeptutor.teaching.database import get_platform_engine
 from deeptutor.teaching.models.classrooms import (
     SourceSnapshot,
     SourceUpload,
     TenantSourceBinding,
 )
+from deeptutor.teaching.models.platform import Tenant, TenantKnowledgeEntitlement
 from deeptutor.teaching.models.tenant import Course, TeachingClass
 from deeptutor.teaching.schema_names import tenant_schema_name
 
@@ -93,7 +94,7 @@ def source_binding_id(
 
 def _require_upload_key(tenant_id: str, upload_id: str, object_key: str) -> None:
     try:
-        expected = temporary_artifact_key(tenant_id, upload_id, "source.pdf")
+        expected = source_upload_key(tenant_id, upload_id)
     except ValueError as exc:
         raise SourceConflictError("source upload identity is invalid") from exc
     if object_key != expected:
@@ -145,6 +146,20 @@ class SqlAlchemySourceRepository:
                 class_id=class_id,
             )
 
+    async def is_knowledge_resource_entitled(self, resource_id: str) -> bool:
+        async with self._session_factory() as session:
+            entitled = await session.scalar(
+                select(TenantKnowledgeEntitlement.knowledge_resource_id)
+                .join(Tenant, Tenant.id == TenantKnowledgeEntitlement.tenant_id)
+                .where(
+                    TenantKnowledgeEntitlement.tenant_id == self._tenant_id,
+                    TenantKnowledgeEntitlement.knowledge_resource_id == resource_id,
+                    TenantKnowledgeEntitlement.status == "active",
+                    Tenant.status == "active",
+                )
+            )
+            return entitled is not None
+
     async def _ensure_binding(
         self,
         session: AsyncSession,
@@ -179,8 +194,8 @@ class SqlAlchemySourceRepository:
         ):
             raise SourceConflictError("source binding identity conflict")
 
-    async def _source_record(self, binding_id: str) -> SourceRecord:
-        statement = (
+    def _source_record_statement(self, binding_id: str):
+        return (
             select(
                 TenantSourceBinding.id,
                 SourceSnapshot.source_type,
@@ -209,11 +224,20 @@ class SqlAlchemySourceRepository:
                 SourceSnapshot.tenant_id == self._tenant_id,
             )
         )
+
+    async def _source_record_in_session(
+        self,
+        session: AsyncSession,
+        binding_id: str,
+    ) -> SourceRecord:
+        row = (await session.execute(self._source_record_statement(binding_id))).one_or_none()
+        if row is None:
+            raise SourceNotFoundError("source binding not found")
+        return SourceRecord(*row)
+
+    async def _source_record(self, binding_id: str) -> SourceRecord:
         async with self._session_factory() as session:
-            row = (await session.execute(statement)).one_or_none()
-            if row is None:
-                raise SourceNotFoundError("source binding not found")
-            return SourceRecord(*row)
+            return await self._source_record_in_session(session, binding_id)
 
     async def list_bindings(
         self,
@@ -409,9 +433,11 @@ class SqlAlchemySourceRepository:
                         class_id=class_id,
                         actor_id=actor_id,
                     )
+                    await session.flush()
+                    record = await self._source_record_in_session(session, binding_id)
         except IntegrityError as exc:
             raise SourceConflictError("source upload conflicts with existing state") from exc
-        return await self._source_record(binding_id), retained
+        return record, retained
 
     async def bind_knowledge_resource(
         self,

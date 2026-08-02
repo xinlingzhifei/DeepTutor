@@ -4,10 +4,19 @@ import asyncio
 import uuid
 
 import pytest
+from sqlalchemy import insert
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
-from deeptutor.teaching.repositories.catalog import SqlAlchemyCatalogRepository
+from deeptutor.teaching.models.platform import (
+    Tenant,
+    TenantKnowledgeEntitlement,
+    TenantMembership,
+)
+from deeptutor.teaching.repositories.catalog import (
+    CatalogNotFoundError,
+    SqlAlchemyCatalogRepository,
+)
 from deeptutor.teaching.repositories.sources import (
     NewKnowledgeSnapshot,
     NewUpload,
@@ -16,6 +25,22 @@ from deeptutor.teaching.repositories.sources import (
     SqlAlchemySourceRepository,
     source_binding_id,
 )
+
+
+async def _seed_memberships(engine, *rows: tuple[str, str, str]) -> None:
+    tenant_ids = sorted({tenant_id for tenant_id, _, _ in rows})
+    async with engine.begin() as connection:
+        await connection.execute(
+            insert(Tenant),
+            [{"id": tenant_id, "name": tenant_id, "status": "active"} for tenant_id in tenant_ids],
+        )
+        await connection.execute(
+            insert(TenantMembership),
+            [
+                {"tenant_id": tenant_id, "user_id": user_id, "status": status}
+                for tenant_id, user_id, status in rows
+            ],
+        )
 
 
 @pytest.mark.asyncio
@@ -29,6 +54,11 @@ async def test_catalog_and_sources_are_isolated_and_upload_dedupe_is_atomic(
     generation_database.migrate_tenant(tenant_b)
     engine = create_async_engine(generation_database.url, poolclass=NullPool)
     try:
+        await _seed_memberships(
+            engine,
+            (tenant_a, "student-a", "active"),
+            (tenant_b, "student-b", "active"),
+        )
         catalog_a = SqlAlchemyCatalogRepository(tenant_a, engine)
         catalog_b = SqlAlchemyCatalogRepository(tenant_b, engine)
         source_a = SqlAlchemySourceRepository(tenant_a, engine)
@@ -76,7 +106,7 @@ async def test_catalog_and_sources_are_isolated_and_upload_dedupe_is_atomic(
                     upload_id=f"foreign-{suffix}",
                     snapshot_id=f"foreign-pdf-{suffix}",
                     filename="foreign.pdf",
-                    object_key=(f"tenants/{tenant_b}/temporary/foreign-{suffix}/source.pdf"),
+                    object_key=(f"tenants/{tenant_b}/sources/foreign-{suffix}/source.pdf"),
                     sha256="e" * 64,
                     size_bytes=1,
                 ),
@@ -95,7 +125,7 @@ async def test_catalog_and_sources_are_isolated_and_upload_dedupe_is_atomic(
             upload_id=f"upload-one-{suffix}",
             snapshot_id=f"pdf-one-{suffix}",
             filename="one.pdf",
-            object_key=f"tenants/{tenant_a}/temporary/upload-one-{suffix}/source.pdf",
+            object_key=f"tenants/{tenant_a}/sources/upload-one-{suffix}/source.pdf",
             sha256=digest,
             size_bytes=123,
         )
@@ -103,7 +133,7 @@ async def test_catalog_and_sources_are_isolated_and_upload_dedupe_is_atomic(
             upload_id=f"upload-two-{suffix}",
             snapshot_id=f"pdf-two-{suffix}",
             filename="two.pdf",
-            object_key=f"tenants/{tenant_a}/temporary/upload-two-{suffix}/source.pdf",
+            object_key=f"tenants/{tenant_a}/sources/upload-two-{suffix}/source.pdf",
             sha256=digest,
             size_bytes=123,
         )
@@ -141,5 +171,83 @@ async def test_catalog_and_sources_are_isolated_and_upload_dedupe_is_atomic(
         assert results[0][0].binding_id == results[1][0].binding_id
         assert len(await source_a.list_bindings(None, None)) == 2
         assert await source_b.list_bindings(None, None) == ()
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_enrollment_requires_active_membership_in_repository_tenant(
+    generation_database,
+) -> None:
+    suffix = uuid.uuid4().hex[:12]
+    tenant_a = f"member-a-{suffix}"
+    tenant_b = f"member-b-{suffix}"
+    generation_database.migrate_tenant(tenant_a)
+    engine = create_async_engine(generation_database.url, poolclass=NullPool)
+    try:
+        await _seed_memberships(
+            engine,
+            (tenant_a, "student-active", "active"),
+            (tenant_a, "student-inactive", "inactive"),
+            (tenant_b, "student-other-tenant", "active"),
+        )
+        catalog = SqlAlchemyCatalogRepository(tenant_a, engine)
+        await catalog.create_course("course-a", "Course A")
+        await catalog.create_class("course-a", "class-a", "Class A")
+
+        active = await catalog.add_enrollment("class-a", "student-active")
+
+        assert active.learner_id == "student-active"
+        for learner_id in (
+            "student-missing",
+            "student-inactive",
+            "student-other-tenant",
+        ):
+            with pytest.raises(CatalogNotFoundError, match="active tenant member"):
+                await catalog.add_enrollment("class-a", learner_id)
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_knowledge_entitlement_is_active_and_tenant_scoped(generation_database) -> None:
+    suffix = uuid.uuid4().hex[:12]
+    tenant_a = f"entitled-a-{suffix}"
+    tenant_b = f"entitled-b-{suffix}"
+    resource_id = "admin:kb:math"
+    engine = create_async_engine(generation_database.url, poolclass=NullPool)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                insert(Tenant),
+                [
+                    {"id": tenant_a, "name": tenant_a, "status": "active"},
+                    {"id": tenant_b, "name": tenant_b, "status": "active"},
+                ],
+            )
+            await connection.execute(
+                insert(TenantKnowledgeEntitlement),
+                [
+                    {
+                        "tenant_id": tenant_a,
+                        "knowledge_resource_id": resource_id,
+                        "status": "active",
+                        "granted_by": "admin-a",
+                    },
+                    {
+                        "tenant_id": tenant_b,
+                        "knowledge_resource_id": resource_id,
+                        "status": "disabled",
+                        "granted_by": "admin-b",
+                    },
+                ],
+            )
+
+        source_a = SqlAlchemySourceRepository(tenant_a, engine)
+        source_b = SqlAlchemySourceRepository(tenant_b, engine)
+
+        assert await source_a.is_knowledge_resource_entitled(resource_id) is True
+        assert await source_b.is_knowledge_resource_entitled(resource_id) is False
+        assert await source_b.is_knowledge_resource_entitled("admin:kb:other") is False
     finally:
         await engine.dispose()

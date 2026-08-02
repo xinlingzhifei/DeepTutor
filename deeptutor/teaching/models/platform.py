@@ -89,6 +89,36 @@ class TenantMembership(PlatformBase):
     __table_args__ = (Index("ix_tenant_memberships_user_id", "user_id"),)
 
 
+class TenantKnowledgeEntitlement(PlatformBase):
+    __tablename__ = "tenant_knowledge_entitlements"
+
+    tenant_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("platform.tenants.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    knowledge_resource_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    status: Mapped[str] = mapped_column(String(32), server_default="active")
+    granted_by: Mapped[str] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        CheckConstraint("status IN ('active', 'disabled')", name="status"),
+        Index(
+            "ix_tenant_knowledge_entitlements_resource_status",
+            "knowledge_resource_id",
+            "status",
+        ),
+    )
+
+
 class RoleGrant(PlatformBase):
     __tablename__ = "role_grants"
 

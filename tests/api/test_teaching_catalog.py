@@ -50,6 +50,7 @@ class _CatalogRepository:
             ("class-a", "student-a"): _Enrollment("class-a", "student-a"),
             ("class-a", "student-b"): _Enrollment("class-a", "student-b"),
         }
+        self.ineligible_learners: set[str] = set()
 
     async def list_courses(self, course_ids):
         return tuple(
@@ -121,6 +122,10 @@ class _CatalogRepository:
         )
 
     async def add_enrollment(self, class_id, learner_id):
+        from deeptutor.teaching.repositories.catalog import CatalogNotFoundError
+
+        if learner_id in self.ineligible_learners:
+            raise CatalogNotFoundError("learner is not an active tenant member")
         record = _Enrollment(class_id, learner_id)
         self.enrollments[(class_id, learner_id)] = record
         return record
@@ -168,7 +173,7 @@ def test_teacher_course_list_contains_only_granted_course() -> None:
     response = _client(context, repository).get("/api/v1/teaching/courses")
 
     assert response.status_code == 200
-    assert [item["id"] for item in response.json()] == ["course-a"]
+    assert [item["id"] for item in response.json()["items"]] == ["course-a"]
 
 
 def test_student_cannot_enroll_another_student() -> None:
@@ -206,7 +211,11 @@ def test_org_admin_can_create_and_list_current_tenant_courses() -> None:
 
     assert created.status_code == 201
     assert created.json()["id"] == "course-c"
-    assert {item["id"] for item in listed.json()} == {"course-a", "course-b", "course-c"}
+    assert {item["id"] for item in listed.json()["items"]} == {
+        "course-a",
+        "course-b",
+        "course-c",
+    }
     assert "tenantId" not in created.json()
 
 
@@ -243,8 +252,8 @@ def test_class_scoped_teacher_sees_only_granted_class() -> None:
     courses = client.get("/api/v1/teaching/courses")
     classes = client.get("/api/v1/teaching/courses/course-a/classes")
 
-    assert [item["id"] for item in courses.json()] == ["course-a"]
-    assert [item["id"] for item in classes.json()] == ["class-a"]
+    assert [item["id"] for item in courses.json()["items"]] == ["course-a"]
+    assert [item["id"] for item in classes.json()["items"]] == ["class-a"]
 
 
 def test_tenant_scoped_teacher_grant_lists_all_tenant_courses_and_classes() -> None:
@@ -260,8 +269,8 @@ def test_tenant_scoped_teacher_grant_lists_all_tenant_courses_and_classes() -> N
     courses = client.get("/api/v1/teaching/courses")
     classes = client.get("/api/v1/teaching/courses/course-b/classes")
 
-    assert {item["id"] for item in courses.json()} == {"course-a", "course-b"}
-    assert [item["id"] for item in classes.json()] == ["class-b"]
+    assert {item["id"] for item in courses.json()["items"]} == {"course-a", "course-b"}
+    assert [item["id"] for item in classes.json()["items"]] == ["class-b"]
 
 
 def test_teacher_can_create_class_only_inside_granted_course() -> None:
@@ -313,6 +322,39 @@ def test_teacher_manages_enrollments_only_in_granted_class() -> None:
     assert removed.status_code == 204
 
 
+def test_enrollment_rejects_unknown_inactive_and_other_tenant_users_without_leaking() -> None:
+    repository = _CatalogRepository()
+    repository.ineligible_learners = {
+        "student-missing",
+        "student-inactive",
+        "student-other-tenant",
+    }
+    context = _context(
+        "teacher-a",
+        "teacher",
+        scope_type="class",
+        scope_id="class-a",
+    )
+    client = _client(context, repository)
+
+    responses = [
+        client.post(
+            "/api/v1/teaching/classes/class-a/enrollments",
+            json={"userId": learner_id},
+        )
+        for learner_id in sorted(repository.ineligible_learners)
+    ]
+
+    assert {response.status_code for response in responses} == {404}
+    assert {response.json()["detail"] for response in responses} == {
+        "learner is not an active tenant member"
+    }
+    assert all(
+        ("class-a", learner_id) not in repository.enrollments
+        for learner_id in repository.ineligible_learners
+    )
+
+
 def test_student_reads_only_own_enrollment_and_cannot_remove_peers() -> None:
     repository = _CatalogRepository()
     context = _context(
@@ -327,9 +369,16 @@ def test_student_reads_only_own_enrollment_and_cannot_remove_peers() -> None:
     removal = client.delete("/api/v1/teaching/classes/class-a/enrollments/student-b")
 
     assert listed.status_code == 200
-    assert listed.json() == [
-        {"classId": "class-a", "userId": "student-a", "status": "active", "createdAt": None}
-    ]
+    assert listed.json() == {
+        "items": [
+            {
+                "classId": "class-a",
+                "userId": "student-a",
+                "status": "active",
+                "createdAt": None,
+            }
+        ]
+    }
     assert removal.status_code == 403
 
 

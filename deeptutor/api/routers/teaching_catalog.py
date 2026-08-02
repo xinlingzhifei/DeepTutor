@@ -36,6 +36,7 @@ from deeptutor.teaching.services.sources import (
     SourceService,
     SourceUploadTooLargeError,
     UnsupportedSourceMediaError,
+    knowledge_resource_exists,
 )
 from deeptutor.teaching.tenant_context import TenantContext, require_tenant
 
@@ -110,6 +111,22 @@ class SourceResponse(_ApiModel):
     created_at: datetime | None = None
 
 
+class CourseListResponse(_ApiModel):
+    items: list[CourseResponse]
+
+
+class ClassListResponse(_ApiModel):
+    items: list[ClassResponse]
+
+
+class EnrollmentListResponse(_ApiModel):
+    items: list[EnrollmentResponse]
+
+
+class SourceListResponse(_ApiModel):
+    items: list[SourceResponse]
+
+
 def get_catalog_repository(
     context: TenantContext = Depends(require_tenant),
 ) -> SqlAlchemyCatalogRepository:
@@ -130,6 +147,10 @@ def get_knowledge_resolver():
     return resolve_kb
 
 
+def get_knowledge_resource_exists():
+    return knowledge_resource_exists
+
+
 def get_catalog_service(
     repository=Depends(get_catalog_repository),
 ) -> CatalogService:
@@ -140,8 +161,9 @@ def get_source_service(
     repository=Depends(get_source_repository),
     store_provider=Depends(get_source_store_provider),
     knowledge_resolver=Depends(get_knowledge_resolver),
+    knowledge_exists=Depends(get_knowledge_resource_exists),
 ) -> SourceService:
-    return SourceService(repository, store_provider, knowledge_resolver)
+    return SourceService(repository, store_provider, knowledge_resolver, knowledge_exists)
 
 
 def _course_response(record: CourseRecord) -> CourseResponse:
@@ -215,13 +237,13 @@ async def _source_result(operation: Awaitable[_T]) -> _T:
         raise AssertionError("unreachable") from exc
 
 
-@router.get("/courses", response_model=list[CourseResponse])
+@router.get("/courses", response_model=CourseListResponse)
 async def list_courses(
     context: TenantContext = Depends(require_tenant),
     service: CatalogService = Depends(get_catalog_service),
-) -> list[CourseResponse]:
+) -> CourseListResponse:
     records = await _catalog_result(service.list_courses(context))
-    return [_course_response(record) for record in records]
+    return CourseListResponse(items=[_course_response(record) for record in records])
 
 
 @router.post("/courses", response_model=CourseResponse, status_code=status.HTTP_201_CREATED)
@@ -240,14 +262,14 @@ async def create_course(
     return _course_response(record)
 
 
-@router.get("/courses/{course_id}/classes", response_model=list[ClassResponse])
+@router.get("/courses/{course_id}/classes", response_model=ClassListResponse)
 async def list_classes(
     course_id: str,
     context: TenantContext = Depends(require_tenant),
     service: CatalogService = Depends(get_catalog_service),
-) -> list[ClassResponse]:
+) -> ClassListResponse:
     records = await _catalog_result(service.list_classes(context, course_id=course_id))
-    return [_class_response(record) for record in records]
+    return ClassListResponse(items=[_class_response(record) for record in records])
 
 
 @router.post(
@@ -272,14 +294,14 @@ async def create_class(
     return _class_response(record)
 
 
-@router.get("/classes/{class_id}/enrollments", response_model=list[EnrollmentResponse])
+@router.get("/classes/{class_id}/enrollments", response_model=EnrollmentListResponse)
 async def list_enrollments(
     class_id: str,
     context: TenantContext = Depends(require_tenant),
     service: CatalogService = Depends(get_catalog_service),
-) -> list[EnrollmentResponse]:
+) -> EnrollmentListResponse:
     records = await _catalog_result(service.list_enrollments(context, class_id=class_id))
-    return [_enrollment_response(record) for record in records]
+    return EnrollmentListResponse(items=[_enrollment_response(record) for record in records])
 
 
 @router.post(
@@ -323,13 +345,13 @@ async def remove_enrollment(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
-@router.get("/sources", response_model=list[SourceResponse])
+@router.get("/sources", response_model=SourceListResponse)
 async def list_sources(
     context: TenantContext = Depends(require_tenant),
     service: SourceService = Depends(get_source_service),
-) -> list[SourceResponse]:
+) -> SourceListResponse:
     records = await _source_result(service.list_sources(context))
-    return [_source_response(record) for record in records]
+    return SourceListResponse(items=[_source_response(record) for record in records])
 
 
 @router.post(
@@ -393,6 +415,7 @@ __all__ = [
     "get_catalog_repository",
     "get_catalog_service",
     "get_knowledge_resolver",
+    "get_knowledge_resource_exists",
     "get_source_repository",
     "get_source_service",
     "get_source_store_provider",

@@ -10,6 +10,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from deeptutor.teaching.database import get_platform_engine
+from deeptutor.teaching.models.platform import Tenant, TenantMembership
 from deeptutor.teaching.models.tenant import Course, Enrollment, TeachingClass
 from deeptutor.teaching.schema_names import tenant_schema_name
 
@@ -72,6 +73,7 @@ class SqlAlchemyCatalogRepository:
         translated = (engine or get_platform_engine()).execution_options(
             schema_translate_map={"tenant": tenant_schema_name(tenant_id)}
         )
+        self._tenant_id = tenant_id
         self._session_factory = async_sessionmaker(translated, expire_on_commit=False)
 
     async def list_courses(
@@ -193,6 +195,18 @@ class SqlAlchemyCatalogRepository:
                 )
                 if teaching_class is None:
                     raise CatalogNotFoundError("class not found")
+                active_member = await session.scalar(
+                    select(TenantMembership.user_id)
+                    .join(Tenant, Tenant.id == TenantMembership.tenant_id)
+                    .where(
+                        TenantMembership.tenant_id == self._tenant_id,
+                        TenantMembership.user_id == learner_id,
+                        TenantMembership.status == "active",
+                        Tenant.status == "active",
+                    )
+                )
+                if active_member is None:
+                    raise CatalogNotFoundError("learner is not an active tenant member")
                 existing = await session.get(
                     Enrollment,
                     {"class_id": class_id, "learner_id": learner_id},

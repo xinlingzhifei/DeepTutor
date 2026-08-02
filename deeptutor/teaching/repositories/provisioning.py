@@ -45,7 +45,14 @@ _AUDIT_COMPLETED = "tenant.provisioning.completed"
 _AUDIT_RETRY_SCHEDULED = "tenant.provisioning.retry_scheduled"
 _AUDIT_FAILED = "tenant.provisioning.failed"
 _AUDIT_SCHEMA_UPGRADE_COMPLETED = "tenant.schema_upgrade.completed"
-_PREVIOUS_TENANT_SCHEMA_REVISION = "20260801_0007"
+_OUTDATED_TENANT_SCHEMA_REVISIONS = (
+    "20260801_0007",
+    "20260802_0008",
+)
+_UPGRADEABLE_TENANT_SCHEMA_REVISIONS = (
+    *_OUTDATED_TENANT_SCHEMA_REVISIONS,
+    TENANT_SCHEMA_REVISION,
+)
 
 
 def schema_upgrade_job_id(tenant_id: str) -> str:
@@ -72,7 +79,7 @@ def build_schema_upgrade_candidate_statement() -> Select[Any]:
             Tenant.status == "active",
             TenantSchemaState.status == "active",
             TenantSchemaState.revision.is_not(None),
-            TenantSchemaState.revision == _PREVIOUS_TENANT_SCHEMA_REVISION,
+            TenantSchemaState.revision.in_(_OUTDATED_TENANT_SCHEMA_REVISIONS),
             ~target_job_exists,
         )
         .order_by(TenantSchemaState.updated_at, Tenant.id)
@@ -101,9 +108,7 @@ def build_claim_statement(reference_time: datetime) -> Select[Any]:
         select(TenantSchemaState.tenant_id).where(
             TenantSchemaState.tenant_id == Tenant.id,
             TenantSchemaState.status == "active",
-            TenantSchemaState.revision.in_(
-                (_PREVIOUS_TENANT_SCHEMA_REVISION, TENANT_SCHEMA_REVISION)
-            ),
+            TenantSchemaState.revision.in_(_UPGRADEABLE_TENANT_SCHEMA_REVISIONS),
         )
     ).exists()
     return (
@@ -194,9 +199,7 @@ def build_fenced_attempt_statement(
             )
             .where(
                 TenantSchemaState.status == "active",
-                TenantSchemaState.revision.in_(
-                    (_PREVIOUS_TENANT_SCHEMA_REVISION, TENANT_SCHEMA_REVISION)
-                ),
+                TenantSchemaState.revision.in_(_UPGRADEABLE_TENANT_SCHEMA_REVISIONS),
             )
             .with_for_update(of=(Tenant, TenantProvisioningJob, TenantSchemaState))
         )
@@ -340,12 +343,7 @@ class SqlAlchemyProvisioningRepository:
                         .where(
                             TenantSchemaState.tenant_id == job.tenant_id,
                             TenantSchemaState.status == "active",
-                            TenantSchemaState.revision.in_(
-                                (
-                                    _PREVIOUS_TENANT_SCHEMA_REVISION,
-                                    TENANT_SCHEMA_REVISION,
-                                )
-                            ),
+                            TenantSchemaState.revision.in_(_UPGRADEABLE_TENANT_SCHEMA_REVISIONS),
                         )
                         .with_for_update()
                     )

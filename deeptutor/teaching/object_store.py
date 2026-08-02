@@ -25,6 +25,7 @@ from deeptutor.teaching.artifacts import (
     ClassroomArtifactManifest,
     StoredArtifact,
     classroom_artifact_key,
+    source_upload_key,
     temporary_artifact_key,
     tenant_artifact_prefix,
 )
@@ -229,6 +230,9 @@ def _canonical_artifact_kind(key: str, tenant_id: str) -> str | None:
                 "/".join(parts[4:]),
             )
             return "temporary" if rebuilt == key else None
+        if len(parts) == 5 and parts[:3] == ["tenants", tenant_id, "sources"]:
+            rebuilt = source_upload_key(tenant_id, parts[3])
+            return "source" if rebuilt == key else None
         if (
             len(parts) >= 7
             and parts[:3] == ["tenants", tenant_id, "classrooms"]
@@ -260,6 +264,10 @@ def _is_canonical_artifact_prefix(prefix: str, tenant_id: str) -> bool:
         completions = {1: "/__job__/__name__", 2: "/__name__"}
         candidate = normalized + completions.get(len(parts), "")
         return _canonical_artifact_kind(candidate, tenant_id) == "temporary"
+    if parts[0] == "sources":
+        completions = {1: "/__upload__/source.pdf", 2: "/source.pdf"}
+        candidate = normalized + completions.get(len(parts), "")
+        return _canonical_artifact_kind(candidate, tenant_id) == "source"
     if parts[0] == "classrooms":
         completions = {
             1: "/__asset__/versions/1/__name__",
@@ -502,6 +510,17 @@ class _TenantScopedStore:
             raise ObjectStoreAccessDenied("uploads must use the current tenant temporary prefix")
         return validated
 
+    def _require_direct_upload_key(self, key: str) -> str:
+        validated = self._require_scoped_key(key)
+        if _canonical_artifact_kind(validated, self.tenant_id) not in {
+            "temporary",
+            "source",
+        }:
+            raise ObjectStoreAccessDenied(
+                "uploads must use a canonical tenant temporary or source key"
+            )
+        return validated
+
     def _require_classroom_key(self, key: str) -> str:
         validated = self._require_scoped_key(key)
         if _canonical_artifact_kind(validated, self.tenant_id) != "classroom":
@@ -709,7 +728,7 @@ class _TenantScopedStore:
         key: str,
     ) -> tuple[str, StoredArtifact | None]:
         safe_key = self._require_key(key)
-        if _canonical_artifact_kind(safe_key, self.tenant_id) == "temporary":
+        if _canonical_artifact_kind(safe_key, self.tenant_id) in {"temporary", "source"}:
             return safe_key, None
         if _is_internal_key(safe_key, self.tenant_id):
             raise ObjectStoreNotFound("object was not found")
@@ -732,7 +751,7 @@ class _TenantScopedStore:
             if not safe_key.startswith(prefix):
                 raise ObjectStoreAccessDenied("backend returned an object outside the prefix")
             kind = _canonical_artifact_kind(safe_key, self.tenant_id)
-            if kind == "temporary":
+            if kind in {"temporary", "source"}:
                 visible.append(safe_key)
                 continue
             if _is_internal_key(safe_key, self.tenant_id):
@@ -977,7 +996,8 @@ class LocalClassroomArtifactStore(_TenantScopedStore):
         *,
         content_type: str = "application/octet-stream",
     ) -> StoredArtifact:
-        safe_key = self._require_temporary_key(key)
+        safe_key = self._require_direct_upload_key(key)
+        create_only = _canonical_artifact_kind(safe_key, self.tenant_id) == "source"
         destination = self._path_for(safe_key)
         expected_sha256 = _validate_sha256(sha256)
         expected_size = _validate_size(size)
@@ -1003,7 +1023,19 @@ class LocalClassroomArtifactStore(_TenantScopedStore):
                 safe_content_type,
             )
             await asyncio.to_thread(temporary_handle.close)
-            await asyncio.to_thread(os.replace, temporary_path, destination)
+            if create_only:
+                revision = await asyncio.to_thread(
+                    _atomic_local_create,
+                    destination,
+                    temporary_path,
+                    expected_sha256,
+                    expected_size,
+                    safe_content_type,
+                )
+                await asyncio.to_thread(temporary_path.unlink, missing_ok=True)
+            else:
+                await asyncio.to_thread(os.replace, temporary_path, destination)
+                revision = await asyncio.to_thread(_local_revision, destination)
         except BaseException:
             await asyncio.to_thread(temporary_handle.close)
             await asyncio.to_thread(temporary_path.unlink, missing_ok=True)
@@ -1014,7 +1046,7 @@ class LocalClassroomArtifactStore(_TenantScopedStore):
             expected_size,
             safe_content_type,
             owner_token,
-            await asyncio.to_thread(_local_revision, destination),
+            revision,
         )
 
     async def open(self, key: str) -> AsyncIterator[bytes]:
@@ -1426,7 +1458,8 @@ class S3ClassroomArtifactStore(_TenantScopedStore):
         *,
         content_type: str = "application/octet-stream",
     ) -> StoredArtifact:
-        safe_key = self._require_temporary_key(key)
+        safe_key = self._require_direct_upload_key(key)
+        create_only = _canonical_artifact_kind(safe_key, self.tenant_id) == "source"
         expected_sha256 = _validate_sha256(sha256)
         expected_size = _validate_size(size)
         safe_content_type = _validate_content_type(content_type)
@@ -1448,7 +1481,7 @@ class S3ClassroomArtifactStore(_TenantScopedStore):
                 content_type=safe_content_type,
                 owner_token=owner_token,
                 reconcile_unclaimed=True,
-                create_only=False,
+                create_only=create_only,
             )
         finally:
             await asyncio.to_thread(spool.close)

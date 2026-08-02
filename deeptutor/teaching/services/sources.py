@@ -14,13 +14,16 @@ import uuid
 from pypdf import PdfReader
 from pypdf.generic import ArrayObject, DictionaryObject, IndirectObject
 
+from deeptutor.multi_user.knowledge_access import manager_for_resource
 from deeptutor.multi_user.models import KnowledgeResource
-from deeptutor.teaching.artifacts import StoredArtifact, temporary_artifact_key
+from deeptutor.teaching.artifacts import StoredArtifact, source_upload_key
 from deeptutor.teaching.object_store import ClassroomArtifactStore
 from deeptutor.teaching.permissions import ResourceScope
 from deeptutor.teaching.repositories.sources import (
     NewKnowledgeSnapshot,
     NewUpload,
+    SourceConflictError,
+    SourceNotFoundError,
     SourceRecord,
     UploadRecord,
     source_binding_id,
@@ -93,6 +96,8 @@ class UploadFileLike(Protocol):
 
 class SourceRepository(Protocol):
     async def validate_target(self, course_id: str, class_id: str | None) -> None: ...
+
+    async def is_knowledge_resource_entitled(self, resource_id: str) -> bool: ...
 
     async def list_bindings(
         self,
@@ -169,6 +174,12 @@ def _safe_filename(value: str | None) -> str:
     if not name or any(character in name for character in "\x00\r\n"):
         return "source.pdf"
     return name[:512]
+
+
+def knowledge_resource_exists(resource: KnowledgeResource) -> bool:
+    """Check the resolved resource against its authoritative KB manager."""
+
+    return resource.name in manager_for_resource(resource).list_knowledge_bases()
 
 
 def _has_permission(
@@ -369,10 +380,12 @@ class SourceService:
         repository: SourceRepository,
         store_provider: SourceStoreProvider,
         knowledge_resolver: Callable[..., KnowledgeResource],
+        knowledge_exists: Callable[[KnowledgeResource], bool],
     ) -> None:
         self._repository = repository
         self._store_provider = store_provider
         self._knowledge_resolver = knowledge_resolver
+        self._knowledge_exists = knowledge_exists
 
     async def list_sources(self, context: TenantContext) -> tuple[SourceRecord, ...]:
         course_ids, class_ids = _scopes_for_source_list(context)
@@ -398,6 +411,10 @@ class SourceService:
             or any(character in stable_id for character in "\x00\r\n")
         ):
             raise InvalidSourceBindingError("knowledge resource identity is invalid")
+        if not self._knowledge_exists(resource):
+            raise SourceNotFoundError("knowledge resource not found")
+        if not await self._repository.is_knowledge_resource_entitled(stable_id):
+            raise SourceAccessDeniedError("knowledge resource is not entitled to this tenant")
         content_sha256 = hashlib.sha256(stable_id.encode()).hexdigest()
         snapshot_id = _digest_id("kb-source", context.tenant_id, stable_id, "binding-v1")
         binding_id = source_binding_id(
@@ -457,11 +474,7 @@ class SourceService:
 
             upload_id = f"upload-{uuid.uuid4().hex}"
             snapshot_id = f"pdf-source-{uuid.uuid4().hex}"
-            object_key = temporary_artifact_key(
-                context.tenant_id,
-                upload_id,
-                "source.pdf",
-            )
+            object_key = source_upload_key(context.tenant_id, upload_id)
             store = await self._store_provider.store_for_tenant(context.tenant_id)
             artifact = await store.put_verified(
                 object_key,
@@ -499,7 +512,7 @@ class SourceService:
                 if not retained:
                     await asyncio.shield(_cleanup_owned(store, artifact))
                 return record
-            except BaseException:
+            except (SourceConflictError, SourceNotFoundError):
                 await asyncio.shield(_cleanup_owned(store, artifact))
                 raise
         finally:
@@ -532,4 +545,5 @@ __all__ = [
     "SourceService",
     "SourceUploadTooLargeError",
     "UnsupportedSourceMediaError",
+    "knowledge_resource_exists",
 ]

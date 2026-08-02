@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from io import BytesIO
 from pathlib import Path
 
@@ -7,6 +8,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from pypdf import PdfWriter
 from pypdf.generic import DictionaryObject, NameObject, TextStringObject
+import pytest
+from starlette.datastructures import Headers, UploadFile
 
 from deeptutor.api.routers import teaching_catalog as teaching_router
 from deeptutor.multi_user.models import KnowledgeResource
@@ -39,8 +42,10 @@ class _SourceRepository:
         self.snapshot_sources: dict[str, tuple[str, str]] = {}
         self.knowledge_snapshots: list[NewKnowledgeSnapshot] = []
         self.fail_create: Exception | None = None
+        self.fail_after_persist: BaseException | None = None
         self.create_calls = 0
         self.valid_classes = {"class-a": "course-a", "class-b": "course-b"}
+        self.knowledge_entitled = True
 
     def _validate_target(self, course_id: str, class_id: str | None) -> None:
         if course_id not in {"course-a", "course-b"}:
@@ -50,6 +55,9 @@ class _SourceRepository:
 
     async def validate_target(self, course_id: str, class_id: str | None) -> None:
         self._validate_target(course_id, class_id)
+
+    async def is_knowledge_resource_entitled(self, resource_id: str) -> bool:
+        return self.knowledge_entitled
 
     async def list_bindings(self, course_ids, class_ids):
         return tuple(
@@ -132,6 +140,8 @@ class _SourceRepository:
             class_id=class_id,
         )
         self.records[binding_id] = record
+        if self.fail_after_persist is not None:
+            raise self.fail_after_persist
         return record, True
 
     async def bind_knowledge_resource(
@@ -245,6 +255,9 @@ def _client(
     repository: _SourceRepository,
     store: _Store | None = None,
     resolver: _KnowledgeResolver | None = None,
+    *,
+    resource_exists: bool = True,
+    raise_server_exceptions: bool = True,
 ) -> tuple[TestClient, _Store, _KnowledgeResolver]:
     actual_store = store or _Store()
     actual_resolver = resolver or _KnowledgeResolver()
@@ -256,7 +269,20 @@ def _client(
         actual_store
     )
     app.dependency_overrides[teaching_router.get_knowledge_resolver] = lambda: actual_resolver
-    return TestClient(app), actual_store, actual_resolver
+    knowledge_exists_dependency = getattr(
+        teaching_router,
+        "get_knowledge_resource_exists",
+        None,
+    )
+    if knowledge_exists_dependency is not None:
+        app.dependency_overrides[knowledge_exists_dependency] = lambda: (
+            lambda _resource: resource_exists
+        )
+    return (
+        TestClient(app, raise_server_exceptions=raise_server_exceptions),
+        actual_store,
+        actual_resolver,
+    )
 
 
 def _pdf_bytes(
@@ -340,7 +366,8 @@ def test_valid_pdf_is_stored_under_current_tenant_and_response_is_sanitized() ->
     assert "objectKey" not in body
     assert "path" not in body
     assert len(store.put_calls) == 1
-    assert store.put_calls[0][0].startswith("tenants/tenant-a/temporary/upload-")
+    assert store.put_calls[0][0].startswith("tenants/tenant-a/sources/upload-")
+    assert store.put_calls[0][0].endswith("/source.pdf")
     assert "tenant-b" not in store.put_calls[0][0]
 
 
@@ -449,6 +476,54 @@ def test_database_failure_cleans_up_owned_object_and_hides_object_key() -> None:
     assert "private DB/object key detail" not in response.text
 
 
+def test_unknown_post_commit_failure_does_not_delete_retained_source_object() -> None:
+    repository = _SourceRepository()
+    repository.fail_after_persist = RuntimeError("post-commit read failed")
+    client, store, _ = _client(
+        _context(),
+        repository,
+        raise_server_exceptions=False,
+    )
+
+    response = _upload(client, _pdf_bytes())
+
+    assert response.status_code == 500
+    assert repository.records
+    assert repository.uploads
+    assert store.deleted == []
+
+
+def test_cancelled_commit_outcome_does_not_delete_retained_source_object() -> None:
+    repository = _SourceRepository()
+    repository.fail_after_persist = asyncio.CancelledError()
+    store = _Store()
+    service = source_service_module.SourceService(
+        repository,
+        _StoreProvider(store),
+        _KnowledgeResolver(),
+        lambda _resource: True,
+    )
+    upload = UploadFile(
+        BytesIO(_pdf_bytes()),
+        filename="book.pdf",
+        headers=Headers({"content-type": "application/pdf"}),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            service.upload_pdf(
+                _context(),
+                upload=upload,
+                course_id="course-a",
+                class_id=None,
+            )
+        )
+
+    assert repository.records
+    assert repository.uploads
+    assert store.deleted == []
+
+
 def test_teacher_lists_only_sources_in_granted_scope() -> None:
     repository = _SourceRepository()
     repository.records = {
@@ -464,8 +539,8 @@ def test_teacher_lists_only_sources_in_granted_scope() -> None:
     response = client.get("/api/v1/teaching/sources")
 
     assert response.status_code == 200
-    assert [item["bindingId"] for item in response.json()] == ["binding-a"]
-    assert all("objectKey" not in item for item in response.json())
+    assert [item["bindingId"] for item in response.json()["items"]] == ["binding-a"]
+    assert all("objectKey" not in item for item in response.json()["items"])
 
 
 def test_class_scoped_teacher_lists_only_sources_bound_to_that_class() -> None:
@@ -500,7 +575,7 @@ def test_class_scoped_teacher_lists_only_sources_bound_to_that_class() -> None:
     response = client.get("/api/v1/teaching/sources")
 
     assert response.status_code == 200
-    assert [item["bindingId"] for item in response.json()] == ["class-a-binding"]
+    assert [item["bindingId"] for item in response.json()["items"]] == ["class-a-binding"]
 
 
 def test_student_cannot_list_teaching_sources() -> None:
@@ -537,6 +612,55 @@ def test_knowledge_binding_requires_user_and_organization_authorization() -> Non
         json={"knowledgeResourceId": "admin:kb:math", "courseId": "course-a"},
     )
     assert user_denied.status_code == 403
+    assert repository.knowledge_snapshots == []
+
+
+def test_same_user_requires_independent_knowledge_entitlement_per_tenant() -> None:
+    resolver = _KnowledgeResolver()
+    entitled_repository = _SourceRepository()
+    denied_repository = _SourceRepository()
+    denied_repository.knowledge_entitled = False
+    entitled_client, _, _ = _client(
+        _context(tenant_id="tenant-a"),
+        entitled_repository,
+        resolver=resolver,
+    )
+    denied_client, _, _ = _client(
+        _context(tenant_id="tenant-b"),
+        denied_repository,
+        resolver=resolver,
+    )
+
+    entitled = entitled_client.post(
+        "/api/v1/teaching/sources/bind",
+        json={"knowledgeResourceId": "admin:kb:math", "courseId": "course-a"},
+    )
+    denied = denied_client.post(
+        "/api/v1/teaching/sources/bind",
+        json={"knowledgeResourceId": "admin:kb:math", "courseId": "course-a"},
+    )
+
+    assert entitled.status_code == 201
+    assert denied.status_code == 403
+    assert denied_repository.knowledge_snapshots == []
+
+
+def test_stale_assigned_knowledge_resource_fails_closed() -> None:
+    repository = _SourceRepository()
+    resolver = _KnowledgeResolver()
+    client, _, _ = _client(
+        _context(),
+        repository,
+        resolver=resolver,
+        resource_exists=False,
+    )
+
+    response = client.post(
+        "/api/v1/teaching/sources/bind",
+        json={"knowledgeResourceId": "admin:kb:math", "courseId": "course-a"},
+    )
+
+    assert response.status_code == 404
     assert repository.knowledge_snapshots == []
 
 
