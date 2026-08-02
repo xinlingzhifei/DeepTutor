@@ -60,14 +60,26 @@ def test_model_metadata_uses_only_platform_and_logical_tenant_schemas():
         "platform.tenants",
     }
     assert set(TenantBase.metadata.tables) == {
+        "tenant.approvals",
         "tenant.artifact_promotion_states",
+        "tenant.assignments",
+        "tenant.batch_items",
+        "tenant.batch_jobs",
         "tenant.classroom_artifacts",
+        "tenant.classroom_assets",
+        "tenant.classroom_drafts",
+        "tenant.classroom_exports",
         "tenant.classroom_versions",
         "tenant.classes",
         "tenant.courses",
         "tenant.enrollments",
         "tenant.generation_jobs",
+        "tenant.publications",
         "tenant.quota_ledger",
+        "tenant.source_snapshots",
+        "tenant.source_uploads",
+        "tenant.teaching_briefs",
+        "tenant.tenant_source_bindings",
     }
 
     cross_schema_foreign_keys = set()

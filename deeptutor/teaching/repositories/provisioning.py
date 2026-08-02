@@ -45,7 +45,7 @@ _AUDIT_COMPLETED = "tenant.provisioning.completed"
 _AUDIT_RETRY_SCHEDULED = "tenant.provisioning.retry_scheduled"
 _AUDIT_FAILED = "tenant.provisioning.failed"
 _AUDIT_SCHEMA_UPGRADE_COMPLETED = "tenant.schema_upgrade.completed"
-_PREVIOUS_TENANT_SCHEMA_REVISION = "20260801_0006"
+_PREVIOUS_TENANT_SCHEMA_REVISION = "20260801_0007"
 
 
 def schema_upgrade_job_id(tenant_id: str) -> str:

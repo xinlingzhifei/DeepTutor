@@ -8,6 +8,7 @@ import hashlib
 import json
 
 from sqlalchemy import func, select, text, update
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from deeptutor.teaching.database import get_platform_engine
@@ -17,6 +18,7 @@ from deeptutor.teaching.job_route_binding import (
     lock_active_job_binding,
 )
 from deeptutor.teaching.models import Tenant
+from deeptutor.teaching.models.classrooms import ClassroomAsset
 from deeptutor.teaching.models.jobs import (
     LEASED_JOB_STATUSES,
     TERMINAL_JOB_STATUSES,
@@ -1507,6 +1509,17 @@ class SqlAlchemyGenerationJobRepository:
                 )
                 if document_artifact is None or document_artifact.sha256 != document_sha256:
                     raise ValueError("document artifact is missing")
+                await session.execute(
+                    insert(ClassroomAsset)
+                    .values(
+                        id=state.classroom_id,
+                        tenant_id=claim.tenant_id,
+                        owner_id=job.owner_id,
+                        title=None,
+                        lifecycle_state="editing",
+                    )
+                    .on_conflict_do_nothing(index_elements=[ClassroomAsset.id])
+                )
                 session.add(
                     ClassroomVersion(
                         id=classroom_version_id,

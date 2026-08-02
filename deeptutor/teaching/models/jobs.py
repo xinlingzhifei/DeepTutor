@@ -20,6 +20,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
+from .classrooms import ClassroomVersion as ClassroomVersion
 from .platform import PlatformBase, Tenant
 from .tenant import TenantBase
 
@@ -288,49 +289,6 @@ class ArtifactPromotionState(TenantBase):
             "classroom_id",
             "version_number",
             name="uq_artifact_promotion_tenant_classroom_version",
-        ),
-    )
-
-
-class ClassroomVersion(TenantBase):
-    """Minimal immutable generated version; Plan 04 adds lifecycle metadata."""
-
-    __tablename__ = "classroom_versions"
-
-    id: Mapped[str] = mapped_column(String(128), primary_key=True)
-    tenant_id: Mapped[str] = mapped_column(String(64))
-    classroom_id: Mapped[str] = mapped_column(String(128))
-    version_number: Mapped[int] = mapped_column(Integer)
-    generation_job_id: Mapped[str] = mapped_column(String(64))
-    document_sha256: Mapped[str] = mapped_column(String(64))
-    media_manifest_sha256: Mapped[str] = mapped_column(String(64))
-    document_object_key: Mapped[str] = mapped_column(String(512))
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        server_default=func.now(),
-    )
-
-    __table_args__ = (
-        CheckConstraint("version_number > 0", name="version_number"),
-        ForeignKeyConstraint(
-            ["generation_job_id", "tenant_id"],
-            [
-                "tenant.generation_jobs.id",
-                "tenant.generation_jobs.tenant_id",
-            ],
-            name="fk_classroom_versions_job_tenant_generation_jobs",
-            ondelete="RESTRICT",
-        ),
-        UniqueConstraint(
-            "tenant_id",
-            "classroom_id",
-            "version_number",
-            name="uq_classroom_versions_tenant_classroom_version",
-        ),
-        UniqueConstraint(
-            "tenant_id",
-            "generation_job_id",
-            name="uq_classroom_versions_tenant_generation_job",
         ),
     )
 
