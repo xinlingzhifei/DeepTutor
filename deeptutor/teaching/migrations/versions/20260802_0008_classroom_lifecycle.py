@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from alembic import context, op
+from alembic.util import CommandError
 import sqlalchemy as sa
 
 revision: str = "20260802_0008"
@@ -683,6 +684,28 @@ def upgrade() -> None:
 
 def _downgrade_tenant() -> None:
     tenant_schema = _tenant_schema()
+    quoted_schema = f'"{tenant_schema}"'
+    has_published_versions = (
+        op.get_bind()
+        .execute(
+            sa.text(
+                f"""
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM {quoted_schema}.classroom_versions
+                    WHERE generation_job_id IS NULL
+                )
+                """
+            )
+        )
+        .scalar()
+    )
+    if has_published_versions:
+        raise CommandError(
+            "cannot downgrade classroom lifecycle: published immutable versions "
+            "require revision 20260802_0008"
+        )
+
     _sync_tenant_schema_revision("20260802_0008", "20260801_0007")
     op.drop_table("batch_items", schema=tenant_schema)
     op.drop_table("batch_jobs", schema=tenant_schema)

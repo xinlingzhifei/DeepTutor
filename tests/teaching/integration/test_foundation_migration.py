@@ -2227,6 +2227,328 @@ def test_generation_tenant_migration_roundtrip_keeps_platform_revision_in_sync(
     assert {"generation_jobs", "quota_ledger"}.issubset(tables)
 
 
+def test_classroom_lifecycle_downgrade_refuses_published_immutable_versions(
+    migration_database,
+) -> None:
+    tenant_id = "classroom-downgrade-guard"
+    schema_name = tenant_schema_name(tenant_id)
+    job_id = "classroom-downgrade-job"
+    classroom_id = "classroom-downgrade-asset"
+    source_version_id = "classroom-downgrade-source"
+    published_version_id = "classroom-downgrade-published"
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(migration_database, "scope=platform"),
+    )
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(
+            migration_database,
+            "scope=tenant",
+            f"tenant_schema={schema_name}",
+        ),
+    )
+
+    async def seed_published_copy() -> None:
+        engine = create_async_engine(migration_database.url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO platform.tenants (id, name, status)
+                        VALUES (:tenant_id, 'Classroom downgrade guard', 'active')
+                        ON CONFLICT (id) DO NOTHING
+                        """
+                    ),
+                    {"tenant_id": tenant_id},
+                )
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO platform.tenant_schema_states (
+                            tenant_id, schema_name, revision, status
+                        ) VALUES (
+                            :tenant_id, :schema_name, :revision, 'active'
+                        )
+                        ON CONFLICT (tenant_id) DO UPDATE
+                        SET schema_name = EXCLUDED.schema_name,
+                            revision = EXCLUDED.revision,
+                            status = EXCLUDED.status
+                        """
+                    ),
+                    {
+                        "tenant_id": tenant_id,
+                        "schema_name": schema_name,
+                        "revision": HEAD_REVISION,
+                    },
+                )
+                await connection.execute(
+                    text(
+                        f"""
+                        INSERT INTO "{schema_name}".generation_jobs (
+                            id, tenant_id, job_kind, phase, status, priority,
+                            quota_units, actor_id, owner_id, visibility, request_id,
+                            idempotency_key, request_sha256, data_plane_route_id,
+                            provider_profile_id, worker_pool_ref, queue_ref,
+                            request_payload, progress_percent
+                        ) VALUES (
+                            :job_id, :tenant_id, 'generation', 'content', 'succeeded',
+                            10, 1, 'teacher-1', 'teacher-1', 'private',
+                            'classroom-downgrade-request',
+                            'classroom-downgrade-idempotency', :request_sha256,
+                            'classroom-downgrade-route',
+                            'classroom-downgrade-provider',
+                            'classroom-downgrade-workers',
+                            'classroom.downgrade', '{{}}', 100
+                        )
+                        """
+                    ),
+                    {
+                        "job_id": job_id,
+                        "tenant_id": tenant_id,
+                        "request_sha256": "1" * 64,
+                    },
+                )
+                await connection.execute(
+                    text(
+                        f"""
+                        INSERT INTO "{schema_name}".classroom_assets (
+                            id, tenant_id, owner_id, title, lifecycle_state
+                        ) VALUES (
+                            :classroom_id, :tenant_id, 'teacher-1',
+                            'Published classroom', 'approved'
+                        )
+                        """
+                    ),
+                    {"classroom_id": classroom_id, "tenant_id": tenant_id},
+                )
+                await connection.execute(
+                    text(
+                        f"""
+                        INSERT INTO "{schema_name}".classroom_versions (
+                            id, tenant_id, classroom_id, version_number,
+                            generation_job_id, source_version_id,
+                            document_sha256, media_manifest_sha256,
+                            document_object_key
+                        ) VALUES (
+                            :source_version_id, :tenant_id, :classroom_id, 1,
+                            :job_id, NULL, :document_sha256, :manifest_sha256,
+                            'classrooms/downgrade/source.json'
+                        )
+                        """
+                    ),
+                    {
+                        "source_version_id": source_version_id,
+                        "tenant_id": tenant_id,
+                        "classroom_id": classroom_id,
+                        "job_id": job_id,
+                        "document_sha256": "2" * 64,
+                        "manifest_sha256": "3" * 64,
+                    },
+                )
+                await connection.execute(
+                    text(
+                        f"""
+                        INSERT INTO "{schema_name}".classroom_versions (
+                            id, tenant_id, classroom_id, version_number,
+                            generation_job_id, source_version_id,
+                            document_sha256, media_manifest_sha256,
+                            document_object_key
+                        ) VALUES (
+                            :published_version_id, :tenant_id, :classroom_id, 2,
+                            NULL, :source_version_id, :document_sha256,
+                            :manifest_sha256, 'classrooms/downgrade/published.json'
+                        )
+                        """
+                    ),
+                    {
+                        "published_version_id": published_version_id,
+                        "tenant_id": tenant_id,
+                        "classroom_id": classroom_id,
+                        "source_version_id": source_version_id,
+                        "document_sha256": "4" * 64,
+                        "manifest_sha256": "5" * 64,
+                    },
+                )
+                await connection.execute(
+                    text(
+                        f"""
+                        INSERT INTO "{schema_name}".publications (
+                            id, tenant_id, classroom_id, classroom_version_id,
+                            actor_id, scope
+                        ) VALUES (
+                            'classroom-downgrade-publication', :tenant_id,
+                            :classroom_id, :published_version_id,
+                            'teacher-1', 'tenant'
+                        )
+                        """
+                    ),
+                    {
+                        "tenant_id": tenant_id,
+                        "classroom_id": classroom_id,
+                        "published_version_id": published_version_id,
+                    },
+                )
+                await connection.execute(
+                    text(
+                        f"""
+                        UPDATE "{schema_name}".classroom_assets
+                        SET lifecycle_state = 'published',
+                            current_published_version_id = :published_version_id
+                        WHERE id = :classroom_id
+                        """
+                    ),
+                    {
+                        "published_version_id": published_version_id,
+                        "classroom_id": classroom_id,
+                    },
+                )
+        finally:
+            await engine.dispose()
+
+    async def inspect_after_refusal() -> tuple[
+        str,
+        str,
+        set[str],
+        dict[str, str],
+        set[str],
+        list[tuple[str, str | None, str | None]],
+        int,
+    ]:
+        engine = create_async_engine(migration_database.url)
+        try:
+            async with engine.connect() as connection:
+                state_revision = await connection.scalar(
+                    text(
+                        "SELECT revision FROM platform.tenant_schema_states "
+                        "WHERE tenant_id = :tenant_id"
+                    ),
+                    {"tenant_id": tenant_id},
+                )
+                alembic_revision = await connection.scalar(
+                    text(f'SELECT version_num FROM "{schema_name}".alembic_version')
+                )
+                tables = set(
+                    (
+                        await connection.execute(
+                            text(
+                                """
+                                SELECT table_name
+                                FROM information_schema.tables
+                                WHERE table_schema = :schema_name
+                                """
+                            ),
+                            {"schema_name": schema_name},
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                columns = dict(
+                    (
+                        await connection.execute(
+                            text(
+                                """
+                                SELECT column_name, is_nullable
+                                FROM information_schema.columns
+                                WHERE table_schema = :schema_name
+                                  AND table_name = 'classroom_versions'
+                                  AND column_name IN (
+                                      'generation_job_id', 'source_version_id'
+                                  )
+                                """
+                            ),
+                            {"schema_name": schema_name},
+                        )
+                    ).all()
+                )
+                constraints = set(
+                    (
+                        await connection.execute(
+                            text(
+                                """
+                                SELECT constraint_name
+                                FROM information_schema.table_constraints
+                                WHERE table_schema = :schema_name
+                                  AND table_name = 'classroom_versions'
+                                """
+                            ),
+                            {"schema_name": schema_name},
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                versions = [
+                    tuple(row)
+                    for row in (
+                        await connection.execute(
+                            text(
+                                f"""
+                                SELECT id, generation_job_id, source_version_id
+                                FROM "{schema_name}".classroom_versions
+                                ORDER BY version_number
+                                """
+                            )
+                        )
+                    ).all()
+                ]
+                publication_count = await connection.scalar(
+                    text(f'SELECT count(*) FROM "{schema_name}".publications')
+                )
+                return (
+                    str(state_revision),
+                    str(alembic_revision),
+                    tables,
+                    columns,
+                    constraints,
+                    versions,
+                    int(publication_count or 0),
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(seed_published_copy())
+    refused = _run_alembic(
+        migration_database,
+        "scope=tenant",
+        f"tenant_schema={schema_name}",
+        action="downgrade",
+        revision="20260801_0007",
+    )
+    safe_output = _assert_secret_safe_output(migration_database, refused)
+    assert refused.returncode != 0, safe_output
+    assert (
+        "cannot downgrade classroom lifecycle: published immutable versions "
+        "require revision 20260802_0008"
+    ) in safe_output
+
+    (
+        state_revision,
+        alembic_revision,
+        tables,
+        columns,
+        constraints,
+        versions,
+        publication_count,
+    ) = asyncio.run(inspect_after_refusal())
+    assert state_revision == HEAD_REVISION
+    assert alembic_revision == HEAD_REVISION
+    assert {"classroom_assets", "publications"}.issubset(tables)
+    assert columns == {"generation_job_id": "YES", "source_version_id": "YES"}
+    assert {
+        "ck_classroom_versions_provenance",
+        "fk_classroom_versions_source_version_classroom_versions",
+        "fk_classroom_versions_asset_tenant_classroom_assets",
+    }.issubset(constraints)
+    assert versions == [
+        (source_version_id, job_id, None),
+        (published_version_id, None, source_version_id),
+    ]
+    assert publication_count == 1
+
+
 def test_postgres_claims_are_unique_and_stale_same_owner_token_is_fenced(
     migration_database,
     monkeypatch,
