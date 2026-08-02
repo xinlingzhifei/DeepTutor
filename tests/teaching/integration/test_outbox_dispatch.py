@@ -31,6 +31,8 @@ from deeptutor.teaching.repositories.jobs import (
 )
 from deeptutor.teaching.schema_names import tenant_schema_name
 
+pytestmark = pytest.mark.usefixtures("clean_generation_runtime_state")
+
 
 def _request(tenant_id: str, job_id: str) -> GenerationJobRequest:
     return GenerationJobRequest(

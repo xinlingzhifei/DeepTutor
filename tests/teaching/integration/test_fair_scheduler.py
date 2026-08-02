@@ -21,6 +21,8 @@ from deeptutor.teaching.models.jobs import (
 from deeptutor.teaching.scheduler import PRIORITY_RANK, FairScheduler
 from deeptutor.teaching.schema_names import tenant_schema_name
 
+pytestmark = pytest.mark.usefixtures("clean_generation_runtime_state")
+
 
 async def _insert_active_tenants(engine, tenant_ids: tuple[str, ...]) -> None:
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
@@ -372,6 +374,7 @@ def test_shared_worker_cannot_claim_dedicated_job_with_the_same_job_id(
                             status="active",
                         )
                     )
+                    await session.flush()
                     session.add(
                         DataPlaneRoute(
                             id="dedicated-route",

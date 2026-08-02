@@ -4,6 +4,7 @@ import {
 } from "../../../../../../../lib/yfeistai/content-generation";
 import { exportJobStore } from "../../../../../../../lib/yfeistai/export-generation";
 import { isPrivateRenderEndpoint } from "../../../../../../../lib/yfeistai/export-generation";
+import { outlineJobStore } from "../../../../../../../lib/yfeistai/job-store";
 import {
   readServiceSecret,
   signServiceRequest,
@@ -75,7 +76,7 @@ async function cancelPersistedRenderJob(
 
 const cancelJob = createJobCancelHandler({
   readSecret: readServiceSecret,
-  stores: [contentJobStore, exportJobStore],
+  stores: [contentJobStore, exportJobStore, outlineJobStore],
   onCanceled: cancelPersistedRenderJob,
 });
 

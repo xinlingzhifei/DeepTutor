@@ -144,7 +144,7 @@ class ClientTimeouts:
 
 @dataclass(frozen=True, slots=True)
 class PollRetryPolicy:
-    max_attempts: int = 8
+    max_attempts: int = 40
     initial_delay: float = 0.25
     max_delay: float = 4.0
     jitter_ratio: float = 0.2

@@ -13,6 +13,9 @@ import pytest
 
 SHA256 = "a" * 64
 OTHER_SHA256 = "b" * 64
+OUTLINE_BUNDLE_CONTRACT_SHA256 = (
+    "a45b0310d5b58a8e2d461ccfa9d60be24615583825a1f3a4f4460672cbd19ba5"
+)
 GENERATED_AT = "2026-07-30T08:00:00Z"
 CONTRACT_SCHEMA_DIR = Path(__file__).resolve().parents[2] / "contracts" / "classroom"
 
@@ -167,7 +170,7 @@ def valid_outline_bundle() -> dict[str, object]:
         ],
         "estimated_scene_count": 1,
         "generation_metadata": valid_generation_metadata(),
-        "contract_sha256": OTHER_SHA256,
+        "contract_sha256": OUTLINE_BUNDLE_CONTRACT_SHA256,
     }
 
 

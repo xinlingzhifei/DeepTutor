@@ -216,16 +216,16 @@ def _validate_document_hashes(
 def _validate_dsl(document: ClassroomDocument) -> None:
     stage_id = document.openmaic.stage.id
     scene_ids: list[str] = []
-    interactive_ids: list[str] = []
+    interaction_ids: list[str] = []
     for expected_order, scene in enumerate(document.openmaic.scenes):
         if scene.stage_id != stage_id or scene.order != expected_order:
             raise ArtifactValidationError("dsl_invalid")
         if scene.id in scene_ids:
             raise ArtifactValidationError("dsl_invalid")
         scene_ids.append(scene.id)
-        if scene.type == "interactive":
-            interactive_ids.append(scene.id)
-    if document.interaction_ids != interactive_ids:
+        if scene.type != "slide":
+            interaction_ids.append(scene.id)
+    if document.interaction_ids != interaction_ids:
         raise ArtifactValidationError("dsl_invalid")
     for mapping in document.knowledge_point_mappings:
         if any(scene_id not in scene_ids for scene_id in mapping.scene_ids):

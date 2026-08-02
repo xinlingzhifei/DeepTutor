@@ -428,7 +428,16 @@ def test_migration_runs_from_outside_repository(
     assert PROJECT_ROOT not in tmp_path.resolve().parents
     assert asyncio.run(_table_names(migration_database.url, tenant_schema)) == set()
 
-    completed = _run_packaged_migration(
+    platform_upgrade = _run_packaged_migration(
+        installed_migration,
+        migration_database,
+        action="upgrade",
+        scope="platform",
+        cwd=tmp_path,
+    )
+    _assert_migration_succeeded(migration_database, platform_upgrade)
+
+    tenant_upgrade = _run_packaged_migration(
         installed_migration,
         migration_database,
         action="upgrade",
@@ -436,15 +445,30 @@ def test_migration_runs_from_outside_repository(
         tenant_schema=tenant_schema,
         cwd=tmp_path,
     )
-
-    _assert_migration_succeeded(migration_database, completed)
+    _assert_migration_succeeded(migration_database, tenant_upgrade)
     assert asyncio.run(_table_names(migration_database.url, tenant_schema)) == {
         "alembic_version",
+        "artifact_promotion_states",
+        "classroom_artifacts",
+        "classroom_versions",
         "classes",
         "courses",
         "enrollments",
         "generation_jobs",
         "quota_ledger",
+    }
+
+    tenant_downgrade = _run_packaged_migration(
+        installed_migration,
+        migration_database,
+        action="downgrade",
+        scope="tenant",
+        tenant_schema=tenant_schema,
+        cwd=tmp_path,
+    )
+    _assert_migration_succeeded(migration_database, tenant_downgrade)
+    assert asyncio.run(_table_names(migration_database.url, tenant_schema)) == {
+        "alembic_version"
     }
 
 
@@ -535,11 +559,27 @@ def test_packaged_entrypoint_runs_platform_and_tenant_scopes(
     }
     assert asyncio.run(_table_names(migration_database.url, tenant_schema)) == {
         "alembic_version",
+        "artifact_promotion_states",
+        "classroom_artifacts",
+        "classroom_versions",
         "classes",
         "courses",
         "enrollments",
         "generation_jobs",
         "quota_ledger",
+    }
+
+    tenant_downgrade = _run_packaged_migration(
+        installed_migration,
+        migration_database,
+        action="downgrade",
+        scope="tenant",
+        tenant_schema=tenant_schema,
+        cwd=tmp_path,
+    )
+    _assert_migration_succeeded(migration_database, tenant_downgrade)
+    assert asyncio.run(_table_names(migration_database.url, tenant_schema)) == {
+        "alembic_version"
     }
 
 
@@ -725,6 +765,9 @@ def test_foundation_migration_is_isolated_and_repeatable(migration_database):
     }
     assert tables_by_schema[tenant_a] == {
         "alembic_version",
+        "artifact_promotion_states",
+        "classroom_artifacts",
+        "classroom_versions",
         "classes",
         "courses",
         "enrollments",
@@ -733,6 +776,9 @@ def test_foundation_migration_is_isolated_and_repeatable(migration_database):
     }
     assert tables_by_schema[tenant_b] == {
         "alembic_version",
+        "artifact_promotion_states",
+        "classroom_artifacts",
+        "classroom_versions",
         "classes",
         "courses",
         "enrollments",
@@ -786,6 +832,25 @@ def test_foundation_migration_is_isolated_and_repeatable(migration_database):
             f"tenant_schema={tenant_b}",
         ),
     )
+
+    for tenant_schema in (tenant_a, tenant_b):
+        _assert_migration_succeeded(
+            migration_database,
+            _run_alembic(
+                migration_database,
+                "scope=tenant",
+                f"tenant_schema={tenant_schema}",
+                action="downgrade",
+                revision="base",
+            ),
+        )
+    tables_by_schema, _, versions, _ = asyncio.run(
+        _inspect_database(migration_database.url, (tenant_a, tenant_b))
+    )
+    assert tables_by_schema[tenant_a] == {"alembic_version"}
+    assert tables_by_schema[tenant_b] == {"alembic_version"}
+    assert versions[tenant_a] == []
+    assert versions[tenant_b] == []
 
     _assert_migration_succeeded(
         migration_database,

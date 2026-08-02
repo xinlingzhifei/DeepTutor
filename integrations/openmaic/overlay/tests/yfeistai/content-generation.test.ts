@@ -14,6 +14,7 @@ import {
 } from "../../lib/yfeistai/content-generation";
 import { ContentJobStore } from "../../lib/yfeistai/content-generation";
 import { createArtifactEntry } from "../../lib/yfeistai/artifact-manifest";
+import { runSceneRouteAdapter } from "../../lib/yfeistai/generation-adapter";
 import type { OutlineBundle } from "../../lib/yfeistai/contracts";
 import { asPortableDocument } from "../../lib/yfeistai/portable-classroom";
 import { signServiceRequest } from "../../lib/yfeistai/service-auth";
@@ -62,7 +63,7 @@ function confirmedOutline(): OutlineBundle {
       templateVersion: "1",
     },
     contractSha256:
-      "f8ddb7c11138f402ed048c4af2010714b2bfd456e5c38122920c689e4a2b3ddf",
+      "a45b0310d5b58a8e2d461ccfa9d60be24615583825a1f3a4f4460672cbd19ba5",
   };
 }
 
@@ -320,7 +321,7 @@ describe("confirmed outline content boundary", () => {
     const writeArtifact = vi.fn(async (input) => ({
       ...createArtifactEntry(input),
       downloadPath:
-        "/api/yfeistai/v1/artifacts/content-a/classroom/classroom.json",
+        "/api/yfeistai/v1/artifacts/content-a/classroom.json",
     }));
 
     await expect(
@@ -397,7 +398,7 @@ describe("confirmed outline content boundary", () => {
       expect(result.classroomDocument.fileSha256).toMatch(/^[0-9a-f]{64}$/);
       expect(result.artifacts).toEqual([
         expect.objectContaining({
-          relativePath: "classroom/classroom.json",
+          relativePath: "classroom.json",
           mime: "application/json",
           sha256: expect.stringMatching(/^[0-9a-f]{64}$/),
           bytes: expect.any(Number),
@@ -729,6 +730,136 @@ describe("confirmed outline content boundary", () => {
 });
 
 describe("OpenMAIC production scene adapter", () => {
+  test("passes the resolved model through the real PBL route adapter", async () => {
+    const languageModel = { id: "server-selected-model" };
+    const upstreamOutline = {
+      id: "scene-pbl",
+      type: "pbl",
+      title: "Bridge",
+      description: "Design a safe bridge.",
+      keyPoints: ["kp-a"],
+      order: 0,
+      pblConfig: {
+        projectTopic: "Bridge",
+        projectDescription: "Design a safe bridge.",
+        targetSkills: ["kp-a"],
+      },
+    };
+    const generate = vi.fn(async (_outline, callProvider, _options) => {
+      await callProvider("system", "user");
+      return {
+        projectConfig: {
+          projectInfo: { title: "Bridge", description: "Design a safe bridge." },
+          agents: [
+            {
+              name: "engineer",
+              actor_role: "Structural engineer",
+              system_prompt: "Check every load calculation.",
+            },
+          ],
+          issueboard: {
+            issues: [
+              {
+                id: "milestone-a",
+                title: "Choose dimensions",
+                description: "Justify the dimensions.",
+                notes: "Use the theorem as the rubric.",
+              },
+            ],
+          },
+        },
+      };
+    });
+
+    const generated = await runSceneRouteAdapter({
+      outline: upstreamOutline,
+      languageDirective: "en-US",
+      languageModel,
+      callProvider: async () => "provider response",
+      generate,
+    });
+
+    expect(generate).toHaveBeenCalledWith(
+      upstreamOutline,
+      expect.any(Function),
+      { languageDirective: "en-US", languageModel },
+    );
+    expect(toPortableOpenMaicSceneContent("pbl", generated)).toMatchObject({
+      type: "pbl",
+      scenario: "Design a safe bridge.",
+    });
+  });
+
+  test("preserves provider failures swallowed by the real scene route adapter", async () => {
+    const providerError = Object.assign(new Error("sensitive-scene-provider"), {
+      response: { status: 503 },
+    });
+    let upstreamLogged = "";
+
+    await expect(
+      runSceneRouteAdapter({
+        outline: { id: "scene-a", type: "slide" },
+        languageDirective: "en-US",
+        languageModel: { id: "server-selected-model" },
+        callProvider: async () => {
+          throw providerError;
+        },
+        generate: async (_outline, callProvider) => {
+          try {
+            await callProvider("system", "user");
+          } catch (error) {
+            // The pinned upstream helper converts this to a null result.
+            upstreamLogged = String(error);
+          }
+          return null;
+        },
+      }),
+    ).rejects.toBe(providerError);
+    expect(upstreamLogged).toContain("OpenMAIC provider request failed.");
+    expect(upstreamLogged).not.toContain("sensitive-scene-provider");
+  });
+
+  test.each(["doGenerate", "doStream"] as const)(
+    "preserves provider failures swallowed through PBL languageModel.%s",
+    async (providerMethod) => {
+      const providerError = Object.assign(
+        new Error(`sensitive-pbl-${providerMethod}`),
+        { status: 429 },
+      );
+      const languageModel = {
+        doGenerate: vi.fn(async () => {
+          throw providerError;
+        }),
+        doStream: vi.fn(async () => {
+          throw providerError;
+        }),
+      };
+      let upstreamLogged = "";
+
+      await expect(
+        runSceneRouteAdapter({
+          outline: { id: "scene-pbl", type: "pbl" },
+          languageDirective: "en-US",
+          languageModel,
+          callProvider: async () => "unused",
+          generate: async (_outline, _callProvider, options) => {
+            try {
+              await options.languageModel[providerMethod]();
+            } catch (error) {
+              // The pinned PBL generator consumes provider errors and returns
+              // null.
+              upstreamLogged = String(error);
+            }
+            return null;
+          },
+        }),
+      ).rejects.toBe(providerError);
+      expect(languageModel[providerMethod]).toHaveBeenCalledOnce();
+      expect(upstreamLogged).toContain("OpenMAIC provider request failed.");
+      expect(upstreamLogged).not.toContain(`sensitive-pbl-${providerMethod}`);
+    },
+  );
+
   test("preserves all four generated scene content discriminators", () => {
     expect(
       toPortableOpenMaicSceneContent("slide", {
@@ -844,6 +975,155 @@ describe("OpenMAIC production scene adapter", () => {
 });
 
 describe("signed classroom routes", () => {
+  async function waitForContentTerminal(
+    store: ContentJobStore<ContentGenerationResult>,
+    jobId: string,
+  ) {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const job = await store.read("tenant-a", jobId);
+      if (job && job.status !== "running") {
+        return job;
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+    throw new Error("content job did not become terminal");
+  }
+
+  test("returns running without awaiting slow content generation", async () => {
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const store = new ContentJobStore<ContentGenerationResult>();
+    const handler = createClassroomPostHandler({
+      readSecret: () => "service-secret",
+      nowSeconds: () => 1_800_000_000,
+      store,
+      generateScenes: async (scene, context) => {
+        await blocked;
+        return generatedSlide(
+          scene.sceneId,
+          scene.title,
+          context.stageId,
+          context.order,
+        );
+      },
+    });
+    const request = boundRequest();
+    const responsePromise = handler(
+      signedRequest({
+        method: "POST",
+        path: "/api/yfeistai/v1/classrooms",
+        body: JSON.stringify(request),
+        tenantId: request.tenantId,
+        jobId: request.jobId,
+        idempotencyKey: request.idempotencyKey,
+      }),
+    );
+
+    const settledBeforeGeneration = await Promise.race([
+      responsePromise.then(() => true),
+      new Promise<false>((resolve) => setTimeout(() => resolve(false), 500)),
+    ]);
+    if (!settledBeforeGeneration) {
+      release();
+    }
+
+    expect(settledBeforeGeneration).toBe(true);
+    const response = await responsePromise;
+    expect(response.status).toBe(202);
+    await expect(response.json()).resolves.toMatchObject({ status: "running" });
+    release();
+    await expect(
+      waitForContentTerminal(store, request.jobId),
+    ).resolves.toMatchObject({ status: "succeeded" });
+  });
+
+  test.each([
+    ["provider_429", { status: 429 }],
+    ["provider_5xx", { response: { status: 503 } }],
+    ["connect_timeout", { code: "UND_ERR_CONNECT_TIMEOUT" }],
+    ["read_timeout", { code: "UND_ERR_HEADERS_TIMEOUT" }],
+    ["read_timeout", { response: { status: 408 } }],
+    ["read_timeout", { code: "ECONNRESET" }],
+    ["read_timeout", { code: "UND_ERR_SOCKET" }],
+  ])(
+    "maps upstream %s failures to stable secret-free codes",
+    async (code, shape) => {
+      const leaked = `sensitive-content-provider-detail-${code}`;
+      const request = {
+        ...boundRequest(),
+        jobId: `content-${code}`,
+        idempotencyKey: `content-idem-${code}`,
+      };
+      const store = new ContentJobStore<ContentGenerationResult>();
+      const handler = createClassroomPostHandler({
+        readSecret: () => "service-secret",
+        nowSeconds: () => 1_800_000_000,
+        store,
+        generateScenes: async () => {
+          throw Object.assign(new Error(leaked), shape);
+        },
+      });
+      const response = await handler(
+        signedRequest({
+          method: "POST",
+          path: "/api/yfeistai/v1/classrooms",
+          body: JSON.stringify(request),
+          tenantId: request.tenantId,
+          jobId: request.jobId,
+          idempotencyKey: request.idempotencyKey,
+        }),
+      );
+      const terminal = await waitForContentTerminal(store, request.jobId);
+
+      expect(response.status).toBe(202);
+      expect(terminal).toMatchObject({
+        status: "failed",
+        error: { code, message: expect.stringMatching(/^Provider/) },
+      });
+      expect(JSON.stringify(terminal)).not.toContain(leaked);
+    },
+  );
+
+  test("keeps content contract failures non-retryable and secret-free", async () => {
+    const leaked = "sensitive-content-contract-detail";
+    const request = {
+      ...boundRequest(),
+      jobId: "content-contract-invalid",
+      idempotencyKey: "content-idem-contract-invalid",
+    };
+    const store = new ContentJobStore<ContentGenerationResult>();
+    const handler = createClassroomPostHandler({
+      readSecret: () => "service-secret",
+      nowSeconds: () => 1_800_000_000,
+      store,
+      generateScenes: async () => {
+        throw new Error(leaked);
+      },
+    });
+    await handler(
+      signedRequest({
+        method: "POST",
+        path: "/api/yfeistai/v1/classrooms",
+        body: JSON.stringify(request),
+        tenantId: request.tenantId,
+        jobId: request.jobId,
+        idempotencyKey: request.idempotencyKey,
+      }),
+    );
+    const terminal = await waitForContentTerminal(store, request.jobId);
+
+    expect(terminal).toMatchObject({
+      status: "failed",
+      error: {
+        code: "CONTENT_GENERATION_FAILED",
+        message: "Content generation failed.",
+      },
+    });
+    expect(JSON.stringify(terminal)).not.toContain(leaked);
+  });
+
   test("authenticates POST before parsing and binds tenant/job/idempotency", async () => {
     const generateScenes = vi.fn();
     const handler = createClassroomPostHandler({

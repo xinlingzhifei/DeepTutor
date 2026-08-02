@@ -20,6 +20,11 @@ from pydantic import (
 from typing_extensions import TypeAliasType
 
 SCHEMA_VERSION = "1.0"
+_OPENMAIC_OUTLINE_GENERATOR_VERSION = "0.3.1"
+_OPENMAIC_PUBLIC_OUTLINE_MODEL_ID = "server-selected-model"
+_OPENMAIC_OUTLINE_CONTRACT_SHA256 = (
+    "a45b0310d5b58a8e2d461ccfa9d60be24615583825a1f3a4f4460672cbd19ba5"
+)
 
 NonEmptyString = Annotated[
     str,
@@ -625,6 +630,90 @@ class GenerationRequest(_ContractModel):
         ):
             raise ValueError("confirmed outline hash does not match canonical JSON")
         return self
+
+
+def validate_outline_binding(
+    outline: OutlineBundle,
+    request: GenerationRequest,
+    *,
+    expected_confirmation_status: Literal["draft", "confirmed"],
+) -> None:
+    confirmation = outline.confirmation_metadata
+    if confirmation.status != expected_confirmation_status:
+        raise ValueError("outline confirmation status is invalid")
+    if expected_confirmation_status == "draft" and (
+        confirmation.confirmed_at is not None or confirmation.confirmed_by is not None
+    ):
+        raise ValueError("draft outline cannot contain confirmation audit fields")
+    metadata = outline.generation_metadata
+    if (
+        outline.outline_id != f"outline-{request.job_id}"
+        or metadata.generator != "openmaic"
+        or metadata.generator_version != _OPENMAIC_OUTLINE_GENERATOR_VERSION
+        or metadata.model_id != _OPENMAIC_PUBLIC_OUTLINE_MODEL_ID
+        or outline.contract_sha256 != _OPENMAIC_OUTLINE_CONTRACT_SHA256
+        or metadata.teaching_brief_id != request.teaching_brief_id
+        or metadata.teaching_brief_sha256 != request.teaching_brief_sha256
+        or metadata.template_id != request.template_id
+        or metadata.template_version != request.template_version
+        or outline.estimated_scene_count != len(outline.scenes)
+        or len(outline.scenes) > request.scene_budget
+    ):
+        raise ValueError("outline request binding is invalid")
+
+    expected_knowledge_ids = [
+        point.knowledge_point_id for point in request.teaching_brief.knowledge_points
+    ]
+    expected_knowledge = set(expected_knowledge_ids)
+    expected_refs = [
+        (ref.citation_id, ref.source_id, ref.fragment_id)
+        for ref in request.teaching_brief.source_refs
+    ]
+    expected_ref_set = set(expected_refs)
+
+    def reference_keys(refs: list[SourceReference]) -> list[tuple[str, str, str]]:
+        return [(ref.citation_id, ref.source_id, ref.fragment_id) for ref in refs]
+
+    top_refs = reference_keys(outline.source_refs)
+    if len(top_refs) != len(expected_refs) or set(top_refs) != expected_ref_set:
+        raise ValueError("outline source references do not match the teaching brief")
+
+    scene_ids: set[str] = set()
+    scene_knowledge: dict[str, set[str]] = {}
+    for scene in outline.scenes:
+        if scene.scene_id in scene_ids:
+            raise ValueError("outline scene identifiers must be unique")
+        scene_ids.add(scene.scene_id)
+        knowledge_ids = scene.knowledge_point_ids
+        if len(knowledge_ids) != len(set(knowledge_ids)) or not set(
+            knowledge_ids
+        ).issubset(expected_knowledge):
+            raise ValueError("outline scene knowledge points are invalid")
+        scene_knowledge[scene.scene_id] = set(knowledge_ids)
+        scene_refs = reference_keys(scene.source_refs)
+        if request.teaching_brief.content_mode == "source_grounded":
+            if len(scene_refs) != len(expected_refs) or set(scene_refs) != expected_ref_set:
+                raise ValueError("source-grounded outline scene lost source references")
+        elif scene_refs:
+            raise ValueError("open-creation outline cannot introduce source references")
+
+    covered_knowledge: set[str] = set()
+    for coverage in outline.knowledge_coverage:
+        if (
+            coverage.knowledge_point_id not in expected_knowledge
+            or coverage.knowledge_point_id in covered_knowledge
+            or len(coverage.scene_ids) != len(set(coverage.scene_ids))
+        ):
+            raise ValueError("outline knowledge coverage is invalid")
+        covered_knowledge.add(coverage.knowledge_point_id)
+        if any(
+            scene_id not in scene_ids
+            or coverage.knowledge_point_id not in scene_knowledge[scene_id]
+            for scene_id in coverage.scene_ids
+        ):
+            raise ValueError("outline knowledge coverage does not match its scenes")
+    if covered_knowledge != expected_knowledge:
+        raise ValueError("outline does not cover every teaching knowledge point")
 
 
 class OpenMaicStage(_ContractModel):
@@ -1341,4 +1430,5 @@ __all__ = [
     "canonical_outline_sha256",
     "canonical_sha256",
     "canonical_teaching_brief_sha256",
+    "validate_outline_binding",
 ]

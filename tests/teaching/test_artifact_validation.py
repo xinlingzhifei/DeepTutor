@@ -58,6 +58,17 @@ def _engine_result() -> dict[str, object]:
     }
 
 
+def _rehash_document_result(result: dict[str, object]) -> None:
+    document = result["classroomDocument"]
+    without_hash = copy.deepcopy(document)
+    without_hash.pop("file_sha256")
+    document["file_sha256"] = hashlib.sha256(_canonical(without_hash)).hexdigest()
+    document_sha256 = hashlib.sha256(_canonical(document)).hexdigest()
+    result["classroomDocumentSha256"] = document_sha256
+    result["artifacts"][0]["sha256"] = document_sha256
+    result["artifacts"][0]["bytes"] = len(_canonical(document))
+
+
 def test_validates_contract_dsl_sources_media_and_tenant_paths() -> None:
     from deeptutor.teaching.artifact_validation import validate_generation_result
 
@@ -73,6 +84,85 @@ def test_validates_contract_dsl_sources_media_and_tenant_paths() -> None:
     assert result.document_artifact.relative_name == "classroom.json"
     assert len(result.artifacts) == 2
     assert all(key.startswith("tenants/tenant-1/") for key in result.target_keys(1))
+
+
+@pytest.mark.parametrize(
+    ("scene_type", "content"),
+    [
+        ("slide", {"type": "slide", "canvas": {"elements": []}}),
+        (
+            "quiz",
+            {
+                "type": "quiz",
+                "questions": [
+                    {
+                        "id": "question-1",
+                        "prompt": "Which signal is periodic?",
+                        "question_type": "single_choice",
+                        "options": [
+                            {"id": "a", "label": "Sine"},
+                            {"id": "b", "label": "Noise"},
+                        ],
+                        "correct_option_ids": ["a"],
+                        "explanation": "A sine wave repeats.",
+                    }
+                ],
+            },
+        ),
+        (
+            "interactive",
+            {
+                "type": "interactive",
+                "html": "<button>Explore</button>",
+                "bridge_version": "1.0",
+                "sandbox": {"allow_scripts": True, "allow_same_origin": False},
+            },
+        ),
+        (
+            "pbl",
+            {
+                "type": "pbl",
+                "scenario": "Build a signal analyzer.",
+                "roles": [
+                    {
+                        "id": "engineer",
+                        "name": "Signal engineer",
+                        "brief": "Design the analyzer.",
+                    }
+                ],
+                "milestones": [
+                    {
+                        "id": "prototype",
+                        "title": "Prototype",
+                        "rubric": "Identifies a periodic signal.",
+                    }
+                ],
+            },
+        ),
+    ],
+)
+def test_interaction_ids_cover_every_non_slide_scene(
+    scene_type: str,
+    content: dict[str, object],
+) -> None:
+    from deeptutor.teaching.artifact_validation import validate_generation_result
+
+    result = _engine_result()
+    document = result["classroomDocument"]
+    scene = document["openmaic"]["scenes"][0]
+    scene["type"] = scene_type
+    scene["content"] = content
+    document["interaction_ids"] = [] if scene_type == "slide" else [scene["id"]]
+    _rehash_document_result(result)
+
+    validated = validate_generation_result(
+        tenant_id="tenant-1",
+        job_id="job-1",
+        request_payload=valid_content_generation_request(),
+        result_payload=result,
+    )
+
+    assert validated.document.interaction_ids == document["interaction_ids"]
 
 
 @pytest.mark.parametrize(

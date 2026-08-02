@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+from datetime import UTC, datetime
 import hashlib
 import json
 from types import SimpleNamespace
@@ -58,6 +60,27 @@ def _internal_request(*, tenant_id: str = "tenant-1", job_id: str = "job-existin
     request["job_id"] = job_id
     request["data_plane_route_id"] = "route-trusted"
     return request
+
+
+def _issued_draft_outline(*, job_id: str = "job-outline") -> dict[str, object]:
+    outline = valid_outline_bundle()
+    outline["outline_id"] = f"outline-{job_id}"
+    outline["confirmation_metadata"] = {"status": "draft"}
+    return outline
+
+
+def _confirmed_outline(
+    draft: dict[str, object],
+    *,
+    confirmed_by: str = "teacher-1",
+) -> dict[str, object]:
+    outline = copy.deepcopy(draft)
+    outline["confirmation_metadata"] = {
+        "status": "confirmed",
+        "confirmed_at": "2026-07-30T08:05:00Z",
+        "confirmed_by": confirmed_by,
+    }
+    return outline
 
 
 def _export_payload(job_id: str) -> str:
@@ -372,6 +395,32 @@ def api_harness():
     app.dependency_overrides[auth_router.require_platform_enabled] = lambda: None
     app.dependency_overrides[require_tenant] = lambda: _context("teacher-1", "teacher")
     return app, repository, cancellation, stores, store
+
+
+def _assert_outline_confirmation_rejected(
+    app: FastAPI,
+    repository: FakeRepository,
+    job: SimpleNamespace,
+    outline: dict[str, object],
+) -> None:
+    original_request = job.request_payload
+    original_result = job.result_payload
+
+    response = TestClient(app).post(
+        f"/api/v1/classroom-jobs/{job.job_id}/confirm-outline",
+        json={
+            "confirmedOutline": outline,
+            "confirmedOutlineSha256": canonical_outline_sha256(outline),
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Outline cannot be confirmed"
+    assert repository.confirmed_payloads == []
+    assert job.status == "awaiting_confirmation"
+    assert job.phase == "outline"
+    assert job.request_payload == original_request
+    assert job.result_payload == original_result
 
 
 def test_duplicate_idempotency_key_returns_same_server_job(api_harness) -> None:
@@ -719,13 +768,28 @@ def test_unvalidated_outline_fields_are_not_exposed(api_harness) -> None:
     assert "must-not-leak" not in response.text
 
 
-def test_outline_confirmation_atomically_freezes_content_request(api_harness) -> None:
+def test_outline_confirmation_atomically_freezes_content_request(
+    api_harness,
+    monkeypatch,
+) -> None:
     app, repository, _cancellation, _stores, _store = api_harness
-    outline = valid_outline_bundle()
+    monkeypatch.setattr(
+        jobs_router,
+        "_utc_now",
+        lambda: datetime(2026, 7, 30, 8, 5, tzinfo=UTC),
+    )
+    draft = _issued_draft_outline()
+    outline = _confirmed_outline(draft)
     repository.jobs["job-outline"] = _detail(
         job_id="job-outline",
-        result_payload=canonical_json_bytes(outline).decode(),
+        result_payload=canonical_json_bytes(draft).decode(),
     )
+    awaiting = TestClient(app).get("/api/v1/classroom-jobs/job-outline")
+
+    assert awaiting.status_code == 200
+    issued_outline = awaiting.json()["outline"]
+    assert issued_outline is not None
+    assert issued_outline["confirmationMetadata"] == {"status": "draft"}
 
     response = TestClient(app).post(
         "/api/v1/classroom-jobs/job-outline/confirm-outline",
@@ -743,6 +807,280 @@ def test_outline_confirmation_atomically_freezes_content_request(api_harness) ->
     assert frozen["phase"] == "content"
     assert frozen["confirmedOutlineSha256"] == canonical_outline_sha256(outline)
     assert frozen["dataPlaneRouteId"] == "route-trusted"
+    issued_semantics = copy.deepcopy(issued_outline)
+    confirmed_semantics = copy.deepcopy(frozen["confirmedOutline"])
+    issued_semantics.pop("confirmationMetadata")
+    confirmed_semantics.pop("confirmationMetadata")
+    assert confirmed_semantics == issued_semantics
+
+
+def test_outline_confirmation_stamps_server_audit_and_rehashes(
+    api_harness,
+    monkeypatch,
+) -> None:
+    app, repository, _cancellation, _stores, _store = api_harness
+    server_now = datetime(2026, 8, 2, 3, 4, 5, tzinfo=UTC)
+    monkeypatch.setattr(jobs_router, "_utc_now", lambda: server_now)
+    draft = _issued_draft_outline()
+    forged = _confirmed_outline(draft, confirmed_by="forged-user")
+    forged["confirmation_metadata"]["confirmed_at"] = "2099-01-01T00:00:00Z"
+    repository.jobs["job-outline"] = _detail(
+        job_id="job-outline",
+        result_payload=canonical_json_bytes(draft).decode(),
+    )
+    client_hash = canonical_outline_sha256(forged)
+
+    response = TestClient(app).post(
+        "/api/v1/classroom-jobs/job-outline/confirm-outline",
+        json={
+            "confirmedOutline": forged,
+            "confirmedOutlineSha256": client_hash,
+        },
+    )
+
+    assert response.status_code == 202
+    payload, _payload_sha256 = repository.confirmed_payloads[-1]
+    frozen = json.loads(payload)
+    audit = frozen["confirmedOutline"]["confirmationMetadata"]
+    assert audit == {
+        "status": "confirmed",
+        "confirmedAt": "2026-08-02T03:04:05Z",
+        "confirmedBy": "teacher-1",
+    }
+    server_hash = canonical_outline_sha256(frozen["confirmedOutline"])
+    assert frozen["confirmedOutlineSha256"] == server_hash
+    assert server_hash != client_hash
+
+
+def test_outline_confirmation_rejects_a_non_draft_issued_result_without_requeue(
+    api_harness,
+) -> None:
+    app, repository, _cancellation, _stores, _store = api_harness
+    outline = _confirmed_outline(_issued_draft_outline())
+    job = _detail(
+        job_id="job-outline",
+        result_payload=canonical_json_bytes(outline).decode(),
+    )
+    repository.jobs["job-outline"] = job
+
+    _assert_outline_confirmation_rejected(app, repository, job, outline)
+
+
+@pytest.mark.parametrize(
+    "changed_field",
+    ["title", "knowledge_point_ids", "source_refs", "scene_summary"],
+)
+def test_outline_confirmation_rejects_changes_to_issued_semantics_without_requeue(
+    api_harness,
+    changed_field: str,
+) -> None:
+    app, repository, _cancellation, _stores, _store = api_harness
+    draft = _issued_draft_outline()
+    outline = _confirmed_outline(draft)
+    scenes = outline["scenes"]
+    assert isinstance(scenes, list)
+    scene = scenes[0]
+    assert isinstance(scene, dict)
+    if changed_field == "title":
+        outline["title"] = "A replacement outline"
+    elif changed_field == "knowledge_point_ids":
+        scene["knowledge_point_ids"] = ["kp-foreign"]
+    elif changed_field == "source_refs":
+        source_refs = scene["source_refs"]
+        assert isinstance(source_refs, list)
+        source_ref = source_refs[0]
+        assert isinstance(source_ref, dict)
+        source_ref["source_id"] = "source-foreign"
+    else:
+        scene["summary"] = "A replacement scene"
+    job = _detail(
+        job_id="job-outline",
+        result_payload=canonical_json_bytes(draft).decode(),
+    )
+    repository.jobs["job-outline"] = job
+
+    _assert_outline_confirmation_rejected(app, repository, job, outline)
+
+
+@pytest.mark.parametrize(
+    "changed_field",
+    [
+        "outline_id",
+        "teaching_brief_id",
+        "teaching_brief_sha256",
+        "template_id",
+        "template_version",
+    ],
+)
+def test_outline_confirmation_rejects_an_issued_draft_not_bound_to_the_job_request(
+    api_harness,
+    changed_field: str,
+) -> None:
+    app, repository, _cancellation, _stores, _store = api_harness
+    draft = _issued_draft_outline()
+    if changed_field == "outline_id":
+        draft["outline_id"] = "outline-job-other"
+    else:
+        metadata = draft["generation_metadata"]
+        assert isinstance(metadata, dict)
+        metadata[changed_field] = (
+            "c" * 64 if changed_field == "teaching_brief_sha256" else "foreign-value"
+        )
+    outline = _confirmed_outline(draft)
+    job = _detail(
+        job_id="job-outline",
+        result_payload=canonical_json_bytes(draft).decode(),
+    )
+    repository.jobs["job-outline"] = job
+
+    _assert_outline_confirmation_rejected(app, repository, job, outline)
+
+
+@pytest.mark.parametrize(
+    "invalid_draft",
+    [
+        "unknown_scene_knowledge",
+        "unknown_coverage_knowledge",
+        "unknown_scene_source",
+        "unknown_outline_source",
+        "missing_scene_sources",
+        "missing_outline_sources",
+        "duplicate_scene_knowledge",
+        "duplicate_coverage",
+        "duplicate_coverage_scene",
+        "unknown_coverage_scene",
+        "duplicate_scene_id",
+        "estimated_over_budget",
+        "estimated_count_mismatch",
+    ],
+)
+def test_outline_confirmation_rejects_an_issued_draft_outside_the_trusted_brief(
+    api_harness,
+    invalid_draft: str,
+) -> None:
+    app, repository, _cancellation, _stores, _store = api_harness
+    draft = _issued_draft_outline()
+    scenes = draft["scenes"]
+    coverage = draft["knowledge_coverage"]
+    outline_sources = draft["source_refs"]
+    assert isinstance(scenes, list)
+    assert isinstance(coverage, list)
+    assert isinstance(outline_sources, list)
+    scene = scenes[0]
+    knowledge_coverage = coverage[0]
+    assert isinstance(scene, dict)
+    assert isinstance(knowledge_coverage, dict)
+    if invalid_draft == "unknown_scene_knowledge":
+        scene["knowledge_point_ids"] = ["kp-foreign"]
+    elif invalid_draft == "unknown_coverage_knowledge":
+        knowledge_coverage["knowledge_point_id"] = "kp-foreign"
+    elif invalid_draft == "unknown_scene_source":
+        scene_sources = scene["source_refs"]
+        assert isinstance(scene_sources, list)
+        source = scene_sources[0]
+        assert isinstance(source, dict)
+        source["fragment_id"] = "fragment-foreign"
+    elif invalid_draft == "unknown_outline_source":
+        source = outline_sources[0]
+        assert isinstance(source, dict)
+        source["source_id"] = "source-foreign"
+    elif invalid_draft == "missing_scene_sources":
+        scene["source_refs"] = []
+    elif invalid_draft == "missing_outline_sources":
+        draft["source_refs"] = []
+    elif invalid_draft == "duplicate_scene_knowledge":
+        scene["knowledge_point_ids"] = ["kp-1", "kp-1"]
+    elif invalid_draft == "duplicate_coverage":
+        coverage.append(copy.deepcopy(knowledge_coverage))
+    elif invalid_draft == "duplicate_coverage_scene":
+        knowledge_coverage["scene_ids"] = ["scene-1", "scene-1"]
+    elif invalid_draft == "unknown_coverage_scene":
+        knowledge_coverage["scene_ids"] = ["scene-foreign"]
+    elif invalid_draft == "duplicate_scene_id":
+        scenes.append(copy.deepcopy(scene))
+    elif invalid_draft == "estimated_over_budget":
+        draft["estimated_scene_count"] = 9
+    else:
+        draft["estimated_scene_count"] = 2
+    outline = _confirmed_outline(draft)
+    job = _detail(
+        job_id="job-outline",
+        result_payload=canonical_json_bytes(draft).decode(),
+    )
+    repository.jobs["job-outline"] = job
+
+    _assert_outline_confirmation_rejected(app, repository, job, outline)
+
+
+@pytest.mark.parametrize(
+    "invalid_draft",
+    ["missing_knowledge_coverage", "coverage_scene_mismatch"],
+)
+def test_outline_confirmation_requires_complete_knowledge_coverage(
+    api_harness,
+    invalid_draft: str,
+) -> None:
+    app, repository, _cancellation, _stores, _store = api_harness
+    request = _internal_request(job_id="job-outline")
+    brief = request["teaching_brief"]
+    assert isinstance(brief, dict)
+    knowledge_points = brief["knowledge_points"]
+    assert isinstance(knowledge_points, list)
+    knowledge_points.append(
+        {
+            "knowledge_point_id": "kp-2",
+            "title": "Energy conservation",
+            "description": "Energy changes form but is conserved.",
+        }
+    )
+    request_payload = canonical_json_bytes(GenerationRequest.model_validate(request)).decode()
+    draft = _issued_draft_outline()
+    if invalid_draft == "coverage_scene_mismatch":
+        scenes = draft["scenes"]
+        assert isinstance(scenes, list)
+        scene = scenes[0]
+        assert isinstance(scene, dict)
+        scene["knowledge_point_ids"] = ["kp-2"]
+    outline = _confirmed_outline(draft)
+    job = _detail(
+        job_id="job-outline",
+        request_payload=request_payload,
+        result_payload=canonical_json_bytes(draft).decode(),
+    )
+    repository.jobs["job-outline"] = job
+
+    _assert_outline_confirmation_rejected(app, repository, job, outline)
+
+
+def test_outline_confirmation_rejects_an_issued_draft_over_the_original_scene_budget(
+    api_harness,
+) -> None:
+    app, repository, _cancellation, _stores, _store = api_harness
+    request = _internal_request(job_id="job-outline")
+    request["scene_budget"] = 1
+    request_payload = canonical_json_bytes(GenerationRequest.model_validate(request)).decode()
+    draft = _issued_draft_outline()
+    scenes = draft["scenes"]
+    assert isinstance(scenes, list)
+    second_scene = copy.deepcopy(scenes[0])
+    assert isinstance(second_scene, dict)
+    second_scene["scene_id"] = "scene-2"
+    scenes.append(second_scene)
+    coverage = draft["knowledge_coverage"]
+    assert isinstance(coverage, list)
+    knowledge_coverage = coverage[0]
+    assert isinstance(knowledge_coverage, dict)
+    knowledge_coverage["scene_ids"] = ["scene-1", "scene-2"]
+    draft["estimated_scene_count"] = 2
+    outline = _confirmed_outline(draft)
+    job = _detail(
+        job_id="job-outline",
+        request_payload=request_payload,
+        result_payload=canonical_json_bytes(draft).decode(),
+    )
+    repository.jobs["job-outline"] = job
+
+    _assert_outline_confirmation_rejected(app, repository, job, outline)
 
 
 def test_outline_confirmation_rejects_a_changed_hash_without_requeue(api_harness) -> None:

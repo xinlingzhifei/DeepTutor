@@ -181,7 +181,7 @@ export interface GenerationRequest {
   priority: "student_micro" | "interaction" | "teacher" | "full" | "batch";
 }
 
-export type OutlineJobStatus = "succeeded" | "failed";
+export type OutlineJobStatus = "running" | "succeeded" | "failed" | "canceled";
 
 export interface OutlineJob {
   tenantId: string;

@@ -15,6 +15,7 @@ import {
   toPortableOpenMaicSceneContent,
 } from "../../../../../lib/yfeistai/content-generation";
 import { readServiceSecret } from "../../../../../lib/yfeistai/service-auth";
+import { runSceneRouteAdapter } from "../../../../../lib/yfeistai/generation-adapter";
 
 function portableClone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
@@ -163,8 +164,12 @@ const postClassroom = createClassroomPostHandler({
           }
         : {}),
     } as Parameters<typeof generateSceneContent>[0];
-    const generated = await generateSceneContent(upstreamOutline, aiCall, {
+    const generated = await runSceneRouteAdapter({
+      outline: upstreamOutline,
       languageDirective: context.outline.language,
+      languageModel: resolved.model,
+      callProvider: aiCall,
+      generate: generateSceneContent,
     });
     if (!generated) {
       throw new Error("OpenMAIC did not generate scene content");

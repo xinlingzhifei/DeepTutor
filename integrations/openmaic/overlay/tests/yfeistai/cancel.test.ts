@@ -62,6 +62,7 @@ import {
   ContentJobStore,
   createJobCancelHandler,
 } from "../../lib/yfeistai/content-generation";
+import { OutlineJobStore } from "../../lib/yfeistai/job-store";
 import { signServiceRequest } from "../../lib/yfeistai/service-auth";
 import {
   durableFile,
@@ -532,6 +533,126 @@ describe("job idempotency and tenant isolation", () => {
 });
 
 describe("signed cancel route", () => {
+  test("durably cancels an outline and fences its old owner across restart", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "openmaic-outline-cancel-"));
+    const now = Date.parse("2026-08-02T02:00:00.000Z");
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const store = new OutlineJobStore(root, 60_000, () => now, false);
+    const oldCompletion = store.submit(
+      {
+        tenantId: "tenant-a",
+        jobId: "shared-job",
+        idempotencyKey: "outline-idem-a",
+        action: "outline",
+        canonicalBody: "{}",
+      },
+      async () => {
+        await blocked;
+        return {
+          tenantId: "tenant-a",
+          jobId: "shared-job",
+          idempotencyKey: "outline-idem-a",
+          phase: "outline",
+          status: "succeeded",
+          createdAt: new Date(now).toISOString(),
+          updatedAt: new Date(now).toISOString(),
+        };
+      },
+    );
+    const handler = createJobCancelHandler({
+      readSecret: () => "service-secret",
+      nowSeconds: () => 1_800_000_000,
+      stores: [store],
+    });
+
+    const response = await handler(signedCancel("tenant-a", "shared-job"), {
+      params: Promise.resolve({ jobId: "shared-job" }),
+    });
+
+    expect(response.status).toBe(202);
+    await expect(response.json()).resolves.toEqual({
+      jobId: "shared-job",
+      status: "canceled",
+    });
+    const restarted = new OutlineJobStore(root, 60_000, () => now, false);
+    await expect(restarted.read("tenant-a", "shared-job")).resolves.toMatchObject({
+      status: "canceled",
+      error: {
+        code: "JOB_CANCELED",
+        message: "The job was canceled.",
+      },
+    });
+
+    release();
+    await expect(oldCompletion).resolves.toMatchObject({ status: "canceled" });
+    await expect(restarted.read("tenant-a", "shared-job")).resolves.toMatchObject({
+      status: "canceled",
+    });
+  });
+
+  test("cancels running content before an old outline with the same job id", async () => {
+    const outlineStore = new OutlineJobStore();
+    await outlineStore.submit(
+      {
+        tenantId: "tenant-a",
+        jobId: "shared-job",
+        idempotencyKey: "outline-idem-a",
+        action: "outline",
+        canonicalBody: "{}",
+      },
+      async () => ({
+        tenantId: "tenant-a",
+        jobId: "shared-job",
+        idempotencyKey: "outline-idem-a",
+        phase: "outline",
+        status: "succeeded",
+        createdAt: "2026-08-02T02:00:00.000Z",
+        updatedAt: "2026-08-02T02:00:00.000Z",
+      }),
+    );
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const contentStore = new ContentJobStore();
+    const contentCompletion = contentStore.start(
+      {
+        tenantId: "tenant-a",
+        jobId: "shared-job",
+        idempotencyKey: "content-idem-a",
+        canonicalBody: "{}",
+      },
+      async () => {
+        await blocked;
+        return { classroomId: "classroom-a" };
+      },
+    );
+    const unusedExportStore = { cancel: vi.fn(async () => null) };
+    const handler = createJobCancelHandler({
+      readSecret: () => "service-secret",
+      nowSeconds: () => 1_800_000_000,
+      stores: [contentStore, unusedExportStore, outlineStore],
+    });
+
+    const response = await handler(signedCancel("tenant-a", "shared-job"), {
+      params: Promise.resolve({ jobId: "shared-job" }),
+    });
+
+    expect(response.status).toBe(202);
+    expect(unusedExportStore.cancel).not.toHaveBeenCalled();
+    await expect(contentStore.read("tenant-a", "shared-job")).resolves.toMatchObject({
+      status: "canceled",
+    });
+    await expect(outlineStore.read("tenant-a", "shared-job")).resolves.toMatchObject({
+      status: "succeeded",
+    });
+    release();
+    await contentCompletion;
+  });
+
   test("authenticates before mutation and binds tenant and job", async () => {
     const store = new ContentJobStore();
     await store.start(

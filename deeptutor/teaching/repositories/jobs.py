@@ -484,6 +484,20 @@ class SqlAlchemyGenerationJobRepository:
         session_factory = self._session_factory(request.tenant_id)
         async with session_factory() as session:
             async with session.begin():
+                await session.execute(
+                    text(
+                        "SELECT pg_advisory_xact_lock("
+                        "hashtextextended(:idempotency_lock_key, 0))"
+                    ),
+                    {
+                        "idempotency_lock_key": hashlib.sha256(
+                            (
+                                "generation-job-idempotency\0"
+                                f"{request.tenant_id}\0{request.idempotency_key}"
+                            ).encode()
+                        ).hexdigest()
+                    },
+                )
                 existing = await session.scalar(
                     select(GenerationJob)
                     .where(
@@ -1347,7 +1361,14 @@ class SqlAlchemyGenerationJobRepository:
                 if existing is None:
                     await session.execute(
                         text("SELECT pg_advisory_xact_lock(hashtextextended(:classroom_key, 0))"),
-                        {"classroom_key": f"{claim.tenant_id}\0{classroom_id}"},
+                        {
+                            "classroom_key": hashlib.sha256(
+                                (
+                                    "classroom-promotion\0"
+                                    f"{claim.tenant_id}\0{classroom_id}"
+                                ).encode()
+                            ).hexdigest()
+                        },
                     )
                     max_version = max(
                         int(
@@ -1498,6 +1519,7 @@ class SqlAlchemyGenerationJobRepository:
                         document_object_key=document_artifact.object_key,
                     )
                 )
+                await session.flush()
                 for artifact in artifacts:
                     session.add(
                         ClassroomArtifact(

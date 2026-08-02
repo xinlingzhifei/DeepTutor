@@ -7,14 +7,16 @@ import {
   type TeachingBrief,
 } from "./contracts";
 import { IdempotencyConflictError, type OutlineJobStore } from "./job-store";
+import { classifyProviderFailure } from "./provider-error";
 import {
   type SignedServiceRequest,
   verifyServiceRequest,
 } from "./service-auth";
 
 export const OUTLINE_BUNDLE_CONTRACT_SHA256 =
-  "f8ddb7c11138f402ed048c4af2010714b2bfd456e5c38122920c689e4a2b3ddf" as const;
+  "a45b0310d5b58a8e2d461ccfa9d60be24615583825a1f3a4f4460672cbd19ba5" as const;
 
+const PUBLIC_OUTLINE_MODEL_ID = "server-selected-model" as const;
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 const OPAQUE_IDENTIFIER = /^[^:\s]+$/;
 const ROUTING_ALIASES = new Set([
@@ -995,7 +997,7 @@ function knowledgePointIdsForScene(
 export function normalizeUpstreamOutlineBundle(
   request: GenerationRequest,
   value: UpstreamOutlineResult,
-  options: { modelId: string; generatedAt: string },
+  options: { generatedAt: string; modelId?: string },
 ): OutlineBundle {
   nonEmptyString(value.languageDirective, "upstream language directive");
   if (!Array.isArray(value.outlines) || value.outlines.length === 0) {
@@ -1059,7 +1061,7 @@ export function normalizeUpstreamOutlineBundle(
     generationMetadata: {
       generator: "openmaic",
       generatorVersion: OPENMAIC_APP_VERSION,
-      modelId: nonEmptyString(options.modelId, "resolved model identifier"),
+      modelId: PUBLIC_OUTLINE_MODEL_ID,
       generatedAt: dateTime(options.generatedAt, "generated timestamp"),
       teachingBriefId: request.teachingBriefId,
       teachingBriefSha256: request.teachingBriefSha256,
@@ -1117,14 +1119,17 @@ export async function generateOutlineJob(
       status: "succeeded",
       result: { outline },
     };
-  } catch {
+  } catch (error) {
+    const providerFailure = classifyProviderFailure(error);
     return {
       ...base,
       status: "failed",
-      error: {
-        code: "OUTLINE_GENERATION_FAILED",
-        message: "Outline generation failed.",
-      },
+      error:
+        providerFailure ??
+        ({
+          code: "OUTLINE_GENERATION_FAILED",
+          message: "Outline generation failed.",
+        } as const),
     };
   }
 }
@@ -1221,7 +1226,7 @@ export function createOutlinePostHandler(
     }
 
     try {
-      const job = await dependencies.store.submit(
+      const job = dependencies.store.start(
         {
           tenantId: generationRequest.tenantId,
           jobId: generationRequest.jobId,

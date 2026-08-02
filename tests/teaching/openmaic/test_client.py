@@ -689,6 +689,16 @@ def test_poll_stops_after_the_configured_attempt_limit() -> None:
     asyncio.run(http.aclose())
 
 
+def test_default_poll_policy_covers_the_longest_supported_render_window() -> None:
+    policy = PollRetryPolicy()
+    minimum_delay_budget = sum(
+        min(policy.max_delay, policy.initial_delay * (2**attempt))
+        for attempt in range(policy.max_attempts - 1)
+    )
+
+    assert minimum_delay_budget >= 120
+
+
 def test_poll_retries_a_transient_connection_failure_with_the_same_bound() -> None:
     attempts = 0
     delays: list[float] = []

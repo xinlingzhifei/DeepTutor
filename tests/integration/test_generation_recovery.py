@@ -6,6 +6,7 @@ import hashlib
 
 import pytest
 from sqlalchemy import func, select, update
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -44,8 +45,9 @@ async def _seed_binding(engine, tenant_id: str) -> None:
                 )
             )
             await session.flush()
-            session.add(
-                ProviderProfile(
+            await session.execute(
+                insert(ProviderProfile)
+                .values(
                     id="recovery-provider",
                     scope="shared",
                     tenant_id=None,
@@ -56,10 +58,11 @@ async def _seed_binding(engine, tenant_id: str) -> None:
                     secret_ref="tests/recovery/provider",
                     status="active",
                 )
+                .on_conflict_do_nothing(index_elements=[ProviderProfile.id])
             )
-            await session.flush()
-            session.add(
-                DataPlaneRoute(
+            await session.execute(
+                insert(DataPlaneRoute)
+                .values(
                     id="recovery-route",
                     tenant_id=None,
                     owner_key="shared",
@@ -71,6 +74,7 @@ async def _seed_binding(engine, tenant_id: str) -> None:
                     status="active",
                     health_status="healthy",
                 )
+                .on_conflict_do_nothing(index_elements=[DataPlaneRoute.id])
             )
 
 

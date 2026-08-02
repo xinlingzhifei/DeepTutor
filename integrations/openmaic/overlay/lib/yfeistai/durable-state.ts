@@ -156,7 +156,14 @@ export function durableFile(
   );
 }
 
-export function readDurableJson(target: string): unknown | null {
+export interface DurableJsonRead {
+  value: unknown;
+  mtimeMs: number;
+}
+
+export function readDurableJsonWithMetadata(
+  target: string,
+): DurableJsonRead | null {
   let descriptor: number;
   try {
     descriptor = openSync(
@@ -186,13 +193,20 @@ export function readDurableJson(target: string): unknown | null {
     }
     const body = readFileSync(descriptor, "utf8");
     try {
-      return JSON.parse(body) as unknown;
+      return {
+        value: JSON.parse(body) as unknown,
+        mtimeMs: descriptorStat.mtimeMs,
+      };
     } catch {
       throw new Error("durable state record is corrupt");
     }
   } finally {
     closeSync(descriptor);
   }
+}
+
+export function readDurableJson(target: string): unknown | null {
+  return readDurableJsonWithMetadata(target)?.value ?? null;
 }
 
 export function writeDurableJsonExclusive(

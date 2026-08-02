@@ -35,9 +35,11 @@ REQUIRED_OVERLAY_FILES = {
     Path("lib/yfeistai/contracts.ts"),
     Path("lib/yfeistai/durable-state.ts"),
     Path("lib/yfeistai/export-generation.ts"),
+    Path("lib/yfeistai/generation-adapter.ts"),
     Path("lib/yfeistai/job-store.ts"),
     Path("lib/yfeistai/outline-generation.ts"),
     Path("lib/yfeistai/portable-classroom.ts"),
+    Path("lib/yfeistai/provider-error.ts"),
     Path("lib/yfeistai/service-boundary.ts"),
     Path("lib/yfeistai/service-auth.ts"),
     Path("tests/yfeistai/artifact-manifest.test.ts"),
@@ -372,6 +374,7 @@ def _verify_outline_generation(overlay_root: Path) -> None:
         "generationRequest.idempotencyKey !== signed.idempotencyKey",
         "dependencies.store.read(signed.tenantId, jobId)",
         "IdempotencyConflictError",
+        '"server-selected-model"',
     )
     missing = [token for token in required_source_tokens if token not in source]
     if missing:
@@ -388,7 +391,9 @@ def _verify_outline_generation(overlay_root: Path) -> None:
         "@/lib/server/resolve-model",
         "@/lib/web-search",
         "generateSceneOutlinesFromRequirements(",
+        "runOutlineRouteAdapter(",
         'resolveModel({ stage: "generate-classroom" })',
+        "maxRetries: 0",
         "resolveClassroomWebSearchConfig({})",
         'answer: ""',
         "createOutlinePostHandler(",
@@ -398,6 +403,10 @@ def _verify_outline_generation(overlay_root: Path) -> None:
     if missing:
         raise OverlayVerificationError(
             "outline POST route is missing pinned upstream adapters: " + ", ".join(missing)
+        )
+    if "resolved.modelString" in post_route:
+        raise OverlayVerificationError(
+            "outline POST route must not expose provider routing as public model metadata"
         )
     required_get_tokens = (
         "createOutlineGetHandler(",
@@ -413,6 +422,7 @@ def _verify_outline_generation(overlay_root: Path) -> None:
         "claimDurableLease(",
         "renewDurableLease(",
         "durableLeaseMatches(",
+        "readDurableJsonWithMetadata(",
         "writeDurableJsonExclusive(",
         "submission.tenantId",
         "submission.jobId",
@@ -426,6 +436,10 @@ def _verify_outline_generation(overlay_root: Path) -> None:
     if missing:
         raise OverlayVerificationError(
             "job-store.ts is missing idempotency bindings: " + ", ".join(missing)
+        )
+    if "statSync(" in store:
+        raise OverlayVerificationError(
+            "job-store.ts must not re-stat a durable record after its safe read"
         )
     verify_outline_contract_hash(source)
 
@@ -491,7 +505,7 @@ def verify_task4_sources(overlay_root: Path) -> None:
             "allowSameOrigin: false",
             "mediaManifest",
             "fileSha256",
-            'relativePath: "classroom/classroom.json"',
+            'relativePath: "classroom.json"',
             "claimExecution(",
             "persistTerminal(terminal, claim, publishSucceeded)",
             "configuredOpenMaicStateRoot()",
@@ -666,7 +680,9 @@ def verify_task4_sources(overlay_root: Path) -> None:
         (
             "@/lib/generation/scene-generator",
             "@/lib/server/resolve-model",
-            "generateSceneContent(",
+            "runSceneRouteAdapter(",
+            "generate: generateSceneContent",
+            "languageModel: resolved.model",
             "generateSceneActions(",
             "materializeEmbeddedMedia(",
             "buildOpenMaicSourcePrompt(",
@@ -734,6 +750,8 @@ def verify_task4_sources(overlay_root: Path) -> None:
             "createJobCancelHandler(",
             "contentJobStore",
             "exportJobStore",
+            "outlineJobStore",
+            "stores: [contentJobStore, exportJobStore, outlineJobStore]",
             "readServiceSecret",
             "return cancelJob(",
         ),

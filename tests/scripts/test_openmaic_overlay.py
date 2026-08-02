@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -258,8 +259,11 @@ def test_outline_contract_hash_verifier_rejects_a_handwritten_mismatch() -> None
     source = (
         INTEGRATION_ROOT / "overlay" / "lib" / "yfeistai" / "outline-generation.ts"
     ).read_text(encoding="utf-8")
+    expected_hash = hashlib.sha256(
+        (ROOT / "contracts" / "classroom" / "outline-bundle.schema.json").read_bytes()
+    ).hexdigest()
     forged = source.replace(
-        "f8ddb7c11138f402ed048c4af2010714b2bfd456e5c38122920c689e4a2b3ddf",
+        expected_hash,
         "0" * 64,
     )
     assert forged != source

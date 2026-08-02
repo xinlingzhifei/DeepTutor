@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -72,6 +73,216 @@ def test_worker_constants_lock_the_lease_protocol() -> None:
 
     assert LEASE_SECONDS == 60
     assert HEARTBEAT_SECONDS == 15
+
+
+def _run_outline_worker(result: dict[str, object]):
+    from deeptutor.teaching.contracts import GenerationRequest, canonical_json_bytes
+    from deeptutor.teaching.openmaic.client import EngineJob
+    from deeptutor.teaching.repositories.jobs import ClaimedJobPayload
+    from deeptutor.teaching.scheduler import ClaimedGenerationJob
+    from deeptutor.teaching.worker import GenerationWorker
+    from tests.teaching.test_contracts import valid_generation_request
+
+    request = valid_generation_request()
+    payload = canonical_json_bytes(GenerationRequest.model_validate(request)).decode()
+    claim = ClaimedGenerationJob(
+        tenant_id="tenant-1",
+        job_id="job-1",
+        job_kind="generation",
+        phase="outline",
+        status="generating_outline",
+        slot_pool="generation",
+        data_plane_route_id="shared-primary",
+        provider_profile_id="provider-default",
+        worker_pool_ref="shared-generation",
+        queue_ref="openmaic.shared",
+        attempt_count=1,
+        lease_owner="worker-1",
+        lease_token="a" * 64,
+        lease_expires_at=datetime(2030, 1, 1, tzinfo=timezone.utc),
+        global_slot_id=1,
+        tenant_slot_id=2,
+    )
+
+    class Scheduler:
+        async def claim(self, *_args, **_kwargs):
+            return claim
+
+    class Repository:
+        def __init__(self) -> None:
+            self.completed: list[str] = []
+            self.failures: list[tuple[str, str]] = []
+
+        async def load_claimed_payload(self, _claim):
+            return ClaimedJobPayload(
+                request_payload=payload,
+                request_sha256=hashlib.sha256(payload.encode()).hexdigest(),
+                idempotency_key="key-1",
+                export_format=None,
+                cancel_requested=False,
+                dsl_repair_attempts=0,
+            )
+
+        async def complete_outline(self, _claim, *, result_payload):
+            self.completed.append(result_payload)
+
+        async def fail_claim(self, _claim, *, error_category, error_code):
+            self.failures.append((error_category, error_code))
+
+        async def heartbeat_claim(self, *_args, **_kwargs):
+            raise AssertionError("short test must not need a heartbeat")
+
+    class Client:
+        async def submit_outline(self, _request):
+            return EngineJob(
+                tenant_id="tenant-1",
+                job_id="job-1",
+                kind="outline",
+                status="succeeded",
+                payload={"result": result},
+            )
+
+    class Clients:
+        async def client_for_claim(self, _claim):
+            return Client()
+
+    async def blocked_sleep(_seconds: float) -> None:
+        await asyncio.Future()
+
+    repository = Repository()
+    worker = GenerationWorker(
+        scheduler=Scheduler(),
+        repository=repository,
+        clients=Clients(),
+        stores=object(),
+        worker_id="worker-1",
+        sleep=blocked_sleep,
+    )
+    assert asyncio.run(
+        worker.run_once(
+            slot_pool="generation",
+            data_plane_route_id="shared-primary",
+            provider_profile_id="provider-default",
+            worker_pool_ref="shared-generation",
+            queue_ref="openmaic.shared",
+        )
+    )
+    return repository
+
+
+def _draft_outline() -> dict[str, object]:
+    from deeptutor.teaching.contracts import OutlineBundle
+    from tests.teaching.test_contracts import valid_outline_bundle
+
+    outline = valid_outline_bundle()
+    outline["outline_id"] = "outline-job-1"
+    outline["confirmation_metadata"] = {"status": "draft"}
+    return OutlineBundle.model_validate(outline).model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+    )
+
+
+def _unbound_draft(reason: str) -> dict[str, object]:
+    outline = copy.deepcopy(_draft_outline())
+    confirmation = outline["confirmationMetadata"]
+    metadata = outline["generationMetadata"]
+    scenes = outline["scenes"]
+    coverage = outline["knowledgeCoverage"]
+    assert isinstance(confirmation, dict)
+    assert isinstance(metadata, dict)
+    assert isinstance(scenes, list)
+    assert isinstance(coverage, list)
+    scene = scenes[0]
+    knowledge_coverage = coverage[0]
+    assert isinstance(scene, dict)
+    assert isinstance(knowledge_coverage, dict)
+    if reason == "draft_confirmation_audit":
+        confirmation.update(
+            confirmedAt="2026-07-30T08:05:00Z",
+            confirmedBy="teacher-1",
+        )
+    elif reason == "confirmed":
+        confirmation.update(
+            status="confirmed",
+            confirmedAt="2026-07-30T08:05:00Z",
+            confirmedBy="teacher-1",
+        )
+    elif reason == "outline_id":
+        outline["outlineId"] = "outline-job-other"
+    elif reason == "brief_id":
+        metadata["teachingBriefId"] = "brief-other"
+    elif reason == "generator_version":
+        metadata["generatorVersion"] = "0.3.2"
+    elif reason == "model_id":
+        metadata["modelId"] = "private-provider-model"
+    elif reason == "contract_sha256":
+        outline["contractSha256"] = "b" * 64
+    elif reason == "missing_sources":
+        outline["sourceRefs"] = []
+        scene["sourceRefs"] = []
+    elif reason == "duplicate_scene_knowledge":
+        scene["knowledgePointIds"] = ["kp-1", "kp-1"]
+    elif reason == "duplicate_coverage":
+        coverage.append(copy.deepcopy(knowledge_coverage))
+    elif reason == "duplicate_coverage_scene":
+        knowledge_coverage["sceneIds"] = ["scene-1", "scene-1"]
+    else:
+        raise AssertionError(f"unknown outline mutation: {reason}")
+    return outline
+
+
+def test_worker_unwraps_and_validates_the_exact_outline_result_envelope() -> None:
+    from deeptutor.teaching.contracts import OutlineBundle, canonical_json_bytes
+
+    outline = _draft_outline()
+    repository = _run_outline_worker({"outline": outline})
+
+    assert repository.completed == [
+        canonical_json_bytes(OutlineBundle.model_validate(outline)).decode()
+    ]
+    assert repository.failures == []
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        {"outline": _draft_outline(), "unexpected": True},
+        {"outline": {"outline": _draft_outline()}},
+        {"outline": {"schemaVersion": "1.0"}},
+    ],
+)
+def test_worker_rejects_malformed_outline_result_envelopes(
+    result: dict[str, object],
+) -> None:
+    repository = _run_outline_worker(result)
+
+    assert repository.completed == []
+    assert repository.failures == [("contract_invalid", "contract_invalid")]
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "draft_confirmation_audit",
+        "confirmed",
+        "outline_id",
+        "brief_id",
+        "generator_version",
+        "model_id",
+        "contract_sha256",
+        "missing_sources",
+        "duplicate_scene_knowledge",
+        "duplicate_coverage",
+        "duplicate_coverage_scene",
+    ],
+)
+def test_worker_rejects_semantically_unbound_outline_drafts(reason: str) -> None:
+    repository = _run_outline_worker({"outline": _unbound_draft(reason)})
+
+    assert repository.completed == []
+    assert repository.failures == [("contract_invalid", "contract_invalid")]
 
 
 def test_explicit_retry_requires_a_new_job_identity() -> None:

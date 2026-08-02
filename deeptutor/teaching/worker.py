@@ -10,6 +10,8 @@ import hashlib
 import json
 from typing import Any, Protocol
 
+from pydantic import ValidationError
+
 from deeptutor.teaching.artifact_validation import (
     ArtifactValidationError,
     ValidatedClassroomOutput,
@@ -21,7 +23,9 @@ from deeptutor.teaching.artifacts import ClassroomArtifactManifest, classroom_ar
 from deeptutor.teaching.contracts import (
     ExportRequest,
     GenerationRequest,
+    OutlineBundle,
     canonical_json_bytes,
+    validate_outline_binding,
 )
 from deeptutor.teaching.export_worker import submit_pinned_export
 from deeptutor.teaching.job_errors import (
@@ -190,6 +194,27 @@ def _validation_failure(error: ArtifactValidationError) -> JobFailure:
     return JobFailure("contract_invalid", error.code, False)
 
 
+def _validated_outline_result(
+    result_payload: Mapping[str, Any],
+    request: GenerationRequest,
+) -> OutlineBundle:
+    if set(result_payload) != {"outline"}:
+        raise ArtifactValidationError("contract_invalid")
+    try:
+        outline = OutlineBundle.model_validate(result_payload["outline"])
+    except ValidationError:
+        raise ArtifactValidationError("contract_invalid") from None
+    try:
+        validate_outline_binding(
+            outline,
+            request,
+            expected_confirmation_status="draft",
+        )
+    except ValueError:
+        raise ArtifactValidationError("contract_invalid")
+    return outline
+
+
 class GenerationWorker:
     """Claim, execute, validate, publish, and finalize one durable job."""
 
@@ -297,6 +322,8 @@ class GenerationWorker:
                 submitted = await submit_pinned_export(client, request)
             else:
                 request = GenerationRequest.model_validate(request_payload)
+                if request.tenant_id != claim.tenant_id or request.job_id != claim.job_id:
+                    raise ArtifactValidationError("contract_invalid")
                 submitted = (
                     await client.submit_outline(request)
                     if claim.phase == "outline"
@@ -333,9 +360,10 @@ class GenerationWorker:
             if not isinstance(result_payload, Mapping):
                 raise ArtifactValidationError("contract_invalid")
             if claim.phase == "outline":
+                outline = _validated_outline_result(result_payload, request)
                 await self._repository.complete_outline(
                     claim,
-                    result_payload=canonical_json_bytes(result_payload).decode(),
+                    result_payload=canonical_json_bytes(outline).decode(),
                 )
                 return
             if claim.job_kind == "export":

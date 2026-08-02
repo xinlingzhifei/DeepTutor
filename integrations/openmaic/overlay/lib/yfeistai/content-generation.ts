@@ -50,6 +50,7 @@ import {
   withDurableLock,
   writeDurableJsonExclusive,
 } from "./durable-state";
+import { classifyProviderFailure } from "./provider-error";
 
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 
@@ -1028,7 +1029,7 @@ export async function generateContentJob(
   const mediaManifestSha256 = sha256Bytes(canonicalJson(mediaManifest));
   const bytes = new TextEncoder().encode(canonicalJson(classroomDocument));
   const expectedDocumentArtifact = createArtifactEntry({
-    relativePath: "classroom/classroom.json",
+    relativePath: "classroom.json",
     bytes,
     mime: "application/json",
     expiresAt,
@@ -1037,7 +1038,7 @@ export async function generateContentJob(
   if (dependencies.writeArtifact) {
     dependencies.assertPublicationActive?.();
     documentArtifact = await dependencies.writeArtifact({
-      relativePath: "classroom/classroom.json",
+      relativePath: "classroom.json",
       bytes,
       mime: "application/json",
       expiresAt,
@@ -1443,6 +1444,7 @@ export class ContentJobStore<Result = unknown> {
               result,
             };
       } catch (error) {
+        const providerFailure = classifyProviderFailure(error);
         terminal = {
           ...running,
           status: error instanceof ContentCanceledError ? "canceled" : "failed",
@@ -1450,7 +1452,7 @@ export class ContentJobStore<Result = unknown> {
           error:
             error instanceof ContentCanceledError
               ? { code: "JOB_CANCELED", message: "The job was canceled." }
-              : {
+              : providerFailure ?? {
                   code: submission.failureCode ?? "CONTENT_GENERATION_FAILED",
                   message:
                     submission.failureCode === "EXPORT_FAILED"

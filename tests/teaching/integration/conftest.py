@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 import json
 import os
@@ -8,7 +9,9 @@ import subprocess
 import sys
 
 import pytest
-from sqlalchemy import make_url
+from sqlalchemy import make_url, text
+from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.pool import NullPool
 from testcontainers.community.postgres import PostgresContainer
 
 from deeptutor.teaching.schema_names import tenant_schema_name
@@ -103,3 +106,27 @@ def generation_database(tmp_path_factory) -> GenerationDatabase:
             url=async_url,
             environment=environment,
         )
+
+
+@pytest.fixture
+def clean_generation_runtime_state(generation_database: GenerationDatabase):
+    async def reset() -> None:
+        engine = create_async_engine(generation_database.url, poolclass=NullPool)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "TRUNCATE TABLE "
+                        "platform.generation_slots, "
+                        "platform.generation_queue, "
+                        "platform.outbox_messages, "
+                        "platform.tenant_scheduler_state "
+                        "RESTART IDENTITY"
+                    )
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(reset())
+    yield
+    asyncio.run(reset())

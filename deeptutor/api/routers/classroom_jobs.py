@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import hashlib
 import hmac
 from pathlib import PurePosixPath
@@ -22,11 +23,13 @@ from deeptutor.teaching.contracts import (
     GenerationPriority,
     GenerationRequest,
     OutlineBundle,
+    OutlineConfirmationMetadata,
     Sha256,
     TeachingBrief,
     canonical_json_bytes,
     canonical_outline_sha256,
     canonical_teaching_brief_sha256,
+    validate_outline_binding,
 )
 from deeptutor.teaching.job_route_binding import DataPlaneBindingUnavailable
 from deeptutor.teaching.models.jobs import TERMINAL_JOB_STATUSES
@@ -250,6 +253,10 @@ def _server_job_id(tenant_id: str, idempotency_key: str) -> str:
     return f"job-{digest[:48]}"
 
 
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def _validate_trusted_brief(
     request: ClassroomJobCreateRequest,
     context: TenantContext,
@@ -393,6 +400,41 @@ def _outline_payload(details: GenerationJobDetails) -> dict[str, Any] | None:
     except ValidationError:
         return None
     return outline.model_dump(mode="json", by_alias=True, exclude_none=True)
+
+
+def _confirmation_matches_issued_outline(
+    details: GenerationJobDetails,
+    original: GenerationRequest,
+    confirmed: OutlineBundle,
+) -> bool:
+    if details.result_payload is None:
+        return False
+    try:
+        issued = OutlineBundle.model_validate_json(details.result_payload)
+    except ValidationError:
+        return False
+    try:
+        validate_outline_binding(
+            issued,
+            original,
+            expected_confirmation_status="draft",
+        )
+    except ValueError:
+        return False
+    exclude_confirmation = {"confirmation_metadata"}
+    issued_semantics = issued.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude=exclude_confirmation,
+        exclude_none=True,
+    )
+    confirmed_semantics = confirmed.model_dump(
+        mode="json",
+        by_alias=True,
+        exclude=exclude_confirmation,
+        exclude_none=True,
+    )
+    return issued_semantics == confirmed_semantics
 
 
 def _response(details: GenerationJobDetails) -> JobStatusResponse:
@@ -586,7 +628,6 @@ async def confirm_outline(
         details.job_kind != "generation"
         or details.phase != "outline"
         or details.status != "awaiting_confirmation"
-        or confirmation.confirmed_outline.confirmation_metadata.confirmed_by != context.user_id
     ):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="Outline cannot be confirmed"
@@ -596,15 +637,32 @@ async def confirm_outline(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="Outline cannot be confirmed"
         )
+    server_confirmed_outline = confirmation.confirmed_outline.model_copy(
+        update={
+            "confirmation_metadata": OutlineConfirmationMetadata(
+                status="confirmed",
+                confirmed_at=_utc_now(),
+                confirmed_by=context.user_id,
+            )
+        }
+    )
+    if not _confirmation_matches_issued_outline(
+        details,
+        original,
+        server_confirmed_outline,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="Outline cannot be confirmed"
+        )
     content_payload = original.model_dump(mode="json", by_alias=True, exclude_none=True)
     content_payload.update(
         phase="content",
-        confirmedOutline=confirmation.confirmed_outline.model_dump(
+        confirmedOutline=server_confirmed_outline.model_dump(
             mode="json",
             by_alias=True,
             exclude_none=True,
         ),
-        confirmedOutlineSha256=confirmation.confirmed_outline_sha256,
+        confirmedOutlineSha256=canonical_outline_sha256(server_confirmed_outline),
     )
     try:
         content_request = GenerationRequest.model_validate(content_payload)
