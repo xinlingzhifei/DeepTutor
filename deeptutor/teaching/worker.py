@@ -555,10 +555,7 @@ class GenerationWorker:
             target_status="materializing",
             progress_percent=90,
         )
-        target = await self._repository.prepare_promotion(
-            claim,
-            classroom_id=f"export-{claim.job_id}",
-        )
+        target = await self._repository.prepare_export_promotion(claim)
         manifest = ClassroomArtifactManifest(
             tenant_id=claim.tenant_id,
             job_id=claim.job_id,

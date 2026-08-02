@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, replace
 import hashlib
 from pathlib import Path
@@ -15,6 +16,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
+from deeptutor.teaching.contracts import ExportRequest, canonical_json_bytes
 from deeptutor.teaching.dispatcher import OutboxDispatcher
 from deeptutor.teaching.models import (
     AuditLog,
@@ -30,7 +32,13 @@ from deeptutor.teaching.models.classrooms import (
     Publication,
     transition,
 )
-from deeptutor.teaching.models.jobs import ArtifactPromotionState, GenerationJob
+from deeptutor.teaching.models.jobs import (
+    ArtifactPromotionState,
+    ClassroomArtifact,
+    GenerationJob,
+)
+from deeptutor.teaching.object_store import LocalClassroomArtifactStore
+from deeptutor.teaching.openmaic.client import EngineJob
 from deeptutor.teaching.repositories.classrooms import (
     ClassroomDocumentReference,
     ClassroomVersionAllocationError,
@@ -46,6 +54,7 @@ from deeptutor.teaching.repositories.jobs import (
 )
 from deeptutor.teaching.scheduler import ClaimedGenerationJob, FairScheduler
 from deeptutor.teaching.schema_names import tenant_schema_name
+from deeptutor.teaching.worker import GenerationWorker
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 PROVIDER_ID = "classroom-lifecycle-provider"
@@ -653,6 +662,184 @@ async def test_generation_cannot_reserve_another_owners_classroom(
 
     assert promotion is None
     assert asset is not None and asset.owner_id == "teacher-1"
+
+
+@pytest.mark.asyncio
+async def test_export_worker_does_not_create_or_modify_classroom_assets_or_versions(
+    repository_context: RepositoryContext,
+    tmp_path: Path,
+) -> None:
+    export_job_id = f"export-{uuid.uuid4().hex[:12]}"
+    artifact_body = b"exported classroom"
+    artifact_sha256 = hashlib.sha256(artifact_body).hexdigest()
+    request = ExportRequest(
+        schema_version="1.0",
+        tenant_id=repository_context.tenant_id,
+        job_id=export_job_id,
+        idempotency_key=f"idempotency-{export_job_id}",
+        classroom_document_sha256="2" * 64,
+        media_manifest_sha256="3" * 64,
+        format="pptx",
+        language="zh-CN",
+        export_policy={
+            "include_source_attribution": True,
+            "allow_external_links": False,
+        },
+    )
+    request_payload = canonical_json_bytes(request).decode()
+    repository = SqlAlchemyGenerationJobRepository(repository_context.engine)
+    await repository.create_job_and_reserve(
+        GenerationJobRequest(
+            tenant_id=repository_context.tenant_id,
+            job_id=export_job_id,
+            job_kind="export",
+            phase="export",
+            export_format="pptx",
+            priority="teacher",
+            quota_units=1,
+            actor_id="teacher-1",
+            owner_id="teacher-1",
+            visibility="private",
+            request_id=f"request-{export_job_id}",
+            idempotency_key=request.idempotency_key,
+            request_sha256=hashlib.sha256(request_payload.encode()).hexdigest(),
+            data_plane_route_id=ROUTE_ID,
+            provider_profile_id=PROVIDER_ID,
+            worker_pool_ref=WORKER_POOL,
+            queue_ref=QUEUE_REF,
+            request_payload=request_payload,
+        )
+    )
+    assert await OutboxDispatcher(repository_context.engine).dispatch_next() is not None
+    scheduler = FairScheduler(repository_context.engine)
+    await scheduler.ensure_generation_capacity(
+        (repository_context.tenant_id,),
+        worker_pool_ref=WORKER_POOL,
+    )
+
+    class ExportClient:
+        async def submit_export(self, submitted: ExportRequest) -> EngineJob:
+            assert submitted == request
+            return EngineJob(
+                tenant_id=submitted.tenant_id,
+                job_id=submitted.job_id,
+                kind="export",
+                status="succeeded",
+                payload={
+                    "result": {
+                        "status": "succeeded",
+                        "format": "pptx",
+                        "artifact": {
+                            "relativePath": "exports/classroom.pptx",
+                            "sha256": artifact_sha256,
+                            "bytes": len(artifact_body),
+                            "mime": (
+                                "application/vnd.openxmlformats-officedocument."
+                                "presentationml.presentation"
+                            ),
+                            "downloadPath": (
+                                f"/api/yfeistai/v1/artifacts/{export_job_id}/"
+                                "exports/classroom.pptx"
+                            ),
+                            "expiresAt": "2030-07-30T09:00:00Z",
+                        },
+                    }
+                },
+            )
+
+        async def submit_outline(self, request: object) -> EngineJob:
+            raise AssertionError("outline endpoint must not be used")
+
+        async def submit_content(self, request: object) -> EngineJob:
+            raise AssertionError("content endpoint must not be used")
+
+        async def poll(self, engine_job_id: str) -> EngineJob:
+            raise AssertionError("terminal export must not be polled")
+
+        async def cancel(self, engine_job_id: str) -> None:
+            raise AssertionError("successful export must not be canceled")
+
+        async def stream_artifact(self, path: str) -> AsyncIterator[bytes]:
+            assert path.endswith("/exports/classroom.pptx")
+            yield artifact_body
+
+    client = ExportClient()
+    store = LocalClassroomArtifactStore(tmp_path, repository_context.tenant_id)
+
+    class ClientProvider:
+        async def client_for_claim(self, claim: ClaimedGenerationJob) -> ExportClient:
+            return client
+
+        async def client_for_cancellation(self, request: object) -> ExportClient:
+            return client
+
+    class StoreProvider:
+        async def store_for_tenant(self, tenant_id: str) -> LocalClassroomArtifactStore:
+            assert tenant_id == repository_context.tenant_id
+            return store
+
+    translated = repository_context.engine.execution_options(
+        schema_translate_map={"tenant": tenant_schema_name(repository_context.tenant_id)}
+    )
+    session_factory = async_sessionmaker(translated, expire_on_commit=False)
+
+    async def classroom_rows() -> tuple[tuple[object, ...], ...]:
+        async with session_factory() as session:
+            rows = await session.execute(
+                select(
+                    ClassroomAsset.id,
+                    ClassroomAsset.owner_id,
+                    ClassroomAsset.title,
+                    ClassroomAsset.lifecycle_state,
+                    ClassroomAsset.current_published_version_id,
+                    ClassroomAsset.created_at,
+                    ClassroomAsset.updated_at,
+                ).order_by(ClassroomAsset.id)
+            )
+            return tuple(tuple(row) for row in rows)
+
+    assets_before = await classroom_rows()
+    async with session_factory() as session:
+        versions_before = await session.scalar(
+            select(func.count()).select_from(ClassroomVersion)
+        )
+
+    worker = GenerationWorker(
+        scheduler=scheduler,
+        repository=repository,
+        clients=ClientProvider(),
+        stores=StoreProvider(),
+        worker_id=f"worker-{export_job_id}",
+        job_kind="export",
+    )
+    assert await worker.run_once(
+        slot_pool="generation",
+        data_plane_route_id=ROUTE_ID,
+        provider_profile_id=PROVIDER_ID,
+        worker_pool_ref=WORKER_POOL,
+        queue_ref=QUEUE_REF,
+    ) is True
+
+    async with session_factory() as session:
+        versions_after = await session.scalar(
+            select(func.count()).select_from(ClassroomVersion)
+        )
+        fake_asset = await session.get(ClassroomAsset, f"export-{export_job_id}")
+        promotion = await session.get(ArtifactPromotionState, export_job_id)
+        artifact = await session.scalar(
+            select(ClassroomArtifact).where(ClassroomArtifact.source_job_id == export_job_id)
+        )
+        job = await session.get(GenerationJob, export_job_id)
+
+    assert await classroom_rows() == assets_before
+    assert fake_asset is None
+    assert versions_after == versions_before
+    assert promotion is not None
+    assert promotion.status == "finalized"
+    assert promotion.version_number == 1
+    assert artifact is not None
+    assert artifact.classroom_version_id == repository_context.source_version_id
+    assert job is not None and job.status == "succeeded"
 
 
 @pytest.mark.asyncio

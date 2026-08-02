@@ -713,6 +713,32 @@ def upgrade() -> None:
 def _downgrade_tenant() -> None:
     tenant_schema = _tenant_schema()
     quoted_schema = f'"{tenant_schema}"'
+    # Freeze every relation used by the guard or destructive DDL before the
+    # first check. The fixed order follows runtime gates and allocator locks so
+    # active writers can finish without a reverse-order table-lock cycle.
+    lock_order = (
+        "generation_jobs",
+        "classroom_versions",
+        "classroom_assets",
+        "source_snapshots",
+        "source_uploads",
+        "tenant_source_bindings",
+        "teaching_briefs",
+        "classroom_drafts",
+        "classroom_exports",
+        "approvals",
+        "publications",
+        "assignments",
+        "batch_jobs",
+        "batch_items",
+    )
+    op.get_bind().execute(
+        sa.text(
+            "LOCK TABLE "
+            + ", ".join(f'{quoted_schema}."{table_name}"' for table_name in lock_order)
+            + " IN ACCESS EXCLUSIVE MODE"
+        )
+    )
     has_published_versions = (
         op.get_bind()
         .execute(

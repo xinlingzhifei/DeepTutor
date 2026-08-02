@@ -12,6 +12,7 @@ import zipfile
 
 import pytest
 from sqlalchemy import func, make_url, select, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 from testcontainers.community.postgres import PostgresContainer
 
@@ -2659,6 +2660,387 @@ def test_classroom_lifecycle_downgrade_refuses_source_data_without_mutation(
         "that requires revision 20260802_0008"
     ) in safe_output
     assert asyncio.run(inspect()) == (HEAD_REVISION, HEAD_REVISION, 1)
+
+
+def test_classroom_lifecycle_downgrade_waits_for_concurrent_writer_then_refuses(
+    migration_database,
+) -> None:
+    tenant_id = "classroom-downgrade-concurrent-writer"
+    schema_name = tenant_schema_name(tenant_id)
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(migration_database, "scope=platform"),
+    )
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(
+            migration_database,
+            "scope=tenant",
+            f"tenant_schema={schema_name}",
+        ),
+    )
+
+    async def race_downgrade() -> tuple[
+        subprocess.CompletedProcess[str],
+        str,
+        str,
+        bool,
+        int,
+    ]:
+        engine = create_async_engine(migration_database.url)
+        writer = await engine.connect()
+        writer_transaction = await writer.begin()
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO platform.tenants (id, name, status)
+                        VALUES (:tenant_id, 'Concurrent downgrade guard', 'active')
+                        """
+                    ),
+                    {"tenant_id": tenant_id},
+                )
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO platform.tenant_schema_states (
+                            tenant_id, schema_name, revision, status
+                        ) VALUES (
+                            :tenant_id, :schema_name, :revision, 'active'
+                        )
+                        """
+                    ),
+                    {
+                        "tenant_id": tenant_id,
+                        "schema_name": schema_name,
+                        "revision": HEAD_REVISION,
+                    },
+                )
+
+            await writer.execute(
+                text(
+                    f"""
+                    INSERT INTO "{schema_name}".source_snapshots (
+                        id, tenant_id, source_type, source_id, source_revision,
+                        content_sha256, permission_sha256, citation_manifest,
+                        created_by
+                    ) VALUES (
+                        'source-concurrent', :tenant_id, 'upload', 'document-1',
+                        'v1', :content_sha256, :permission_sha256, '{{}}',
+                        'teacher-1'
+                    )
+                    """
+                ),
+                {
+                    "tenant_id": tenant_id,
+                    "content_sha256": "1" * 64,
+                    "permission_sha256": "2" * 64,
+                },
+            )
+            downgrade_task = asyncio.create_task(
+                asyncio.to_thread(
+                    _run_alembic,
+                    migration_database,
+                    "scope=tenant",
+                    f"tenant_schema={schema_name}",
+                    action="downgrade",
+                    revision="20260801_0007",
+                )
+            )
+
+            waiting_for_writer = False
+            async with engine.connect() as observer:
+                for _ in range(200):
+                    waiting_for_writer = bool(
+                        await observer.scalar(
+                            text(
+                                """
+                                SELECT EXISTS (
+                                    SELECT 1
+                                    FROM pg_locks
+                                    WHERE relation = to_regclass(:table_name)
+                                      AND mode = 'AccessExclusiveLock'
+                                      AND NOT granted
+                                )
+                                """
+                            ),
+                            {"table_name": f'"{schema_name}".source_snapshots'},
+                        )
+                    )
+                    if waiting_for_writer or downgrade_task.done():
+                        break
+                    await asyncio.sleep(0.05)
+            assert waiting_for_writer, "downgrade never waited for the active writer"
+
+            await writer_transaction.commit()
+            completed = await asyncio.wait_for(downgrade_task, timeout=30)
+
+            async with engine.connect() as connection:
+                state_revision = await connection.scalar(
+                    text(
+                        "SELECT revision FROM platform.tenant_schema_states "
+                        "WHERE tenant_id = :tenant_id"
+                    ),
+                    {"tenant_id": tenant_id},
+                )
+                alembic_revision = await connection.scalar(
+                    text(f'SELECT version_num FROM "{schema_name}".alembic_version')
+                )
+                source_table_exists = bool(
+                    await connection.scalar(
+                        text("SELECT to_regclass(:table_name) IS NOT NULL"),
+                        {"table_name": f'"{schema_name}".source_snapshots'},
+                    )
+                )
+                source_count = (
+                    int(
+                        await connection.scalar(
+                            text(f'SELECT count(*) FROM "{schema_name}".source_snapshots')
+                        )
+                        or 0
+                    )
+                    if source_table_exists
+                    else 0
+                )
+            return (
+                completed,
+                str(state_revision),
+                str(alembic_revision),
+                source_table_exists,
+                source_count,
+            )
+        finally:
+            if writer_transaction.is_active:
+                await writer_transaction.rollback()
+            await writer.close()
+            await engine.dispose()
+
+    completed, state_revision, alembic_revision, table_exists, source_count = asyncio.run(
+        race_downgrade()
+    )
+    safe_output = _assert_secret_safe_output(migration_database, completed)
+    assert completed.returncode != 0, safe_output
+    assert (
+        "cannot downgrade classroom lifecycle: source_snapshots contains data "
+        "that requires revision 20260802_0008"
+    ) in safe_output
+    assert (state_revision, alembic_revision, table_exists, source_count) == (
+        HEAD_REVISION,
+        HEAD_REVISION,
+        True,
+        1,
+    )
+
+
+def test_classroom_lifecycle_downgrade_blocks_writer_started_after_guard(
+    migration_database,
+) -> None:
+    tenant_id = "classroom-downgrade-late-writer"
+    schema_name = tenant_schema_name(tenant_id)
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(migration_database, "scope=platform"),
+    )
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(
+            migration_database,
+            "scope=tenant",
+            f"tenant_schema={schema_name}",
+        ),
+    )
+
+    async def race_downgrade() -> tuple[
+        subprocess.CompletedProcess[str],
+        bool,
+        BaseException | None,
+        str,
+        str,
+        bool,
+    ]:
+        engine = create_async_engine(migration_database.url)
+        blocker = await engine.connect()
+        blocker_transaction = await blocker.begin()
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO platform.tenants (id, name, status)
+                        VALUES (:tenant_id, 'Late writer downgrade guard', 'active')
+                        """
+                    ),
+                    {"tenant_id": tenant_id},
+                )
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO platform.tenant_schema_states (
+                            tenant_id, schema_name, revision, status
+                        ) VALUES (
+                            :tenant_id, :schema_name, :revision, 'active'
+                        )
+                        """
+                    ),
+                    {
+                        "tenant_id": tenant_id,
+                        "schema_name": schema_name,
+                        "revision": HEAD_REVISION,
+                    },
+                )
+
+            await blocker.execute(
+                text(
+                    """
+                    SELECT revision
+                    FROM platform.tenant_schema_states
+                    WHERE schema_name = :schema_name
+                    FOR UPDATE
+                    """
+                ),
+                {"schema_name": schema_name},
+            )
+            blocker_xid = await blocker.scalar(
+                text("SELECT pg_current_xact_id()::text")
+            )
+            assert isinstance(blocker_xid, str)
+            downgrade_task = asyncio.create_task(
+                asyncio.to_thread(
+                    _run_alembic,
+                    migration_database,
+                    "scope=tenant",
+                    f"tenant_schema={schema_name}",
+                    action="downgrade",
+                    revision="20260801_0007",
+                )
+            )
+
+            migration_reached_revision_sync = False
+            async with engine.connect() as observer:
+                for _ in range(200):
+                    migration_reached_revision_sync = bool(
+                        await observer.scalar(
+                            text(
+                                """
+                                SELECT EXISTS (
+                                    SELECT 1
+                                    FROM pg_locks
+                                    WHERE locktype = 'transactionid'
+                                      AND transactionid::text = :blocker_xid
+                                      AND mode = 'ShareLock'
+                                      AND NOT granted
+                                )
+                                """
+                            ),
+                            {"blocker_xid": blocker_xid},
+                        )
+                    )
+                    if migration_reached_revision_sync or downgrade_task.done():
+                        break
+                    await asyncio.sleep(0.05)
+            assert migration_reached_revision_sync, (
+                "downgrade never reached revision synchronization"
+            )
+
+            async def insert_source() -> None:
+                async with engine.begin() as connection:
+                    await connection.execute(
+                        text(
+                            f"""
+                            INSERT INTO "{schema_name}".source_snapshots (
+                                id, tenant_id, source_type, source_id,
+                                source_revision, content_sha256,
+                                permission_sha256, citation_manifest, created_by
+                            ) VALUES (
+                                'source-late', :tenant_id, 'upload', 'document-1',
+                                'v1', :content_sha256, :permission_sha256, '{{}}',
+                                'teacher-1'
+                            )
+                            """
+                        ),
+                        {
+                            "tenant_id": tenant_id,
+                            "content_sha256": "3" * 64,
+                            "permission_sha256": "4" * 64,
+                        },
+                    )
+
+            writer_task = asyncio.create_task(insert_source())
+            writer_waited = False
+            async with engine.connect() as observer:
+                for _ in range(200):
+                    writer_waited = bool(
+                        await observer.scalar(
+                            text(
+                                """
+                                SELECT EXISTS (
+                                    SELECT 1
+                                    FROM pg_locks
+                                    WHERE relation = to_regclass(:table_name)
+                                      AND mode = 'RowExclusiveLock'
+                                      AND NOT granted
+                                )
+                                """
+                            ),
+                            {"table_name": f'"{schema_name}".source_snapshots'},
+                        )
+                    )
+                    if writer_waited or writer_task.done():
+                        break
+                    await asyncio.sleep(0.05)
+
+            await blocker_transaction.commit()
+            completed = await asyncio.wait_for(downgrade_task, timeout=30)
+            writer_error: BaseException | None = None
+            try:
+                await asyncio.wait_for(writer_task, timeout=30)
+            except Exception as exc:
+                writer_error = exc
+
+            async with engine.connect() as connection:
+                state_revision = await connection.scalar(
+                    text(
+                        "SELECT revision FROM platform.tenant_schema_states "
+                        "WHERE tenant_id = :tenant_id"
+                    ),
+                    {"tenant_id": tenant_id},
+                )
+                alembic_revision = await connection.scalar(
+                    text(f'SELECT version_num FROM "{schema_name}".alembic_version')
+                )
+                source_table_exists = bool(
+                    await connection.scalar(
+                        text("SELECT to_regclass(:table_name) IS NOT NULL"),
+                        {"table_name": f'"{schema_name}".source_snapshots'},
+                    )
+                )
+            return (
+                completed,
+                writer_waited,
+                writer_error,
+                str(state_revision),
+                str(alembic_revision),
+                source_table_exists,
+            )
+        finally:
+            if blocker_transaction.is_active:
+                await blocker_transaction.rollback()
+            await blocker.close()
+            await engine.dispose()
+
+    completed, writer_waited, writer_error, state_revision, alembic_revision, table_exists = (
+        asyncio.run(race_downgrade())
+    )
+    _assert_migration_succeeded(migration_database, completed)
+    assert writer_waited
+    assert isinstance(writer_error, DBAPIError)
+    assert getattr(writer_error.orig, "sqlstate", None) == "42P01"
+    assert (state_revision, alembic_revision, table_exists) == (
+        "20260801_0007",
+        "20260801_0007",
+        False,
+    )
 
 
 @pytest.mark.parametrize(

@@ -1395,6 +1395,29 @@ class SqlAlchemyGenerationJobRepository:
         *,
         classroom_id: str,
     ) -> PromotionTarget:
+        return await self._prepare_promotion_target(
+            claim,
+            classroom_id=classroom_id,
+            expected_job_kind="generation",
+        )
+
+    async def prepare_export_promotion(
+        self,
+        claim: ClaimedGenerationJob,
+    ) -> PromotionTarget:
+        return await self._prepare_promotion_target(
+            claim,
+            classroom_id=f"export-{claim.job_id}",
+            expected_job_kind="export",
+        )
+
+    async def _prepare_promotion_target(
+        self,
+        claim: ClaimedGenerationJob,
+        *,
+        classroom_id: str,
+        expected_job_kind: str,
+    ) -> PromotionTarget:
         _required(classroom_id, "classroom_id", 128)
         session_factory = self._session_factory(claim.tenant_id)
         async with session_factory() as session:
@@ -1402,6 +1425,8 @@ class SqlAlchemyGenerationJobRepository:
                 job, _, _, now = await self._lock_claim(session, claim)
                 if job.cancel_requested or job.status != "materializing":
                     raise JobAlreadyTerminal("materialization lost cancellation race")
+                if job.job_kind != expected_job_kind:
+                    raise ValueError("promotion path does not match job kind")
                 existing = await session.scalar(
                     select(ArtifactPromotionState)
                     .where(ArtifactPromotionState.job_id == claim.job_id)
@@ -1410,17 +1435,20 @@ class SqlAlchemyGenerationJobRepository:
                 if existing is not None and existing.classroom_id != classroom_id:
                     raise ValueError("promotion target conflicts with durable state")
                 if existing is None:
-                    version_number = await allocate_classroom_version_number(
-                        session,
-                        tenant_id=claim.tenant_id,
-                        classroom_id=classroom_id,
-                    )
-                    await _lock_or_create_classroom_asset(
-                        session,
-                        tenant_id=claim.tenant_id,
-                        classroom_id=classroom_id,
-                        owner_id=job.owner_id,
-                    )
+                    if expected_job_kind == "generation":
+                        version_number = await allocate_classroom_version_number(
+                            session,
+                            tenant_id=claim.tenant_id,
+                            classroom_id=classroom_id,
+                        )
+                        await _lock_or_create_classroom_asset(
+                            session,
+                            tenant_id=claim.tenant_id,
+                            classroom_id=classroom_id,
+                            owner_id=job.owner_id,
+                        )
+                    else:
+                        version_number = 1
                     existing = ArtifactPromotionState(
                         job_id=claim.job_id,
                         tenant_id=claim.tenant_id,
@@ -1431,7 +1459,7 @@ class SqlAlchemyGenerationJobRepository:
                     )
                     session.add(existing)
                     await session.flush()
-                else:
+                elif expected_job_kind == "generation":
                     await _lock_or_create_classroom_asset(
                         session,
                         tenant_id=claim.tenant_id,
