@@ -9,11 +9,13 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
 from deeptutor.multi_user.models import ADMIN_KNOWLEDGE_OWNER_ID
+from deeptutor.teaching.models.classrooms import SourceSnapshot, TenantSourceBinding
 from deeptutor.teaching.models.platform import (
     Tenant,
     TenantKnowledgeEntitlement,
     TenantMembership,
 )
+from deeptutor.teaching.repositories import sources as source_repository_module
 from deeptutor.teaching.repositories.catalog import (
     CatalogNotFoundError,
     SqlAlchemyCatalogRepository,
@@ -52,6 +54,7 @@ async def test_catalog_and_sources_are_isolated_and_upload_dedupe_is_atomic(
     suffix = uuid.uuid4().hex[:12]
     tenant_a = f"catalog-a-{suffix}"
     tenant_b = f"catalog-b-{suffix}"
+    knowledge_resource_id = f"admin:kb:{uuid.uuid4()}"
     generation_database.migrate_tenant(tenant_a)
     generation_database.migrate_tenant(tenant_b)
     engine = create_async_engine(generation_database.url, poolclass=NullPool)
@@ -61,6 +64,17 @@ async def test_catalog_and_sources_are_isolated_and_upload_dedupe_is_atomic(
             (tenant_a, "student-a", "active"),
             (tenant_b, "student-b", "active"),
         )
+        async with engine.begin() as connection:
+            await connection.execute(
+                insert(TenantKnowledgeEntitlement),
+                {
+                    "tenant_id": tenant_a,
+                    "knowledge_resource_id": knowledge_resource_id,
+                    "resource_owner_id": ADMIN_KNOWLEDGE_OWNER_ID,
+                    "status": "active",
+                    "granted_by": "admin-a",
+                },
+            )
         catalog_a = SqlAlchemyCatalogRepository(tenant_a, engine)
         catalog_b = SqlAlchemyCatalogRepository(tenant_b, engine)
         source_a = SqlAlchemySourceRepository(tenant_a, engine)
@@ -78,7 +92,7 @@ async def test_catalog_and_sources_are_isolated_and_upload_dedupe_is_atomic(
 
         knowledge_snapshot = NewKnowledgeSnapshot(
             snapshot_id=f"kb-source-{suffix}",
-            resource_id="admin:kb:math",
+            resource_id=knowledge_resource_id,
             resource_owner_id=ADMIN_KNOWLEDGE_OWNER_ID,
             revision="binding-v1",
             content_sha256="a" * 64,
@@ -97,7 +111,7 @@ async def test_catalog_and_sources_are_isolated_and_upload_dedupe_is_atomic(
             class_id="class-a",
             actor_id="teacher-a",
         )
-        assert knowledge_record.source_id == "admin:kb:math"
+        assert knowledge_record.source_id == knowledge_resource_id
         async with engine.connect() as connection:
             owner_and_audit = (
                 await connection.execute(
@@ -325,5 +339,197 @@ async def test_personal_knowledge_entitlement_is_owner_scoped(generation_databas
 
         assert await source.is_knowledge_resource_entitled(resource_id, "alice") is True
         assert await source.is_knowledge_resource_entitled(resource_id, "bob") is False
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_revocation_locked_first_prevents_knowledge_binding(
+    generation_database,
+) -> None:
+    suffix = uuid.uuid4().hex[:12]
+    tenant_id = f"entitlement-revoke-first-{suffix}"
+    resource_id = f"admin:kb:{uuid.uuid4()}"
+    generation_database.migrate_tenant(tenant_id)
+    engine = create_async_engine(generation_database.url, poolclass=NullPool)
+    denied_error = getattr(
+        source_repository_module,
+        "SourceEntitlementDeniedError",
+        PermissionError,
+    )
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                insert(Tenant),
+                {"id": tenant_id, "name": tenant_id, "status": "active"},
+            )
+            await connection.execute(
+                insert(TenantKnowledgeEntitlement),
+                {
+                    "tenant_id": tenant_id,
+                    "knowledge_resource_id": resource_id,
+                    "resource_owner_id": ADMIN_KNOWLEDGE_OWNER_ID,
+                    "status": "active",
+                    "granted_by": "admin-a",
+                },
+            )
+        catalog = SqlAlchemyCatalogRepository(tenant_id, engine)
+        await catalog.create_course("course-a", "Course A")
+        repository = SqlAlchemySourceRepository(tenant_id, engine)
+        snapshot = NewKnowledgeSnapshot(
+            snapshot_id=f"kb-source-{suffix}",
+            resource_id=resource_id,
+            resource_owner_id=ADMIN_KNOWLEDGE_OWNER_ID,
+            revision="binding-v1",
+            content_sha256="a" * 64,
+            permission_sha256="b" * 64,
+        )
+        binding_id = source_binding_id(
+            tenant_id,
+            snapshot.snapshot_id,
+            "course-a",
+            None,
+        )
+
+        revoke_connection = await engine.connect()
+        revoke_transaction = await revoke_connection.begin()
+        await revoke_connection.execute(
+            text(
+                """
+                UPDATE platform.tenant_knowledge_entitlements
+                   SET status = 'disabled'
+                 WHERE tenant_id = :tenant_id
+                   AND knowledge_resource_id = :resource_id
+                   AND resource_owner_id = :resource_owner_id
+                """
+            ),
+            {
+                "tenant_id": tenant_id,
+                "resource_id": resource_id,
+                "resource_owner_id": ADMIN_KNOWLEDGE_OWNER_ID,
+            },
+        )
+        bind_task = asyncio.create_task(
+            repository.bind_knowledge_resource(
+                snapshot,
+                binding_id=binding_id,
+                course_id="course-a",
+                class_id=None,
+                actor_id="teacher-a",
+            )
+        )
+        try:
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.shield(bind_task), timeout=0.5)
+        finally:
+            await revoke_transaction.commit()
+            await revoke_connection.close()
+
+        with pytest.raises(denied_error):
+            await bind_task
+        async with repository._session_factory() as session:
+            assert await session.get(SourceSnapshot, snapshot.snapshot_id) is None
+            assert await session.get(TenantSourceBinding, binding_id) is None
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_binding_lock_linearizes_before_concurrent_revocation(
+    generation_database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    suffix = uuid.uuid4().hex[:12]
+    tenant_id = f"entitlement-bind-first-{suffix}"
+    resource_id = f"admin:kb:{uuid.uuid4()}"
+    generation_database.migrate_tenant(tenant_id)
+    engine = create_async_engine(generation_database.url, poolclass=NullPool)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                insert(Tenant),
+                {"id": tenant_id, "name": tenant_id, "status": "active"},
+            )
+            await connection.execute(
+                insert(TenantKnowledgeEntitlement),
+                {
+                    "tenant_id": tenant_id,
+                    "knowledge_resource_id": resource_id,
+                    "resource_owner_id": ADMIN_KNOWLEDGE_OWNER_ID,
+                    "status": "active",
+                    "granted_by": "admin-a",
+                },
+            )
+        catalog = SqlAlchemyCatalogRepository(tenant_id, engine)
+        await catalog.create_course("course-a", "Course A")
+        repository = SqlAlchemySourceRepository(tenant_id, engine)
+        snapshot = NewKnowledgeSnapshot(
+            snapshot_id=f"kb-source-{suffix}",
+            resource_id=resource_id,
+            resource_owner_id=ADMIN_KNOWLEDGE_OWNER_ID,
+            revision="binding-v1",
+            content_sha256="c" * 64,
+            permission_sha256="d" * 64,
+        )
+        binding_id = source_binding_id(
+            tenant_id,
+            snapshot.snapshot_id,
+            "course-a",
+            None,
+        )
+        entered_binding = asyncio.Event()
+        release_binding = asyncio.Event()
+        original_ensure_binding = repository._ensure_binding
+
+        async def paused_ensure_binding(*args, **kwargs):
+            entered_binding.set()
+            await release_binding.wait()
+            return await original_ensure_binding(*args, **kwargs)
+
+        monkeypatch.setattr(repository, "_ensure_binding", paused_ensure_binding)
+        bind_task = asyncio.create_task(
+            repository.bind_knowledge_resource(
+                snapshot,
+                binding_id=binding_id,
+                course_id="course-a",
+                class_id=None,
+                actor_id="teacher-a",
+            )
+        )
+        await asyncio.wait_for(entered_binding.wait(), timeout=5)
+
+        async def revoke() -> None:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        """
+                        UPDATE platform.tenant_knowledge_entitlements
+                           SET status = 'disabled'
+                         WHERE tenant_id = :tenant_id
+                           AND knowledge_resource_id = :resource_id
+                           AND resource_owner_id = :resource_owner_id
+                        """
+                    ),
+                    {
+                        "tenant_id": tenant_id,
+                        "resource_id": resource_id,
+                        "resource_owner_id": ADMIN_KNOWLEDGE_OWNER_ID,
+                    },
+                )
+
+        revoke_task = asyncio.create_task(revoke())
+        try:
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.shield(revoke_task), timeout=0.5)
+        finally:
+            release_binding.set()
+
+        record = await bind_task
+        await revoke_task
+        assert record.binding_id == binding_id
+        assert not await repository.is_knowledge_resource_entitled(
+            resource_id,
+            ADMIN_KNOWLEDGE_OWNER_ID,
+        )
     finally:
         await engine.dispose()

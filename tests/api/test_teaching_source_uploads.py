@@ -26,6 +26,7 @@ from deeptutor.teaching.repositories.sources import (
     NewKnowledgeSnapshot,
     NewUpload,
     SourceConflictError,
+    SourceEntitlementDeniedError,
     SourceNotFoundError,
     SourceRecord,
     UploadRecord,
@@ -169,6 +170,18 @@ class _SourceRepository:
         actor_id,
     ):
         self._validate_target(course_id, class_id)
+        self.entitlement_calls.append((snapshot.resource_id, snapshot.resource_owner_id))
+        if self.knowledge_entitlements is not None:
+            entitled = (
+                snapshot.resource_id,
+                snapshot.resource_owner_id,
+            ) in self.knowledge_entitlements
+        else:
+            entitled = self.knowledge_entitled
+        if not entitled:
+            raise SourceEntitlementDeniedError(
+                "knowledge resource is not entitled to this tenant"
+            )
         self.knowledge_snapshots.append(snapshot)
         record = SourceRecord(
             binding_id=binding_id,

@@ -34,6 +34,7 @@ from deeptutor.teaching.repositories.sources import (
     NewKnowledgeSnapshot,
     NewUpload,
     SourceConflictError,
+    SourceEntitlementDeniedError,
     SourceNotFoundError,
     SourceRecord,
     UploadRecord,
@@ -117,12 +118,6 @@ class UploadFileLike(Protocol):
 
 class SourceRepository(Protocol):
     async def validate_target(self, course_id: str, class_id: str | None) -> None: ...
-
-    async def is_knowledge_resource_entitled(
-        self,
-        resource_id: str,
-        resource_owner_id: str,
-    ) -> bool: ...
 
     async def list_bindings(
         self,
@@ -747,11 +742,6 @@ class SourceService:
         if not self._knowledge_exists(resource):
             raise SourceNotFoundError("knowledge resource not found")
         resource_owner_id = _knowledge_resource_owner_id(context, resource)
-        if not await self._repository.is_knowledge_resource_entitled(
-            stable_id,
-            resource_owner_id,
-        ):
-            raise SourceAccessDeniedError("knowledge resource is not entitled to this tenant")
         content_sha256 = hashlib.sha256(f"{resource_owner_id}\0{stable_id}".encode()).hexdigest()
         snapshot_id = _digest_id(
             "kb-source",
@@ -769,20 +759,25 @@ class SourceService:
         permission_sha256 = hashlib.sha256(
             f"{context.tenant_id}\0{resource_owner_id}\0{stable_id}\0source.use".encode()
         ).hexdigest()
-        return await self._repository.bind_knowledge_resource(
-            NewKnowledgeSnapshot(
-                snapshot_id=snapshot_id,
-                resource_id=stable_id,
-                resource_owner_id=resource_owner_id,
-                revision="binding-v1",
-                content_sha256=content_sha256,
-                permission_sha256=permission_sha256,
-            ),
-            binding_id=binding_id,
-            course_id=course_id,
-            class_id=class_id,
-            actor_id=context.user_id,
-        )
+        try:
+            return await self._repository.bind_knowledge_resource(
+                NewKnowledgeSnapshot(
+                    snapshot_id=snapshot_id,
+                    resource_id=stable_id,
+                    resource_owner_id=resource_owner_id,
+                    revision="binding-v1",
+                    content_sha256=content_sha256,
+                    permission_sha256=permission_sha256,
+                ),
+                binding_id=binding_id,
+                course_id=course_id,
+                class_id=class_id,
+                actor_id=context.user_id,
+            )
+        except SourceEntitlementDeniedError as exc:
+            raise SourceAccessDeniedError(
+                "knowledge resource is not entitled to this tenant"
+            ) from exc
 
     async def upload_pdf(
         self,

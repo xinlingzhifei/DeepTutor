@@ -37,6 +37,10 @@ class SourceConflictError(SourceRepositoryError):
     """A source write conflicts with existing tenant state."""
 
 
+class SourceEntitlementDeniedError(SourceRepositoryError):
+    """The tenant has no active entitlement for a knowledge resource."""
+
+
 @dataclass(frozen=True, slots=True)
 class SourceRecord:
     binding_id: str
@@ -167,6 +171,40 @@ class SqlAlchemySourceRepository:
                 )
             )
             return entitled is not None
+
+    async def _lock_knowledge_entitlement(
+        self,
+        session: AsyncSession,
+        *,
+        resource_id: str,
+        resource_owner_id: str,
+    ) -> None:
+        tenant = await session.scalar(
+            select(Tenant.id)
+            .where(
+                Tenant.id == self._tenant_id,
+                Tenant.status == "active",
+            )
+            .with_for_update(read=True)
+        )
+        if tenant is None:
+            raise SourceEntitlementDeniedError(
+                "knowledge resource is not entitled to this tenant"
+            )
+        entitlement = await session.scalar(
+            select(TenantKnowledgeEntitlement.knowledge_resource_id)
+            .where(
+                TenantKnowledgeEntitlement.tenant_id == self._tenant_id,
+                TenantKnowledgeEntitlement.knowledge_resource_id == resource_id,
+                TenantKnowledgeEntitlement.resource_owner_id == resource_owner_id,
+                TenantKnowledgeEntitlement.status == "active",
+            )
+            .with_for_update(read=True)
+        )
+        if entitlement is None:
+            raise SourceEntitlementDeniedError(
+                "knowledge resource is not entitled to this tenant"
+            )
 
     async def _ensure_binding(
         self,
@@ -468,6 +506,11 @@ class SqlAlchemySourceRepository:
         try:
             async with self._session_factory() as session:
                 async with session.begin():
+                    await self._lock_knowledge_entitlement(
+                        session,
+                        resource_id=snapshot.resource_id,
+                        resource_owner_id=snapshot.resource_owner_id,
+                    )
                     await session.execute(
                         insert(SourceSnapshot)
                         .values(
@@ -525,6 +568,7 @@ __all__ = [
     "NewKnowledgeSnapshot",
     "NewUpload",
     "SourceConflictError",
+    "SourceEntitlementDeniedError",
     "SourceNotFoundError",
     "SourceRecord",
     "SqlAlchemySourceRepository",
