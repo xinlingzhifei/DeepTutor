@@ -6,8 +6,11 @@ import asyncio
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 import hashlib
+import multiprocessing
+import os
 from pathlib import PurePosixPath
 import tempfile
+import threading
 from typing import Any, BinaryIO, Protocol
 import uuid
 
@@ -34,6 +37,9 @@ MAX_PDF_BYTES = 100 * 1024 * 1024
 MAX_PDF_PAGES = 2_000
 _READ_CHUNK_BYTES = 1024 * 1024
 _MAX_OBJECTS_INSPECTED = 250_000
+_PDF_INSPECTION_TIMEOUT_SECONDS = 30.0
+_PDF_INSPECTION_MEMORY_BYTES = 384 * 1024 * 1024
+_PDF_INSPECTION_SLOTS = threading.BoundedSemaphore(value=2)
 _FORBIDDEN_ACTION_TYPES = frozenset(
     {
         "/GoToR",
@@ -54,6 +60,11 @@ _FORBIDDEN_KEYS = frozenset(
         "/AF",
         "/EmbeddedFiles",
         "/EF",
+        "/Movie",
+        "/Sound",
+        "/3D",
+        "/3DA",
+        "/3DD",
         "/JS",
         "/JavaScript",
         "/OpenAction",
@@ -62,7 +73,9 @@ _FORBIDDEN_KEYS = frozenset(
     }
 )
 _FORBIDDEN_TYPES = frozenset({"/EmbeddedFile", "/Filespec"})
-_FORBIDDEN_SUBTYPES = frozenset({"/FileAttachment", "/RichMedia", "/Screen"})
+_FORBIDDEN_SUBTYPES = frozenset(
+    {"/3D", "/FileAttachment", "/Movie", "/RichMedia", "/Screen", "/Sound"}
+)
 
 
 class SourceAccessDeniedError(PermissionError):
@@ -154,12 +167,17 @@ class SourceStoreProvider(Protocol):
 @dataclass(slots=True)
 class _StagedPdf:
     handle: BinaryIO
+    path: str
     filename: str
     sha256: str
     size_bytes: int
 
     def close(self) -> None:
         self.handle.close()
+        try:
+            os.unlink(self.path)
+        except FileNotFoundError:
+            pass
 
 
 def _digest_id(prefix: str, *values: str) -> str:
@@ -284,6 +302,58 @@ def _action_dictionary(value: Any) -> bool:
     return isinstance(resolved, DictionaryObject) and str(resolved.get("/S", "")) != ""
 
 
+def _bounded_page_count(reader: PdfReader, max_pages: int) -> int:
+    root = _resolve_pdf_object(reader.trailer["/Root"])
+    if not isinstance(root, DictionaryObject):
+        raise InvalidPdfSourceError("PDF catalog is invalid")
+    pages = root.get("/Pages")
+    if pages is None:
+        raise InvalidPdfSourceError("PDF page tree is missing")
+    pending: list[Any] = [pages]
+    seen_indirect: set[tuple[int, int]] = set()
+    seen_direct: set[int] = set()
+    page_count = 0
+    inspected = 0
+    while pending:
+        item = pending.pop()
+        if isinstance(item, IndirectObject):
+            reference = (item.idnum, item.generation)
+            if reference in seen_indirect:
+                raise InvalidPdfSourceError("PDF page tree is cyclic")
+            seen_indirect.add(reference)
+            item = _resolve_pdf_object(item)
+        if not isinstance(item, DictionaryObject):
+            raise InvalidPdfSourceError("PDF page tree is invalid")
+        identity = id(item)
+        if identity in seen_direct:
+            raise InvalidPdfSourceError("PDF page tree is cyclic")
+        seen_direct.add(identity)
+        inspected += 1
+        if inspected > _MAX_OBJECTS_INSPECTED:
+            raise InvalidPdfSourceError("PDF page tree is too complex")
+        item_type = str(item.get("/Type", ""))
+        kids = item.get("/Kids")
+        if item_type == "/Page" or kids is None:
+            page_count += 1
+            if page_count > max_pages:
+                raise InvalidPdfSourceError("PDF exceeds the 2,000 page limit")
+            continue
+        if item_type not in {"", "/Pages"}:
+            raise InvalidPdfSourceError("PDF page tree is invalid")
+        declared_count = item.get("/Count")
+        if not isinstance(declared_count, int) or declared_count < 0:
+            raise InvalidPdfSourceError("PDF page count is invalid")
+        if declared_count > max_pages:
+            raise InvalidPdfSourceError("PDF exceeds the 2,000 page limit")
+        children = _resolve_pdf_object(kids)
+        if not isinstance(children, ArrayObject):
+            raise InvalidPdfSourceError("PDF page tree is invalid")
+        if len(pending) + len(children) > _MAX_OBJECTS_INSPECTED:
+            raise InvalidPdfSourceError("PDF page tree is too complex")
+        pending.extend(children)
+    return page_count
+
+
 def _reject_active_or_embedded_content(reader: PdfReader) -> None:
     root = _resolve_pdf_object(reader.trailer["/Root"])
     if not isinstance(root, DictionaryObject):
@@ -338,22 +408,207 @@ def _reject_active_or_embedded_content(reader: PdfReader) -> None:
             pending.append(value)
 
 
-def _validate_pdf_structure(handle: BinaryIO) -> None:
+def _validate_pdf_structure(path: str, max_pages: int, max_objects: int) -> None:
+    global _MAX_OBJECTS_INSPECTED
+    previous_max_objects = _MAX_OBJECTS_INSPECTED
+    _MAX_OBJECTS_INSPECTED = max_objects
     try:
-        handle.seek(0)
-        reader = PdfReader(handle, strict=False)
-        if reader.is_encrypted:
-            raise InvalidPdfSourceError("encrypted PDFs are not allowed")
-        page_count = len(reader.pages)
-        if page_count > MAX_PDF_PAGES:
-            raise InvalidPdfSourceError("PDF exceeds the 2,000 page limit")
-        _reject_active_or_embedded_content(reader)
+        with open(path, "rb") as handle:
+            reader = PdfReader(handle, strict=False)
+            if reader.is_encrypted:
+                raise InvalidPdfSourceError("encrypted PDFs are not allowed")
+            _bounded_page_count(reader, max_pages)
+            _reject_active_or_embedded_content(reader)
     except InvalidPdfSourceError:
         raise
     except Exception as exc:
         raise InvalidPdfSourceError("PDF could not be safely parsed") from exc
     finally:
-        handle.seek(0)
+        _MAX_OBJECTS_INSPECTED = previous_max_objects
+
+
+_WINDOWS_PDF_JOB_HANDLE: int | None = None
+
+
+def _apply_windows_pdf_memory_limit(limit_bytes: int) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    class _IoCounters(ctypes.Structure):
+        _fields_ = [
+            ("ReadOperationCount", ctypes.c_ulonglong),
+            ("WriteOperationCount", ctypes.c_ulonglong),
+            ("OtherOperationCount", ctypes.c_ulonglong),
+            ("ReadTransferCount", ctypes.c_ulonglong),
+            ("WriteTransferCount", ctypes.c_ulonglong),
+            ("OtherTransferCount", ctypes.c_ulonglong),
+        ]
+
+    class _BasicLimitInformation(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_longlong),
+            ("PerJobUserTimeLimit", ctypes.c_longlong),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class _ExtendedLimitInformation(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", _BasicLimitInformation),
+            ("IoInfo", _IoCounters),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.SetInformationJobObject.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    )
+    kernel32.SetInformationJobObject.restype = wintypes.BOOL
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+    kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        raise OSError(ctypes.get_last_error(), "could not create PDF inspection job")
+    information = _ExtendedLimitInformation()
+    information.BasicLimitInformation.LimitFlags = 0x00000100
+    information.ProcessMemoryLimit = limit_bytes
+    if not kernel32.SetInformationJobObject(
+        job,
+        9,
+        ctypes.byref(information),
+        ctypes.sizeof(information),
+    ) or not kernel32.AssignProcessToJobObject(job, kernel32.GetCurrentProcess()):
+        error = ctypes.get_last_error()
+        kernel32.CloseHandle(job)
+        raise OSError(error, "could not constrain PDF inspection memory")
+    global _WINDOWS_PDF_JOB_HANDLE
+    _WINDOWS_PDF_JOB_HANDLE = int(job)
+
+
+def _apply_pdf_worker_memory_limit(limit_bytes: int) -> None:
+    if os.name == "nt":
+        _apply_windows_pdf_memory_limit(limit_bytes)
+        return
+    import resource
+
+    soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+    del soft
+    bounded = limit_bytes if hard == resource.RLIM_INFINITY else min(limit_bytes, hard)
+    resource.setrlimit(resource.RLIMIT_AS, (bounded, bounded))
+
+
+def _pdf_inspection_worker(
+    path: str,
+    connection,
+    max_pages: int,
+    max_objects: int,
+    memory_limit_bytes: int,
+) -> None:
+    try:
+        _apply_pdf_worker_memory_limit(memory_limit_bytes)
+        _validate_pdf_structure(path, max_pages, max_objects)
+        connection.send(("ok", ""))
+    except InvalidPdfSourceError as exc:
+        connection.send(("invalid", str(exc)))
+    except BaseException:
+        try:
+            connection.send(("invalid", "PDF could not be safely parsed"))
+        except BaseException:
+            pass
+    finally:
+        connection.close()
+
+
+def _terminate_and_reap_pdf_process(process: multiprocessing.Process) -> None:
+    if process.is_alive():
+        process.terminate()
+    process.join(timeout=0.5)
+    if process.is_alive():
+        process.kill()
+        process.join(timeout=0.5)
+    if process.is_alive():
+        raise RuntimeError("PDF inspection child could not be terminated")
+    process.close()
+
+
+async def _acquire_pdf_inspection_slot(deadline: float) -> None:
+    loop = asyncio.get_running_loop()
+    while not _PDF_INSPECTION_SLOTS.acquire(blocking=False):
+        if loop.time() >= deadline:
+            raise InvalidPdfSourceError("PDF inspection timed out")
+        await asyncio.sleep(0.01)
+
+
+async def _run_pdf_inspection_process(
+    path: str | os.PathLike[str],
+    *,
+    timeout_seconds: float = _PDF_INSPECTION_TIMEOUT_SECONDS,
+    worker: Callable[..., None] = _pdf_inspection_worker,
+) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    await _acquire_pdf_inspection_slot(deadline)
+    context = multiprocessing.get_context("spawn")
+    receiver, sender = context.Pipe(duplex=False)
+    process = context.Process(
+        name="yfeistai-pdf-inspector",
+        target=worker,
+        args=(
+            os.fspath(path),
+            sender,
+            MAX_PDF_PAGES,
+            _MAX_OBJECTS_INSPECTED,
+            _PDF_INSPECTION_MEMORY_BYTES,
+        ),
+    )
+    try:
+        process.start()
+        sender.close()
+        message: tuple[str, str] | None = None
+        while True:
+            try:
+                if receiver.poll():
+                    message = receiver.recv()
+                    break
+            except (EOFError, OSError):
+                break
+            if not process.is_alive():
+                try:
+                    if receiver.poll():
+                        message = receiver.recv()
+                except (EOFError, OSError):
+                    pass
+                break
+            if loop.time() >= deadline:
+                raise InvalidPdfSourceError("PDF inspection timed out")
+            await asyncio.sleep(0.01)
+        if message is None or message[0] != "ok":
+            detail = message[1] if message is not None else "PDF could not be safely parsed"
+            raise InvalidPdfSourceError(detail)
+    finally:
+        receiver.close()
+        sender.close()
+        if process.pid is not None:
+            _terminate_and_reap_pdf_process(process)
+        else:
+            process.close()
+        _PDF_INSPECTION_SLOTS.release()
 
 
 async def _stage_pdf(upload: UploadFileLike) -> _StagedPdf:
@@ -362,7 +617,12 @@ async def _stage_pdf(upload: UploadFileLike) -> _StagedPdf:
             raise UnsupportedSourceMediaError("only application/pdf is accepted")
         finally:
             await upload.close()
-    handle = tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode="w+b")
+    handle = tempfile.NamedTemporaryFile(
+        mode="w+b",
+        prefix="yfeistai-pdf-",
+        suffix=".pdf",
+        delete=False,
+    )
     digest = hashlib.sha256()
     total = 0
     magic = b""
@@ -377,15 +637,22 @@ async def _stage_pdf(upload: UploadFileLike) -> _StagedPdf:
             handle.write(chunk)
         if magic != b"%PDF-":
             raise UnsupportedSourceMediaError("file content is not a PDF")
-        await asyncio.to_thread(_validate_pdf_structure, handle)
+        handle.flush()
+        await _run_pdf_inspection_process(handle.name)
+        handle.seek(0)
         return _StagedPdf(
             handle=handle,
+            path=handle.name,
             filename=_safe_filename(upload.filename),
             sha256=digest.hexdigest(),
             size_bytes=total,
         )
     except BaseException:
         handle.close()
+        try:
+            os.unlink(handle.name)
+        except FileNotFoundError:
+            pass
         raise
     finally:
         await upload.close()

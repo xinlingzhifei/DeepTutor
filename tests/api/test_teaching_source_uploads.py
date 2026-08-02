@@ -7,7 +7,13 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from pypdf import PdfWriter
-from pypdf.generic import DictionaryObject, NameObject, TextStringObject
+from pypdf.generic import (
+    ArrayObject,
+    DictionaryObject,
+    NameObject,
+    NumberObject,
+    TextStringObject,
+)
 import pytest
 from starlette.datastructures import Headers, UploadFile
 
@@ -326,6 +332,43 @@ def _pdf_bytes(
     return output.getvalue()
 
 
+def _active_annotation_pdf(
+    *,
+    subtype: str | None = None,
+    payload_key: str | None = None,
+    indirect: bool,
+) -> bytes:
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=72, height=72)
+    annotation = DictionaryObject(
+        {
+            NameObject("/Type"): NameObject("/Annot"),
+            NameObject("/Subtype"): NameObject(subtype or "/Text"),
+            NameObject("/Rect"): ArrayObject(
+                [NumberObject(0), NumberObject(0), NumberObject(10), NumberObject(10)]
+            ),
+        }
+    )
+    if payload_key is not None:
+        annotation[NameObject(payload_key)] = TextStringObject("active-payload")
+    page[NameObject("/Annots")] = ArrayObject(
+        [writer._add_object(annotation) if indirect else annotation]
+    )
+    output = BytesIO()
+    writer.write(output)
+    return output.getvalue()
+
+
+def _declared_page_bomb_pdf() -> bytes:
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    pages = writer._root_object[NameObject("/Pages")].get_object()
+    pages[NameObject("/Count")] = NumberObject(2_001)
+    output = BytesIO()
+    writer.write(output)
+    return output.getvalue()
+
+
 def _upload(
     client: TestClient,
     payload: bytes,
@@ -408,6 +451,15 @@ def test_pdf_with_more_than_2000_pages_is_rejected() -> None:
     assert store.put_calls == []
 
 
+def test_pdf_declaring_more_than_2000_pages_is_rejected_before_flattening() -> None:
+    client, store, _ = _client(_context(), _SourceRepository())
+
+    response = _upload(client, _declared_page_bomb_pdf())
+
+    assert response.status_code == 422
+    assert store.put_calls == []
+
+
 def test_malformed_pdf_with_valid_magic_is_rejected() -> None:
     client, store, _ = _client(_context(), _SourceRepository())
 
@@ -443,6 +495,37 @@ def test_pdf_catalog_and_page_actions_are_rejected() -> None:
 
     assert catalog.status_code == 422
     assert page.status_code == 422
+    assert store.put_calls == []
+
+
+@pytest.mark.parametrize("subtype", ["/Movie", "/Sound", "/3D"])
+@pytest.mark.parametrize("indirect", [False, True], ids=["direct", "indirect"])
+def test_active_annotation_subtypes_are_rejected(subtype: str, indirect: bool) -> None:
+    client, store, _ = _client(_context(), _SourceRepository())
+
+    response = _upload(
+        client,
+        _active_annotation_pdf(subtype=subtype, indirect=indirect),
+    )
+
+    assert response.status_code == 422
+    assert store.put_calls == []
+
+
+@pytest.mark.parametrize("payload_key", ["/Movie", "/Sound", "/3D", "/3DA", "/3DD"])
+@pytest.mark.parametrize("indirect", [False, True], ids=["direct", "indirect"])
+def test_active_annotation_payload_keys_are_rejected(
+    payload_key: str,
+    indirect: bool,
+) -> None:
+    client, store, _ = _client(_context(), _SourceRepository())
+
+    response = _upload(
+        client,
+        _active_annotation_pdf(payload_key=payload_key, indirect=indirect),
+    )
+
+    assert response.status_code == 422
     assert store.put_calls == []
 
 
