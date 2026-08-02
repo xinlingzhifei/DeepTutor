@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from sqlalchemy import delete, func, select, update
-from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from deeptutor.teaching.models.classrooms import (
@@ -15,6 +15,11 @@ from deeptutor.teaching.models.classrooms import (
     transition,
 )
 from deeptutor.teaching.models.platform import AuditLog
+from deeptutor.teaching.repositories.classroom_version_allocation import (
+    ClassroomVersionAllocationError,
+    allocate_classroom_version_number,
+    raise_for_classroom_version_allocation_conflict,
+)
 from deeptutor.teaching.schema_names import tenant_schema_name
 
 _LOWER_HEX_DIGITS = frozenset("0123456789abcdef")
@@ -59,7 +64,6 @@ class PublishedClassroomVersion:
 
     id: str
     classroom_id: str
-    version_number: int
     source_version_id: str
     document: ClassroomDocumentReference
     publication_id: str
@@ -73,8 +77,6 @@ class PublishedClassroomVersion:
         _required(self.source_version_id, "source_version_id", 128)
         _required(self.publication_id, "publication_id", 128)
         _required(self.actor_id, "actor_id", 128)
-        if self.version_number <= 0:
-            raise ValueError("version_number must be positive")
         if self.scope not in {"private", "class", "tenant"}:
             raise ValueError("scope is invalid")
         if self.scope == "class":
@@ -123,6 +125,11 @@ class SqlAlchemyClassroomRepository:
 
         async with self._session_factory() as session:
             async with session.begin():
+                version_number = await allocate_classroom_version_number(
+                    session,
+                    tenant_id=self._tenant_id,
+                    classroom_id=published.classroom_id,
+                )
                 asset = await session.scalar(
                     select(ClassroomAsset)
                     .where(
@@ -153,7 +160,7 @@ class SqlAlchemyClassroomRepository:
                     id=published.id,
                     tenant_id=self._tenant_id,
                     classroom_id=published.classroom_id,
-                    version_number=published.version_number,
+                    version_number=version_number,
                     generation_job_id=None,
                     source_version_id=source_version.id,
                     document_sha256=published.document.sha256,
@@ -161,7 +168,11 @@ class SqlAlchemyClassroomRepository:
                     document_object_key=published.document.object_key,
                 )
                 session.add(version)
-                await session.flush()
+                try:
+                    await session.flush()
+                except IntegrityError as exc:
+                    raise_for_classroom_version_allocation_conflict(exc)
+                    raise
 
                 session.add(
                     Publication(
@@ -243,6 +254,7 @@ class SqlAlchemyClassroomRepository:
 __all__ = [
     "ClassroomAssetNotFoundError",
     "ClassroomDocumentReference",
+    "ClassroomVersionAllocationError",
     "ClassroomVersionNotFoundError",
     "ImmutableVersionError",
     "PublishedClassroomVersion",

@@ -78,12 +78,18 @@ def _upgrade_tenant() -> None:
         nullable=True,
         schema=tenant_schema,
     )
+    op.create_unique_constraint(
+        "uq_classroom_versions_id_classroom_tenant",
+        "classroom_versions",
+        ["id", "classroom_id", "tenant_id"],
+        schema=tenant_schema,
+    )
     op.create_foreign_key(
-        "fk_classroom_versions_source_version_classroom_versions",
+        "fk_classroom_versions_source_classroom_tenant",
         "classroom_versions",
         "classroom_versions",
-        ["source_version_id"],
-        ["id"],
+        ["source_version_id", "classroom_id", "tenant_id"],
+        ["id", "classroom_id", "tenant_id"],
         source_schema=tenant_schema,
         referent_schema=tenant_schema,
         ondelete="RESTRICT",
@@ -281,9 +287,13 @@ def _upgrade_tenant() -> None:
             name="ck_classroom_assets_lifecycle_state",
         ),
         sa.ForeignKeyConstraint(
-            ["current_published_version_id"],
-            ["tenant.classroom_versions.id"],
-            name="fk_classroom_assets_current_version_classroom_versions",
+            ["current_published_version_id", "id", "tenant_id"],
+            [
+                "tenant.classroom_versions.id",
+                "tenant.classroom_versions.classroom_id",
+                "tenant.classroom_versions.tenant_id",
+            ],
+            name="fk_classroom_assets_current_version_classroom_tenant",
             ondelete="RESTRICT",
         ),
         sa.PrimaryKeyConstraint("id", name="pk_classroom_assets"),
@@ -368,9 +378,13 @@ def _upgrade_tenant() -> None:
         ),
         sa.CheckConstraint("revision > 0", name="ck_classroom_drafts_revision"),
         sa.ForeignKeyConstraint(
-            ["base_version_id"],
-            ["tenant.classroom_versions.id"],
-            name="fk_classroom_drafts_base_version_id_classroom_versions",
+            ["base_version_id", "classroom_id", "tenant_id"],
+            [
+                "tenant.classroom_versions.id",
+                "tenant.classroom_versions.classroom_id",
+                "tenant.classroom_versions.tenant_id",
+            ],
+            name="fk_classroom_drafts_base_version_classroom_tenant",
             ondelete="RESTRICT",
         ),
         sa.ForeignKeyConstraint(
@@ -386,6 +400,12 @@ def _upgrade_tenant() -> None:
             ondelete="RESTRICT",
         ),
         sa.PrimaryKeyConstraint("id", name="pk_classroom_drafts"),
+        sa.UniqueConstraint(
+            "id",
+            "classroom_id",
+            "tenant_id",
+            name="uq_classroom_drafts_id_classroom_tenant",
+        ),
         schema="tenant",
     )
     op.create_index(
@@ -457,9 +477,13 @@ def _upgrade_tenant() -> None:
             name="ck_approvals_decision",
         ),
         sa.ForeignKeyConstraint(
-            ["classroom_draft_id"],
-            ["tenant.classroom_drafts.id"],
-            name="fk_approvals_classroom_draft_id_classroom_drafts",
+            ["classroom_draft_id", "classroom_id", "tenant_id"],
+            [
+                "tenant.classroom_drafts.id",
+                "tenant.classroom_drafts.classroom_id",
+                "tenant.classroom_drafts.tenant_id",
+            ],
+            name="fk_approvals_draft_classroom_tenant",
             ondelete="RESTRICT",
         ),
         sa.ForeignKeyConstraint(
@@ -510,9 +534,13 @@ def _upgrade_tenant() -> None:
             ondelete="RESTRICT",
         ),
         sa.ForeignKeyConstraint(
-            ["classroom_version_id"],
-            ["tenant.classroom_versions.id"],
-            name="fk_publications_classroom_version_id_classroom_versions",
+            ["classroom_version_id", "classroom_id", "tenant_id"],
+            [
+                "tenant.classroom_versions.id",
+                "tenant.classroom_versions.classroom_id",
+                "tenant.classroom_versions.tenant_id",
+            ],
+            name="fk_publications_version_classroom_tenant",
             ondelete="RESTRICT",
         ),
         sa.PrimaryKeyConstraint("id", name="pk_publications"),
@@ -705,6 +733,71 @@ def _downgrade_tenant() -> None:
             "cannot downgrade classroom lifecycle: published immutable versions "
             "require revision 20260802_0008"
         )
+    # Every populated 0008-only table is lossy on 0007. Classroom assets are
+    # checked separately because the exact legacy-version backfill is reconstructible.
+    for table_name in (
+        "source_snapshots",
+        "source_uploads",
+        "tenant_source_bindings",
+        "teaching_briefs",
+        "classroom_drafts",
+        "classroom_exports",
+        "approvals",
+        "publications",
+        "assignments",
+        "batch_jobs",
+        "batch_items",
+    ):
+        has_rows = (
+            op.get_bind()
+            .execute(
+                sa.text(
+                    f"SELECT EXISTS (SELECT 1 FROM {quoted_schema}.{table_name})"
+                )
+            )
+            .scalar()
+        )
+        if has_rows:
+            raise CommandError(
+                f"cannot downgrade classroom lifecycle: {table_name} contains data "
+                "that requires revision 20260802_0008"
+            )
+    has_nonreconstructible_assets = (
+        op.get_bind()
+        .execute(
+            sa.text(
+                f"""
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM {quoted_schema}.classroom_assets AS assets
+                    LEFT JOIN LATERAL (
+                        SELECT jobs.owner_id
+                        FROM {quoted_schema}.classroom_versions AS versions
+                        JOIN {quoted_schema}.generation_jobs AS jobs
+                          ON jobs.id = versions.generation_job_id
+                         AND jobs.tenant_id = versions.tenant_id
+                        WHERE versions.classroom_id = assets.id
+                          AND versions.tenant_id = assets.tenant_id
+                          AND versions.generation_job_id IS NOT NULL
+                        ORDER BY versions.version_number DESC
+                        LIMIT 1
+                    ) AS legacy ON TRUE
+                    WHERE legacy.owner_id IS NULL
+                       OR assets.owner_id <> legacy.owner_id
+                       OR assets.title IS NOT NULL
+                       OR assets.lifecycle_state <> 'editing'
+                       OR assets.current_published_version_id IS NOT NULL
+                )
+                """
+            )
+        )
+        .scalar()
+    )
+    if has_nonreconstructible_assets:
+        raise CommandError(
+            "cannot downgrade classroom lifecycle: classroom_assets contains "
+            "non-reconstructible data that requires revision 20260802_0008"
+        )
 
     _sync_tenant_schema_revision("20260802_0008", "20260801_0007")
     op.drop_table("batch_items", schema=tenant_schema)
@@ -732,9 +825,15 @@ def _downgrade_tenant() -> None:
         schema=tenant_schema,
     )
     op.drop_constraint(
-        "fk_classroom_versions_source_version_classroom_versions",
+        "fk_classroom_versions_source_classroom_tenant",
         "classroom_versions",
         type_="foreignkey",
+        schema=tenant_schema,
+    )
+    op.drop_constraint(
+        "uq_classroom_versions_id_classroom_tenant",
+        "classroom_versions",
+        type_="unique",
         schema=tenant_schema,
     )
     op.alter_column(

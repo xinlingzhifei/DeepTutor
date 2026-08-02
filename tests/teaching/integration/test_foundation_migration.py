@@ -2539,14 +2539,505 @@ def test_classroom_lifecycle_downgrade_refuses_published_immutable_versions(
     assert columns == {"generation_job_id": "YES", "source_version_id": "YES"}
     assert {
         "ck_classroom_versions_provenance",
-        "fk_classroom_versions_source_version_classroom_versions",
+        "fk_classroom_versions_source_classroom_tenant",
         "fk_classroom_versions_asset_tenant_classroom_assets",
+        "uq_classroom_versions_id_classroom_tenant",
     }.issubset(constraints)
     assert versions == [
         (source_version_id, job_id, None),
         (published_version_id, None, source_version_id),
     ]
     assert publication_count == 1
+
+
+def test_classroom_lifecycle_downgrade_refuses_source_data_without_mutation(
+    migration_database,
+) -> None:
+    tenant_id = "classroom-downgrade-source-data"
+    schema_name = tenant_schema_name(tenant_id)
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(migration_database, "scope=platform"),
+    )
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(
+            migration_database,
+            "scope=tenant",
+            f"tenant_schema={schema_name}",
+        ),
+    )
+
+    async def seed_source() -> None:
+        engine = create_async_engine(migration_database.url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO platform.tenants (id, name, status)
+                        VALUES (:tenant_id, 'Source downgrade guard', 'active')
+                        """
+                    ),
+                    {"tenant_id": tenant_id},
+                )
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO platform.tenant_schema_states (
+                            tenant_id, schema_name, revision, status
+                        ) VALUES (
+                            :tenant_id, :schema_name, :revision, 'active'
+                        )
+                        """
+                    ),
+                    {
+                        "tenant_id": tenant_id,
+                        "schema_name": schema_name,
+                        "revision": HEAD_REVISION,
+                    },
+                )
+                await connection.execute(
+                    text(
+                        f"""
+                        INSERT INTO "{schema_name}".source_snapshots (
+                            id, tenant_id, source_type, source_id, source_revision,
+                            content_sha256, permission_sha256, citation_manifest,
+                            created_by
+                        ) VALUES (
+                            'source-1', :tenant_id, 'upload', 'document-1', 'v1',
+                            :content_sha256, :permission_sha256, '{{}}', 'teacher-1'
+                        )
+                        """
+                    ),
+                    {
+                        "tenant_id": tenant_id,
+                        "content_sha256": "1" * 64,
+                        "permission_sha256": "2" * 64,
+                    },
+                )
+        finally:
+            await engine.dispose()
+
+    async def inspect() -> tuple[str, str, int]:
+        engine = create_async_engine(migration_database.url)
+        try:
+            async with engine.connect() as connection:
+                state_revision = await connection.scalar(
+                    text(
+                        "SELECT revision FROM platform.tenant_schema_states "
+                        "WHERE tenant_id = :tenant_id"
+                    ),
+                    {"tenant_id": tenant_id},
+                )
+                alembic_revision = await connection.scalar(
+                    text(f'SELECT version_num FROM "{schema_name}".alembic_version')
+                )
+                source_count = await connection.scalar(
+                    text(f'SELECT count(*) FROM "{schema_name}".source_snapshots')
+                )
+                return (
+                    str(state_revision),
+                    str(alembic_revision),
+                    int(source_count or 0),
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(seed_source())
+    refused = _run_alembic(
+        migration_database,
+        "scope=tenant",
+        f"tenant_schema={schema_name}",
+        action="downgrade",
+        revision="20260801_0007",
+    )
+    safe_output = _assert_secret_safe_output(migration_database, refused)
+    assert refused.returncode != 0, safe_output
+    assert (
+        "cannot downgrade classroom lifecycle: source_snapshots contains data "
+        "that requires revision 20260802_0008"
+    ) in safe_output
+    assert asyncio.run(inspect()) == (HEAD_REVISION, HEAD_REVISION, 1)
+
+
+@pytest.mark.parametrize(
+    ("case", "blocking_table"),
+    [
+        ("draft", "classroom_drafts"),
+        ("assignment", "assignments"),
+        ("batch", "batch_jobs"),
+    ],
+)
+def test_classroom_lifecycle_downgrade_refuses_nonreconstructible_data(
+    migration_database,
+    case: str,
+    blocking_table: str,
+) -> None:
+    tenant_id = f"classroom-downgrade-{case}"
+    schema_name = tenant_schema_name(tenant_id)
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(migration_database, "scope=platform"),
+    )
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(
+            migration_database,
+            "scope=tenant",
+            f"tenant_schema={schema_name}",
+        ),
+    )
+
+    async def seed() -> None:
+        engine = create_async_engine(migration_database.url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO platform.tenants (id, name, status)
+                        VALUES (:tenant_id, 'Lifecycle downgrade guard', 'active')
+                        """
+                    ),
+                    {"tenant_id": tenant_id},
+                )
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO platform.tenant_schema_states (
+                            tenant_id, schema_name, revision, status
+                        ) VALUES (
+                            :tenant_id, :schema_name, :revision, 'active'
+                        )
+                        """
+                    ),
+                    {
+                        "tenant_id": tenant_id,
+                        "schema_name": schema_name,
+                        "revision": HEAD_REVISION,
+                    },
+                )
+                if case == "draft":
+                    await connection.execute(
+                        text(
+                            f"""
+                            INSERT INTO "{schema_name}".classroom_assets (
+                                id, tenant_id, owner_id, lifecycle_state
+                            ) VALUES (
+                                'asset-1', :tenant_id, 'teacher-1', 'editing'
+                            )
+                            """
+                        ),
+                        {"tenant_id": tenant_id},
+                    )
+                    await connection.execute(
+                        text(
+                            f"""
+                            INSERT INTO "{schema_name}".classroom_drafts (
+                                id, tenant_id, classroom_id, revision, document,
+                                document_sha256, created_by, updated_by
+                            ) VALUES (
+                                'draft-1', :tenant_id, 'asset-1', 1, '{{}}',
+                                :document_sha256, 'teacher-1', 'teacher-1'
+                            )
+                            """
+                        ),
+                        {"tenant_id": tenant_id, "document_sha256": "3" * 64},
+                    )
+                elif case == "assignment":
+                    await connection.execute(
+                        text(
+                            f"""
+                            INSERT INTO "{schema_name}".courses (id, title)
+                            VALUES ('course-1', 'Downgrade course')
+                            """
+                        )
+                    )
+                    await connection.execute(
+                        text(
+                            f"""
+                            INSERT INTO "{schema_name}".classes (id, course_id, name)
+                            VALUES ('class-1', 'course-1', 'Downgrade class')
+                            """
+                        )
+                    )
+                    await connection.execute(
+                        text(
+                            f"""
+                            INSERT INTO "{schema_name}".generation_jobs (
+                                id, tenant_id, job_kind, phase, status, priority,
+                                quota_units, actor_id, owner_id, visibility,
+                                request_id, idempotency_key, request_sha256,
+                                data_plane_route_id, provider_profile_id,
+                                worker_pool_ref, queue_ref, request_payload,
+                                progress_percent
+                            ) VALUES (
+                                'job-1', :tenant_id, 'generation', 'content',
+                                'succeeded', 10, 1, 'teacher-1', 'teacher-1',
+                                'private', 'assignment-request',
+                                'assignment-idempotency', :request_sha256,
+                                'assignment-route', 'assignment-provider',
+                                'assignment-workers', 'assignment.queue', '{{}}', 100
+                            )
+                            """
+                        ),
+                        {"tenant_id": tenant_id, "request_sha256": "4" * 64},
+                    )
+                    await connection.execute(
+                        text(
+                            f"""
+                            INSERT INTO "{schema_name}".classroom_assets (
+                                id, tenant_id, owner_id, lifecycle_state
+                            ) VALUES (
+                                'asset-1', :tenant_id, 'teacher-1', 'editing'
+                            )
+                            """
+                        ),
+                        {"tenant_id": tenant_id},
+                    )
+                    await connection.execute(
+                        text(
+                            f"""
+                            INSERT INTO "{schema_name}".classroom_versions (
+                                id, tenant_id, classroom_id, version_number,
+                                generation_job_id, source_version_id,
+                                document_sha256, media_manifest_sha256,
+                                document_object_key
+                            ) VALUES (
+                                'version-1', :tenant_id, 'asset-1', 1, 'job-1',
+                                NULL, :document_sha256, :manifest_sha256,
+                                'classrooms/asset-1/v1/classroom.json'
+                            )
+                            """
+                        ),
+                        {
+                            "tenant_id": tenant_id,
+                            "document_sha256": "5" * 64,
+                            "manifest_sha256": "6" * 64,
+                        },
+                    )
+                    await connection.execute(
+                        text(
+                            f"""
+                            INSERT INTO "{schema_name}".assignments (
+                                id, tenant_id, classroom_version_id, class_id,
+                                assigned_by
+                            ) VALUES (
+                                'assignment-1', :tenant_id, 'version-1', 'class-1',
+                                'teacher-1'
+                            )
+                            """
+                        ),
+                        {"tenant_id": tenant_id},
+                    )
+                elif case == "batch":
+                    await connection.execute(
+                        text(
+                            f"""
+                            INSERT INTO "{schema_name}".batch_jobs (
+                                id, tenant_id, actor_id, status, item_count,
+                                succeeded_count, failed_count
+                            ) VALUES (
+                                'batch-1', :tenant_id, 'teacher-1', 'created',
+                                0, 0, 0
+                            )
+                            """
+                        ),
+                        {"tenant_id": tenant_id},
+                    )
+                else:
+                    raise AssertionError(f"unknown downgrade case: {case}")
+        finally:
+            await engine.dispose()
+
+    async def inspect() -> tuple[str, str, int, bool]:
+        engine = create_async_engine(migration_database.url)
+        try:
+            async with engine.connect() as connection:
+                state_revision = await connection.scalar(
+                    text(
+                        "SELECT revision FROM platform.tenant_schema_states "
+                        "WHERE tenant_id = :tenant_id"
+                    ),
+                    {"tenant_id": tenant_id},
+                )
+                alembic_revision = await connection.scalar(
+                    text(f'SELECT version_num FROM "{schema_name}".alembic_version')
+                )
+                row_count = await connection.scalar(
+                    text(f'SELECT count(*) FROM "{schema_name}".{blocking_table}')
+                )
+                asset_table_exists = await connection.scalar(
+                    text("SELECT to_regclass(:table_name) IS NOT NULL"),
+                    {"table_name": f'"{schema_name}".classroom_assets'},
+                )
+                return (
+                    str(state_revision),
+                    str(alembic_revision),
+                    int(row_count or 0),
+                    bool(asset_table_exists),
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(seed())
+    refused = _run_alembic(
+        migration_database,
+        "scope=tenant",
+        f"tenant_schema={schema_name}",
+        action="downgrade",
+        revision="20260801_0007",
+    )
+    safe_output = _assert_secret_safe_output(migration_database, refused)
+    assert refused.returncode != 0, safe_output
+    assert (
+        f"cannot downgrade classroom lifecycle: {blocking_table} contains data "
+        "that requires revision 20260802_0008"
+    ) in safe_output
+    assert asyncio.run(inspect()) == (HEAD_REVISION, HEAD_REVISION, 1, True)
+
+
+def test_classroom_lifecycle_downgrade_allows_reconstructible_plan02_backfill(
+    migration_database,
+) -> None:
+    tenant_id = "classroom-downgrade-reconstructible"
+    schema_name = tenant_schema_name(tenant_id)
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(migration_database, "scope=platform"),
+    )
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(
+            migration_database,
+            "scope=tenant",
+            f"tenant_schema={schema_name}",
+            revision="20260801_0007",
+        ),
+    )
+
+    async def seed_plan02_version() -> None:
+        engine = create_async_engine(migration_database.url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO platform.tenants (id, name, status)
+                        VALUES (:tenant_id, 'Reconstructible classroom', 'active')
+                        """
+                    ),
+                    {"tenant_id": tenant_id},
+                )
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO platform.tenant_schema_states (
+                            tenant_id, schema_name, revision, status
+                        ) VALUES (
+                            :tenant_id, :schema_name, '20260801_0007', 'active'
+                        )
+                        """
+                    ),
+                    {"tenant_id": tenant_id, "schema_name": schema_name},
+                )
+                await connection.execute(
+                    text(
+                        f"""
+                        INSERT INTO "{schema_name}".generation_jobs (
+                            id, tenant_id, job_kind, phase, status, priority,
+                            quota_units, actor_id, owner_id, visibility,
+                            request_id, idempotency_key, request_sha256,
+                            data_plane_route_id, provider_profile_id,
+                            worker_pool_ref, queue_ref, request_payload,
+                            progress_percent
+                        ) VALUES (
+                            'job-1', :tenant_id, 'generation', 'content',
+                            'succeeded', 10, 1, 'teacher-1', 'teacher-1',
+                            'private', 'reconstructible-request',
+                            'reconstructible-idempotency', :request_sha256,
+                            'reconstructible-route', 'reconstructible-provider',
+                            'reconstructible-workers', 'reconstructible.queue',
+                            '{{}}', 100
+                        )
+                        """
+                    ),
+                    {"tenant_id": tenant_id, "request_sha256": "7" * 64},
+                )
+                await connection.execute(
+                    text(
+                        f"""
+                        INSERT INTO "{schema_name}".classroom_versions (
+                            id, tenant_id, classroom_id, version_number,
+                            generation_job_id, document_sha256,
+                            media_manifest_sha256, document_object_key
+                        ) VALUES (
+                            'version-1', :tenant_id, 'asset-1', 1, 'job-1',
+                            :document_sha256, :manifest_sha256,
+                            'classrooms/asset-1/v1/classroom.json'
+                        )
+                        """
+                    ),
+                    {
+                        "tenant_id": tenant_id,
+                        "document_sha256": "8" * 64,
+                        "manifest_sha256": "9" * 64,
+                    },
+                )
+        finally:
+            await engine.dispose()
+
+    async def inspect() -> tuple[str, str, int, bool]:
+        engine = create_async_engine(migration_database.url)
+        try:
+            async with engine.connect() as connection:
+                state_revision = await connection.scalar(
+                    text(
+                        "SELECT revision FROM platform.tenant_schema_states "
+                        "WHERE tenant_id = :tenant_id"
+                    ),
+                    {"tenant_id": tenant_id},
+                )
+                alembic_revision = await connection.scalar(
+                    text(f'SELECT version_num FROM "{schema_name}".alembic_version')
+                )
+                version_count = await connection.scalar(
+                    text(f'SELECT count(*) FROM "{schema_name}".classroom_versions')
+                )
+                asset_table_exists = await connection.scalar(
+                    text("SELECT to_regclass(:table_name) IS NOT NULL"),
+                    {"table_name": f'"{schema_name}".classroom_assets'},
+                )
+                return (
+                    str(state_revision),
+                    str(alembic_revision),
+                    int(version_count or 0),
+                    bool(asset_table_exists),
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(seed_plan02_version())
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(
+            migration_database,
+            "scope=tenant",
+            f"tenant_schema={schema_name}",
+        ),
+    )
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(
+            migration_database,
+            "scope=tenant",
+            f"tenant_schema={schema_name}",
+            action="downgrade",
+            revision="20260801_0007",
+        ),
+    )
+    assert asyncio.run(inspect()) == ("20260801_0007", "20260801_0007", 1, False)
 
 
 def test_postgres_claims_are_unique_and_stale_same_owner_token_is_fenced(

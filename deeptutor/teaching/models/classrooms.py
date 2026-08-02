@@ -189,14 +189,7 @@ class ClassroomAsset(TenantBase):
     owner_id: Mapped[str] = mapped_column(String(128))
     title: Mapped[str | None] = mapped_column(String(255))
     lifecycle_state: Mapped[str] = mapped_column(String(32), server_default="draft")
-    current_published_version_id: Mapped[str | None] = mapped_column(
-        String(128),
-        ForeignKey(
-            "tenant.classroom_versions.id",
-            name="fk_classroom_assets_current_version_classroom_versions",
-            ondelete="RESTRICT",
-        ),
-    )
+    current_published_version_id: Mapped[str | None] = mapped_column(String(128))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
@@ -214,6 +207,16 @@ class ClassroomAsset(TenantBase):
             "'validated', 'approved', 'published', 'failed', 'canceled'"
             ")",
             name="lifecycle_state",
+        ),
+        ForeignKeyConstraint(
+            ["current_published_version_id", "id", "tenant_id"],
+            [
+                "tenant.classroom_versions.id",
+                "tenant.classroom_versions.classroom_id",
+                "tenant.classroom_versions.tenant_id",
+            ],
+            name="fk_classroom_assets_current_version_classroom_tenant",
+            ondelete="RESTRICT",
         ),
         UniqueConstraint(
             "id",
@@ -239,14 +242,7 @@ class ClassroomVersion(TenantBase):
     classroom_id: Mapped[str] = mapped_column(String(128))
     version_number: Mapped[int] = mapped_column(Integer)
     generation_job_id: Mapped[str | None] = mapped_column(String(64))
-    source_version_id: Mapped[str | None] = mapped_column(
-        String(128),
-        ForeignKey(
-            "tenant.classroom_versions.id",
-            name="fk_classroom_versions_source_version_classroom_versions",
-            ondelete="RESTRICT",
-        ),
-    )
+    source_version_id: Mapped[str | None] = mapped_column(String(128))
     document_sha256: Mapped[str] = mapped_column(String(64))
     media_manifest_sha256: Mapped[str] = mapped_column(String(64))
     document_object_key: Mapped[str] = mapped_column(String(512))
@@ -280,6 +276,22 @@ class ClassroomVersion(TenantBase):
             name="fk_classroom_versions_job_tenant_generation_jobs",
             ondelete="RESTRICT",
         ),
+        ForeignKeyConstraint(
+            ["source_version_id", "classroom_id", "tenant_id"],
+            [
+                "tenant.classroom_versions.id",
+                "tenant.classroom_versions.classroom_id",
+                "tenant.classroom_versions.tenant_id",
+            ],
+            name="fk_classroom_versions_source_classroom_tenant",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint(
+            "id",
+            "classroom_id",
+            "tenant_id",
+            name="uq_classroom_versions_id_classroom_tenant",
+        ),
         UniqueConstraint(
             "tenant_id",
             "classroom_id",
@@ -306,10 +318,7 @@ class ClassroomDraft(TenantBase):
         String(128),
         ForeignKey("tenant.teaching_briefs.id", ondelete="RESTRICT"),
     )
-    base_version_id: Mapped[str | None] = mapped_column(
-        String(128),
-        ForeignKey("tenant.classroom_versions.id", ondelete="RESTRICT"),
-    )
+    base_version_id: Mapped[str | None] = mapped_column(String(128))
     revision: Mapped[int] = mapped_column(Integer, server_default="1")
     document: Mapped[str] = mapped_column(Text)
     document_sha256: Mapped[str] = mapped_column(String(64))
@@ -327,6 +336,16 @@ class ClassroomDraft(TenantBase):
     __table_args__ = (
         CheckConstraint("revision > 0", name="revision"),
         ForeignKeyConstraint(
+            ["base_version_id", "classroom_id", "tenant_id"],
+            [
+                "tenant.classroom_versions.id",
+                "tenant.classroom_versions.classroom_id",
+                "tenant.classroom_versions.tenant_id",
+            ],
+            name="fk_classroom_drafts_base_version_classroom_tenant",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
             ["classroom_id", "tenant_id"],
             [
                 "tenant.classroom_assets.id",
@@ -334,6 +353,12 @@ class ClassroomDraft(TenantBase):
             ],
             name="fk_classroom_drafts_asset_tenant_classroom_assets",
             ondelete="CASCADE",
+        ),
+        UniqueConstraint(
+            "id",
+            "classroom_id",
+            "tenant_id",
+            name="uq_classroom_drafts_id_classroom_tenant",
         ),
         Index("ix_classroom_drafts_classroom_updated", "classroom_id", "updated_at"),
     )
@@ -387,10 +412,7 @@ class Approval(TenantBase):
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
     tenant_id: Mapped[str] = mapped_column(String(64))
     classroom_id: Mapped[str] = mapped_column(String(128))
-    classroom_draft_id: Mapped[str] = mapped_column(
-        String(128),
-        ForeignKey("tenant.classroom_drafts.id", ondelete="RESTRICT"),
-    )
+    classroom_draft_id: Mapped[str] = mapped_column(String(128))
     submitted_by: Mapped[str] = mapped_column(String(128))
     reviewer_id: Mapped[str | None] = mapped_column(String(128))
     decision: Mapped[str] = mapped_column(String(32))
@@ -404,6 +426,16 @@ class Approval(TenantBase):
         CheckConstraint(
             "decision IN ('submitted', 'approved', 'rejected')",
             name="decision",
+        ),
+        ForeignKeyConstraint(
+            ["classroom_draft_id", "classroom_id", "tenant_id"],
+            [
+                "tenant.classroom_drafts.id",
+                "tenant.classroom_drafts.classroom_id",
+                "tenant.classroom_drafts.tenant_id",
+            ],
+            name="fk_approvals_draft_classroom_tenant",
+            ondelete="RESTRICT",
         ),
         ForeignKeyConstraint(
             ["classroom_id", "tenant_id"],
@@ -426,10 +458,7 @@ class Publication(TenantBase):
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
     tenant_id: Mapped[str] = mapped_column(String(64))
     classroom_id: Mapped[str] = mapped_column(String(128))
-    classroom_version_id: Mapped[str] = mapped_column(
-        String(128),
-        ForeignKey("tenant.classroom_versions.id", ondelete="RESTRICT"),
-    )
+    classroom_version_id: Mapped[str] = mapped_column(String(128))
     actor_id: Mapped[str] = mapped_column(String(128))
     scope: Mapped[str] = mapped_column(String(16))
     class_id: Mapped[str | None] = mapped_column(
@@ -454,6 +483,16 @@ class Publication(TenantBase):
                 "tenant.classroom_assets.tenant_id",
             ],
             name="fk_publications_asset_tenant_classroom_assets",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["classroom_version_id", "classroom_id", "tenant_id"],
+            [
+                "tenant.classroom_versions.id",
+                "tenant.classroom_versions.classroom_id",
+                "tenant.classroom_versions.tenant_id",
+            ],
+            name="fk_publications_version_classroom_tenant",
             ondelete="RESTRICT",
         ),
         UniqueConstraint(

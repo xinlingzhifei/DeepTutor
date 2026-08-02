@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import pytest
-from sqlalchemy import CheckConstraint, UniqueConstraint
+from sqlalchemy import CheckConstraint, ForeignKeyConstraint, UniqueConstraint
 
 from deeptutor.teaching.models.classrooms import (
     ALLOWED_TRANSITIONS,
+    Approval,
     Assignment,
     ClassroomAsset,
+    ClassroomDraft,
     ClassroomVersion,
     InvalidClassroomTransition,
+    Publication,
     transition,
 )
 from deeptutor.teaching.models.jobs import GenerationJob
@@ -93,11 +96,7 @@ def test_classroom_version_is_unique_per_asset_version_number() -> None:
     }
 
     assert ("tenant_id", "classroom_id", "version_number") in unique_columns
-    assert {
-        foreign_key.target_fullname
-        for foreign_key in ClassroomVersion.__table__.foreign_keys
-        if foreign_key.parent.name == "classroom_id"
-    } == {"tenant.classroom_assets.id"}
+    assert ("id", "classroom_id", "tenant_id") in unique_columns
 
 
 def test_classroom_version_has_exactly_one_immutable_provenance() -> None:
@@ -111,14 +110,81 @@ def test_classroom_version_has_exactly_one_immutable_provenance() -> None:
 
     assert table.c.generation_job_id.nullable is True
     assert table.c.source_version_id.nullable is True
-    assert {
-        foreign_key.target_fullname
-        for foreign_key in table.c.source_version_id.foreign_keys
-    } == {"tenant.classroom_versions.id"}
     assert provenance_constraints == {
         "(generation_job_id IS NOT NULL AND source_version_id IS NULL) OR "
         "(generation_job_id IS NULL AND source_version_id IS NOT NULL)"
     }
+
+
+@pytest.mark.parametrize(
+    ("table", "constraint_name", "local_columns", "target_columns"),
+    [
+        (
+            ClassroomVersion.__table__,
+            "fk_classroom_versions_source_classroom_tenant",
+            ("source_version_id", "classroom_id", "tenant_id"),
+            (
+                "tenant.classroom_versions.id",
+                "tenant.classroom_versions.classroom_id",
+                "tenant.classroom_versions.tenant_id",
+            ),
+        ),
+        (
+            ClassroomAsset.__table__,
+            "fk_classroom_assets_current_version_classroom_tenant",
+            ("current_published_version_id", "id", "tenant_id"),
+            (
+                "tenant.classroom_versions.id",
+                "tenant.classroom_versions.classroom_id",
+                "tenant.classroom_versions.tenant_id",
+            ),
+        ),
+        (
+            Publication.__table__,
+            "fk_publications_version_classroom_tenant",
+            ("classroom_version_id", "classroom_id", "tenant_id"),
+            (
+                "tenant.classroom_versions.id",
+                "tenant.classroom_versions.classroom_id",
+                "tenant.classroom_versions.tenant_id",
+            ),
+        ),
+        (
+            ClassroomDraft.__table__,
+            "fk_classroom_drafts_base_version_classroom_tenant",
+            ("base_version_id", "classroom_id", "tenant_id"),
+            (
+                "tenant.classroom_versions.id",
+                "tenant.classroom_versions.classroom_id",
+                "tenant.classroom_versions.tenant_id",
+            ),
+        ),
+        (
+            Approval.__table__,
+            "fk_approvals_draft_classroom_tenant",
+            ("classroom_draft_id", "classroom_id", "tenant_id"),
+            (
+                "tenant.classroom_drafts.id",
+                "tenant.classroom_drafts.classroom_id",
+                "tenant.classroom_drafts.tenant_id",
+            ),
+        ),
+    ],
+)
+def test_redundant_classroom_identity_uses_composite_foreign_keys(
+    table,
+    constraint_name: str,
+    local_columns: tuple[str, ...],
+    target_columns: tuple[str, ...],
+) -> None:
+    constraint = next(
+        item
+        for item in table.constraints
+        if isinstance(item, ForeignKeyConstraint) and item.name == constraint_name
+    )
+
+    assert tuple(constraint.columns.keys()) == local_columns
+    assert tuple(element.target_fullname for element in constraint.elements) == target_columns
 
 
 def test_assignment_directly_references_an_immutable_version() -> None:

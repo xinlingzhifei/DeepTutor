@@ -11,6 +11,7 @@ import pytest
 import pytest_asyncio
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -22,14 +23,17 @@ from deeptutor.teaching.models import (
     Tenant,
 )
 from deeptutor.teaching.models.classrooms import (
+    Approval,
     ClassroomAsset,
+    ClassroomDraft,
     ClassroomVersion,
     Publication,
     transition,
 )
-from deeptutor.teaching.models.jobs import GenerationJob
+from deeptutor.teaching.models.jobs import ArtifactPromotionState, GenerationJob
 from deeptutor.teaching.repositories.classrooms import (
     ClassroomDocumentReference,
+    ClassroomVersionAllocationError,
     ImmutableVersionError,
     PublishedClassroomVersion,
     SqlAlchemyClassroomRepository,
@@ -37,9 +41,10 @@ from deeptutor.teaching.repositories.classrooms import (
 from deeptutor.teaching.repositories.jobs import (
     GenerationJobRequest,
     MaterializedArtifactInput,
+    PromotionTarget,
     SqlAlchemyGenerationJobRepository,
 )
-from deeptutor.teaching.scheduler import FairScheduler
+from deeptutor.teaching.scheduler import ClaimedGenerationJob, FairScheduler
 from deeptutor.teaching.schema_names import tenant_schema_name
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -236,7 +241,6 @@ def valid_version(context: RepositoryContext) -> PublishedClassroomVersion:
     return PublishedClassroomVersion(
         id=f"{context.asset_id}:published-v2",
         classroom_id=context.asset_id,
-        version_number=2,
         source_version_id=context.source_version_id,
         document=ClassroomDocumentReference(
             sha256="2" * 64,
@@ -255,6 +259,99 @@ def changed_document(context: RepositoryContext) -> ClassroomDocumentReference:
         media_manifest_sha256="5" * 64,
         object_key=f"classrooms/{context.asset_id}/v1/changed.json",
     )
+
+
+async def prepare_generation(
+    context: RepositoryContext,
+    *,
+    job_id: str,
+    owner_id: str = "teacher-1",
+) -> tuple[
+    SqlAlchemyGenerationJobRepository,
+    ClaimedGenerationJob,
+    PromotionTarget,
+]:
+    repository = SqlAlchemyGenerationJobRepository(context.engine)
+    payload = f'{{"job_id":"{job_id}"}}'
+    await repository.create_job_and_reserve(
+        GenerationJobRequest(
+            tenant_id=context.tenant_id,
+            job_id=job_id,
+            job_kind="generation",
+            phase="content",
+            export_format=None,
+            priority="teacher",
+            quota_units=1,
+            actor_id=owner_id,
+            owner_id=owner_id,
+            visibility="private",
+            request_id=f"request-{job_id}",
+            idempotency_key=f"idempotency-{job_id}",
+            request_sha256=hashlib.sha256(payload.encode()).hexdigest(),
+            data_plane_route_id=ROUTE_ID,
+            provider_profile_id=PROVIDER_ID,
+            worker_pool_ref=WORKER_POOL,
+            queue_ref=QUEUE_REF,
+            request_payload=payload,
+        )
+    )
+    assert await OutboxDispatcher(context.engine).dispatch_next() is not None
+    scheduler = FairScheduler(context.engine)
+    await scheduler.ensure_generation_capacity(
+        (context.tenant_id,),
+        worker_pool_ref=WORKER_POOL,
+    )
+    claim = await scheduler.claim(
+        "generation",
+        data_plane_route_id=ROUTE_ID,
+        provider_profile_id=PROVIDER_ID,
+        worker_pool_ref=WORKER_POOL,
+        queue_ref=QUEUE_REF,
+        worker_id=f"worker-{job_id}",
+        lease_seconds=60,
+    )
+    assert claim is not None
+    await repository.transition_claim(
+        claim,
+        expected_status="generating_content",
+        target_status="validating",
+        progress_percent=80,
+    )
+    await repository.transition_claim(
+        claim,
+        expected_status="validating",
+        target_status="materializing",
+        progress_percent=90,
+    )
+    target = await repository.prepare_promotion(
+        claim,
+        classroom_id=context.asset_id,
+    )
+    return repository, claim, target
+
+
+async def create_other_asset(
+    context: RepositoryContext,
+    *,
+    prefix: str,
+) -> str:
+    asset_id = f"{prefix}-{context.asset_id}"
+    translated = context.engine.execution_options(
+        schema_translate_map={"tenant": tenant_schema_name(context.tenant_id)}
+    )
+    session_factory = async_sessionmaker(translated, expire_on_commit=False)
+    async with session_factory() as session:
+        async with session.begin():
+            session.add(
+                ClassroomAsset(
+                    id=asset_id,
+                    tenant_id=context.tenant_id,
+                    owner_id="teacher-1",
+                    title="Other classroom",
+                    lifecycle_state="approved",
+                )
+            )
+    return asset_id
 
 
 def migrate_tenant_revision(generation_database, tenant_id: str, revision: str) -> None:
@@ -412,6 +509,153 @@ async def test_publishing_creates_version_publication_audit_and_pointer(
 
 
 @pytest.mark.asyncio
+async def test_publication_allocates_around_a_pending_generation_reservation(
+    repository_context: RepositoryContext,
+) -> None:
+    job_id = f"pending-{repository_context.generation_job_id}"
+    generation_repository, claim, target = await prepare_generation(
+        repository_context,
+        job_id=job_id,
+    )
+    assert target.version_number == 2
+
+    published_version = await repository_context.repository.insert_published_version(
+        valid_version(repository_context)
+    )
+    manifest_sha256 = "8" * 64
+    await generation_repository.bind_promotion_manifest(
+        claim,
+        manifest_sha256=manifest_sha256,
+    )
+    await generation_repository.mark_object_committed(
+        claim,
+        manifest_sha256=manifest_sha256,
+    )
+    generated_version_id = f"{repository_context.asset_id}:generated-v2"
+    await generation_repository.finalize_generation(
+        claim,
+        classroom_version_id=generated_version_id,
+        document_sha256="6" * 64,
+        media_manifest_sha256="7" * 64,
+        manifest_sha256=manifest_sha256,
+        artifacts=(
+            MaterializedArtifactInput(
+                relative_name="classroom.json",
+                object_key=(
+                    f"classrooms/{repository_context.asset_id}/generated-v2/classroom.json"
+                ),
+                sha256="6" * 64,
+                size_bytes=128,
+                mime_type="application/json",
+                artifact_kind="dsl_json",
+            ),
+        ),
+    )
+
+    translated = repository_context.engine.execution_options(
+        schema_translate_map={"tenant": tenant_schema_name(repository_context.tenant_id)}
+    )
+    session_factory = async_sessionmaker(translated, expire_on_commit=False)
+    async with session_factory() as session:
+        generated_version = await session.get(ClassroomVersion, generated_version_id)
+
+    assert generated_version is not None
+    assert generated_version.version_number == target.version_number
+    assert published_version.version_number == 3
+
+
+@pytest.mark.asyncio
+async def test_stale_generation_allocation_raises_a_domain_error(
+    repository_context: RepositoryContext,
+) -> None:
+    job_id = f"stale-{repository_context.generation_job_id}"
+    generation_repository, claim, target = await prepare_generation(
+        repository_context,
+        job_id=job_id,
+    )
+    translated = repository_context.engine.execution_options(
+        schema_translate_map={"tenant": tenant_schema_name(repository_context.tenant_id)}
+    )
+    session_factory = async_sessionmaker(translated, expire_on_commit=False)
+    async with session_factory() as session:
+        async with session.begin():
+            session.add(
+                ClassroomVersion(
+                    id=f"{repository_context.asset_id}:stale-v2",
+                    tenant_id=repository_context.tenant_id,
+                    classroom_id=repository_context.asset_id,
+                    version_number=target.version_number,
+                    generation_job_id=None,
+                    source_version_id=repository_context.source_version_id,
+                    document_sha256="9" * 64,
+                    media_manifest_sha256="a" * 64,
+                    document_object_key=(
+                        f"classrooms/{repository_context.asset_id}/stale-v2/classroom.json"
+                    ),
+                )
+            )
+
+    manifest_sha256 = "b" * 64
+    await generation_repository.bind_promotion_manifest(
+        claim,
+        manifest_sha256=manifest_sha256,
+    )
+    await generation_repository.mark_object_committed(
+        claim,
+        manifest_sha256=manifest_sha256,
+    )
+    with pytest.raises(
+        ClassroomVersionAllocationError,
+        match="classroom version allocation is stale",
+    ):
+        await generation_repository.finalize_generation(
+            claim,
+            classroom_version_id=f"{repository_context.asset_id}:generated-stale-v2",
+            document_sha256="c" * 64,
+            media_manifest_sha256="d" * 64,
+            manifest_sha256=manifest_sha256,
+            artifacts=(
+                MaterializedArtifactInput(
+                    relative_name="classroom.json",
+                    object_key=(
+                        f"classrooms/{repository_context.asset_id}/generated-stale-v2/"
+                        "classroom.json"
+                    ),
+                    sha256="c" * 64,
+                    size_bytes=128,
+                    mime_type="application/json",
+                    artifact_kind="dsl_json",
+                ),
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_generation_cannot_reserve_another_owners_classroom(
+    repository_context: RepositoryContext,
+) -> None:
+    job_id = f"foreign-owner-{repository_context.generation_job_id}"
+
+    with pytest.raises(ValueError, match="classroom asset is owned by another user"):
+        await prepare_generation(
+            repository_context,
+            job_id=job_id,
+            owner_id="teacher-2",
+        )
+
+    translated = repository_context.engine.execution_options(
+        schema_translate_map={"tenant": tenant_schema_name(repository_context.tenant_id)}
+    )
+    session_factory = async_sessionmaker(translated, expire_on_commit=False)
+    async with session_factory() as session:
+        promotion = await session.get(ArtifactPromotionState, job_id)
+        asset = await session.get(ClassroomAsset, repository_context.asset_id)
+
+    assert promotion is None
+    assert asset is not None and asset.owner_id == "teacher-1"
+
+
+@pytest.mark.asyncio
 async def test_publication_rejects_a_missing_materialized_source_version(
     repository_context: RepositoryContext,
 ) -> None:
@@ -459,7 +703,6 @@ async def test_publication_rejects_a_source_version_from_another_asset(
         valid_version(repository_context),
         id=f"{other_asset_id}:published-v1",
         classroom_id=other_asset_id,
-        version_number=1,
         publication_id=f"publication-{other_asset_id}",
     )
 
@@ -472,6 +715,167 @@ async def test_publication_rejects_a_source_version_from_another_asset(
     assert asset is not None and asset.lifecycle_state == "approved"
     assert asset.current_published_version_id is None
     assert publication_count == 0
+
+
+@pytest.mark.asyncio
+async def test_database_rejects_cross_asset_source_lineage(
+    repository_context: RepositoryContext,
+) -> None:
+    other_asset_id = await create_other_asset(repository_context, prefix="lineage")
+    translated = repository_context.engine.execution_options(
+        schema_translate_map={"tenant": tenant_schema_name(repository_context.tenant_id)}
+    )
+    session_factory = async_sessionmaker(translated, expire_on_commit=False)
+    with pytest.raises(
+        IntegrityError,
+        match="fk_classroom_versions_source_classroom_tenant",
+    ):
+        async with session_factory() as session:
+            async with session.begin():
+                session.add(
+                    ClassroomVersion(
+                        id=f"{other_asset_id}:cross-source",
+                        tenant_id=repository_context.tenant_id,
+                        classroom_id=other_asset_id,
+                        version_number=1,
+                        generation_job_id=None,
+                        source_version_id=repository_context.source_version_id,
+                        document_sha256="e" * 64,
+                        media_manifest_sha256="f" * 64,
+                        document_object_key=(
+                            f"classrooms/{other_asset_id}/cross-source/classroom.json"
+                        ),
+                    )
+                )
+
+
+@pytest.mark.asyncio
+async def test_database_rejects_cross_asset_current_version_pointer(
+    repository_context: RepositoryContext,
+) -> None:
+    other_asset_id = await create_other_asset(repository_context, prefix="pointer")
+    translated = repository_context.engine.execution_options(
+        schema_translate_map={"tenant": tenant_schema_name(repository_context.tenant_id)}
+    )
+    session_factory = async_sessionmaker(translated, expire_on_commit=False)
+
+    with pytest.raises(
+        IntegrityError,
+        match="fk_classroom_assets_current_version_classroom_tenant",
+    ):
+        async with session_factory() as session:
+            async with session.begin():
+                asset = await session.get(ClassroomAsset, other_asset_id)
+                assert asset is not None
+                asset.current_published_version_id = repository_context.source_version_id
+
+
+@pytest.mark.asyncio
+async def test_database_rejects_cross_asset_publication_version(
+    repository_context: RepositoryContext,
+) -> None:
+    other_asset_id = await create_other_asset(repository_context, prefix="publication")
+    translated = repository_context.engine.execution_options(
+        schema_translate_map={"tenant": tenant_schema_name(repository_context.tenant_id)}
+    )
+    session_factory = async_sessionmaker(translated, expire_on_commit=False)
+
+    with pytest.raises(
+        IntegrityError,
+        match="fk_publications_version_classroom_tenant",
+    ):
+        async with session_factory() as session:
+            async with session.begin():
+                session.add(
+                    Publication(
+                        id=f"cross-publication-{other_asset_id}",
+                        tenant_id=repository_context.tenant_id,
+                        classroom_id=other_asset_id,
+                        classroom_version_id=repository_context.source_version_id,
+                        actor_id="teacher-1",
+                        scope="tenant",
+                        class_id=None,
+                    )
+                )
+
+
+@pytest.mark.asyncio
+async def test_database_rejects_cross_asset_draft_base_version(
+    repository_context: RepositoryContext,
+) -> None:
+    other_asset_id = await create_other_asset(repository_context, prefix="draft")
+    translated = repository_context.engine.execution_options(
+        schema_translate_map={"tenant": tenant_schema_name(repository_context.tenant_id)}
+    )
+    session_factory = async_sessionmaker(translated, expire_on_commit=False)
+
+    with pytest.raises(
+        IntegrityError,
+        match="fk_classroom_drafts_base_version_classroom_tenant",
+    ):
+        async with session_factory() as session:
+            async with session.begin():
+                session.add(
+                    ClassroomDraft(
+                        id=f"cross-draft-{other_asset_id}",
+                        tenant_id=repository_context.tenant_id,
+                        classroom_id=other_asset_id,
+                        teaching_brief_id=None,
+                        base_version_id=repository_context.source_version_id,
+                        revision=1,
+                        document="{}",
+                        document_sha256="0" * 64,
+                        created_by="teacher-1",
+                        updated_by="teacher-1",
+                    )
+                )
+
+
+@pytest.mark.asyncio
+async def test_database_rejects_cross_asset_approval_draft(
+    repository_context: RepositoryContext,
+) -> None:
+    other_asset_id = await create_other_asset(repository_context, prefix="approval")
+    draft_id = f"draft-{repository_context.asset_id}"
+    translated = repository_context.engine.execution_options(
+        schema_translate_map={"tenant": tenant_schema_name(repository_context.tenant_id)}
+    )
+    session_factory = async_sessionmaker(translated, expire_on_commit=False)
+    async with session_factory() as session:
+        async with session.begin():
+            session.add(
+                ClassroomDraft(
+                    id=draft_id,
+                    tenant_id=repository_context.tenant_id,
+                    classroom_id=repository_context.asset_id,
+                    teaching_brief_id=None,
+                    base_version_id=repository_context.source_version_id,
+                    revision=1,
+                    document="{}",
+                    document_sha256="1" * 64,
+                    created_by="teacher-1",
+                    updated_by="teacher-1",
+                )
+            )
+
+    with pytest.raises(
+        IntegrityError,
+        match="fk_approvals_draft_classroom_tenant",
+    ):
+        async with session_factory() as session:
+            async with session.begin():
+                session.add(
+                    Approval(
+                        id=f"cross-approval-{other_asset_id}",
+                        tenant_id=repository_context.tenant_id,
+                        classroom_id=other_asset_id,
+                        classroom_draft_id=draft_id,
+                        submitted_by="teacher-1",
+                        reviewer_id=None,
+                        decision="submitted",
+                        reason=None,
+                    )
+                )
 
 
 @pytest.mark.asyncio

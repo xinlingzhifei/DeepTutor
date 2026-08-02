@@ -9,6 +9,7 @@ import json
 
 from sqlalchemy import func, select, text, update
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from deeptutor.teaching.database import get_platform_engine
@@ -34,6 +35,10 @@ from deeptutor.teaching.models.jobs import (
     require_job_transition,
 )
 from deeptutor.teaching.quota import reserve_quota
+from deeptutor.teaching.repositories.classroom_version_allocation import (
+    allocate_classroom_version_number,
+    raise_for_classroom_version_allocation_conflict,
+)
 from deeptutor.teaching.scheduler import PRIORITY_RANK, ClaimedGenerationJob, slot_pool_for
 from deeptutor.teaching.schema_names import tenant_schema_name
 
@@ -87,6 +92,48 @@ async def _database_now(session: AsyncSession) -> datetime:
     if not isinstance(value, datetime):
         raise RuntimeError("database clock is unavailable")
     return value
+
+
+async def _lock_or_create_classroom_asset(
+    session: AsyncSession,
+    *,
+    tenant_id: str,
+    classroom_id: str,
+    owner_id: str,
+) -> ClassroomAsset:
+    asset = await session.scalar(
+        select(ClassroomAsset)
+        .where(
+            ClassroomAsset.id == classroom_id,
+            ClassroomAsset.tenant_id == tenant_id,
+        )
+        .with_for_update()
+    )
+    if asset is None:
+        await session.execute(
+            insert(ClassroomAsset)
+            .values(
+                id=classroom_id,
+                tenant_id=tenant_id,
+                owner_id=owner_id,
+                title=None,
+                lifecycle_state="editing",
+            )
+            .on_conflict_do_nothing(index_elements=[ClassroomAsset.id])
+        )
+        asset = await session.scalar(
+            select(ClassroomAsset)
+            .where(
+                ClassroomAsset.id == classroom_id,
+                ClassroomAsset.tenant_id == tenant_id,
+            )
+            .with_for_update()
+        )
+    if asset is None:
+        raise RuntimeError("classroom asset could not be established")
+    if asset.owner_id != owner_id:
+        raise ValueError("classroom asset is owned by another user")
+    return asset
 
 
 @dataclass(frozen=True, slots=True)
@@ -1360,56 +1407,37 @@ class SqlAlchemyGenerationJobRepository:
                     .where(ArtifactPromotionState.job_id == claim.job_id)
                     .with_for_update()
                 )
+                if existing is not None and existing.classroom_id != classroom_id:
+                    raise ValueError("promotion target conflicts with durable state")
                 if existing is None:
-                    await session.execute(
-                        text("SELECT pg_advisory_xact_lock(hashtextextended(:classroom_key, 0))"),
-                        {
-                            "classroom_key": hashlib.sha256(
-                                (
-                                    "classroom-promotion\0"
-                                    f"{claim.tenant_id}\0{classroom_id}"
-                                ).encode()
-                            ).hexdigest()
-                        },
+                    version_number = await allocate_classroom_version_number(
+                        session,
+                        tenant_id=claim.tenant_id,
+                        classroom_id=classroom_id,
                     )
-                    max_version = max(
-                        int(
-                            await session.scalar(
-                                select(
-                                    func.coalesce(func.max(ClassroomVersion.version_number), 0)
-                                ).where(
-                                    ClassroomVersion.tenant_id == claim.tenant_id,
-                                    ClassroomVersion.classroom_id == classroom_id,
-                                )
-                            )
-                            or 0
-                        ),
-                        int(
-                            await session.scalar(
-                                select(
-                                    func.coalesce(
-                                        func.max(ArtifactPromotionState.version_number), 0
-                                    )
-                                ).where(
-                                    ArtifactPromotionState.tenant_id == claim.tenant_id,
-                                    ArtifactPromotionState.classroom_id == classroom_id,
-                                )
-                            )
-                            or 0
-                        ),
+                    await _lock_or_create_classroom_asset(
+                        session,
+                        tenant_id=claim.tenant_id,
+                        classroom_id=classroom_id,
+                        owner_id=job.owner_id,
                     )
                     existing = ArtifactPromotionState(
                         job_id=claim.job_id,
                         tenant_id=claim.tenant_id,
                         classroom_id=classroom_id,
-                        version_number=max_version + 1,
+                        version_number=version_number,
                         status="prepared",
                         updated_at=now,
                     )
                     session.add(existing)
                     await session.flush()
-                elif existing.classroom_id != classroom_id:
-                    raise ValueError("promotion target conflicts with durable state")
+                else:
+                    await _lock_or_create_classroom_asset(
+                        session,
+                        tenant_id=claim.tenant_id,
+                        classroom_id=existing.classroom_id,
+                        owner_id=job.owner_id,
+                    )
                 return PromotionTarget(
                     classroom_id=existing.classroom_id,
                     version_number=existing.version_number,
@@ -1509,16 +1537,11 @@ class SqlAlchemyGenerationJobRepository:
                 )
                 if document_artifact is None or document_artifact.sha256 != document_sha256:
                     raise ValueError("document artifact is missing")
-                await session.execute(
-                    insert(ClassroomAsset)
-                    .values(
-                        id=state.classroom_id,
-                        tenant_id=claim.tenant_id,
-                        owner_id=job.owner_id,
-                        title=None,
-                        lifecycle_state="editing",
-                    )
-                    .on_conflict_do_nothing(index_elements=[ClassroomAsset.id])
+                await _lock_or_create_classroom_asset(
+                    session,
+                    tenant_id=claim.tenant_id,
+                    classroom_id=state.classroom_id,
+                    owner_id=job.owner_id,
                 )
                 session.add(
                     ClassroomVersion(
@@ -1532,7 +1555,11 @@ class SqlAlchemyGenerationJobRepository:
                         document_object_key=document_artifact.object_key,
                     )
                 )
-                await session.flush()
+                try:
+                    await session.flush()
+                except IntegrityError as exc:
+                    raise_for_classroom_version_allocation_conflict(exc)
+                    raise
                 for artifact in artifacts:
                     session.add(
                         ClassroomArtifact(
