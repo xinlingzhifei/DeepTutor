@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Callable
 from contextlib import contextmanager
+from dataclasses import replace
 import hashlib
 import io
 import os
@@ -415,6 +416,71 @@ async def test_local_source_reconcile_requires_the_persisted_owner_token(tmp_pat
             content_type="application/pdf",
             ownership_token="b" * 32,
         )
+
+
+@pytest.mark.asyncio
+async def test_local_temporary_reconcile_and_delete_require_persisted_owner(
+    tmp_path,
+) -> None:
+    payload = b"draft-media-result-unknown"
+    digest = hashlib.sha256(payload).hexdigest()
+    key = temporary_artifact_key(
+        "tenant-a",
+        "draft-asset-1",
+        "media/media-0123456789abcdef0123456789abcdef.png",
+    )
+    owner_token = "a" * 32
+    fake_token = "b" * 32
+    store = LocalClassroomArtifactStore(tmp_path, "tenant-a")
+
+    async def put_then_lose_response() -> None:
+        await store.put_verified(
+            key,
+            _body(payload),
+            digest,
+            len(payload),
+            content_type="image/png",
+            ownership_token=owner_token,
+        )
+        raise RuntimeError("object store response lost")
+
+    with pytest.raises(RuntimeError, match="response lost"):
+        await put_then_lose_response()
+
+    with pytest.raises(ObjectStoreConflictError, match="owned"):
+        await store.reconcile_verified(
+            key,
+            digest,
+            len(payload),
+            content_type="image/png",
+            ownership_token=fake_token,
+        )
+    assert await store.exists(key)
+
+    reconciled = await store.reconcile_verified(
+        key,
+        digest,
+        len(payload),
+        content_type="image/png",
+        ownership_token=owner_token,
+    )
+    assert reconciled is not None
+    with pytest.raises(ObjectStoreConflictError, match="owned"):
+        await store.delete_owned(replace(reconciled, ownership_token=fake_token))
+    assert await store.exists(key)
+    await store.delete_owned(reconciled)
+
+    assert not await store.exists(key)
+    assert (
+        await store.reconcile_verified(
+            key,
+            digest,
+            len(payload),
+            content_type="image/png",
+            ownership_token=fake_token,
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio

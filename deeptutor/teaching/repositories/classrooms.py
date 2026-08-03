@@ -919,6 +919,33 @@ class SqlAlchemyClassroomRepository:
             )
             return self._media_record(model) if model is not None else None
 
+    async def list_cleanup_pending(
+        self,
+        asset_id: str,
+        *,
+        limit: int = 8,
+    ) -> tuple[DraftMediaRecord, ...]:
+        _required(asset_id, "asset_id", 128)
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 8:
+            raise ValueError("limit must be between 1 and 8")
+        async with self._session_factory() as session:
+            models = (
+                await session.scalars(
+                    select(ClassroomDraftMedia)
+                    .where(
+                        ClassroomDraftMedia.classroom_id == asset_id,
+                        ClassroomDraftMedia.tenant_id == self._tenant_id,
+                        ClassroomDraftMedia.status == "cleanup_pending",
+                    )
+                    .order_by(
+                        ClassroomDraftMedia.created_at,
+                        ClassroomDraftMedia.id,
+                    )
+                    .limit(limit)
+                )
+            ).all()
+            return tuple(self._media_record(model) for model in models)
+
     async def get_media(
         self,
         asset_id: str,

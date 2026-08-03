@@ -275,6 +275,46 @@ def test_media_and_url_fields_reject_obfuscated_or_embedded_raw_references(
         validate_draft_document_references(document)
 
 
+def test_resource_url_reference_semantics_are_rejected_fail_closed() -> None:
+    with pytest.raises(InvalidDraftDocument, match="unsafe reference"):
+        validate_draft_document_references(
+            {"resourceUrl": "https://attacker.invalid/resource.json"}
+        )
+
+
+def test_thumbnail_path_rejects_a_relative_object_reference() -> None:
+    with pytest.raises(InvalidDraftDocument, match="unsafe reference"):
+        validate_draft_document_references(
+            {"thumbnailPath": "previews/chapter-1.png"}
+        )
+
+
+def test_thumbnail_path_field_is_rejected_without_url_syntax() -> None:
+    with pytest.raises(InvalidDraftDocument, match="unsafe reference"):
+        validate_draft_document_references({"thumbnailPath": "chapter-one"})
+
+
+def test_reference_values_are_recursively_decoded_to_a_bounded_fixed_point() -> None:
+    with pytest.raises(InvalidDraftDocument, match="unsafe reference"):
+        validate_draft_document_references(
+            {"thumbnailPath": "%2525252e%2525252e%2525252fsecret"}
+        )
+
+
+def test_asset_url_reference_semantics_are_rejected_fail_closed() -> None:
+    with pytest.raises(InvalidDraftDocument, match="unsafe reference"):
+        validate_draft_document_references(
+            {"assetUrl": "//attacker.invalid/asset.png"}
+        )
+
+
+def test_image_srcset_reference_semantics_are_rejected_fail_closed() -> None:
+    with pytest.raises(InvalidDraftDocument, match="unsafe reference"):
+        validate_draft_document_references(
+            {"imageSrcSet": "preview.png 1x, https://attacker.invalid/preview.png 2x"}
+        )
+
+
 def test_ordinary_teaching_text_may_name_a_url_without_becoming_a_reference() -> None:
     document = {
         "dslVersion": "0.1.0",
@@ -288,6 +328,17 @@ def test_ordinary_teaching_text_may_name_a_url_without_becoming_a_reference() ->
             }
         ],
         "mediaIds": [],
+    }
+
+    assert validate_draft_document_references(document) == frozenset()
+
+
+def test_path_like_field_names_do_not_reject_svg_or_teaching_text() -> None:
+    document = {
+        "path": "M 10 10 L 20 20 Z",
+        "learningPath": "Compare speed/distance, then explain the result.",
+        "resourceTitle": "Chapter 2 classroom discussion",
+        "thumbnailLabel": "Lesson preview",
     }
 
     assert validate_draft_document_references(document) == frozenset()
@@ -329,6 +380,55 @@ def test_interactive_html_parser_blocks_unsafe_or_malformed_markup(html: str) ->
     assert report["sections"]["interactive_security"]["status"] == "error"
 
 
+def test_svg_presentation_attributes_cannot_load_external_url_resources() -> None:
+    document = {
+        "scenes": [
+            {
+                "type": "interactive",
+                "content": {
+                    "html": (
+                        '<svg viewBox="0 0 10 10">'
+                        '<circle cx="5" cy="5" r="4" '
+                        'fill="url(//evil.invalid/pixel.svg)"></circle>'
+                        "</svg>"
+                    )
+                },
+            }
+        ]
+    }
+
+    with pytest.raises(InvalidDraftDocument, match="unsafe reference"):
+        validate_draft_document_references(document)
+
+
+@pytest.mark.parametrize(
+    "fill",
+    [
+        "U R L ( //evil.invalid/pixel.svg )",
+        "url(&#x2f;&#x2f;evil.invalid/pixel.svg)",
+        "%75%72%6c%28%2f%2fevil.invalid%2fpixel.svg%29",
+    ],
+)
+def test_svg_css_url_obfuscation_is_rejected(fill: str) -> None:
+    document = {
+        "scenes": [
+            {
+                "type": "interactive",
+                "content": {
+                    "html": (
+                        '<svg viewBox="0 0 10 10">'
+                        f'<circle cx="5" cy="5" r="4" fill="{fill}"></circle>'
+                        "</svg>"
+                    )
+                },
+            }
+        ]
+    }
+
+    with pytest.raises(InvalidDraftDocument, match="unsafe reference"):
+        validate_draft_document_references(document)
+
+
 def test_safe_interactive_fragment_and_opaque_media_id_are_accepted() -> None:
     media_id = "media-0123456789abcdef0123456789abcdef"
     document = {
@@ -346,6 +446,14 @@ def test_safe_interactive_fragment_and_opaque_media_id_are_accepted() -> None:
     }
 
     assert validate_draft_document_references(document) == frozenset({media_id})
+
+
+def test_semantic_media_id_suffix_is_validated_and_collected() -> None:
+    media_id = "media-0123456789abcdef0123456789abcdef"
+
+    assert validate_draft_document_references(
+        {"thumbnailMediaId": media_id}
+    ) == frozenset({media_id})
 
 
 def test_validation_report_has_nine_named_sections_and_explicit_severity() -> None:

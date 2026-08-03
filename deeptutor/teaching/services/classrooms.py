@@ -254,6 +254,13 @@ class ClassroomRepository(Protocol):
         media_id: str,
     ) -> DraftMediaRecord | None: ...
 
+    async def list_cleanup_pending(
+        self,
+        asset_id: str,
+        *,
+        limit: int = 8,
+    ) -> tuple[DraftMediaRecord, ...]: ...
+
     async def get_media(
         self,
         asset_id: str,
@@ -331,6 +338,7 @@ class DraftMediaStoreProvider(Protocol):
 
 
 _MEDIA_ID_PATTERN = re.compile(r"^media-[0-9a-f]{32}$")
+_MAX_OPPORTUNISTIC_MEDIA_CLEANUPS = 8
 _CREATION_IDEMPOTENCY_KEY_PATTERN = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$"
 )
@@ -566,13 +574,20 @@ def _normalized_field_name(value: str) -> str:
     return re.sub(r"[^a-z0-9]", "", value.casefold())
 
 
+def _field_tokens(value: str) -> tuple[str, ...]:
+    separated = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", value)
+    return tuple(token.casefold() for token in re.findall(r"[A-Za-z0-9]+", separated))
+
+
 def _decoded_reference(value: str) -> str:
     decoded = value
-    for _ in range(3):
+    for _ in range(8):
         candidate = unescape(unquote(decoded))
         if candidate == decoded:
-            break
+            return decoded
         decoded = candidate
+    if unescape(unquote(decoded)) != decoded:
+        raise InvalidDraftDocument("draft document has an unsafe reference")
     return decoded
 
 
@@ -591,10 +606,81 @@ def _contains_unsafe_reference(value: str) -> bool:
     )
 
 
-def _is_raw_reference_field(normalized_key: str) -> bool:
-    return normalized_key in _RAW_REFERENCE_FIELDS or (
-        _MEDIA_REFERENCE_FIELD.fullmatch(normalized_key) is not None
+def _contains_css_url(value: str) -> bool:
+    compact = "".join(
+        character
+        for character in _decoded_reference(value).casefold()
+        if not character.isspace() and ord(character) >= 32 and ord(character) != 127
     )
+    return "url(" in compact
+
+
+def _looks_like_reference_value(value: object) -> bool:
+    if isinstance(value, Mapping) or (
+        isinstance(value, Sequence)
+        and not isinstance(value, (str, bytes, bytearray))
+    ):
+        return True
+    if not isinstance(value, str):
+        return False
+    decoded = _decoded_reference(value).strip()
+    if _contains_unsafe_reference(decoded) or "\\" in decoded:
+        return True
+    if decoded.startswith(("/", "./", "../")):
+        return True
+    if re.search(r"(?:^|/)\.\.?(/|$)", decoded):
+        return True
+    if "/" in decoded and not any(character.isspace() for character in decoded):
+        return True
+    return re.fullmatch(r"[^\s/\\]+\.[A-Za-z0-9]{1,10}(?:[?#].*)?", decoded) is not None
+
+
+def _is_raw_reference_field(key: str) -> bool:
+    normalized_key = _normalized_field_name(key)
+    tokens = _field_tokens(key)
+    return (
+        normalized_key in _RAW_REFERENCE_FIELDS
+        or _MEDIA_REFERENCE_FIELD.fullmatch(normalized_key) is not None
+        or any(token in {"href", "src", "uri", "url"} for token in tokens)
+    )
+
+
+def _is_reference_semantic_field(key: str, value: object) -> bool:
+    if _is_raw_reference_field(key):
+        return True
+    normalized_key = _normalized_field_name(key)
+    tokens = set(_field_tokens(key))
+    reference_context = {
+        "asset",
+        "audio",
+        "file",
+        "image",
+        "media",
+        "object",
+        "poster",
+        "resource",
+        "storage",
+        "thumbnail",
+        "video",
+    }
+    if normalized_key.endswith("srcset"):
+        return True
+    if "path" in tokens:
+        if tokens.intersection(reference_context):
+            return True
+        return normalized_key == "path" and _looks_like_reference_value(value)
+    if tokens.intersection({"asset", "resource", "thumbnail"}):
+        return _looks_like_reference_value(value)
+    return False
+
+
+def _media_id_field_kind(key: str) -> str | None:
+    normalized = _normalized_field_name(key)
+    if normalized.endswith("mediaids"):
+        return "plural"
+    if normalized.endswith("mediaid"):
+        return "singular"
+    return None
 
 
 class _InteractiveHtmlValidator(HTMLParser):
@@ -628,10 +714,12 @@ class _InteractiveHtmlValidator(HTMLParser):
                 raise self._unsafe()
             value = raw_value or ""
             normalized_name = _normalized_field_name(name)
+            if _contains_css_url(value):
+                raise self._unsafe()
             if name == "href":
                 if not re.fullmatch(r"#[A-Za-z][A-Za-z0-9_.:-]*", value):
                     raise self._unsafe()
-            elif _is_raw_reference_field(normalized_name) or _contains_unsafe_reference(value):
+            elif _is_raw_reference_field(name) or _contains_unsafe_reference(value):
                 raise self._unsafe()
             if name == "data-media-id":
                 if _MEDIA_ID_PATTERN.fullmatch(value) is None:
@@ -708,21 +796,22 @@ def validate_draft_document_references(document: Mapping[str, Any]) -> frozenset
     media_ids: set[str] = set()
     for _path, key, value in _walk(document):
         normalized_key = _normalized_field_name(key) if isinstance(key, str) else None
+        media_id_kind = _media_id_field_kind(key) if isinstance(key, str) else None
         if normalized_key == "html":
             media_ids.update(_validate_interactive_html(value))
-        elif normalized_key is not None and _is_raw_reference_field(normalized_key):
-            raise InvalidDraftDocument("draft document has an unsafe reference")
-        if normalized_key == "mediaid":
+        elif media_id_kind == "singular":
             if not isinstance(value, str) or _MEDIA_ID_PATTERN.fullmatch(value) is None:
                 raise InvalidDraftDocument("draft document has an unsafe reference")
             media_ids.add(value)
-        elif normalized_key == "mediaids":
+        elif media_id_kind == "plural":
             if not isinstance(value, list) or any(
                 not isinstance(item, str) or _MEDIA_ID_PATTERN.fullmatch(item) is None
                 for item in value
             ):
                 raise InvalidDraftDocument("draft document has an unsafe reference")
             media_ids.update(value)
+        elif normalized_key is not None and _is_reference_semantic_field(key, value):
+            raise InvalidDraftDocument("draft document has an unsafe reference")
     return frozenset(media_ids)
 
 
@@ -1541,6 +1630,7 @@ class ClassroomService:
         record = await self._repository.get_workflow(asset_id)
         if record is None or not self._can_edit(context, record):
             return None
+        await self._reconcile_pending_media(context, asset_id)
         if record.job_id is not None:
             stage = await self._generation.get_stage(
                 context=context,
@@ -1562,6 +1652,24 @@ class ClassroomService:
                     record.job_id,
                 )
         return record
+
+    async def _reconcile_pending_media(
+        self,
+        context: TenantContext,
+        asset_id: str,
+    ) -> None:
+        try:
+            receipts = await self._repository.list_cleanup_pending(
+                asset_id,
+                limit=_MAX_OPPORTUNISTIC_MEDIA_CLEANUPS,
+            )
+        except Exception:
+            return
+        for receipt in receipts:
+            try:
+                await self.reconcile_media_cleanup(context, asset_id, receipt.id)
+            except Exception:
+                continue
 
     async def get_draft(
         self,

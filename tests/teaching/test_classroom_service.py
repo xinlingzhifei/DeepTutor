@@ -291,6 +291,13 @@ class _Repository:
     async def get_media_receipt(self, asset_id, media_id):
         return self.media.get((asset_id, media_id))
 
+    async def list_cleanup_pending(self, asset_id, *, limit=8):
+        return tuple(
+            receipt
+            for (classroom_id, _), receipt in self.media.items()
+            if classroom_id == asset_id and receipt.status == "cleanup_pending"
+        )[:limit]
+
     async def get_media(self, asset_id, media_id):
         return self.media.get((asset_id, media_id))
 
@@ -1251,6 +1258,48 @@ class _AfterWriteFailureStore(_Store):
         await super().delete_owned(artifact)
 
 
+class _CleanupListingRepository(_Repository):
+    def __init__(self) -> None:
+        super().__init__()
+        self.cleanup_list_calls: list[tuple[str, int]] = []
+
+    async def list_cleanup_pending(self, asset_id: str, *, limit: int = 8):
+        self.cleanup_list_calls.append((asset_id, limit))
+        return tuple(
+            receipt
+            for (classroom_id, _), receipt in self.media.items()
+            if classroom_id == asset_id and receipt.status == "cleanup_pending"
+        )[:limit]
+
+
+def _seed_cleanup_pending(
+    repository: _Repository,
+    store: _Store,
+    asset_id: str,
+    index: int = 0,
+) -> DraftMediaRecord:
+    media_id = f"media-{index:032x}"
+    body = b"\x89PNG\r\n\x1a\nimage-" + str(index).encode()
+    receipt = DraftMediaRecord(
+        id=media_id,
+        classroom_id=asset_id,
+        mime_type="image/png",
+        sha256=hashlib.sha256(body).hexdigest(),
+        size_bytes=len(body),
+        object_key=(
+            f"tenants/tenant-a/temporary/draft-{asset_id}/media/{media_id}.png"
+        ),
+        ownership_token=f"{index + 1:032x}",
+        object_revision=None,
+        status="cleanup_pending",
+        last_error_code="upload_failed",
+    )
+    repository.media[(asset_id, media_id)] = receipt
+    repository.media_status[(asset_id, media_id)] = "cleanup_pending"
+    store.content[receipt.object_key] = body
+    return receipt
+
+
 def _service_with_custom_store(context: TenantContext, store: _Store):
     repository = _Repository()
     return (
@@ -1263,6 +1312,137 @@ def _service_with_custom_store(context: TenantContext, store: _Store):
         ),
         repository,
     )
+
+
+@pytest.mark.asyncio
+async def test_authorized_asset_read_recovers_pending_media_without_media_id() -> None:
+    context = _context()
+    repository = _CleanupListingRepository()
+    store = _AfterWriteFailureStore(cleanup_failures=1)
+    service = ClassroomService(
+        repository,
+        TeachingBriefBuilder(context, object()),
+        _Generation(),
+        _StoreProvider(store),
+        clock=lambda: NOW,
+    )
+    created = await service.create(context, _request())
+    repository.records[created.asset_id] = replace(
+        repository.records[created.asset_id],
+        job_id=None,
+        lifecycle_state="editing",
+        status="succeeded",
+    )
+    body = b"\x89PNG\r\n\x1a\nimage"
+    with pytest.raises(RuntimeError, match="response lost"):
+        await service.upload_media(
+            context,
+            created.asset_id,
+            _Upload(body, "image/png"),
+            hashlib.sha256(body).hexdigest(),
+        )
+    ((asset_id, media_id), _) = next(iter(repository.media.items()))
+    assert repository.media_status[(asset_id, media_id)] == "cleanup_pending"
+
+    result = await service.get(context, created.asset_id)
+
+    assert result is not None
+    assert repository.cleanup_list_calls == [(created.asset_id, 8)]
+    assert repository.media_status[(asset_id, media_id)] == "failed"
+    assert store.content == {}
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_asset_read_does_not_probe_or_reconcile_pending_media() -> None:
+    owner_context = _context()
+    repository = _CleanupListingRepository()
+    store = _AfterWriteFailureStore()
+    service = ClassroomService(
+        repository,
+        TeachingBriefBuilder(owner_context, object()),
+        _Generation(),
+        _StoreProvider(store),
+        clock=lambda: NOW,
+    )
+    created = await service.create(owner_context, _request())
+    receipt = _seed_cleanup_pending(repository, store, created.asset_id)
+
+    result = await service.get(
+        _context(user_id="teacher-b", scope_id="class-b"),
+        created.asset_id,
+    )
+
+    assert result is None
+    assert repository.cleanup_list_calls == []
+    assert store.reconcile_calls == []
+    assert receipt.object_key in store.content
+
+
+@pytest.mark.asyncio
+async def test_authorized_asset_read_bounds_and_idempotently_retries_cleanup() -> None:
+    context = _context()
+    repository = _CleanupListingRepository()
+    store = _AfterWriteFailureStore()
+    service = ClassroomService(
+        repository,
+        TeachingBriefBuilder(context, object()),
+        _Generation(),
+        _StoreProvider(store),
+        clock=lambda: NOW,
+    )
+    created = await service.create(context, _request())
+    repository.records[created.asset_id] = replace(
+        repository.records[created.asset_id],
+        job_id=None,
+        lifecycle_state="editing",
+        status="succeeded",
+    )
+    receipts = [
+        _seed_cleanup_pending(repository, store, created.asset_id, index)
+        for index in range(9)
+    ]
+
+    assert await service.get(context, created.asset_id) is not None
+    assert len(store.reconcile_calls) == 8
+    assert repository.media_status[(created.asset_id, receipts[-1].id)] == (
+        "cleanup_pending"
+    )
+
+    assert await service.get(context, created.asset_id) is not None
+    assert len(store.reconcile_calls) == 9
+    assert repository.media_status[(created.asset_id, receipts[-1].id)] == "failed"
+
+    assert await service.get(context, created.asset_id) is not None
+    assert len(store.reconcile_calls) == 9
+    assert repository.cleanup_list_calls == [(created.asset_id, 8)] * 3
+
+
+@pytest.mark.asyncio
+async def test_opportunistic_cleanup_failure_does_not_block_authorized_read() -> None:
+    context = _context()
+    repository = _CleanupListingRepository()
+    store = _AfterWriteFailureStore(cleanup_failures=1)
+    service = ClassroomService(
+        repository,
+        TeachingBriefBuilder(context, object()),
+        _Generation(),
+        _StoreProvider(store),
+        clock=lambda: NOW,
+    )
+    created = await service.create(context, _request())
+    repository.records[created.asset_id] = replace(
+        repository.records[created.asset_id],
+        job_id=None,
+        lifecycle_state="editing",
+        status="succeeded",
+    )
+    receipt = _seed_cleanup_pending(repository, store, created.asset_id)
+
+    assert await service.get(context, created.asset_id) is not None
+    assert repository.media_status[(created.asset_id, receipt.id)] == "cleanup_pending"
+
+    assert await service.get(context, created.asset_id) is not None
+    assert repository.media_status[(created.asset_id, receipt.id)] == "failed"
 
 
 @pytest.mark.asyncio

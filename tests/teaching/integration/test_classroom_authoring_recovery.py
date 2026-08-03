@@ -202,6 +202,14 @@ async def test_postgres_authoring_recovery_is_durable_and_atomically_bound(
             "upload_failed",
         )
         assert pending.status == "cleanup_pending"
+        assert [
+            receipt.id
+            for receipt in await repository.list_cleanup_pending(
+                created.asset_id,
+                limit=8,
+            )
+        ] == [media_id]
+        assert await repository.list_cleanup_pending(second.asset_id, limit=8) == ()
         await repository.finish_media_cleanup(
             created.asset_id,
             media_id,
@@ -210,6 +218,7 @@ async def test_postgres_authoring_recovery_is_durable_and_atomically_bound(
         failed = await repository.get_media_receipt(created.asset_id, media_id)
         assert failed is not None
         assert failed.status == "failed"
+        assert await repository.list_cleanup_pending(created.asset_id, limit=8) == ()
 
         async with engine.connect() as connection:
             revision = await connection.scalar(

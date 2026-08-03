@@ -1046,8 +1046,13 @@ class LocalClassroomArtifactStore(_TenantScopedStore):
 
     def _source_receipt_path(self, key: str) -> Path:
         safe_key = self._require_scoped_key(key)
-        if _canonical_artifact_kind(safe_key, self.tenant_id) != "source":
-            raise ObjectStoreAccessDenied("ownership receipts require a source key")
+        if _canonical_artifact_kind(safe_key, self.tenant_id) not in {
+            "source",
+            "temporary",
+        }:
+            raise ObjectStoreAccessDenied(
+                "ownership receipts require a direct upload key"
+            )
         directory = self._root / _LOCAL_SOURCE_RECEIPT_DIRECTORY
         if directory.is_symlink():
             raise ObjectStoreAccessDenied("local source receipt path contains a symlink")
@@ -1117,19 +1122,13 @@ class LocalClassroomArtifactStore(_TenantScopedStore):
         await asyncio.to_thread(destination.parent.mkdir, parents=True, exist_ok=True)
         destination = self._path_for(safe_key)
         owner_token = _owner_token(ownership_token)
-        if create_only:
-            receipt_payload = _source_receipt_payload(
-                safe_key,
-                expected_sha256,
-                expected_size,
-                safe_content_type,
-                owner_token,
-            )
-            await asyncio.to_thread(
-                _ensure_local_source_receipt,
-                self._source_receipt_path(safe_key),
-                receipt_payload,
-            )
+        receipt_payload = _source_receipt_payload(
+            safe_key,
+            expected_sha256,
+            expected_size,
+            safe_content_type,
+            owner_token,
+        )
 
         temporary_handle = tempfile.NamedTemporaryFile(
             mode="w+b",
@@ -1148,6 +1147,11 @@ class LocalClassroomArtifactStore(_TenantScopedStore):
                 safe_content_type,
             )
             await asyncio.to_thread(temporary_handle.close)
+            await asyncio.to_thread(
+                _ensure_local_source_receipt,
+                self._source_receipt_path(safe_key),
+                receipt_payload,
+            )
             if create_only:
                 revision = await asyncio.to_thread(
                     _atomic_local_create,
@@ -1188,28 +1192,25 @@ class LocalClassroomArtifactStore(_TenantScopedStore):
         expected_size = _validate_size(size)
         safe_content_type = _validate_content_type(content_type)
         owner_token = _owner_token(ownership_token)
-        source_receipt_path: Path | None = None
-        source_receipt_payload: bytes | None = None
-        if _canonical_artifact_kind(safe_key, self.tenant_id) == "source":
-            source_receipt_path = self._source_receipt_path(safe_key)
-            source_receipt_payload = _source_receipt_payload(
-                safe_key,
-                expected_sha256,
-                expected_size,
-                safe_content_type,
-                owner_token,
-            )
-            receipt_exists = await asyncio.to_thread(
-                _require_local_source_receipt,
-                source_receipt_path,
-                source_receipt_payload,
-            )
-            if not receipt_exists:
-                if await asyncio.to_thread(self._path_for(safe_key).is_file):
-                    raise ObjectStoreConflictError(
-                        "source object has no matching ownership receipt"
-                    )
-                return None
+        receipt_path = self._source_receipt_path(safe_key)
+        receipt_payload = _source_receipt_payload(
+            safe_key,
+            expected_sha256,
+            expected_size,
+            safe_content_type,
+            owner_token,
+        )
+        receipt_exists = await asyncio.to_thread(
+            _require_local_source_receipt,
+            receipt_path,
+            receipt_payload,
+        )
+        if not receipt_exists:
+            if await asyncio.to_thread(self._path_for(safe_key).is_file):
+                raise ObjectStoreConflictError(
+                    "object has no matching ownership receipt"
+                )
+            return None
         artifact = _stored_artifact(
             safe_key,
             expected_sha256,
@@ -1420,7 +1421,10 @@ class LocalClassroomArtifactStore(_TenantScopedStore):
         path = self._path_for(artifact.key)
         receipt_path: Path | None = None
         receipt_payload: bytes | None = None
-        if _canonical_artifact_kind(artifact.key, self.tenant_id) == "source":
+        if _canonical_artifact_kind(artifact.key, self.tenant_id) in {
+            "source",
+            "temporary",
+        }:
             if not _is_owner_token(artifact.ownership_token):
                 raise ObjectStoreError("object ownership could not be verified")
             receipt_path = self._source_receipt_path(artifact.key)
