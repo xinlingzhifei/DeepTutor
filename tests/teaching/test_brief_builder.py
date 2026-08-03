@@ -91,8 +91,9 @@ def _snapshot() -> SourceSnapshot:
             scope_type="course",
             scope_id="course-a",
         ),
+        query_sha256="1" * 64,
         retrieval_provider="llamaindex",
-        index_signature="idx-v1",
+        retrieval_view_signature="2" * 64,
         created_at=datetime(2026, 8, 3, 8, tzinfo=timezone.utc),
         created_by="teacher-a",
     )
@@ -173,3 +174,5 @@ async def test_pdf_brief_uses_the_same_grounded_contract_mapping() -> None:
     assert brief.content_mode == "source_grounded"
     assert brief.contract.source_fragments[0].text == brief.fragments[0].text
     assert snapshots.calls[0][0] == "pdf-binding-a"
+    assert "Newton's second law" in snapshots.calls[0][1].query
+    assert "Relate net force, mass, and acceleration." in snapshots.calls[0][1].query

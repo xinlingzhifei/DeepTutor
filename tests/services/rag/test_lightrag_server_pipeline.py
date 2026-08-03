@@ -190,6 +190,8 @@ def test_search_returns_grounded_context(tmp_path: Path) -> None:
     assert res["mode"] == "hybrid"  # per-KB search_mode wins
     assert res["content"] == "CONTEXT[hybrid]"
     assert res["answer"] == res["content"]
+    assert res["content_kind"] == "retrieval_context"
+    assert res["retrieval_provenance"] == res["sources"]
     assert res["sources"][0]["file_path"] == "/docs/a.pdf"
 
 

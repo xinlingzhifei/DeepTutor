@@ -203,7 +203,12 @@ class LightRagPipeline:
         try:
             self._ensure_available()
             rag = engine.build_rag(storage.working_dir(root_dir))
-            answer = await engine.query(rag, query, mode)
+            context_only = kwargs.get("retrieval_context_only") is True
+            answer = (
+                await engine.query_context(rag, query, mode)
+                if context_only
+                else await engine.query(rag, query, mode)
+            )
         except lr_config.LightRagNotAvailableError as exc:
             return self._error_result(query, exc, error_type="not_configured")
         except Exception as exc:
@@ -211,7 +216,7 @@ class LightRagPipeline:
             self.logger.error(traceback.format_exc())
             return self._error_result(query, exc, error_type="retrieval_error")
 
-        return {
+        result = {
             "query": query,
             "answer": answer,
             "content": answer,
@@ -219,6 +224,15 @@ class LightRagPipeline:
             "provider": storage.PROVIDER,
             "mode": mode,
         }
+        if context_only:
+            result["content_kind"] = "retrieval_context"
+            result["retrieval_provenance"] = [
+                {
+                    "kind": "local_retrieval_view",
+                    "storage_view": root_dir.name,
+                }
+            ]
+        return result
 
     def _error_result(self, query: str, exc: Exception, *, error_type: str) -> Dict[str, Any]:
         return {

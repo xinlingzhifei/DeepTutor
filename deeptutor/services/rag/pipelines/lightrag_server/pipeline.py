@@ -78,11 +78,14 @@ class LightRagServerPipeline:
             return self._error_result(query, exc, error_type="retrieval_error")
 
         content = result.get("content") or ""
+        sources = result.get("sources") or []
         return {
             "query": query,
             "answer": content,
             "content": content,
-            "sources": result.get("sources") or [],
+            "content_kind": "retrieval_context",
+            "retrieval_provenance": sources,
+            "sources": sources,
             "provider": PROVIDER,
             "mode": mode,
         }

@@ -12,6 +12,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 import hashlib
+import hmac
 import json
 import multiprocessing
 import os
@@ -26,6 +27,10 @@ from deeptutor.multi_user.knowledge_access import (
     AuthorizedKnowledgeSource,
     resolve_authorized_source,
 )
+from deeptutor.services.rag.retrieval_view import (
+    canonical_retrieval_fragments,
+    canonical_retrieval_view_signature,
+)
 from deeptutor.teaching.permissions import ResourceScope
 from deeptutor.teaching.repositories.sources import (
     BoundSourceRecord,
@@ -38,10 +43,29 @@ from deeptutor.teaching.tenant_context import TenantContext
 
 _MAX_FRAGMENTS = 20
 _MAX_FRAGMENT_CHARS = 20_000
+_MAX_PDF_FRAGMENTS = 8
+_MAX_PDF_FRAGMENT_CHARS = 2_000
+_MAX_PDF_TOTAL_CHARS = 8_000
+_MAX_PDF_CANDIDATES = _MAX_PDF_FRAGMENTS * 4
 _MAX_PDF_BYTES = 100 * 1024 * 1024
-_MAX_EXTRACTED_PDF_CHARS = _MAX_FRAGMENTS * _MAX_FRAGMENT_CHARS
 _PDF_EXTRACTION_TIMEOUT_SECONDS = 30.0
 _PAGE_HEADING = re.compile(r"^--- Page (\d+) ---\s*$", re.MULTILINE)
+_PDF_SEGMENT_BOUNDARY = re.compile(r"\n\s*\n+|(?<=[.!?。！？])\s+")
+_QUERY_WORD = re.compile(r"[a-z0-9]+|[\u3400-\u9fff]+", re.IGNORECASE)
+_QUERY_STOP_WORDS = {
+    "about",
+    "and",
+    "describe",
+    "explain",
+    "for",
+    "how",
+    "into",
+    "lesson",
+    "the",
+    "this",
+    "what",
+    "with",
+}
 
 
 class SourceAccessDenied(PermissionError):
@@ -144,8 +168,9 @@ class SourceSnapshot:
     fragments: tuple[AuthorizedFragment, ...]
     source_refs: tuple[AuthorizedSourceReference, ...]
     permission_summary: PermissionEvidence
+    query_sha256: str
     retrieval_provider: str
-    index_signature: str
+    retrieval_view_signature: str
     created_at: datetime
     created_by: str
 
@@ -159,8 +184,9 @@ class SourceSnapshot:
         fragments: tuple[AuthorizedFragment, ...],
         source_refs: tuple[AuthorizedSourceReference, ...],
         permission_summary: PermissionEvidence,
+        query_sha256: str,
         retrieval_provider: str,
-        index_signature: str,
+        retrieval_view_signature: str,
         created_at: datetime,
         created_by: str,
     ) -> SourceSnapshot:
@@ -168,6 +194,9 @@ class SourceSnapshot:
             raise ValueError("source snapshot requires matched fragments and references")
         if created_at.utcoffset() is None:
             raise ValueError("source snapshot timestamp must be timezone-aware")
+        for digest in (query_sha256, retrieval_view_signature):
+            if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+                raise ValueError("source snapshot digest is invalid")
         fragment_ids = {fragment.fragment_id for fragment in fragments}
         if len(fragment_ids) != len(fragments):
             raise ValueError("source snapshot fragment identities must be unique")
@@ -183,9 +212,10 @@ class SourceSnapshot:
         canonical = {
             "created_by": created_by,
             "fragments": [_fragment_payload(item) for item in fragments],
-            "index_signature": index_signature,
             "permission_summary": asdict(permission_summary),
+            "query_sha256": query_sha256,
             "retrieval_provider": retrieval_provider,
+            "retrieval_view_signature": retrieval_view_signature,
             "schema_version": 1,
             "source_kind": source_kind,
             "source_revision": source_revision,
@@ -202,8 +232,9 @@ class SourceSnapshot:
             fragments=fragments,
             source_refs=source_refs,
             permission_summary=permission_summary,
+            query_sha256=query_sha256,
             retrieval_provider=retrieval_provider,
-            index_signature=index_signature,
+            retrieval_view_signature=retrieval_view_signature,
             created_at=created_at,
             created_by=created_by,
         )
@@ -220,9 +251,10 @@ class SourceSnapshot:
             "fragments": [_fragment_payload(item) for item in self.fragments],
             "source_refs": [asdict(item) for item in self.source_refs],
             "permission_summary": asdict(self.permission_summary),
+            "query_sha256": self.query_sha256,
             "retrieval": {
                 "provider": self.retrieval_provider,
-                "index_signature": self.index_signature,
+                "retrieval_view_signature": self.retrieval_view_signature,
             },
             "created_at": self.created_at.isoformat(),
             "created_by": self.created_by,
@@ -258,6 +290,7 @@ def _pdf_extraction_worker(
     max_pages: int,
     max_objects: int,
     memory_limit_bytes: int,
+    query: str,
 ) -> None:
     """Revalidate and extract a PDF inside a killable memory-bounded child."""
 
@@ -266,15 +299,9 @@ def _pdf_extraction_worker(
             _apply_pdf_worker_memory_limit,
             _validate_pdf_structure,
         )
-        from deeptutor.utils.document_extractor import extract_text_from_path
-
         _apply_pdf_worker_memory_limit(memory_limit_bytes)
         _validate_pdf_structure(path, max_pages, max_objects)
-        text = extract_text_from_path(
-            path,
-            max_bytes=_MAX_PDF_BYTES,
-            max_chars=_MAX_EXTRACTED_PDF_CHARS,
-        )
+        text = _extract_query_selected_pdf_text(path, query)
         connection.send(("ok", text))
     except BaseException:
         try:
@@ -291,6 +318,7 @@ async def _run_pdf_extraction_process(
     timeout_seconds: float = _PDF_EXTRACTION_TIMEOUT_SECONDS,
     worker: Callable[..., None] = _pdf_extraction_worker,
     memory_limit_bytes: int | None = None,
+    query: str = "document",
 ) -> str:
     """Extract text with the Task 2 process, timeout, and memory guardrails."""
 
@@ -320,6 +348,7 @@ async def _run_pdf_extraction_process(
             MAX_PDF_PAGES,
             _MAX_OBJECTS_INSPECTED,
             memory_limit_bytes or _PDF_INSPECTION_MEMORY_BYTES,
+            query,
         ),
     )
     try:
@@ -389,6 +418,27 @@ def _fragment_payload(fragment: AuthorizedFragment) -> dict[str, object]:
     }
 
 
+def _authorized_view_signature(
+    provider: str,
+    fragments: tuple[AuthorizedFragment, ...],
+) -> str:
+    return canonical_retrieval_view_signature(
+        {
+            "provider": provider,
+            "sources": [
+                {
+                    "content": fragment.text,
+                    "document_id": fragment.document_id,
+                    "id": fragment.fragment_id,
+                    "page": fragment.page,
+                    "section": fragment.section,
+                }
+                for fragment in fragments
+            ],
+        }
+    )
+
+
 def _scope_permission(context: TenantContext, request: SnapshotRequest) -> PermissionEvidence:
     scope = ResourceScope(
         tenant_id=context.tenant_id,
@@ -439,32 +489,27 @@ def _fragments_from_rag(
     stable_source_id: str,
     result: dict[str, Any],
 ) -> tuple[tuple[AuthorizedFragment, ...], tuple[AuthorizedSourceReference, ...]]:
-    raw_sources = result.get("sources")
-    if not isinstance(raw_sources, list):
-        raise SourceSnapshotUnavailable("knowledge retrieval returned no sources")
+    grounded = canonical_retrieval_fragments(result)
     fragments: list[AuthorizedFragment] = []
     references: list[AuthorizedSourceReference] = []
-    for position, raw in enumerate(raw_sources[:_MAX_FRAGMENTS]):
-        if not isinstance(raw, dict):
-            continue
-        text = str(raw.get("content") or raw.get("text") or raw.get("snippet") or "").strip()
+    for position, raw in enumerate(grounded[:_MAX_FRAGMENTS]):
+        text = str(raw.get("content") or "").strip()
         if not text:
             continue
         text = text[:_MAX_FRAGMENT_CHARS]
-        provider_id = str(raw.get("chunk_id") or raw.get("id") or position)
-        raw_origin = str(
-            raw.get("document_id")
-            or raw.get("doc_id")
-            or raw.get("source_id")
-            or raw.get("source")
-            or raw.get("file_path")
-            or raw.get("title")
-            or position
+        provenance = raw.get("provenance")
+        provenance_rows = provenance if isinstance(provenance, list) else []
+        primary = provenance_rows[0] if provenance_rows else {}
+        provider_id = str(
+            primary.get("chunk_id")
+            or primary.get("id")
+            or _digest(_canonical_json(provenance_rows), str(position))
         )
+        raw_origin = _canonical_json(provenance_rows) or str(position)
         document_id = f"document-{_digest(stable_source_id, raw_origin)}"
-        section_value = raw.get("title") or raw.get("section")
+        section_value = primary.get("title") or primary.get("section")
         section = _safe_label(section_value) if section_value else None
-        page = _page_number(raw.get("page"))
+        page = _page_number(primary.get("page"))
         fragment = AuthorizedFragment.create(
             stable_source_id=stable_source_id,
             provider_fragment_id=provider_id,
@@ -495,6 +540,8 @@ def _fragments_from_rag(
 def _pdf_fragments(
     stable_source_id: str,
     text: str,
+    *,
+    query: str,
 ) -> tuple[tuple[AuthorizedFragment, ...], tuple[AuthorizedSourceReference, ...]]:
     matches = list(_PAGE_HEADING.finditer(text))
     sections: list[tuple[int | None, str]] = []
@@ -507,13 +554,10 @@ def _pdf_fragments(
     document_id = f"document-{_digest(stable_source_id)}"
     fragments: list[AuthorizedFragment] = []
     references: list[AuthorizedSourceReference] = []
-    for position, (page, raw) in enumerate(sections[:_MAX_FRAGMENTS]):
-        normalized = raw.strip()[:_MAX_FRAGMENT_CHARS]
-        if not normalized:
-            continue
+    for page, position, normalized in _select_pdf_segments(sections, query):
         fragment = AuthorizedFragment.create(
             stable_source_id=stable_source_id,
-            provider_fragment_id=f"page-{page or position + 1}",
+            provider_fragment_id=f"page-{page or 0}-segment-{position}",
             text=normalized,
             document_id=document_id,
             page=page,
@@ -536,6 +580,115 @@ def _pdf_fragments(
     return tuple(fragments), tuple(references)
 
 
+def _query_terms(query: str) -> tuple[str, ...]:
+    terms: set[str] = set()
+    for match in _QUERY_WORD.finditer(query.casefold()):
+        value = match.group(0)
+        if value.isascii():
+            if len(value) >= 3 and value not in _QUERY_STOP_WORDS:
+                terms.add(value)
+            continue
+        if len(value) == 1:
+            terms.add(value)
+        else:
+            terms.update(value[index : index + 2] for index in range(len(value) - 1))
+    return tuple(sorted(terms, key=lambda item: (-len(item), item)))
+
+
+def _pdf_segments(raw: str) -> tuple[str, ...]:
+    segments: list[str] = []
+    for part in _PDF_SEGMENT_BOUNDARY.split(raw):
+        normalized = " ".join(part.split())
+        if not normalized:
+            continue
+        while len(normalized) > _MAX_PDF_FRAGMENT_CHARS:
+            split_at = normalized.rfind(" ", 0, _MAX_PDF_FRAGMENT_CHARS + 1)
+            if split_at < _MAX_PDF_FRAGMENT_CHARS // 2:
+                split_at = _MAX_PDF_FRAGMENT_CHARS
+            segments.append(normalized[:split_at].strip())
+            normalized = normalized[split_at:].strip()
+        if normalized:
+            segments.append(normalized)
+    return tuple(segments)
+
+
+def _pdf_relevance(text: str, query_terms: tuple[str, ...]) -> int:
+    lowered = text.casefold()
+    return sum(min(lowered.count(term), 3) * len(term) for term in query_terms)
+
+
+def _select_pdf_segments(
+    sections: Any,
+    query: str,
+) -> tuple[tuple[int | None, int, str], ...]:
+    query_terms = _query_terms(query)
+    candidates: list[tuple[int, int | None, int, str]] = []
+    for page_position, (page, raw) in enumerate(sections):
+        for segment_position, segment in enumerate(_pdf_segments(raw)):
+            score = _pdf_relevance(segment, query_terms)
+            if score <= 0:
+                continue
+            candidates.append(
+                (score, page, page_position * 10_000 + segment_position, segment)
+            )
+            if len(candidates) > _MAX_PDF_CANDIDATES:
+                candidates.sort(key=lambda item: (-item[0], item[2]))
+                del candidates[_MAX_PDF_CANDIDATES:]
+    if not candidates:
+        raise SourceSnapshotUnavailable("PDF source has no query-relevant text")
+    candidates.sort(key=lambda item: (-item[0], item[2]))
+
+    selected: list[tuple[int | None, int, str]] = []
+    total_chars = 0
+    for _score, page, position, raw in candidates:
+        if len(selected) >= _MAX_PDF_FRAGMENTS or total_chars >= _MAX_PDF_TOTAL_CHARS:
+            break
+        remaining = _MAX_PDF_TOTAL_CHARS - total_chars
+        normalized = raw.strip()[: min(_MAX_PDF_FRAGMENT_CHARS, remaining)]
+        if not normalized:
+            continue
+        selected.append((page, position, normalized))
+        total_chars += len(normalized)
+    return tuple(selected)
+
+
+def _extract_query_selected_pdf_text(path: str, query: str) -> str:
+    """Scan every page but retain only the bounded query-relevant view."""
+
+    try:
+        import fitz
+    except ImportError:  # pragma: no cover - production installs PyMuPDF
+        fitz = None
+
+    if fitz is not None:
+        with fitz.open(path) as document:
+            if document.is_encrypted and not document.authenticate(""):
+                raise SourceSnapshotUnavailable("PDF is encrypted")
+            selected = _select_pdf_segments(
+                (
+                    (page_number, page.get_text() or "")
+                    for page_number, page in enumerate(document, 1)
+                ),
+                query,
+            )
+    else:  # pragma: no cover - fallback for minimal installations
+        from pypdf import PdfReader
+
+        reader = PdfReader(path)
+        if getattr(reader, "is_encrypted", False):
+            raise SourceSnapshotUnavailable("PDF is encrypted")
+        selected = _select_pdf_segments(
+            (
+                (page_number, page.extract_text() or "")
+                for page_number, page in enumerate(reader.pages, 1)
+            ),
+            query,
+        )
+    return "\n\n".join(
+        f"--- Page {page or 0} ---\n{text}" for page, _position, text in selected
+    )
+
+
 class SourceSnapshotBuilder:
     """Build and persist query-specific snapshots after two-layer authorization."""
 
@@ -555,9 +708,7 @@ class SourceSnapshotBuilder:
         self._context = context
         self._repository = repository
         self._knowledge_resolver = knowledge_resolver
-        self._rag_service_factory = rag_service_factory or (
-            lambda source: source.create_rag_service()
-        )
+        self._rag_service_factory = rag_service_factory
         self._store_provider = store_provider
         self._pdf_extractor = pdf_extractor
         self._clock = clock
@@ -621,19 +772,41 @@ class SourceSnapshotBuilder:
             or bound.resource_owner_id != resource.resource_owner_id
         ):
             raise SourceAccessDenied("knowledge source identity does not match its binding")
-        result = await self._rag_service_factory(resource).search(request.query, resource.name)
+        if self._rag_service_factory is None:
+            result = await resource.search(request.query)
+        else:
+            result = await self._rag_service_factory(resource).search(
+                request.query,
+                resource.name,
+            )
         if result.get("error_type") or result.get("needs_reindex"):
             raise SourceSnapshotUnavailable("knowledge retrieval is unavailable")
         provider = str(result.get("provider") or "").strip()
         if not provider:
             raise SourceSnapshotUnavailable("knowledge retrieval provider is missing")
-        index_signature = str(
-            result.get("index_signature") or resource.index_signature
-        ).strip()
-        if not index_signature:
-            raise SourceSnapshotUnavailable("knowledge index signature is missing")
-        if index_signature != resource.index_signature:
+        if provider != resource.retrieval_provider:
             raise SourceAccessDenied("knowledge source changed during retrieval")
+        computed_view_signature = canonical_retrieval_view_signature(result)
+        if not computed_view_signature:
+            if (
+                result.get("content_kind") == "retrieval_context"
+                and str(result.get("content") or "").strip()
+            ):
+                raise SourceSnapshotUnavailable(
+                    "knowledge provider returned context without traceable provenance; "
+                    "update or reconnect the provider"
+                )
+            raise SourceSnapshotUnavailable(
+                "knowledge retrieval returned no grounded fragments"
+            )
+        claimed_view_signature = str(
+            result.get("retrieval_view_signature") or ""
+        ).strip()
+        if not claimed_view_signature or not hmac.compare_digest(
+            claimed_view_signature,
+            computed_view_signature,
+        ):
+            raise SourceAccessDenied("knowledge retrieval view changed during retrieval")
         try:
             current_resource = self._knowledge_resolver(resource.resource_id)
         except HTTPException as exc:
@@ -644,10 +817,11 @@ class SourceSnapshotBuilder:
             or current_resource.name != resource.name
             or current_resource.source != resource.source
             or current_resource.resource_owner_id != resource.resource_owner_id
-            or current_resource.index_signature != resource.index_signature
+            or current_resource.retrieval_provider != resource.retrieval_provider
         ):
             raise SourceAccessDenied("knowledge source changed during retrieval")
         fragments, references = _fragments_from_rag(resource.resource_id, result)
+        authorized_view_signature = _authorized_view_signature(provider, fragments)
         snapshot = SourceSnapshot.create(
             source_kind="knowledge_base",
             stable_source_id=resource.resource_id,
@@ -655,8 +829,9 @@ class SourceSnapshotBuilder:
             fragments=fragments,
             source_refs=references,
             permission_summary=permission,
+            query_sha256=hashlib.sha256(request.query.encode("utf-8")).hexdigest(),
             retrieval_provider=provider,
-            index_signature=index_signature,
+            retrieval_view_signature=authorized_view_signature,
             created_at=self._clock(),
             created_by=self._context.user_id,
         )
@@ -701,7 +876,10 @@ class SourceSnapshotBuilder:
                 raise SourceSnapshotUnavailable("PDF source integrity check failed")
             filename = bound.display_name or "source.pdf"
             if self._pdf_extractor is None:
-                text = await _run_pdf_extraction_process(handle.name)
+                text = await _run_pdf_extraction_process(
+                    handle.name,
+                    query=request.query,
+                )
             else:
                 text = await self._pdf_extractor(handle.name, filename)
         finally:
@@ -711,7 +889,15 @@ class SourceSnapshotBuilder:
                 await asyncio.to_thread(os.unlink, handle.name)
             except FileNotFoundError:
                 pass
-        fragments, references = _pdf_fragments(bound.source_id, text)
+        fragments, references = _pdf_fragments(
+            bound.source_id,
+            text,
+            query=request.query,
+        )
+        retrieval_view_signature = _authorized_view_signature(
+            "document_extractor",
+            fragments,
+        )
         snapshot = SourceSnapshot.create(
             source_kind="pdf",
             stable_source_id=bound.source_id,
@@ -719,8 +905,9 @@ class SourceSnapshotBuilder:
             fragments=fragments,
             source_refs=references,
             permission_summary=permission,
+            query_sha256=hashlib.sha256(request.query.encode("utf-8")).hexdigest(),
             retrieval_provider="document_extractor",
-            index_signature="document-extractor-v1",
+            retrieval_view_signature=retrieval_view_signature,
             created_at=self._clock(),
             created_by=self._context.user_id,
         )

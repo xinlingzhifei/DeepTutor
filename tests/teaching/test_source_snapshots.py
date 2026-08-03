@@ -12,6 +12,7 @@ from fastapi import HTTPException
 import pytest
 
 from deeptutor.multi_user.knowledge_access import AuthorizedKnowledgeSource
+from deeptutor.services.rag.retrieval_view import stamp_retrieval_view_signature
 from deeptutor.teaching.permissions import ScopedPermission
 from deeptutor.teaching.repositories.sources import (
     BoundSourceRecord,
@@ -24,6 +25,7 @@ from deeptutor.teaching.source_snapshots import (
     SourceAccessDenied,
     SourceSnapshotBuilder,
     SourceSnapshotUnavailable,
+    _pdf_fragments,
     _run_pdf_extraction_process,
 )
 from deeptutor.teaching.tenant_context import TenantContext
@@ -58,16 +60,20 @@ def _request() -> SnapshotRequest:
     )
 
 
-def _resource(tmp_path: Path) -> AuthorizedKnowledgeSource:
+def _resource(
+    tmp_path: Path,
+    *,
+    provider: str = "llamaindex",
+) -> AuthorizedKnowledgeSource:
+    del tmp_path
     return AuthorizedKnowledgeSource(
         resource_id=RESOURCE_ID,
         generation_id=GENERATION,
         name="mechanics",
         source="user",
         resource_owner_id="teacher-a",
-        read_only=False,
-        index_signature="idx-v1",
-        _base_dir=tmp_path,
+        read_only=True,
+        retrieval_provider=provider,
     )
 
 
@@ -79,9 +85,8 @@ def test_authorized_knowledge_source_rejects_alias_identity(tmp_path: Path) -> N
             name="mechanics",
             source="user",
             resource_owner_id="teacher-a",
-            read_only=False,
-            index_signature="idx-v1",
-            _base_dir=tmp_path,
+            read_only=True,
+            retrieval_provider="llamaindex",
         )
 
 
@@ -101,8 +106,15 @@ def _bound_source() -> BoundSourceRecord:
     )
 
 
-def _sleeping_pdf_extraction_worker(path, connection, max_pages, max_objects, memory_limit):
-    del path, connection, max_pages, max_objects, memory_limit
+def _sleeping_pdf_extraction_worker(
+    path,
+    connection,
+    max_pages,
+    max_objects,
+    memory_limit,
+    query,
+):
+    del path, connection, max_pages, max_objects, memory_limit, query
     time.sleep(10)
 
 
@@ -112,8 +124,9 @@ def _memory_bomb_pdf_extraction_worker(
     max_pages,
     max_objects,
     memory_limit,
+    query,
 ):
-    del path, max_pages, max_objects
+    del path, max_pages, max_objects, query
     from deeptutor.teaching.services.sources import _apply_pdf_worker_memory_limit
 
     _apply_pdf_worker_memory_limit(memory_limit)
@@ -151,7 +164,32 @@ class _RagService:
 
     async def search(self, query: str, kb_name: str):
         self.calls.append((query, kb_name))
+        if "retrieval_view_signature" not in self.result:
+            stamp_retrieval_view_signature(self.result)
         return self.result
+
+
+def _context_view_signature(result: dict[str, object]) -> str:
+    payload = {
+        "content_kind": "retrieval_context",
+        "fragments": [
+            {
+                "content": str(result["content"]).strip(),
+                "provenance": result.get("retrieval_provenance") or result.get("sources") or [],
+            }
+        ],
+        "mode": str(result.get("mode") or ""),
+        "provider": str(result["provider"]),
+        "schema_version": 1,
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 @pytest.mark.asyncio
@@ -231,7 +269,7 @@ async def test_grounded_snapshot_contains_only_authorized_fragments_and_stable_d
     # Idempotent persistence returns the original immutable creation timestamp.
     assert first.created_at == second.created_at
     assert first.retrieval_provider == "llamaindex"
-    assert first.index_signature == "idx-v1"
+    assert len(first.retrieval_view_signature) == 64
     assert len(first.fragments) == 1
     assert all(fragment.permission == "source.use" for fragment in first.fragments)
     assert all(reference.document_id for reference in first.source_refs)
@@ -278,7 +316,7 @@ async def test_different_queries_materialize_distinct_immutable_manifests(
 
     class _SequentialRag:
         async def search(self, query: str, kb_name: str):
-            return next(results)
+            return stamp_retrieval_view_signature(next(results))
 
     builder = SourceSnapshotBuilder(
         _context(),
@@ -370,7 +408,7 @@ async def test_pdf_snapshot_uses_controlled_object_reader_without_leaking_key() 
 
     async def extract(_path: str, filename: str) -> str:
         assert filename == "mechanics.pdf"
-        return "--- Page 1 ---\nForce and motion."
+        return "--- Page 1 ---\nNewton's second law explains force and motion."
 
     builder = SourceSnapshotBuilder(
         _context(),
@@ -382,7 +420,7 @@ async def test_pdf_snapshot_uses_controlled_object_reader_without_leaking_key() 
     snapshot = await builder.from_pdf("pdf-binding-a", _request())
 
     payload = json.dumps(snapshot.to_generation_payload(), sort_keys=True)
-    assert snapshot.fragments[0].text == "Force and motion."
+    assert snapshot.fragments[0].text == "Newton's second law explains force and motion."
     assert snapshot.source_refs[0].page == 1
     assert bound.object_key not in payload
     assert "object_key" not in payload
@@ -397,9 +435,8 @@ async def test_generation_flip_during_retrieval_is_rejected(tmp_path: Path) -> N
         name=original.name,
         source="user",
         resource_owner_id="teacher-a",
-        read_only=False,
-        index_signature="idx-v2",
-        _base_dir=tmp_path,
+        read_only=True,
+        retrieval_provider="llamaindex",
     )
     resolutions = iter((original, replacement))
     repository = _Repository()
@@ -409,6 +446,40 @@ async def test_generation_flip_during_retrieval_is_rejected(tmp_path: Path) -> N
             "index_signature": "idx-v1",
             "sources": [
                 {"chunk_id": "new", "content": "Replacement content", "source": "book.pdf"}
+            ],
+        }
+    )
+    builder = SourceSnapshotBuilder(
+        _context(),
+        repository,
+        knowledge_resolver=lambda _kb_ref: next(resolutions),
+        rag_service_factory=lambda _source: rag,
+    )
+
+    with pytest.raises(SourceAccessDenied, match="changed during retrieval"):
+        await builder.from_kb(RESOURCE_ID, _request())
+
+    assert repository.persisted == []
+
+
+@pytest.mark.asyncio
+async def test_provider_flip_during_retrieval_is_rejected(tmp_path: Path) -> None:
+    resolutions = iter(
+        (
+            _resource(tmp_path, provider="llamaindex"),
+            _resource(tmp_path, provider="lightrag"),
+        )
+    )
+    repository = _Repository()
+    rag = _RagService(
+        {
+            "provider": "llamaindex",
+            "sources": [
+                {
+                    "chunk_id": "chunk",
+                    "content": "Grounded context.",
+                    "source": "book.pdf",
+                }
             ],
         }
     )
@@ -518,3 +589,217 @@ async def test_pdf_extraction_cancellation_reaps_child(tmp_path: Path) -> None:
         await task
 
     assert _active_pdf_extractors() == before
+
+
+@pytest.mark.asyncio
+async def test_pdf_worker_selects_relevant_pages_after_old_400k_cutoff(
+    tmp_path: Path,
+) -> None:
+    fitz = pytest.importorskip("fitz")
+    pdf = tmp_path / "late-relevant.pdf"
+    document = fitz.open()
+    try:
+        filler_line = "administrative scheduling material " * 3
+        for _ in range(210):
+            page = document.new_page(width=612, height=792)
+            for line in range(35):
+                page.insert_text((20, 20 + line * 20), filler_line, fontsize=8)
+        page = document.new_page(width=612, height=792)
+        page.insert_text(
+            (20, 40),
+            "Photosynthesis uses chlorophyll to convert light into chemical energy.",
+            fontsize=10,
+        )
+        document.save(pdf)
+    finally:
+        document.close()
+
+    selected = await _run_pdf_extraction_process(
+        pdf,
+        query="Explain photosynthesis and chlorophyll",
+    )
+
+    assert "Photosynthesis uses chlorophyll" in selected
+    assert "administrative scheduling" not in selected
+    assert len(selected) <= 10_000
+
+
+def test_pdf_fragments_are_query_selected_and_strictly_bounded() -> None:
+    pages = [
+        "--- Page 1 ---\nPRIVATE student medical notes must stay outside teaching context.",
+        *(f"--- Page {page} ---\nUnrelated administrative material {page}." for page in range(2, 27)),
+        (
+            "--- Page 27 ---\nPhotosynthesis uses chlorophyll to convert light energy "
+            "into chemical energy.\n\n" + "Relevant detail. " * 400
+        ),
+        "--- Page 28 ---\nUnrelated appendix.",
+    ]
+
+    fragments, references = _pdf_fragments(
+        "pdf-source-a",
+        "\n".join(pages),
+        query="Explain photosynthesis and chlorophyll",
+    )
+
+    assert {reference.page for reference in references} == {27}
+    assert all("PRIVATE" not in fragment.text for fragment in fragments)
+    assert len(fragments) <= 8
+    assert all(len(fragment.text) <= 2_000 for fragment in fragments)
+    assert sum(len(fragment.text) for fragment in fragments) <= 8_000
+
+
+@pytest.mark.asyncio
+async def test_query_hash_changes_snapshot_identity_when_fragments_are_identical(
+    tmp_path: Path,
+) -> None:
+    repository = _Repository()
+    rag = _RagService(
+        {
+            "provider": "llamaindex",
+            "index_signature": "idx-v1",
+            "sources": [
+                {
+                    "chunk_id": "same",
+                    "content": "The same grounded passage.",
+                    "source": "book.pdf",
+                }
+            ],
+        }
+    )
+    builder = SourceSnapshotBuilder(
+        _context(),
+        repository,
+        knowledge_resolver=lambda _kb_ref: _resource(tmp_path),
+        rag_service_factory=lambda _source: rag,
+    )
+
+    first = await builder.from_kb(RESOURCE_ID, _request())
+    second = await builder.from_kb(
+        RESOURCE_ID,
+        SnapshotRequest("course-a", "class-a", "Explain a different objective"),
+    )
+
+    assert first.snapshot_id != second.snapshot_id
+    manifests = [json.loads(item[1].citation_manifest) for item in repository.persisted]
+    assert manifests[0]["query_sha256"] != manifests[1]["query_sha256"]
+    assert "Explain" not in repository.persisted[0][1].citation_manifest
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "result,expected",
+    (
+        (
+            {
+                "provider": "lightrag",
+                "content": "Local context-only passage.",
+                "sources": [],
+            },
+            "Local context-only passage.",
+        ),
+        (
+            {
+                "provider": "lightrag-server",
+                "content": "Remote context-only passage.",
+                "sources": [{"id": "1", "file_path": "/docs/a.pdf"}],
+            },
+            "Remote context-only passage.",
+        ),
+    ),
+)
+async def test_real_lightrag_provider_shapes_produce_grounded_snapshots(
+    tmp_path: Path,
+    result: dict[str, object],
+    expected: str,
+) -> None:
+    result["content_kind"] = "retrieval_context"
+    result["retrieval_provenance"] = result.get("sources") or [
+        {"kind": "local_retrieval_view", "storage_view": "version-7"}
+    ]
+    result["retrieval_view_signature"] = _context_view_signature(result)
+    builder = SourceSnapshotBuilder(
+        _context(),
+        _Repository(),
+        knowledge_resolver=lambda _kb_ref: _resource(
+            tmp_path,
+            provider=str(result["provider"]),
+        ),
+        rag_service_factory=lambda _source: _RagService(result),
+    )
+
+    snapshot = await builder.from_kb(RESOURCE_ID, _request())
+
+    assert snapshot.fragments[0].text == expected
+
+
+@pytest.mark.asyncio
+async def test_answer_shaped_lightrag_content_without_context_marker_fails_closed(
+    tmp_path: Path,
+) -> None:
+    builder = SourceSnapshotBuilder(
+        _context(),
+        _Repository(),
+        knowledge_resolver=lambda _kb_ref: _resource(tmp_path, provider="lightrag"),
+        rag_service_factory=lambda _source: _RagService(
+            {
+                "provider": "lightrag",
+                "answer": "Model-generated answer.",
+                "content": "Model-generated answer.",
+                "sources": [],
+            }
+        ),
+    )
+
+    with pytest.raises(SourceSnapshotUnavailable, match="grounded fragments"):
+        await builder.from_kb(RESOURCE_ID, _request())
+
+
+@pytest.mark.asyncio
+async def test_context_only_provider_without_provenance_fails_actionably(
+    tmp_path: Path,
+) -> None:
+    builder = SourceSnapshotBuilder(
+        _context(),
+        _Repository(),
+        knowledge_resolver=lambda _kb_ref: _resource(
+            tmp_path,
+            provider="lightrag-server",
+        ),
+        rag_service_factory=lambda _source: _RagService(
+            {
+                "provider": "lightrag-server",
+                "content_kind": "retrieval_context",
+                "content": "Context from an old server without references.",
+                "sources": [],
+            }
+        ),
+    )
+
+    with pytest.raises(SourceSnapshotUnavailable, match="traceable provenance"):
+        await builder.from_kb(RESOURCE_ID, _request())
+
+
+@pytest.mark.asyncio
+async def test_claimed_retrieval_view_signature_cannot_hide_content_flip(
+    tmp_path: Path,
+) -> None:
+    result = {
+        "provider": "llamaindex",
+        "retrieval_view_signature": hashlib.sha256(b"original context").hexdigest(),
+        "sources": [
+            {
+                "chunk_id": "chunk-a",
+                "content": "Tampered replacement context.",
+                "source": "book.pdf",
+            }
+        ],
+    }
+    builder = SourceSnapshotBuilder(
+        _context(),
+        _Repository(),
+        knowledge_resolver=lambda _kb_ref: _resource(tmp_path),
+        rag_service_factory=lambda _source: _RagService(result),
+    )
+
+    with pytest.raises(SourceAccessDenied, match="retrieval view changed"):
+        await builder.from_kb(RESOURCE_ID, _request())

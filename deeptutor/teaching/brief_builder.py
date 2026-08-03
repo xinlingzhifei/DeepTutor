@@ -125,6 +125,16 @@ def _brief_id(
     return f"brief-{_digest(context.tenant_id, spec.course_id, spec.class_id, spec.objective, content_mode, snapshot_sha256 or '')}"
 
 
+def _grounding_query(spec: TeachingBriefSpec) -> str:
+    return "\n".join(
+        (
+            spec.objective,
+            *(point.title for point in spec.knowledge_points),
+            *(point.description for point in spec.knowledge_points),
+        )
+    )
+
+
 class TeachingBriefBuilder:
     """Map source authorization evidence to the immutable v1 contract."""
 
@@ -145,18 +155,12 @@ class TeachingBriefBuilder:
             raise OpenCreationNotAcknowledged(
                 "open creation must use the explicit open_creation entry point"
             )
-        query = "\n".join(
-            (
-                spec.objective,
-                *(point.title for point in spec.knowledge_points),
-            )
-        )
         snapshot = await self._snapshots.from_kb(
             kb_ref,
             SnapshotRequest(
                 course_id=spec.course_id,
                 class_id=spec.class_id,
-                query=query,
+                query=_grounding_query(spec),
             ),
         )
         return self._grounded(spec, snapshot)
@@ -175,7 +179,7 @@ class TeachingBriefBuilder:
             SnapshotRequest(
                 course_id=spec.course_id,
                 class_id=spec.class_id,
-                query=spec.objective,
+                query=_grounding_query(spec),
             ),
         )
         return self._grounded(spec, snapshot)

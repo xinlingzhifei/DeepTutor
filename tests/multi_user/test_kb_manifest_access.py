@@ -87,5 +87,11 @@ def test_authorized_source_exposes_only_generation_pinned_identity(
         assert source.resource_id == f"user:kb:{source.generation_id}"
         assert source.resource_owner_id == "u_alice"
         assert source.name == "alice-kb"
+        assert source.read_only is True
         assert not hasattr(source, "base_dir")
+        assert not hasattr(source, "_base_dir")
+        assert not hasattr(source, "create_rag_service")
+        assert not hasattr(source, "initialize")
+        assert not hasattr(source, "add_documents")
+        assert not hasattr(source, "delete")
         assert str(mu_isolated_root.resolve()) not in repr(source)

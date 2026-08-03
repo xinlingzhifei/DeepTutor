@@ -16,6 +16,7 @@ from deeptutor.runtime.home import get_runtime_data_root
 
 from .factory import DEFAULT_PROVIDER, get_pipeline, list_pipelines, normalize_provider_name
 from .provider_binding import resolve_bound_provider
+from .retrieval_view import stamp_retrieval_view_signature
 
 DEFAULT_KB_BASE_DIR = str(get_runtime_data_root() / "knowledge_bases")
 
@@ -167,6 +168,31 @@ class RAGService:
                 pass
 
             return result
+
+    async def search_grounded(
+        self,
+        query: str,
+        kb_name: str,
+        event_sink=None,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """Return context-only retrieval with a canonical view signature.
+
+        Providers that return source chunks are normalized directly. Providers
+        with top-level content must explicitly mark it as retrieval context;
+        generated answer-shaped content is never stamped as grounded.
+        """
+
+        result = await self.search(
+            query,
+            kb_name,
+            event_sink=event_sink,
+            retrieval_context_only=True,
+            **kwargs,
+        )
+        if result.get("error_type") or result.get("needs_reindex"):
+            return result
+        return stamp_retrieval_view_signature(result)
 
     async def _emit_tool_event(
         self,

@@ -80,6 +80,24 @@ async def test_search_forwards_mode_kwarg_to_pipeline(fake_service) -> None:
     assert last["kwargs"].get("top_k") == 5
 
 
+@pytest.mark.asyncio
+async def test_search_grounded_stamps_actual_context_and_provenance(fake_service) -> None:
+    service, pipeline = fake_service
+    pipeline.search_result = {
+        "content": "retrieved context",
+        "content_kind": "retrieval_context",
+        "retrieval_provenance": [
+            {"kind": "local_retrieval_view", "storage_view": "version-3"}
+        ],
+        "sources": [],
+    }
+
+    result = await service.search_grounded(query="hi", kb_name="kb")
+
+    assert len(result["retrieval_view_signature"]) == 64
+    assert pipeline.calls[-1]["kwargs"]["retrieval_context_only"] is True
+
+
 def test_ragservice_routes_provider_from_kb_config_when_metadata_missing(tmp_path) -> None:
     kb = tmp_path / "kb"
     kb.mkdir()

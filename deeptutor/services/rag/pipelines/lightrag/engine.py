@@ -103,4 +103,35 @@ async def query(rag: Any, question: str, mode: str | None = None) -> str:
     return result if isinstance(result, str) else str(result)
 
 
-__all__ = ["build_rag", "insert", "ensure_ready", "query"]
+async def query_context(rag: Any, question: str, mode: str | None = None) -> str:
+    """Return LightRAG retrieval context without invoking answer generation."""
+
+    resolved = normalize_mode(mode) or DEFAULT_MODE
+    extra = query_kwargs_from_settings()
+    await ensure_ready(rag)
+    try:
+        result = await rag.aquery(
+            question,
+            mode=resolved,
+            only_need_context=True,
+            **extra,
+        )
+    except TypeError:
+        if not extra:
+            raise
+        logger.debug(
+            "RAG-Anything rejected extra query kwargs; retrying context-only mode."
+        )
+        result = await rag.aquery(
+            question,
+            mode=resolved,
+            only_need_context=True,
+        )
+    if isinstance(result, str):
+        return result
+    if isinstance(result, dict):
+        return str(result.get("content") or result.get("response") or "")
+    return str(result)
+
+
+__all__ = ["build_rag", "insert", "ensure_ready", "query", "query_context"]

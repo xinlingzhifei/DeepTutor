@@ -296,6 +296,28 @@ def test_lightrag_query_initializes_raganything_before_aquery(monkeypatch) -> No
     assert calls == ["ensure", "aquery"]
 
 
+def test_lightrag_query_context_never_falls_back_to_generated_answer(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class _Rag:
+        lightrag = object()
+
+        async def aquery(self, question, mode=None, **kwargs):
+            captured.update({"question": question, "mode": mode, **kwargs})
+            return "retrieved context"
+
+    monkeypatch.setattr(engine, "query_kwargs_from_settings", lambda: {})
+
+    result = asyncio.run(engine.query_context(_Rag(), "hello", "hybrid"))
+
+    assert result == "retrieved context"
+    assert captured == {
+        "question": "hello",
+        "mode": "hybrid",
+        "only_need_context": True,
+    }
+
+
 def test_lightrag_query_surfaces_raganything_initialization_failure() -> None:
     class _Rag:
         lightrag = None
@@ -350,8 +372,12 @@ def _stub_engine(monkeypatch, answer: str = "ANSWER") -> list[dict]:
     async def fake_query(rag, question, mode):
         return f"{answer}|{mode}"
 
+    async def fake_query_context(rag, question, mode):
+        return f"CONTEXT:{answer}|{mode}"
+
     monkeypatch.setattr(engine, "insert", fake_insert)
     monkeypatch.setattr(engine, "query", fake_query)
+    monkeypatch.setattr(engine, "query_context", fake_query_context)
     return inserts
 
 
@@ -491,6 +517,24 @@ def test_search_happy_path_resolves_mode(tmp_path, monkeypatch) -> None:
     assert res["answer"] == "GROUNDED|local"
     assert res["mode"] == "local"
     assert res["provider"] == "lightrag"
+
+
+def test_search_context_only_marks_local_retrieval_view(tmp_path, monkeypatch) -> None:
+    _force_available(monkeypatch, True)
+    _stub_engine(monkeypatch, answer="GROUNDING")
+    _stub_parse(monkeypatch, blocks=[{"type": "text", "text": "x", "page_idx": 0}])
+    pipe = LightRagPipeline(kb_base_dir=str(tmp_path))
+    pdf = tmp_path / "a.pdf"
+    pdf.write_bytes(b"%PDF")
+    asyncio.run(pipe.initialize("kb", [str(pdf)]))
+
+    res = asyncio.run(pipe.search("question?", "kb", retrieval_context_only=True))
+
+    assert res["content"] == "CONTEXT:GROUNDING|hybrid"
+    assert res["content_kind"] == "retrieval_context"
+    assert res["retrieval_provenance"] == [
+        {"kind": "local_retrieval_view", "storage_view": "version-1"}
+    ]
 
 
 def test_explicit_mode_overrides_kb_config(tmp_path, monkeypatch) -> None:
