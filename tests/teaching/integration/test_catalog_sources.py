@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 
 import pytest
@@ -27,10 +28,12 @@ from deeptutor.teaching.repositories.catalog import (
     SqlAlchemyCatalogRepository,
 )
 from deeptutor.teaching.repositories.sources import (
+    NewAuthorizedSnapshot,
     NewKnowledgeSnapshot,
     NewPdfSnapshot,
     NewUploadReceipt,
     SourceConflictError,
+    SourceEntitlementDeniedError,
     SourceNotFoundError,
     SqlAlchemySourceRepository,
     source_binding_id,
@@ -864,5 +867,166 @@ async def test_binding_lock_linearizes_before_concurrent_revocation(
             resource_id,
             ADMIN_KNOWLEDGE_OWNER_ID,
         )
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_authorized_snapshot_is_derived_and_revalidates_its_base_binding(
+    generation_database,
+) -> None:
+    suffix = uuid.uuid4().hex[:12]
+    tenant_id = f"snapshot-derived-{suffix}"
+    resource_id = f"admin:kb:{uuid.uuid4()}"
+    generation_database.migrate_tenant(tenant_id)
+    engine = create_async_engine(generation_database.url, poolclass=NullPool)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                insert(Tenant),
+                {"id": tenant_id, "name": tenant_id, "status": "active"},
+            )
+            await connection.execute(
+                insert(TenantKnowledgeEntitlement),
+                {
+                    "tenant_id": tenant_id,
+                    "knowledge_resource_id": resource_id,
+                    "resource_owner_id": ADMIN_KNOWLEDGE_OWNER_ID,
+                    "status": "active",
+                    "granted_by": "admin-a",
+                },
+            )
+        catalog = SqlAlchemyCatalogRepository(tenant_id, engine)
+        await catalog.create_course("course-a", "Course A")
+        await catalog.create_class("course-a", "class-a", "Class A")
+        repository = SqlAlchemySourceRepository(tenant_id, engine)
+        base = NewKnowledgeSnapshot(
+            snapshot_id=f"kb-source-{suffix}",
+            resource_id=resource_id,
+            resource_owner_id=ADMIN_KNOWLEDGE_OWNER_ID,
+            revision="binding-v1",
+            content_sha256="a" * 64,
+            permission_sha256="b" * 64,
+        )
+        base_binding_id = source_binding_id(
+            tenant_id,
+            base.snapshot_id,
+            "course-a",
+            "class-a",
+        )
+        await repository.bind_knowledge_resource(
+            base,
+            binding_id=base_binding_id,
+            course_id="course-a",
+            class_id="class-a",
+            actor_id="teacher-a",
+        )
+        bound = await repository.require_authorized_source(
+            source_type="knowledge_base",
+            source_id=resource_id,
+            resource_owner_id=ADMIN_KNOWLEDGE_OWNER_ID,
+            course_id="course-a",
+            class_id="class-a",
+        )
+        manifest = json.dumps(
+            {"fragments": [{"fragment_id": "fragment-a", "text": "Grounded"}]},
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        derived = NewAuthorizedSnapshot(
+            snapshot_id=f"source-snapshot-{'c' * 64}",
+            source_revision=f"retrieval-v1-{'d' * 64}",
+            content_sha256="e" * 64,
+            permission_sha256="f" * 64,
+            citation_manifest=manifest,
+        )
+
+        saved = await repository.persist_authorized_snapshot(
+            bound,
+            derived,
+            course_id="course-a",
+            class_id="class-a",
+            actor_id="teacher-a",
+        )
+
+        assert saved.snapshot_id == derived.snapshot_id
+        async with engine.connect() as connection:
+            rows = (
+                await connection.execute(
+                    text(
+                        f'SELECT id, citation_manifest FROM "{tenant_schema_name(tenant_id)}".'
+                        "source_snapshots ORDER BY id"
+                    )
+                )
+            ).all()
+        assert rows == [
+            (base.snapshot_id, "[]"),
+            (derived.snapshot_id, manifest),
+        ]
+
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    """
+                    UPDATE platform.tenant_knowledge_entitlements
+                       SET status = 'disabled'
+                     WHERE tenant_id = :tenant_id
+                       AND knowledge_resource_id = :resource_id
+                       AND resource_owner_id = :resource_owner_id
+                    """
+                ),
+                {
+                    "tenant_id": tenant_id,
+                    "resource_id": resource_id,
+                    "resource_owner_id": ADMIN_KNOWLEDGE_OWNER_ID,
+                },
+            )
+        with pytest.raises(SourceEntitlementDeniedError, match="not entitled"):
+            await repository.persist_authorized_snapshot(
+                bound,
+                NewAuthorizedSnapshot(
+                    snapshot_id=f"source-snapshot-{'5' * 64}",
+                    source_revision=f"retrieval-v1-{'6' * 64}",
+                    content_sha256="7" * 64,
+                    permission_sha256="8" * 64,
+                    citation_manifest=manifest,
+                ),
+                course_id="course-a",
+                class_id="class-a",
+                actor_id="teacher-a",
+            )
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    """
+                    UPDATE platform.tenant_knowledge_entitlements
+                       SET status = 'active'
+                     WHERE tenant_id = :tenant_id
+                       AND knowledge_resource_id = :resource_id
+                       AND resource_owner_id = :resource_owner_id
+                    """
+                ),
+                {
+                    "tenant_id": tenant_id,
+                    "resource_id": resource_id,
+                    "resource_owner_id": ADMIN_KNOWLEDGE_OWNER_ID,
+                },
+            )
+
+        await repository.delete_binding(base_binding_id)
+        with pytest.raises(SourceNotFoundError, match="not bound"):
+            await repository.persist_authorized_snapshot(
+                bound,
+                NewAuthorizedSnapshot(
+                    snapshot_id=f"source-snapshot-{'1' * 64}",
+                    source_revision=f"retrieval-v1-{'2' * 64}",
+                    content_sha256="3" * 64,
+                    permission_sha256="4" * 64,
+                    citation_manifest=manifest,
+                ),
+                course_id="course-a",
+                class_id="class-a",
+                actor_id="teacher-a",
+            )
     finally:
         await engine.dispose()

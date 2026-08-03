@@ -11,7 +11,10 @@ from __future__ import annotations
 from pathlib import Path
 
 from deeptutor.knowledge.manager import KnowledgeBaseManager
-from deeptutor.multi_user.knowledge_access import resolve_kb_manifest
+from deeptutor.multi_user.knowledge_access import (
+    resolve_authorized_source,
+    resolve_kb_manifest,
+)
 
 
 def _make_kb(manager: KnowledgeBaseManager, name: str, *files: str) -> None:
@@ -68,3 +71,21 @@ def test_empty_reference_yields_no_manifest(mu_isolated_root, as_user) -> None:
     with as_user("u_alice", role="user"):
         assert resolve_kb_manifest("") is None
         assert resolve_kb_manifest(None) is None
+
+
+def test_authorized_source_exposes_only_generation_pinned_identity(
+    mu_isolated_root,
+    as_user,
+) -> None:
+    from deeptutor.multi_user.knowledge_access import current_kb_manager
+
+    with as_user("u_alice", role="user"):
+        _make_kb(current_kb_manager(), "alice-kb", "a.pdf")
+
+        source = resolve_authorized_source("alice-kb")
+
+        assert source.resource_id == f"user:kb:{source.generation_id}"
+        assert source.resource_owner_id == "u_alice"
+        assert source.name == "alice-kb"
+        assert not hasattr(source, "base_dir")
+        assert str(mu_isolated_root.resolve()) not in repr(source)

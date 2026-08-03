@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from functools import lru_cache
+import hashlib
+import json
 from pathlib import Path
 from typing import Any, Literal
 import uuid
@@ -14,11 +17,55 @@ from deeptutor.knowledge.manifest import MANIFEST_NOTE_LIMIT, KbManifest, build_
 
 from .context import get_current_user
 from .grants import load_grant
-from .models import KnowledgeResource
+from .models import ADMIN_KNOWLEDGE_OWNER_ID, KnowledgeResource
 from .paths import get_admin_path_service, get_current_path_service
 
 ADMIN_PREFIX = "admin:kb:"
 USER_PREFIX = "user:kb:"
+
+
+@dataclass(frozen=True, slots=True)
+class AuthorizedKnowledgeSource:
+    """Access-checked immutable KB identity with an internal retrieval handle.
+
+    ``resource_id`` and ``generation_id`` are safe to persist. The base
+    directory is intentionally private so teaching contracts and shared data
+    planes cannot accidentally serialize a filesystem path.
+    """
+
+    resource_id: str
+    generation_id: str
+    name: str
+    source: Literal["admin", "user"]
+    resource_owner_id: str
+    read_only: bool
+    index_signature: str
+    _base_dir: Path = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if (
+            self.source not in {"admin", "user"}
+            or not _is_generation_id(self.generation_id)
+            or self.resource_id != f"{self.source}:kb:{self.generation_id}"
+        ):
+            raise ValueError("knowledge source requires a stable generation identity")
+        for value in (self.name, self.resource_owner_id, self.index_signature):
+            if not isinstance(value, str) or not value.strip() or any(
+                character in value for character in "\x00\r\n"
+            ):
+                raise ValueError("knowledge source descriptor is invalid")
+        if not isinstance(self.read_only, bool):
+            raise ValueError("knowledge source descriptor is invalid")
+        object.__setattr__(self, "_base_dir", self._base_dir.resolve())
+
+    def create_rag_service(self) -> Any:
+        """Create a RAG service without exposing the resolved path to callers."""
+
+        from deeptutor.services.rag.service import RAGService
+
+        return RAGService(kb_base_dir=str(self._base_dir))
+
+
 DEFAULT_KB_ALIASES = {"", "default", "current", "selected", "默认", "默认知识库", "当前知识库"}
 
 
@@ -317,6 +364,62 @@ def resolve_for_rag(kb_ref: str | None) -> KnowledgeResource | None:
 
         log_usage("knowledge_base", resource.id, "rag_query")
     return resource
+
+
+def _has_stable_resource_identity(resource: KnowledgeResource) -> bool:
+    generation = resource.generation_id
+    return _is_generation_id(generation) and resource.id == (
+        f"{resource.source}:kb:{generation}"
+    )
+
+
+def resolve_authorized_source(kb_ref: str) -> AuthorizedKnowledgeSource:
+    """Resolve a visible KB to a generation-pinned, read-only descriptor.
+
+    Human-readable aliases remain an input convenience only. Callers receive
+    the stable generation identity and cannot serialize the internal KB root.
+    """
+
+    resource = resolve_for_rag(kb_ref)
+    if resource is None or not _has_stable_resource_identity(resource):
+        raise HTTPException(status_code=404, detail="Knowledge base not found")
+    user = get_current_user()
+    owner_id = ADMIN_KNOWLEDGE_OWNER_ID if resource.source == "admin" else user.id
+    base_dir = resource.base_dir.resolve()
+    manager = manager_for_resource(resource)
+    if manager.base_dir.resolve() != base_dir:
+        raise HTTPException(status_code=404, detail="Knowledge base not found")
+    entry = manager.get_kb_entry(resource.name)
+    if entry is None or entry.get("generation_id") != resource.generation_id:
+        raise HTTPException(status_code=404, detail="Knowledge base identity is stale")
+    metadata = resource.metadata if isinstance(resource.metadata, dict) else {}
+    signature_payload = {
+        "embedding_signature": str(metadata.get("embedding_signature") or ""),
+        "generation_id": resource.generation_id,
+        "last_indexed_action": str(metadata.get("last_indexed_action") or ""),
+        "last_indexed_at": str(metadata.get("last_indexed_at") or ""),
+        "last_indexed_count": metadata.get("last_indexed_count"),
+        "last_updated": str(metadata.get("last_updated") or ""),
+        "rag_provider": str(metadata.get("rag_provider") or ""),
+    }
+    signature = hashlib.sha256(
+        json.dumps(
+            signature_payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    return AuthorizedKnowledgeSource(
+        resource_id=resource.id,
+        generation_id=resource.generation_id,
+        name=resource.name,
+        source=resource.source,
+        resource_owner_id=owner_id,
+        read_only=resource.read_only,
+        index_signature=signature,
+        _base_dir=base_dir,
+    )
 
 
 def resolve_kb_metadata(kb_ref: str | None) -> dict[str, Any] | None:

@@ -5,8 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 import hashlib
+import json
 
-from sqlalchemy import and_, delete, func, or_, select, text
+from sqlalchemy import and_, case, delete, func, or_, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
@@ -93,6 +94,38 @@ class NewKnowledgeSnapshot:
     revision: str
     content_sha256: str
     permission_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class BoundSourceRecord:
+    """Internal source handle proven to be bound inside this tenant schema."""
+
+    binding_id: str
+    snapshot_id: str
+    source_type: str
+    source_id: str
+    resource_owner_id: str
+    source_revision: str
+    content_sha256: str
+    permission_sha256: str
+    display_name: str | None
+    upload_id: str | None
+    object_key: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class NewAuthorizedSnapshot:
+    snapshot_id: str
+    source_revision: str
+    content_sha256: str
+    permission_sha256: str
+    citation_manifest: str
+
+
+@dataclass(frozen=True, slots=True)
+class SavedSourceSnapshot:
+    snapshot_id: str
+    created_at: datetime
 
 
 def _lock_key(tenant_id: str, digest: str) -> int:
@@ -355,6 +388,230 @@ class SqlAlchemySourceRepository:
 
     async def get_binding(self, binding_id: str) -> SourceRecord:
         return await self._source_record(binding_id)
+
+    def _bound_source_statement(
+        self,
+        *,
+        source_type: str,
+        source_id: str | None,
+        resource_owner_id: str | None,
+        course_id: str,
+        class_id: str | None,
+        binding_id: str | None,
+    ):
+        statement = (
+            select(
+                TenantSourceBinding.id,
+                SourceSnapshot.id,
+                SourceSnapshot.source_type,
+                SourceSnapshot.source_id,
+                SourceSnapshot.resource_owner_id,
+                SourceSnapshot.source_revision,
+                SourceSnapshot.content_sha256,
+                SourceSnapshot.permission_sha256,
+                SourceSnapshot.display_name,
+                SourceSnapshot.source_upload_id,
+                SourceUpload.object_key,
+            )
+            .join(
+                SourceSnapshot,
+                and_(
+                    SourceSnapshot.id == TenantSourceBinding.source_snapshot_id,
+                    SourceSnapshot.tenant_id == TenantSourceBinding.tenant_id,
+                ),
+            )
+            .outerjoin(
+                SourceUpload,
+                and_(
+                    SourceUpload.id == SourceSnapshot.source_upload_id,
+                    SourceUpload.tenant_id == SourceSnapshot.tenant_id,
+                ),
+            )
+            .where(
+                TenantSourceBinding.tenant_id == self._tenant_id,
+                SourceSnapshot.tenant_id == self._tenant_id,
+                SourceSnapshot.source_type == source_type,
+                SourceSnapshot.citation_manifest == "[]",
+                TenantSourceBinding.course_id == course_id,
+            )
+        )
+        if class_id is None:
+            statement = statement.where(TenantSourceBinding.class_id.is_(None))
+        else:
+            statement = statement.where(
+                or_(
+                    TenantSourceBinding.class_id == class_id,
+                    TenantSourceBinding.class_id.is_(None),
+                )
+            ).order_by(
+                case((TenantSourceBinding.class_id == class_id, 0), else_=1)
+            )
+        if source_id is not None:
+            statement = statement.where(SourceSnapshot.source_id == source_id)
+        if resource_owner_id is not None:
+            statement = statement.where(
+                SourceSnapshot.resource_owner_id == resource_owner_id
+            )
+        if binding_id is not None:
+            statement = statement.where(TenantSourceBinding.id == binding_id)
+        return statement.order_by(TenantSourceBinding.created_at, TenantSourceBinding.id)
+
+    @staticmethod
+    def _bound_source_record(row) -> BoundSourceRecord:
+        record = BoundSourceRecord(*row)
+        if record.source_type == "pdf":
+            if record.upload_id is None or record.object_key is None:
+                raise SourceConflictError("PDF source storage identity is incomplete")
+        elif record.object_key is not None or record.upload_id is not None:
+            raise SourceConflictError("knowledge source storage identity is invalid")
+        return record
+
+    async def _require_authorized_source_in_session(
+        self,
+        session: AsyncSession,
+        *,
+        source_type: str,
+        source_id: str | None,
+        resource_owner_id: str | None,
+        course_id: str,
+        class_id: str | None,
+        binding_id: str | None,
+        lock: bool,
+    ) -> BoundSourceRecord:
+        statement = self._bound_source_statement(
+            source_type=source_type,
+            source_id=source_id,
+            resource_owner_id=resource_owner_id,
+            course_id=course_id,
+            class_id=class_id,
+            binding_id=binding_id,
+        )
+        if lock:
+            statement = statement.with_for_update(of=TenantSourceBinding, read=True)
+        row = (await session.execute(statement.limit(1))).one_or_none()
+        if row is None:
+            raise SourceNotFoundError("source is not bound to the requested scope")
+        record = self._bound_source_record(row)
+        if record.source_type == "knowledge_base":
+            await self._lock_knowledge_entitlement(
+                session,
+                resource_id=record.source_id,
+                resource_owner_id=record.resource_owner_id,
+            )
+        if record.source_type == "pdf":
+            assert record.upload_id is not None and record.object_key is not None
+            _require_upload_key(self._tenant_id, record.upload_id, record.object_key)
+        return record
+
+    async def require_authorized_source(
+        self,
+        *,
+        source_type: str,
+        source_id: str | None,
+        resource_owner_id: str | None,
+        course_id: str,
+        class_id: str | None,
+        binding_id: str | None = None,
+    ) -> BoundSourceRecord:
+        """Revalidate a bound source in the current tenant and target scope."""
+
+        if source_type not in {"knowledge_base", "pdf"}:
+            raise SourceNotFoundError("source type is not supported")
+        await self.validate_target(course_id, class_id)
+        async with self._session_factory() as session:
+            async with session.begin():
+                return await self._require_authorized_source_in_session(
+                    session,
+                    source_type=source_type,
+                    source_id=source_id,
+                    resource_owner_id=resource_owner_id,
+                    course_id=course_id,
+                    class_id=class_id,
+                    binding_id=binding_id,
+                    lock=True,
+                )
+
+    async def persist_authorized_snapshot(
+        self,
+        bound: BoundSourceRecord,
+        snapshot: NewAuthorizedSnapshot,
+        *,
+        course_id: str,
+        class_id: str | None,
+        actor_id: str,
+    ) -> SavedSourceSnapshot:
+        """Clone a bound revision into an immutable, query-specific snapshot.
+
+        The original binding row is never updated. Re-authorization and the
+        derived insert occur in one transaction, closing revoke-vs-snapshot
+        races without holding a database lock while RAG runs.
+        """
+
+        try:
+            manifest = json.loads(snapshot.citation_manifest)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise SourceConflictError("source citation manifest is invalid") from exc
+        if not isinstance(manifest, dict) or not manifest.get("fragments"):
+            raise SourceConflictError("source citation manifest is empty")
+        for digest in (snapshot.content_sha256, snapshot.permission_sha256):
+            if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+                raise SourceConflictError("source snapshot digest is invalid")
+        try:
+            async with self._session_factory() as session:
+                async with session.begin():
+                    current = await self._require_authorized_source_in_session(
+                        session,
+                        source_type=bound.source_type,
+                        source_id=bound.source_id,
+                        resource_owner_id=bound.resource_owner_id,
+                        course_id=course_id,
+                        class_id=class_id,
+                        binding_id=bound.binding_id,
+                        lock=True,
+                    )
+                    if current != bound:
+                        raise SourceConflictError("source binding changed during retrieval")
+                    await session.execute(
+                        insert(SourceSnapshot)
+                        .values(
+                            id=snapshot.snapshot_id,
+                            tenant_id=self._tenant_id,
+                            source_type=bound.source_type,
+                            source_id=bound.source_id,
+                            resource_owner_id=bound.resource_owner_id,
+                            source_upload_id=bound.upload_id,
+                            display_name=bound.display_name,
+                            source_revision=snapshot.source_revision,
+                            content_sha256=snapshot.content_sha256,
+                            permission_sha256=snapshot.permission_sha256,
+                            citation_manifest=snapshot.citation_manifest,
+                            created_by=actor_id,
+                        )
+                        .on_conflict_do_nothing(index_elements=[SourceSnapshot.id])
+                    )
+                    existing = await session.get(SourceSnapshot, snapshot.snapshot_id)
+                    if existing is None or (
+                        existing.tenant_id != self._tenant_id
+                        or existing.source_type != bound.source_type
+                        or existing.source_id != bound.source_id
+                        or existing.resource_owner_id != bound.resource_owner_id
+                        or existing.source_upload_id != bound.upload_id
+                        or existing.display_name != bound.display_name
+                        or existing.source_revision != snapshot.source_revision
+                        or existing.content_sha256 != snapshot.content_sha256
+                        or existing.permission_sha256 != snapshot.permission_sha256
+                        or existing.citation_manifest != snapshot.citation_manifest
+                        or existing.created_by != actor_id
+                    ):
+                        raise SourceConflictError("authorized source snapshot identity conflict")
+                    await session.flush()
+                    await session.refresh(existing, attribute_names=["created_at"])
+                    if existing.created_at is None:
+                        raise SourceConflictError("source snapshot timestamp is missing")
+                    saved = SavedSourceSnapshot(existing.id, existing.created_at)
+        except IntegrityError as exc:
+            raise SourceConflictError("authorized source snapshot conflicts with existing state") from exc
+        return saved
 
     @staticmethod
     def _upload_record(row) -> UploadRecord:
@@ -695,9 +952,12 @@ class SqlAlchemySourceRepository:
 
 
 __all__ = [
+    "BoundSourceRecord",
+    "NewAuthorizedSnapshot",
     "NewKnowledgeSnapshot",
     "NewPdfSnapshot",
     "NewUploadReceipt",
+    "SavedSourceSnapshot",
     "SourceConflictError",
     "SourceEntitlementDeniedError",
     "SourceNotFoundError",
