@@ -9,9 +9,13 @@ from deeptutor.teaching.models.classrooms import (
     ALLOWED_TRANSITIONS,
     Approval,
     Assignment,
+    AssignmentMigration,
+    ClassLearningState,
     ClassroomAsset,
     ClassroomDraft,
     ClassroomDraftMedia,
+    ClassroomReviewPolicy,
+    ClassroomReviewRequest,
     ClassroomVersion,
     InvalidClassroomTransition,
     Publication,
@@ -86,6 +90,10 @@ def test_tenant_metadata_contains_the_classroom_domain_tables() -> None:
         "tenant.classroom_assets",
         "tenant.classroom_drafts",
         "tenant.classroom_draft_media",
+        "tenant.classroom_review_policies",
+        "tenant.classroom_review_requests",
+        "tenant.assignment_migrations",
+        "tenant.class_learning_states",
         "tenant.classroom_versions",
         "tenant.classroom_exports",
         "tenant.approvals",
@@ -94,6 +102,60 @@ def test_tenant_metadata_contains_the_classroom_domain_tables() -> None:
         "tenant.batch_jobs",
         "tenant.batch_items",
     }.issubset(TenantBase.metadata.tables)
+
+
+def test_review_publication_schema_has_durable_idempotency_and_guard_fences() -> None:
+    review = ClassroomReviewRequest.__table__
+    publication = Publication.__table__
+    assignment = Assignment.__table__
+    migration = AssignmentMigration.__table__
+    learning = ClassLearningState.__table__
+
+    def unique_columns(table) -> set[tuple[str, ...]]:
+        return {
+            tuple(constraint.columns.keys())
+            for constraint in table.constraints
+            if isinstance(constraint, UniqueConstraint)
+        }
+
+    assert ("tenant_id", "idempotency_key") in unique_columns(review)
+    assert ("tenant_id", "idempotency_key") in unique_columns(publication)
+    assert ("tenant_id", "review_request_id") in unique_columns(publication)
+    assert ("tenant_id", "idempotency_key") in unique_columns(assignment)
+    assert ("tenant_id", "idempotency_key") in unique_columns(migration)
+    assert {
+        "old_assignment_id",
+        "old_version_id",
+        "new_version_id",
+        "new_assignment_id",
+        "class_id",
+        "actor_id",
+        "reason",
+        "outcome",
+    }.issubset(migration.c.keys())
+    assert {"state", "active_session_count", "updated_by"}.issubset(
+        learning.c.keys()
+    )
+    assert ClassroomReviewPolicy.__table__.c.teacher_self_publish.default is not None
+
+
+def test_review_events_link_to_request_and_terminal_decision_is_unique() -> None:
+    approval = Approval.__table__
+    assert "review_request_id" in approval.c
+    terminal_indexes = {
+        index.name: index
+        for index in approval.indexes
+        if index.unique
+    }
+    assert "uq_approvals_terminal_review_decision" in terminal_indexes
+
+
+def test_review_publication_migration_is_the_tenant_head() -> None:
+    migration = importlib.import_module(
+        "deeptutor.teaching.migrations.versions.20260803_0011_review_publication"
+    )
+    assert migration.revision == "20260803_0011"
+    assert migration.down_revision == "20260803_0010"
 
 
 def test_draft_media_is_integrity_checked_and_bound_to_tenant_asset() -> None:

@@ -6,6 +6,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -16,6 +17,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -601,6 +603,133 @@ class ClassroomExport(TenantBase):
     )
 
 
+class ClassroomReviewPolicy(TenantBase):
+    """Explicit per-tenant review policy; self-publish defaults fail closed."""
+
+    __tablename__ = "classroom_review_policies"
+
+    tenant_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    teacher_self_publish: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        server_default="false",
+    )
+    org_content_requires_review: Mapped[bool] = mapped_column(
+        Boolean,
+        default=True,
+        server_default="true",
+    )
+    platform_template_requires_review: Mapped[bool] = mapped_column(
+        Boolean,
+        default=True,
+        server_default="true",
+    )
+    prohibit_self_review: Mapped[bool] = mapped_column(
+        Boolean,
+        default=True,
+        server_default="true",
+    )
+    updated_by: Mapped[str] = mapped_column(String(128))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+
+
+class ClassroomReviewRequest(TenantBase):
+    """Mutable decision fence bound to one exact validated draft revision."""
+
+    __tablename__ = "classroom_review_requests"
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64))
+    classroom_id: Mapped[str] = mapped_column(String(128))
+    classroom_draft_id: Mapped[str] = mapped_column(String(128))
+    draft_revision: Mapped[int] = mapped_column(Integer)
+    document_sha256: Mapped[str] = mapped_column(String(64))
+    validation_report_sha256: Mapped[str] = mapped_column(String(64))
+    submitted_by: Mapped[str] = mapped_column(String(128))
+    scope: Mapped[str] = mapped_column(String(16))
+    class_id: Mapped[str | None] = mapped_column(String(64))
+    status: Mapped[str] = mapped_column(String(16), server_default="pending")
+    warnings: Mapped[str] = mapped_column(Text, server_default="[]")
+    idempotency_key: Mapped[str] = mapped_column(String(128))
+    request_sha256: Mapped[str] = mapped_column(String(64))
+    decided_by: Mapped[str | None] = mapped_column(String(128))
+    decision_comment: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        CheckConstraint("draft_revision > 0", name="draft_revision"),
+        CheckConstraint(
+            "document_sha256 ~ '^[0-9a-f]{64}$' AND "
+            "validation_report_sha256 ~ '^[0-9a-f]{64}$' AND "
+            "request_sha256 ~ '^[0-9a-f]{64}$'",
+            name="hashes",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'approved', 'rejected')",
+            name="status",
+        ),
+        CheckConstraint(
+            "(scope = 'class' AND class_id IS NOT NULL) OR "
+            "(scope IN ('tenant', 'platform') AND class_id IS NULL)",
+            name="scope_class",
+        ),
+        CheckConstraint(
+            "(status = 'pending' AND decided_by IS NULL AND decided_at IS NULL "
+            "AND decision_comment IS NULL) OR "
+            "(status IN ('approved', 'rejected') AND decided_by IS NOT NULL "
+            "AND decided_at IS NOT NULL AND decision_comment IS NOT NULL)",
+            name="decision_binding",
+        ),
+        ForeignKeyConstraint(
+            ["classroom_draft_id", "classroom_id", "tenant_id"],
+            [
+                "tenant.classroom_drafts.id",
+                "tenant.classroom_drafts.classroom_id",
+                "tenant.classroom_drafts.tenant_id",
+            ],
+            name="fk_classroom_review_requests_draft_classroom_tenant",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["classroom_id", "tenant_id"],
+            [
+                "tenant.classroom_assets.id",
+                "tenant.classroom_assets.tenant_id",
+            ],
+            name="fk_classroom_review_requests_asset_tenant",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["class_id"],
+            ["tenant.classes.id"],
+            name="fk_classroom_review_requests_class",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint(
+            "id",
+            "tenant_id",
+            name="uq_classroom_review_requests_id_tenant",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "idempotency_key",
+            name="uq_classroom_review_requests_tenant_idempotency",
+        ),
+        Index(
+            "ix_classroom_review_requests_pending",
+            "status",
+            "created_at",
+        ),
+    )
+
+
 class Approval(TenantBase):
     """Append-only submission or review decision for one classroom draft."""
 
@@ -614,6 +743,7 @@ class Approval(TenantBase):
     reviewer_id: Mapped[str | None] = mapped_column(String(128))
     decision: Mapped[str] = mapped_column(String(32))
     reason: Mapped[str | None] = mapped_column(Text)
+    review_request_id: Mapped[str | None] = mapped_column(String(128))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
@@ -643,7 +773,23 @@ class Approval(TenantBase):
             name="fk_approvals_asset_tenant_classroom_assets",
             ondelete="RESTRICT",
         ),
+        ForeignKeyConstraint(
+            ["review_request_id", "tenant_id"],
+            [
+                "tenant.classroom_review_requests.id",
+                "tenant.classroom_review_requests.tenant_id",
+            ],
+            name="fk_approvals_review_request_tenant",
+            ondelete="RESTRICT",
+        ),
         Index("ix_approvals_classroom_created", "classroom_id", "created_at"),
+        Index(
+            "uq_approvals_terminal_review_decision",
+            "tenant_id",
+            "review_request_id",
+            unique=True,
+            postgresql_where=text("decision IN ('approved', 'rejected')"),
+        ),
     )
 
 
@@ -662,6 +808,9 @@ class Publication(TenantBase):
         String(64),
         ForeignKey("tenant.classes.id", ondelete="RESTRICT"),
     )
+    review_request_id: Mapped[str | None] = mapped_column(String(128))
+    idempotency_key: Mapped[str | None] = mapped_column(String(128))
+    request_sha256: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
@@ -670,8 +819,13 @@ class Publication(TenantBase):
     __table_args__ = (
         CheckConstraint(
             "(scope = 'class' AND class_id IS NOT NULL) OR "
-            "(scope IN ('private', 'tenant') AND class_id IS NULL)",
+            "(scope IN ('private', 'tenant', 'platform') AND class_id IS NULL)",
             name="scope_class",
+        ),
+        CheckConstraint(
+            "(idempotency_key IS NULL AND request_sha256 IS NULL) OR "
+            "(idempotency_key IS NOT NULL AND request_sha256 IS NOT NULL)",
+            name="idempotency_binding",
         ),
         ForeignKeyConstraint(
             ["classroom_id", "tenant_id"],
@@ -680,6 +834,15 @@ class Publication(TenantBase):
                 "tenant.classroom_assets.tenant_id",
             ],
             name="fk_publications_asset_tenant_classroom_assets",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["review_request_id", "tenant_id"],
+            [
+                "tenant.classroom_review_requests.id",
+                "tenant.classroom_review_requests.tenant_id",
+            ],
+            name="fk_publications_review_request_tenant",
             ondelete="RESTRICT",
         ),
         ForeignKeyConstraint(
@@ -698,6 +861,16 @@ class Publication(TenantBase):
             "scope",
             "class_id",
             name="uq_publications_tenant_version_scope_class",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "idempotency_key",
+            name="uq_publications_tenant_idempotency",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "review_request_id",
+            name="uq_publications_tenant_review_request",
         ),
     )
 
@@ -718,6 +891,8 @@ class Assignment(TenantBase):
         ForeignKey("tenant.classes.id", ondelete="CASCADE"),
     )
     assigned_by: Mapped[str] = mapped_column(String(128))
+    idempotency_key: Mapped[str | None] = mapped_column(String(128))
+    request_sha256: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
@@ -725,13 +900,117 @@ class Assignment(TenantBase):
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     __table_args__ = (
+        CheckConstraint(
+            "(idempotency_key IS NULL AND request_sha256 IS NULL) OR "
+            "(idempotency_key IS NOT NULL AND request_sha256 IS NOT NULL)",
+            name="idempotency_binding",
+        ),
         UniqueConstraint(
             "tenant_id",
             "class_id",
             "classroom_version_id",
             name="uq_assignments_tenant_class_version",
         ),
+        UniqueConstraint(
+            "tenant_id",
+            "idempotency_key",
+            name="uq_assignments_tenant_idempotency",
+        ),
         Index("ix_assignments_class_active", "class_id", "revoked_at"),
+    )
+
+
+class ClassLearningState(TenantBase):
+    """Plan-06 integration seam used to fail closed during migration."""
+
+    __tablename__ = "class_learning_states"
+
+    class_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("tenant.classes.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    tenant_id: Mapped[str] = mapped_column(String(64))
+    state: Mapped[str] = mapped_column(String(16), server_default="unknown")
+    active_session_count: Mapped[int] = mapped_column(Integer, server_default="0")
+    updated_by: Mapped[str] = mapped_column(String(128))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "(state IN ('unknown', 'idle') AND active_session_count = 0) OR "
+            "(state = 'active' AND active_session_count > 0)",
+            name="state_count",
+        ),
+        UniqueConstraint(
+            "class_id",
+            "tenant_id",
+            name="uq_class_learning_states_class_tenant",
+        ),
+    )
+
+
+class AssignmentMigration(TenantBase):
+    """Append-only audit of one explicit pinned assignment migration."""
+
+    __tablename__ = "assignment_migrations"
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64))
+    old_assignment_id: Mapped[str] = mapped_column(
+        String(128),
+        ForeignKey("tenant.assignments.id", ondelete="RESTRICT"),
+    )
+    old_version_id: Mapped[str] = mapped_column(
+        String(128),
+        ForeignKey("tenant.classroom_versions.id", ondelete="RESTRICT"),
+    )
+    new_version_id: Mapped[str] = mapped_column(
+        String(128),
+        ForeignKey("tenant.classroom_versions.id", ondelete="RESTRICT"),
+    )
+    new_assignment_id: Mapped[str | None] = mapped_column(
+        String(128),
+        ForeignKey("tenant.assignments.id", ondelete="RESTRICT"),
+    )
+    class_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("tenant.classes.id", ondelete="RESTRICT"),
+    )
+    actor_id: Mapped[str] = mapped_column(String(128))
+    reason: Mapped[str] = mapped_column(Text)
+    outcome: Mapped[str] = mapped_column(String(32))
+    idempotency_key: Mapped[str] = mapped_column(String(128))
+    request_sha256: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "outcome IN ('succeeded', 'refused_active_learning', "
+            "'refused_guard_unavailable')",
+            name="outcome",
+        ),
+        CheckConstraint(
+            "(outcome = 'succeeded' AND new_assignment_id IS NOT NULL) OR "
+            "(outcome <> 'succeeded' AND new_assignment_id IS NULL)",
+            name="outcome_assignment",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "idempotency_key",
+            name="uq_assignment_migrations_tenant_idempotency",
+        ),
+        Index(
+            "ix_assignment_migrations_class_created",
+            "class_id",
+            "created_at",
+        ),
     )
 
 
@@ -819,13 +1098,17 @@ __all__ = [
     "ALLOWED_TRANSITIONS",
     "Approval",
     "Assignment",
+    "AssignmentMigration",
     "BatchItem",
     "BatchJob",
     "CLASSROOM_STATES",
+    "ClassLearningState",
     "ClassroomAsset",
     "ClassroomDraft",
     "ClassroomDraftMedia",
     "ClassroomExport",
+    "ClassroomReviewPolicy",
+    "ClassroomReviewRequest",
     "ClassroomVersion",
     "InvalidClassroomTransition",
     "Publication",

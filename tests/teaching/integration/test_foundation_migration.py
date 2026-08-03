@@ -24,7 +24,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 FOUNDATION_REVISION = "20260728_0001"
 SCOPED_GRANTS_REVISION = "20260730_0002"
 PROVISIONING_REVISION = "20260730_0003"
-HEAD_REVISION = "20260803_0010"
+HEAD_REVISION = "20260803_0011"
 
 
 @dataclass(frozen=True)
@@ -512,6 +512,7 @@ def test_wheel_packages_migrations_and_full_app_entrypoint(
         "deeptutor/teaching/migrations/versions/20260802_0008_classroom_lifecycle.py",
         "deeptutor/teaching/migrations/versions/20260803_0009_knowledge_entitlements.py",
         "deeptutor/teaching/migrations/versions/20260803_0010_classroom_authoring.py",
+        "deeptutor/teaching/migrations/versions/20260803_0011_review_publication.py",
     }.issubset(names)
     assert "deeptutor-migrate = deeptutor.teaching.migrations.cli:main" in entry_points
     assert "deeptutor-provisioner = deeptutor.teaching.provisioning_cli:main" in entry_points
@@ -4402,7 +4403,7 @@ def test_future_tenant_schema_revision_is_not_enqueued_or_claimed(
                         TenantSchemaState(
                             tenant_id="future-schema-tenant",
                             schema_name=tenant_schema_name("future-schema-tenant"),
-                            revision="20260803_0010",
+                            revision="20260803_0011",
                             status="active",
                         )
                     )
