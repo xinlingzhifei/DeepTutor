@@ -56,6 +56,13 @@ _ORPHAN_PRUNE_GRACE_SECONDS = 60
 KB_GENERATION_ID_KEY = "generation_id"
 
 
+class KnowledgeBaseConfigError(RuntimeError):
+    """The existing KB config cannot safely participate in a write."""
+
+
+_INVALID_CONFIG_MESSAGE = "Knowledge-base config is unreadable or invalid."
+
+
 def _ensure_kb_generation_id(entry: dict[str, Any]) -> bool:
     raw = str(entry.get(KB_GENERATION_ID_KEY) or "").strip()
     try:
@@ -337,16 +344,21 @@ class KnowledgeBaseManager:
         self._config_snapshot = deepcopy(config)
         return config
 
-    def _load_config_locked(self) -> dict:
+    def _load_config_locked(self, *, strict: bool = False) -> dict:
         if self.config_file.exists():
             config_changed = False
             try:
                 with open(self.config_file, encoding="utf-8") as f:
                     content = f.read()
                     if not content.strip():
-                        # Empty file, return default
-                        return {"knowledge_bases": {}}
+                        raise KnowledgeBaseConfigError(_INVALID_CONFIG_MESSAGE)
                     config = json.loads(content)
+
+                if not isinstance(config, dict) or (
+                    "knowledge_bases" in config
+                    and not isinstance(config["knowledge_bases"], dict)
+                ):
+                    raise KnowledgeBaseConfigError(_INVALID_CONFIG_MESSAGE)
 
                 # Ensure knowledge_bases key exists
                 if "knowledge_bases" not in config:
@@ -415,10 +427,17 @@ class KnowledgeBaseManager:
                         raise
 
                 return config
-            except (json.JSONDecodeError, Exception) as e:
+            except KnowledgeBaseConfigError as e:
+                logger.warning(f"Error loading config: {e}")
+                if strict:
+                    raise
+                return {"knowledge_bases": {}}
+            except Exception as e:
                 if config_changed:
                     raise
                 logger.warning(f"Error loading config: {e}")
+                if strict:
+                    raise KnowledgeBaseConfigError(_INVALID_CONFIG_MESSAGE) from e
                 return {"knowledge_bases": {}}
         return {"knowledge_bases": {}}
 
@@ -427,7 +446,7 @@ class KnowledgeBaseManager:
         with _exclusive_config_lock(self._config_lock_file):
             desired = deepcopy(self.config)
             base = deepcopy(getattr(self, "_config_snapshot", {}))
-            current = self._load_config_locked()
+            current = self._load_config_locked(strict=True)
             merged = _merge_config_values(base, desired, current)
             if not isinstance(merged, dict):
                 raise RuntimeError("Knowledge-base config must be a JSON object")
@@ -439,7 +458,7 @@ class KnowledgeBaseManager:
     def _mutate_config(self, mutation):
         """Apply one config mutation to the latest state under the writer lock."""
         with _exclusive_config_lock(self._config_lock_file):
-            config = self._load_config_locked()
+            config = self._load_config_locked(strict=True)
             result = mutation(config)
             _ensure_config_generation_ids(config)
             atomic_write_json(self.config_file, config)

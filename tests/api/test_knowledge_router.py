@@ -598,6 +598,23 @@ def test_list_omits_legacy_assigned_name_aliases(monkeypatch, tmp_path: Path) ->
     assert "admin:kb:legacy-name" not in response.text
 
 
+def test_list_top_level_failure_returns_sanitized_detail(monkeypatch) -> None:
+    private_detail = r"C:\private\kb_config.json token=super-secret"
+    monkeypatch.setattr(
+        knowledge_router_module,
+        "get_kb_manager",
+        lambda: (_ for _ in ()).throw(RuntimeError(private_detail)),
+    )
+
+    with TestClient(_build_app()) as client:
+        response = client.get("/api/v1/knowledge/list")
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Failed to load knowledge bases."}
+    assert private_detail not in response.text
+    assert "super-secret" not in response.text
+
+
 def _ready_kb_manager(tmp_path: Path, name: str = "kb") -> "_FakeKBManager":
     manager = _FakeKBManager(tmp_path / "knowledge_bases")
     manager.config["knowledge_bases"][name] = {

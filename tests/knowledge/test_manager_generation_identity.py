@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 import json
 from pathlib import Path
 import subprocess
@@ -12,7 +13,7 @@ import uuid
 import pytest
 
 from deeptutor.knowledge import manager as manager_module
-from deeptutor.knowledge.manager import KnowledgeBaseManager
+from deeptutor.knowledge.manager import KnowledgeBaseConfigError, KnowledgeBaseManager
 
 
 def _assert_generation(value: object) -> str:
@@ -76,6 +77,63 @@ def test_legacy_generation_migration_fails_closed_when_publish_fails(
         KnowledgeBaseManager(base_dir=tmp_path)
 
     assert json.loads(config_path.read_text(encoding="utf-8")) == legacy_config
+
+
+def test_mutation_does_not_overwrite_existing_invalid_config(tmp_path: Path) -> None:
+    config_path = tmp_path / "kb_config.json"
+    invalid_bytes = b'{"knowledge_bases":'
+    config_path.write_bytes(invalid_bytes)
+    (tmp_path / "new-kb").mkdir()
+    manager = KnowledgeBaseManager(base_dir=tmp_path)
+
+    with pytest.raises(KnowledgeBaseConfigError, match="config is unreadable or invalid"):
+        manager.register_knowledge_base("new-kb")
+
+    assert config_path.read_bytes() == invalid_bytes
+    assert b"generation_id" not in config_path.read_bytes()
+
+    config_path.write_text(json.dumps({"knowledge_bases": {}}), encoding="utf-8")
+    manager.register_knowledge_base("new-kb")
+    persisted = json.loads(config_path.read_text(encoding="utf-8"))
+    _assert_generation(persisted["knowledge_bases"]["new-kb"]["generation_id"])
+
+
+def test_stale_save_does_not_overwrite_existing_invalid_config(tmp_path: Path) -> None:
+    config_path = tmp_path / "kb_config.json"
+    invalid_bytes = b"not-json"
+    config_path.write_bytes(invalid_bytes)
+    manager = KnowledgeBaseManager(base_dir=tmp_path)
+    manager.config["knowledge_bases"]["new-kb"] = {"path": "new-kb"}
+
+    with pytest.raises(KnowledgeBaseConfigError, match="config is unreadable or invalid"):
+        manager._save_config()
+
+    assert config_path.read_bytes() == invalid_bytes
+    assert b"generation_id" not in config_path.read_bytes()
+
+
+def test_mutation_does_not_overwrite_existing_unreadable_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "kb_config.json"
+    original_bytes = json.dumps({"knowledge_bases": {}}).encode()
+    config_path.write_bytes(original_bytes)
+    (tmp_path / "new-kb").mkdir()
+    manager = KnowledgeBaseManager(base_dir=tmp_path)
+    real_open = builtins.open
+
+    def fail_config_read(file, mode="r", *args, **kwargs):
+        if Path(file) == config_path and "r" in mode:
+            raise PermissionError("C:/secret/config is unavailable")
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", fail_config_read)
+
+    with pytest.raises(KnowledgeBaseConfigError, match="config is unreadable or invalid"):
+        manager.register_knowledge_base("new-kb")
+
+    assert config_path.read_bytes() == original_bytes
 
 
 def test_concurrent_legacy_loaders_publish_one_shared_generation(tmp_path: Path) -> None:

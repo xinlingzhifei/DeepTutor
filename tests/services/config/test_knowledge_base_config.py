@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 import json
 from pathlib import Path
 import threading
@@ -9,6 +10,7 @@ import uuid
 
 import pytest
 
+from deeptutor.knowledge.manager import KnowledgeBaseConfigError
 from deeptutor.services.config.knowledge_base_config import (
     KnowledgeBaseConfigService,
 )
@@ -172,6 +174,47 @@ class TestPayloadNormalizationOnLoad:
 
 
 class TestPersistence:
+    def test_mutation_does_not_overwrite_existing_invalid_config(self, tmp_path: Path) -> None:
+        config_path = tmp_path / "kb_config.json"
+        invalid_bytes = b'{"knowledge_bases":'
+        config_path.write_bytes(invalid_bytes)
+        service = KnowledgeBaseConfigService(config_path=config_path)
+
+        with pytest.raises(KnowledgeBaseConfigError, match="config is unreadable or invalid"):
+            service.set_kb_config("new-kb", {"description": "new"})
+
+        assert config_path.read_bytes() == invalid_bytes
+        assert b"generation_id" not in config_path.read_bytes()
+
+        config_path.write_text(json.dumps({"knowledge_bases": {}}), encoding="utf-8")
+        service.set_kb_config("new-kb", {"description": "new"})
+        persisted = json.loads(config_path.read_text(encoding="utf-8"))
+        generation = persisted["knowledge_bases"]["new-kb"]["generation_id"]
+        assert str(uuid.UUID(generation)) == generation
+
+    def test_mutation_does_not_overwrite_existing_unreadable_config(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        config_path = tmp_path / "kb_config.json"
+        original_bytes = json.dumps({"knowledge_bases": {}}).encode()
+        config_path.write_bytes(original_bytes)
+        service = KnowledgeBaseConfigService(config_path=config_path)
+        real_open = builtins.open
+
+        def fail_config_read(file, mode="r", *args, **kwargs):
+            if Path(file) == config_path and "r" in mode:
+                raise PermissionError("C:/secret/config is unavailable")
+            return real_open(file, mode, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", fail_config_read)
+
+        with pytest.raises(KnowledgeBaseConfigError, match="config is unreadable or invalid"):
+            service.set_kb_config("new-kb", {"description": "new"})
+
+        assert config_path.read_bytes() == original_bytes
+
     def test_set_kb_config_publishes_generation_identity(self, tmp_path: Path) -> None:
         config_path = tmp_path / "kb_config.json"
         service = KnowledgeBaseConfigService(config_path=config_path)

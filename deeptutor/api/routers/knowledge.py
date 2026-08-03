@@ -1861,7 +1861,7 @@ async def list_knowledge_bases():
     except Exception as e:
         error_msg = f"Error listing knowledge bases: {e}"
         logger.error(f"{error_msg}\n{traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"Failed to list knowledge bases: {e!s}")
+        raise HTTPException(status_code=500, detail="Failed to load knowledge bases.")
 
 
 @router.get("/{kb_name}")

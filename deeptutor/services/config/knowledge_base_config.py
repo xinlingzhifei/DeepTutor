@@ -53,20 +53,28 @@ class KnowledgeBaseConfigService:
             cls._instances[key] = cls(resolved)
         return cls._instances[key]
 
-    def _load_config(self) -> dict[str, Any]:
+    def _load_config(self, *, strict: bool = False) -> dict[str, Any]:
         payload = _default_payload()
-        if self.config_path.exists():
-            try:
+        try:
+            if self.config_path.exists():
                 with open(self.config_path, "r", encoding="utf-8") as handle:
-                    loaded = json.load(handle) or {}
+                    loaded = json.load(handle)
+                if not isinstance(loaded, dict):
+                    raise ValueError("KB config root must be an object")
                 payload.update({k: v for k, v in loaded.items() if k != "defaults"})
                 payload["defaults"].update(loaded.get("defaults", {}))
-            except Exception as exc:
-                logger.warning(f"Failed to load KB config: {exc}")
-        payload.setdefault("knowledge_bases", {})
-        payload.setdefault("defaults", _default_payload()["defaults"])
-        payload = self._normalize_payload(payload)
-        return payload
+            payload.setdefault("knowledge_bases", {})
+            payload.setdefault("defaults", _default_payload()["defaults"])
+            return self._normalize_payload(payload)
+        except Exception as exc:
+            logger.warning(f"Failed to load KB config: {exc}")
+            if strict:
+                from deeptutor.knowledge.manager import KnowledgeBaseConfigError
+
+                raise KnowledgeBaseConfigError(
+                    "Knowledge-base config is unreadable or invalid."
+                ) from exc
+            return self._normalize_payload(_default_payload())
 
     def _normalize_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         defaults = payload.setdefault("defaults", _default_payload()["defaults"])
@@ -115,7 +123,7 @@ class KnowledgeBaseConfigService:
 
         lock_path = self.config_path.parent / ".kb_config.lock"
         with _exclusive_config_lock(lock_path):
-            config = self._load_config()
+            config = self._load_config(strict=True)
             mutation(config)
             config = self._normalize_payload(config)
             _ensure_config_generation_ids(config)
