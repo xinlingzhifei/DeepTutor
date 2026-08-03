@@ -71,8 +71,35 @@ def _upgrade_tenant() -> None:
         sa.Column("confirmed_outline_sha256", sa.String(length=64), nullable=True),
         sa.Column("validation_report", sa.Text(), nullable=True),
         sa.Column("validation_report_sha256", sa.String(length=64), nullable=True),
+        sa.Column("validation_revision", sa.Integer(), nullable=True),
+        sa.Column("validation_document_sha256", sa.String(length=64), nullable=True),
+        sa.Column("creation_idempotency_key", sa.String(length=128), nullable=True),
+        sa.Column("creation_request_sha256", sa.String(length=64), nullable=True),
     ):
         op.add_column("classroom_drafts", column, schema=tenant_schema)
+    op.create_check_constraint(
+        "ck_classroom_drafts_validation_binding",
+        "classroom_drafts",
+        "(validation_report IS NULL AND validation_report_sha256 IS NULL "
+        "AND validation_revision IS NULL AND validation_document_sha256 IS NULL) OR "
+        "(validation_report IS NOT NULL AND validation_report_sha256 IS NOT NULL "
+        "AND validation_revision IS NOT NULL AND validation_revision > 0 "
+        "AND validation_document_sha256 IS NOT NULL)",
+        schema=tenant_schema,
+    )
+    op.create_check_constraint(
+        "ck_classroom_drafts_creation_binding",
+        "classroom_drafts",
+        "(creation_idempotency_key IS NULL AND creation_request_sha256 IS NULL) OR "
+        "(creation_idempotency_key IS NOT NULL AND creation_request_sha256 IS NOT NULL)",
+        schema=tenant_schema,
+    )
+    op.create_unique_constraint(
+        "uq_classroom_drafts_tenant_creation_idempotency",
+        "classroom_drafts",
+        ["tenant_id", "creation_idempotency_key"],
+        schema=tenant_schema,
+    )
     op.create_foreign_key(
         "fk_classroom_drafts_job_tenant_generation_jobs",
         "classroom_drafts",
@@ -119,7 +146,7 @@ def _upgrade_tenant() -> None:
             name="ck_classroom_draft_media_size_bytes",
         ),
         sa.CheckConstraint(
-            "status IN ('writing', 'uploaded', 'failed')",
+            "status IN ('writing', 'uploaded', 'cleanup_pending', 'failed')",
             name="ck_classroom_draft_media_status",
         ),
         sa.CheckConstraint(
@@ -131,6 +158,7 @@ def _upgrade_tenant() -> None:
             "AND last_error_code IS NULL) OR "
             "(status = 'uploaded' AND object_revision IS NOT NULL "
             "AND last_error_code IS NULL) OR "
+            "(status = 'cleanup_pending' AND last_error_code IS NOT NULL) OR "
             "(status = 'failed' AND last_error_code IS NOT NULL)",
             name="ck_classroom_draft_media_receipt_state",
         ),
@@ -191,6 +219,10 @@ def _downgrade_tenant() -> None:
                    OR confirmed_outline_sha256 IS NOT NULL
                    OR validation_report IS NOT NULL
                    OR validation_report_sha256 IS NOT NULL
+                   OR validation_revision IS NOT NULL
+                   OR validation_document_sha256 IS NOT NULL
+                   OR creation_idempotency_key IS NOT NULL
+                   OR creation_request_sha256 IS NOT NULL
             )
             """
         )
@@ -212,7 +244,29 @@ def _downgrade_tenant() -> None:
         type_="foreignkey",
         schema=tenant_schema,
     )
+    op.drop_constraint(
+        "ck_classroom_drafts_validation_binding",
+        "classroom_drafts",
+        type_="check",
+        schema=tenant_schema,
+    )
+    op.drop_constraint(
+        "uq_classroom_drafts_tenant_creation_idempotency",
+        "classroom_drafts",
+        type_="unique",
+        schema=tenant_schema,
+    )
+    op.drop_constraint(
+        "ck_classroom_drafts_creation_binding",
+        "classroom_drafts",
+        type_="check",
+        schema=tenant_schema,
+    )
     for column_name in (
+        "creation_request_sha256",
+        "creation_idempotency_key",
+        "validation_document_sha256",
+        "validation_revision",
         "validation_report_sha256",
         "validation_report",
         "confirmed_outline_sha256",

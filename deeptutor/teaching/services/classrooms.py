@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import hmac
+from html import unescape
+from html.parser import HTMLParser
+import json
 import re
 import secrets
 import tempfile
 from typing import Any, AsyncIterator, Protocol
+from urllib.parse import unquote
 import zipfile
 
 from deeptutor.teaching.artifacts import StoredArtifact, temporary_artifact_key
@@ -58,6 +63,14 @@ class ClassroomRevisionConflict(ClassroomServiceError):
     """The mutable classroom draft revision changed before this update."""
 
 
+class ClassroomConfirmationConflict(ClassroomServiceError):
+    """A repeated outline confirmation does not match its durable binding."""
+
+
+class ClassroomIdempotencyConflict(ClassroomServiceError):
+    """A classroom creation key is already bound to a different request."""
+
+
 class InvalidClassroomState(ClassroomServiceError):
     """The requested authoring operation is invalid in the current lifecycle state."""
 
@@ -85,6 +98,10 @@ class ClassroomRecord:
     classroom_version_id: str | None
     confirmed_outline_sha256: str | None
     validation_report: dict[str, Any] | None
+    validation_revision: int | None = None
+    validation_document_sha256: str | None = None
+    creation_idempotency_key: str | None = None
+    creation_request_sha256: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +112,8 @@ class NewClassroomWorkflow:
     owner_id: str
     title: str
     teaching_brief: TeachingBrief
+    creation_idempotency_key: str
+    creation_request_sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,6 +146,8 @@ class DraftMediaRecord:
     object_key: str = field(repr=False)
     ownership_token: str = field(repr=False)
     object_revision: str | None = field(repr=False)
+    status: str = "writing"
+    last_error_code: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,6 +160,8 @@ class DraftMediaContent:
 
 
 class ClassroomRepository(Protocol):
+    async def get_creation(self, idempotency_key: str) -> ClassroomRecord | None: ...
+
     async def create_workflow(self, workflow: NewClassroomWorkflow) -> ClassroomRecord: ...
 
     async def list_workflows(self) -> tuple[ClassroomRecord, ...]: ...
@@ -167,6 +190,7 @@ class ClassroomRepository(Protocol):
         asset_id: str,
         outline: dict[str, Any],
         confirmed_outline_sha256: str,
+        source_outline_sha256: str,
     ) -> ClassroomRecord: ...
 
     async def mark_generation_succeeded(
@@ -190,7 +214,9 @@ class ClassroomRepository(Protocol):
         asset_id: str,
         report: dict[str, object],
         report_sha256: str,
-    ) -> ClassroomRecord: ...
+        expected_revision: int,
+        expected_document_sha256: str,
+    ) -> ClassroomRecord | None: ...
 
     async def reserve_media(self, media: NewDraftMedia) -> DraftMediaRecord: ...
 
@@ -207,6 +233,26 @@ class ClassroomRepository(Protocol):
         media_id: str,
         error_code: str,
     ) -> None: ...
+
+    async def mark_media_cleanup_pending(
+        self,
+        asset_id: str,
+        media_id: str,
+        error_code: str,
+    ) -> DraftMediaRecord: ...
+
+    async def finish_media_cleanup(
+        self,
+        asset_id: str,
+        media_id: str,
+        error_code: str,
+    ) -> None: ...
+
+    async def get_media_receipt(
+        self,
+        asset_id: str,
+        media_id: str,
+    ) -> DraftMediaRecord | None: ...
 
     async def get_media(
         self,
@@ -237,6 +283,8 @@ class ClassroomGeneration(Protocol):
         self,
         *,
         context: TenantContext,
+        asset_id: str,
+        draft_id: str,
         job_id: str,
         confirmed_outline: OutlineBundle,
         confirmed_outline_sha256: str,
@@ -263,6 +311,16 @@ class DraftMediaStore(Protocol):
         ownership_token: str,
     ) -> StoredArtifact: ...
 
+    async def reconcile_verified(
+        self,
+        key: str,
+        sha256: str,
+        size: int,
+        *,
+        content_type: str,
+        ownership_token: str,
+    ) -> StoredArtifact | None: ...
+
     async def open(self, key: str) -> AsyncIterator[bytes]: ...
 
     async def delete_owned(self, artifact: StoredArtifact) -> None: ...
@@ -273,17 +331,198 @@ class DraftMediaStoreProvider(Protocol):
 
 
 _MEDIA_ID_PATTERN = re.compile(r"^media-[0-9a-f]{32}$")
-_FORBIDDEN_REFERENCE_KEYS = frozenset(
-    {"objectkey", "object_key", "url", "uri", "href", "downloadurl"}
+_CREATION_IDEMPOTENCY_KEY_PATTERN = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$"
 )
-_FORBIDDEN_REFERENCE_PREFIXES = (
-    "http://",
-    "https://",
-    "s3://",
-    "file://",
-    "tenants/",
-    "/tenants/",
+_RAW_REFERENCE_FIELDS = frozenset(
+    {
+        "action",
+        "downloadurl",
+        "fileurl",
+        "formaction",
+        "href",
+        "objectkey",
+        "objectpath",
+        "poster",
+        "relativepath",
+        "s3key",
+        "src",
+        "storagekey",
+        "uri",
+        "url",
+    }
 )
+
+
+def _creation_request_sha256(request: object) -> str:
+    payload = {
+        "allowedWebDomains": list(getattr(request, "allowed_web_domains")),
+        "audience": getattr(request, "audience"),
+        "classId": getattr(request, "class_id"),
+        "classroomMode": getattr(request, "classroom_mode"),
+        "contentMode": getattr(request, "content_mode"),
+        "courseId": getattr(request, "course_id"),
+        "durationMinutes": getattr(request, "duration_minutes"),
+        "gradeBand": getattr(request, "grade_band"),
+        "knowledgePoints": [
+            {
+                "description": point.description,
+                "knowledgePointId": point.knowledge_point_id,
+                "title": point.title,
+            }
+            for point in getattr(request, "knowledge_points")
+        ],
+        "objective": getattr(request, "objective"),
+        "openCreationAcknowledged": getattr(
+            request,
+            "open_creation_acknowledged",
+        ),
+        "requestedExports": list(getattr(request, "requested_exports")),
+        "sourceRef": getattr(request, "source_ref"),
+        "sourceType": getattr(request, "source_type"),
+        "templateId": getattr(request, "template_id"),
+        "templateVersion": getattr(request, "template_version"),
+        "title": getattr(request, "title"),
+        "webPolicy": getattr(request, "web_policy"),
+    }
+    return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
+
+
+def _creation_key(
+    context: TenantContext,
+    request_sha256: str,
+    supplied: str | None,
+) -> str:
+    if supplied is not None:
+        if _CREATION_IDEMPOTENCY_KEY_PATTERN.fullmatch(supplied) is None:
+            raise InvalidClassroomState("classroom idempotency key is invalid")
+        return supplied
+    digest = hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "requestSha256": request_sha256,
+                "tenantId": context.tenant_id,
+                "userId": context.user_id,
+            }
+        )
+    ).hexdigest()
+    return f"auto-{digest}"
+
+
+def _creation_identifier(prefix: str, tenant_id: str, idempotency_key: str) -> str:
+    digest = hashlib.sha256(
+        canonical_json_bytes(
+            {
+                "idempotencyKey": idempotency_key,
+                "tenantId": tenant_id,
+            }
+        )
+    ).hexdigest()
+    return f"{prefix}-{digest[:32]}"
+
+
+_MEDIA_REFERENCE_FIELD = re.compile(
+    r"^(?:audio|file|image|media|poster|video)(?:href|path|ref|reference|src|uri|url)$"
+)
+_UNSAFE_SCHEMES = (
+    "blob:",
+    "data:",
+    "file:",
+    "ftp:",
+    "http:",
+    "https:",
+    "javascript:",
+    "s3:",
+    "vbscript:",
+    "ws:",
+    "wss:",
+)
+_ALLOWED_HTML_TAGS = frozenset(
+    {
+        "a",
+        "article",
+        "b",
+        "br",
+        "button",
+        "canvas",
+        "circle",
+        "div",
+        "em",
+        "footer",
+        "g",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "header",
+        "hr",
+        "i",
+        "img",
+        "input",
+        "label",
+        "li",
+        "line",
+        "main",
+        "ol",
+        "option",
+        "p",
+        "path",
+        "polygon",
+        "polyline",
+        "rect",
+        "section",
+        "select",
+        "small",
+        "span",
+        "strong",
+        "svg",
+        "table",
+        "tbody",
+        "td",
+        "text",
+        "th",
+        "thead",
+        "tr",
+        "ul",
+    }
+)
+_VOID_HTML_TAGS = frozenset({"br", "hr", "img", "input"})
+_GLOBAL_HTML_ATTRIBUTES = frozenset(
+    {"class", "dir", "hidden", "id", "lang", "role", "tabindex", "title"}
+)
+_HTML_ATTRIBUTES_BY_TAG = {
+    "a": frozenset({"href"}),
+    "button": frozenset({"disabled", "name", "type", "value"}),
+    "canvas": frozenset({"height", "width"}),
+    "circle": frozenset({"cx", "cy", "fill", "r", "stroke"}),
+    "img": frozenset({"alt", "data-media-id", "height", "width"}),
+    "input": frozenset(
+        {
+            "checked",
+            "disabled",
+            "max",
+            "min",
+            "name",
+            "placeholder",
+            "step",
+            "type",
+            "value",
+        }
+    ),
+    "label": frozenset({"for"}),
+    "line": frozenset({"stroke", "x1", "x2", "y1", "y2"}),
+    "option": frozenset({"disabled", "selected", "value"}),
+    "path": frozenset({"d", "fill", "stroke"}),
+    "polygon": frozenset({"fill", "points", "stroke"}),
+    "polyline": frozenset({"fill", "points", "stroke"}),
+    "rect": frozenset({"fill", "height", "rx", "ry", "stroke", "width", "x", "y"}),
+    "select": frozenset({"disabled", "multiple", "name"}),
+    "svg": frozenset({"height", "viewbox", "width"}),
+    "td": frozenset({"colspan", "rowspan"}),
+    "th": frozenset({"colspan", "rowspan", "scope"}),
+}
 _VALIDATION_SECTION_NAMES = (
     "dsl_integrity",
     "media_integrity",
@@ -323,6 +562,144 @@ def _walk(value: object, path: str = "$"):
             yield from _walk(item, f"{path}[{index}]")
 
 
+def _normalized_field_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", value.casefold())
+
+
+def _decoded_reference(value: str) -> str:
+    decoded = value
+    for _ in range(3):
+        candidate = unescape(unquote(decoded))
+        if candidate == decoded:
+            break
+        decoded = candidate
+    return decoded
+
+
+def _contains_unsafe_reference(value: str) -> bool:
+    decoded = _decoded_reference(value)
+    compact = "".join(
+        character
+        for character in decoded.casefold()
+        if not character.isspace() and ord(character) >= 32 and ord(character) != 127
+    )
+    return (
+        any(scheme in compact for scheme in _UNSAFE_SCHEMES)
+        or compact.startswith("//")
+        or "tenants/" in compact
+        or "/tenants/" in compact
+    )
+
+
+def _is_raw_reference_field(normalized_key: str) -> bool:
+    return normalized_key in _RAW_REFERENCE_FIELDS or (
+        _MEDIA_REFERENCE_FIELD.fullmatch(normalized_key) is not None
+    )
+
+
+class _InteractiveHtmlValidator(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.media_ids: set[str] = set()
+        self._open_tags: list[str] = []
+
+    @staticmethod
+    def _unsafe() -> InvalidDraftDocument:
+        return InvalidDraftDocument("draft document has an unsafe reference")
+
+    def _validate_attributes(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        allowed = _HTML_ATTRIBUTES_BY_TAG.get(tag, frozenset())
+        seen: set[str] = set()
+        for raw_name, raw_value in attrs:
+            name = raw_name.casefold()
+            if name in seen or name.startswith("on") or name == "style":
+                raise self._unsafe()
+            seen.add(name)
+            if (
+                name not in _GLOBAL_HTML_ATTRIBUTES
+                and name not in allowed
+                and not name.startswith("aria-")
+                and not name.startswith("data-")
+            ):
+                raise self._unsafe()
+            value = raw_value or ""
+            normalized_name = _normalized_field_name(name)
+            if name == "href":
+                if not re.fullmatch(r"#[A-Za-z][A-Za-z0-9_.:-]*", value):
+                    raise self._unsafe()
+            elif _is_raw_reference_field(normalized_name) or _contains_unsafe_reference(value):
+                raise self._unsafe()
+            if name == "data-media-id":
+                if _MEDIA_ID_PATTERN.fullmatch(value) is None:
+                    raise self._unsafe()
+                self.media_ids.add(value)
+            elif normalized_name.endswith(("url", "uri", "src", "href", "path")):
+                raise self._unsafe()
+
+    def handle_starttag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        tag = tag.casefold()
+        if tag not in _ALLOWED_HTML_TAGS:
+            raise self._unsafe()
+        self._validate_attributes(tag, attrs)
+        if tag not in _VOID_HTML_TAGS:
+            self._open_tags.append(tag)
+
+    def handle_startendtag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        tag = tag.casefold()
+        if tag not in _ALLOWED_HTML_TAGS:
+            raise self._unsafe()
+        self._validate_attributes(tag, attrs)
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.casefold()
+        if not self._open_tags or self._open_tags[-1] != tag:
+            raise self._unsafe()
+        self._open_tags.pop()
+
+    def handle_data(self, data: str) -> None:
+        if _contains_unsafe_reference(data):
+            raise self._unsafe()
+
+    def handle_decl(self, _decl: str) -> None:
+        raise self._unsafe()
+
+    def handle_pi(self, _data: str) -> None:
+        raise self._unsafe()
+
+    def unknown_decl(self, _data: str) -> None:
+        raise self._unsafe()
+
+    def validated_media_ids(self, value: str) -> frozenset[str]:
+        try:
+            self.feed(value)
+            self.close()
+        except InvalidDraftDocument:
+            raise
+        except Exception:
+            raise self._unsafe() from None
+        if self._open_tags:
+            raise self._unsafe()
+        return frozenset(self.media_ids)
+
+
+def _validate_interactive_html(value: object) -> frozenset[str]:
+    if not isinstance(value, str) or not value.strip():
+        raise InvalidDraftDocument("draft document has an unsafe reference")
+    return _InteractiveHtmlValidator().validated_media_ids(value)
+
+
 def validate_draft_document_references(document: Mapping[str, Any]) -> frozenset[str]:
     """Reject client object-store identities and return opaque media references."""
 
@@ -330,12 +707,10 @@ def validate_draft_document_references(document: Mapping[str, Any]) -> frozenset
         raise InvalidDraftDocument("draft document is invalid")
     media_ids: set[str] = set()
     for _path, key, value in _walk(document):
-        normalized_key = key.lower() if isinstance(key, str) else None
-        if normalized_key in _FORBIDDEN_REFERENCE_KEYS:
-            raise InvalidDraftDocument("draft document has an unsafe reference")
-        if isinstance(value, str) and value.strip().lower().startswith(
-            _FORBIDDEN_REFERENCE_PREFIXES
-        ):
+        normalized_key = _normalized_field_name(key) if isinstance(key, str) else None
+        if normalized_key == "html":
+            media_ids.update(_validate_interactive_html(value))
+        elif normalized_key is not None and _is_raw_reference_field(normalized_key):
             raise InvalidDraftDocument("draft document has an unsafe reference")
         if normalized_key == "mediaid":
             if not isinstance(value, str) or _MEDIA_ID_PATTERN.fullmatch(value) is None:
@@ -487,13 +862,14 @@ def build_validation_report(
                 )
         if scene.get("type") == "interactive" and isinstance(content, Mapping):
             html = content.get("html")
-            lowered = html.lower() if isinstance(html, str) else ""
-            if any(token in lowered for token in ("<script", "javascript:", " onerror=", " onclick=")):
+            try:
+                _validate_interactive_html(html)
+            except InvalidDraftDocument:
                 security_issues.append(
                     _issue(
                         "error",
-                        "interactive_script_unsafe",
-                        "Remove scripts and inline event handlers from interactive HTML.",
+                        "interactive_html_unsafe",
+                        "Use only approved HTML elements, attributes, and opaque media IDs.",
                         f"$.scenes[{index}].content.html",
                     )
                 )
@@ -577,6 +953,13 @@ def _outline_payload(outline: OutlineBundle) -> dict[str, Any]:
     return outline.model_dump(mode="json", by_alias=True, exclude_none=True)
 
 
+def _draft_outline_sha256(outline: OutlineBundle) -> str:
+    draft = outline.model_copy(
+        update={"confirmation_metadata": OutlineConfirmationMetadata(status="draft")}
+    )
+    return canonical_outline_sha256(draft)
+
+
 def _sha256_payload(value: object) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
@@ -649,6 +1032,16 @@ async def _spooled_chunks(handle) -> AsyncIterator[bytes]:
         yield chunk
 
 
+def _generation_request_payload(request: GenerationRequest) -> str:
+    return json.dumps(
+        request.model_dump(mode="json", by_alias=True, exclude_none=False),
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
 class SqlAlchemyClassroomGeneration:
     """Adapter from teacher authoring to the Plan 02 durable job state machine."""
 
@@ -715,7 +1108,7 @@ class SqlAlchemyClassroomGeneration:
             data_plane_route_id=selection.route_ref,
             priority="teacher",
         )
-        payload = canonical_json_bytes(generation).decode("utf-8")
+        payload = _generation_request_payload(generation)
         payload_sha256 = hashlib.sha256(payload.encode()).hexdigest()
         await self._repository.create_job_and_reserve(
             GenerationJobRequest(
@@ -763,15 +1156,27 @@ class SqlAlchemyClassroomGeneration:
         self,
         *,
         context: TenantContext,
+        asset_id: str,
+        draft_id: str,
         job_id: str,
         confirmed_outline: OutlineBundle,
         confirmed_outline_sha256: str,
     ) -> GenerationStage:
         details = await self._repository.get_job_details(context.tenant_id, job_id)
+        if details is None or details.tenant_id != context.tenant_id:
+            raise InvalidClassroomState("outline cannot start content generation")
+        if details.phase == "content":
+            return self._idempotent_content_stage(
+                details,
+                context=context,
+                asset_id=asset_id,
+                draft_id=draft_id,
+                job_id=job_id,
+                confirmed_outline=confirmed_outline,
+                confirmed_outline_sha256=confirmed_outline_sha256,
+            )
         if (
-            details is None
-            or details.tenant_id != context.tenant_id
-            or details.job_kind != "generation"
+            details.job_kind != "generation"
             or details.phase != "outline"
             or details.status != "awaiting_confirmation"
             or details.result_payload is None
@@ -780,6 +1185,14 @@ class SqlAlchemyClassroomGeneration:
         try:
             original = GenerationRequest.model_validate_json(details.request_payload)
             issued = OutlineBundle.model_validate_json(details.result_payload)
+            self._validate_job_request_identity(
+                details,
+                original,
+                context,
+                asset_id,
+                draft_id,
+                job_id,
+            )
             validate_outline_binding(
                 issued,
                 original,
@@ -790,6 +1203,8 @@ class SqlAlchemyClassroomGeneration:
                 original,
                 expected_confirmation_status="confirmed",
             )
+        except InvalidClassroomState:
+            raise
         except Exception:
             raise InvalidClassroomState("confirmed outline is invalid") from None
         if not hmac.compare_digest(
@@ -800,7 +1215,7 @@ class SqlAlchemyClassroomGeneration:
         content_payload = original.model_dump(
             mode="json",
             by_alias=True,
-            exclude_none=True,
+            exclude_none=False,
         )
         content_payload.update(
             phase="content",
@@ -808,7 +1223,7 @@ class SqlAlchemyClassroomGeneration:
             confirmedOutlineSha256=confirmed_outline_sha256,
         )
         content_request = GenerationRequest.model_validate(content_payload)
-        payload = canonical_json_bytes(content_request).decode("utf-8")
+        payload = _generation_request_payload(content_request)
         requeued = await self._repository.requeue_confirmed_content(
             context.tenant_id,
             job_id,
@@ -816,11 +1231,102 @@ class SqlAlchemyClassroomGeneration:
             request_sha256=hashlib.sha256(payload.encode()).hexdigest(),
         )
         if not requeued:
-            raise InvalidClassroomState("outline cannot start content generation")
+            raced = await self._repository.get_job_details(context.tenant_id, job_id)
+            if raced is None:
+                raise InvalidClassroomState("outline cannot start content generation")
+            return self._idempotent_content_stage(
+                raced,
+                context=context,
+                asset_id=asset_id,
+                draft_id=draft_id,
+                job_id=job_id,
+                confirmed_outline=confirmed_outline,
+                confirmed_outline_sha256=confirmed_outline_sha256,
+            )
         updated = await self._repository.get_job_details(context.tenant_id, job_id)
         if updated is None:
             raise InvalidClassroomState("generation job is unavailable")
         return self._stage(updated)
+
+    @staticmethod
+    def _validate_job_request_identity(
+        details: GenerationJobDetails,
+        request: GenerationRequest,
+        context: TenantContext,
+        asset_id: str,
+        draft_id: str,
+        job_id: str,
+    ) -> None:
+        if (
+            details.job_kind != "generation"
+            or request.tenant_id != context.tenant_id
+            or job_id != SqlAlchemyClassroomGeneration._job_id(context.tenant_id, asset_id)
+            or request.job_id != job_id
+            or request.request_id != details.request_id
+            or request.idempotency_key != details.idempotency_key
+            or request.data_plane_route_id != details.data_plane_route_id
+            or details.classroom_draft_id != draft_id
+            or request.callback_context != draft_id
+        ):
+            raise InvalidClassroomState("confirmed outline job binding is invalid")
+
+    def _idempotent_content_stage(
+        self,
+        details: GenerationJobDetails,
+        *,
+        context: TenantContext,
+        asset_id: str,
+        draft_id: str,
+        job_id: str,
+        confirmed_outline: OutlineBundle,
+        confirmed_outline_sha256: str,
+    ) -> GenerationStage:
+        if details.status not in {
+            "queued",
+            "generating_content",
+            "validating",
+            "materializing",
+            "succeeded",
+            "failed",
+            "canceled",
+        }:
+            raise InvalidClassroomState("content generation state is invalid")
+        try:
+            request = GenerationRequest.model_validate_json(details.request_payload)
+            self._validate_job_request_identity(
+                details,
+                request,
+                context,
+                asset_id,
+                draft_id,
+                job_id,
+            )
+            validate_outline_binding(
+                confirmed_outline,
+                request,
+                expected_confirmation_status="confirmed",
+            )
+        except InvalidClassroomState:
+            raise
+        except Exception:
+            raise InvalidClassroomState("confirmed content binding is invalid") from None
+        if (
+            request.phase != "content"
+            or request.confirmed_outline is None
+            or request.confirmed_outline_sha256 is None
+            or not hmac.compare_digest(
+                confirmed_outline_sha256,
+                canonical_outline_sha256(confirmed_outline),
+            )
+            or not hmac.compare_digest(
+                confirmed_outline_sha256,
+                request.confirmed_outline_sha256,
+            )
+            or canonical_json_bytes(confirmed_outline)
+            != canonical_json_bytes(request.confirmed_outline)
+        ):
+            raise InvalidClassroomState("confirmed content binding is invalid")
+        return self._stage(details)
 
 
 class ClassroomService:
@@ -841,7 +1347,12 @@ class ClassroomService:
         self._store_provider = store_provider
         self._clock = clock
 
-    async def create(self, context: TenantContext, request: object) -> ClassroomRecord:
+    async def create(
+        self,
+        context: TenantContext,
+        request: object,
+        idempotency_key: str | None = None,
+    ) -> ClassroomRecord:
         course_id = str(getattr(request, "course_id"))
         class_id = str(getattr(request, "class_id"))
         if not _allows(
@@ -853,6 +1364,22 @@ class ClassroomService:
             raise ClassroomAccessDenied("classroom creation is denied")
         if getattr(request, "classroom_mode") != "full":
             raise InvalidClassroomState("teacher classroom must use full mode")
+
+        request_sha256 = _creation_request_sha256(request)
+        creation_key = _creation_key(context, request_sha256, idempotency_key)
+        existing = await self._repository.get_creation(creation_key)
+        if existing is not None:
+            self._validate_creation_binding(
+                context,
+                existing,
+                creation_key,
+                request_sha256,
+            )
+            return await self._resume_creation(
+                context,
+                existing,
+                tuple(getattr(request, "requested_exports")),
+            )
 
         points = tuple(
             KnowledgePointSpec(
@@ -897,8 +1424,8 @@ class ClassroomService:
             else:
                 raise InvalidClassroomState("classroom source is invalid")
 
-        asset_id = f"asset-{secrets.token_hex(16)}"
-        draft_id = f"draft-{secrets.token_hex(16)}"
+        asset_id = _creation_identifier("asset", context.tenant_id, creation_key)
+        draft_id = _creation_identifier("draft", context.tenant_id, creation_key)
         record = await self._repository.create_workflow(
             NewClassroomWorkflow(
                 tenant_id=context.tenant_id,
@@ -907,22 +1434,85 @@ class ClassroomService:
                 owner_id=context.user_id,
                 title=str(getattr(request, "title")),
                 teaching_brief=built.contract,
+                creation_idempotency_key=creation_key,
+                creation_request_sha256=request_sha256,
             )
         )
-        stage = await self._generation.start_outline(
-            context=context,
-            asset_id=asset_id,
-            draft_id=draft_id,
-            teaching_brief=built.contract,
-            requested_exports=tuple(getattr(request, "requested_exports")),
+        self._validate_creation_binding(
+            context,
+            record,
+            creation_key,
+            request_sha256,
         )
-        record = await self._repository.attach_outline_job(asset_id, stage.job_id)
+        return await self._resume_creation(
+            context,
+            record,
+            tuple(getattr(request, "requested_exports")),
+        )
+
+    @staticmethod
+    def _validate_creation_binding(
+        context: TenantContext,
+        record: ClassroomRecord,
+        idempotency_key: str,
+        request_sha256: str,
+    ) -> None:
+        if (
+            record.tenant_id != context.tenant_id
+            or record.owner_id != context.user_id
+            or record.creation_idempotency_key != idempotency_key
+            or record.creation_request_sha256 is None
+            or not hmac.compare_digest(
+                record.creation_request_sha256,
+                request_sha256,
+            )
+            or record.asset_id
+            != _creation_identifier("asset", context.tenant_id, idempotency_key)
+            or record.draft_id
+            != _creation_identifier("draft", context.tenant_id, idempotency_key)
+        ):
+            raise ClassroomIdempotencyConflict(
+                "classroom idempotency key conflicts"
+            )
+
+    async def _resume_creation(
+        self,
+        context: TenantContext,
+        record: ClassroomRecord,
+        requested_exports: tuple[str, ...],
+    ) -> ClassroomRecord:
+        brief = record.teaching_brief
+        if brief is None:
+            raise InvalidClassroomState("teaching brief is unavailable")
+        if record.job_id is None:
+            stage = await self._generation.start_outline(
+                context=context,
+                asset_id=record.asset_id,
+                draft_id=record.draft_id,
+                teaching_brief=brief,
+                requested_exports=requested_exports,
+            )
+            if stage.classroom_version_id is not None:
+                raise InvalidClassroomState(
+                    "outline stage cannot create a classroom version"
+                )
+            record = await self._repository.attach_outline_job(
+                record.asset_id,
+                stage.job_id,
+            )
+        else:
+            stage = await self._generation.get_stage(
+                context=context,
+                job_id=record.job_id,
+            )
+        if record.job_id != stage.job_id:
+            raise InvalidClassroomState("outline generation binding is invalid")
         if stage.classroom_version_id is not None:
             raise InvalidClassroomState("outline stage cannot create a classroom version")
         if stage.status == "awaiting_confirmation" and stage.outline is not None:
             payload = _outline_payload(stage.outline)
             record = await self._repository.save_outline(
-                asset_id,
+                record.asset_id,
                 payload,
                 canonical_outline_sha256(stage.outline),
             )
@@ -1044,17 +1634,42 @@ class ClassroomService:
                 or record.confirmed_outline_sha256 is None
             ):
                 raise InvalidClassroomState("confirmed outline is unavailable")
+        source_outline_sha256 = _draft_outline_sha256(outline)
         outline_sha256 = canonical_outline_sha256(confirmed)
         persisted = await self._repository.confirm_outline(
             asset_id,
             _outline_payload(confirmed),
             outline_sha256,
+            source_outline_sha256,
         )
+        if (
+            persisted.outline is None
+            or persisted.confirmed_outline_sha256 is None
+        ):
+            raise InvalidClassroomState("confirmed outline is unavailable")
+        try:
+            persisted_outline = OutlineBundle.model_validate(persisted.outline)
+        except Exception:
+            raise InvalidClassroomState("confirmed outline is unavailable") from None
+        if (
+            persisted_outline.confirmation_metadata.status != "confirmed"
+            or not hmac.compare_digest(
+                persisted.confirmed_outline_sha256,
+                canonical_outline_sha256(persisted_outline),
+            )
+            or not hmac.compare_digest(
+                source_outline_sha256,
+                _draft_outline_sha256(persisted_outline),
+            )
+        ):
+            raise InvalidClassroomState("confirmed outline binding is invalid")
         stage = await self._generation.start_content(
             context=context,
+            asset_id=asset_id,
+            draft_id=record.draft_id,
             job_id=record.job_id,
-            confirmed_outline=confirmed,
-            confirmed_outline_sha256=outline_sha256,
+            confirmed_outline=persisted_outline,
+            confirmed_outline_sha256=persisted.confirmed_outline_sha256,
         )
         if stage.classroom_version_id is not None:
             raise InvalidClassroomState("content was not queued safely")
@@ -1108,11 +1723,21 @@ class ClassroomService:
             grounded=brief.content_mode == "source_grounded",
             available_media_ids=available,
         )
-        return await self._repository.save_validation_report(
+        document_sha256 = _sha256_payload(record.document)
+        report.update(
+            draftRevision=record.revision,
+            documentSha256=document_sha256,
+        )
+        persisted = await self._repository.save_validation_report(
             asset_id,
             report,
             _sha256_payload(report),
+            record.revision,
+            document_sha256,
         )
+        if persisted is None:
+            raise ClassroomRevisionConflict("draft revision is stale")
+        return persisted
 
     async def upload_media(
         self,
@@ -1155,9 +1780,9 @@ class ClassroomService:
                     ownership_token=ownership_token,
                 )
             )
-            store = await self._store_provider.store_for_tenant(context.tenant_id)
-            artifact: StoredArtifact | None = None
+            store: DraftMediaStore | None = None
             try:
+                store = await self._store_provider.store_for_tenant(context.tenant_id)
                 artifact = await store.put_verified(
                     object_key,
                     _spooled_chunks(staged),
@@ -1174,19 +1799,101 @@ class ClassroomService:
                     artifact.revision,
                 )
             except BaseException:
-                await self._repository.fail_media(
-                    asset_id,
-                    media_id,
-                    "upload_failed",
+                cleanup = asyncio.create_task(
+                    self._recover_media_upload(
+                        asset_id,
+                        media_id,
+                        store,
+                    )
                 )
-                if artifact is not None:
-                    try:
-                        await store.delete_owned(artifact)
-                    except Exception:
-                        pass
+                await asyncio.shield(cleanup)
                 raise
         finally:
             staged.close()
+
+    @staticmethod
+    def _matches_media_receipt(
+        artifact: StoredArtifact,
+        receipt: DraftMediaRecord,
+    ) -> bool:
+        return (
+            artifact.key == receipt.object_key
+            and hmac.compare_digest(artifact.sha256, receipt.sha256)
+            and artifact.size == receipt.size_bytes
+            and artifact.content_type == receipt.mime_type
+            and artifact.ownership_token is not None
+            and hmac.compare_digest(
+                artifact.ownership_token,
+                receipt.ownership_token,
+            )
+            and (artifact.revision is not None or artifact.version_id is not None)
+        )
+
+    async def _finish_media_cleanup(
+        self,
+        store: DraftMediaStore,
+        receipt: DraftMediaRecord,
+    ) -> bool:
+        try:
+            artifact = await store.reconcile_verified(
+                receipt.object_key,
+                receipt.sha256,
+                receipt.size_bytes,
+                content_type=receipt.mime_type,
+                ownership_token=receipt.ownership_token,
+            )
+            if artifact is not None:
+                if not self._matches_media_receipt(artifact, receipt):
+                    return False
+                await store.delete_owned(artifact)
+            await self._repository.finish_media_cleanup(
+                receipt.classroom_id,
+                receipt.id,
+                "upload_failed",
+            )
+        except Exception:
+            return False
+        return True
+
+    async def _recover_media_upload(
+        self,
+        asset_id: str,
+        media_id: str,
+        store: DraftMediaStore | None,
+    ) -> bool:
+        try:
+            receipt = await self._repository.mark_media_cleanup_pending(
+                asset_id,
+                media_id,
+                "upload_failed",
+            )
+        except Exception:
+            return False
+        if store is None:
+            return False
+        return await self._finish_media_cleanup(store, receipt)
+
+    async def reconcile_media_cleanup(
+        self,
+        context: TenantContext,
+        asset_id: str,
+        media_id: str,
+    ) -> bool:
+        await self._editable_record(context, asset_id)
+        if _MEDIA_ID_PATTERN.fullmatch(media_id) is None:
+            return False
+        receipt = await self._repository.get_media_receipt(asset_id, media_id)
+        if receipt is None:
+            return False
+        if receipt.status == "failed":
+            return True
+        if receipt.status != "cleanup_pending" or self._store_provider is None:
+            return False
+        try:
+            store = await self._store_provider.store_for_tenant(context.tenant_id)
+        except Exception:
+            return False
+        return await self._finish_media_cleanup(store, receipt)
 
     async def get_media(
         self,
@@ -1214,6 +1921,8 @@ class ClassroomService:
 
 __all__ = [
     "ClassroomAccessDenied",
+    "ClassroomConfirmationConflict",
+    "ClassroomIdempotencyConflict",
     "ClassroomNotFound",
     "ClassroomRecord",
     "ClassroomRevisionConflict",

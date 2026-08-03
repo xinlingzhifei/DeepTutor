@@ -1,32 +1,42 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 from io import BytesIO
+import json
 from types import SimpleNamespace
 
 import pytest
 
+from deeptutor.teaching.artifacts import StoredArtifact
 from deeptutor.teaching.brief_builder import TeachingBriefBuilder
 from deeptutor.teaching.contracts import (
     GenerationMetadata,
+    GenerationRequest,
     KnowledgeCoverage,
     OutlineBundle,
     OutlineConfirmationMetadata,
     OutlineScene,
+    canonical_json_bytes,
     canonical_outline_sha256,
 )
 from deeptutor.teaching.permissions import permissions_for_roles
+from deeptutor.teaching.repositories.jobs import GenerationJobDetails
 from deeptutor.teaching.services.classrooms import (
     ClassroomAccessDenied,
+    ClassroomIdempotencyConflict,
     ClassroomRecord,
+    ClassroomRevisionConflict,
     ClassroomService,
     DraftMediaRecord,
     GenerationStage,
+    InvalidClassroomState,
     InvalidDraftMedia,
     NewClassroomWorkflow,
     NewDraftMedia,
+    SqlAlchemyClassroomGeneration,
 )
 from deeptutor.teaching.tenant_context import TenantContext
 
@@ -90,8 +100,25 @@ class _Repository:
         self.new_workflows: list[NewClassroomWorkflow] = []
         self.validation_reports: list[dict[str, object]] = []
         self.media: dict[tuple[str, str], DraftMediaRecord] = {}
+        self.media_status: dict[tuple[str, str], str] = {}
+        self.cleanup_transitions: list[str] = []
+
+    async def get_creation(self, idempotency_key: str):
+        for record in self.records.values():
+            if record.creation_idempotency_key == idempotency_key:
+                return record
+        return None
 
     async def create_workflow(self, workflow: NewClassroomWorkflow) -> ClassroomRecord:
+        existing = await self.get_creation(workflow.creation_idempotency_key)
+        if existing is not None:
+            if (
+                existing.owner_id != workflow.owner_id
+                or existing.creation_request_sha256
+                != workflow.creation_request_sha256
+            ):
+                raise ClassroomIdempotencyConflict()
+            return existing
         self.new_workflows.append(workflow)
         record = ClassroomRecord(
             tenant_id=workflow.tenant_id,
@@ -111,6 +138,8 @@ class _Repository:
             classroom_version_id=None,
             confirmed_outline_sha256=None,
             validation_report=None,
+            creation_idempotency_key=workflow.creation_idempotency_key,
+            creation_request_sha256=workflow.creation_request_sha256,
         )
         self.records[record.asset_id] = record
         return record
@@ -150,8 +179,13 @@ class _Repository:
         return self.records[asset_id]
 
     async def confirm_outline(
-        self, asset_id: str, outline: dict, confirmed_outline_sha256: str
+        self,
+        asset_id: str,
+        outline: dict,
+        confirmed_outline_sha256: str,
+        source_outline_sha256: str,
     ):
+        assert len(source_outline_sha256) == 64
         current = self.records[asset_id]
         self.records[asset_id] = replace(
             current,
@@ -177,9 +211,21 @@ class _Repository:
     async def available_media_ids(self, asset_id: str):
         return frozenset()
 
-    async def save_validation_report(self, asset_id, report, report_sha256):
-        self.validation_reports.append(report)
+    async def save_validation_report(
+        self,
+        asset_id,
+        report,
+        report_sha256,
+        expected_revision,
+        expected_document_sha256,
+    ):
         current = self.records[asset_id]
+        assert current.revision == expected_revision
+        assert (
+            hashlib.sha256(canonical_json_bytes(current.document)).hexdigest()
+            == expected_document_sha256
+        )
+        self.validation_reports.append(report)
         self.records[asset_id] = replace(current, validation_report=report)
         return self.records[asset_id]
 
@@ -195,16 +241,55 @@ class _Repository:
             object_revision=None,
         )
         self.media[(media.classroom_id, media.id)] = record
+        self.media_status[(media.classroom_id, media.id)] = "writing"
         return record
 
     async def complete_media(self, asset_id, media_id, object_revision):
         current = self.media[(asset_id, media_id)]
-        completed = replace(current, object_revision=object_revision)
+        completed = replace(
+            current,
+            object_revision=object_revision,
+            status="uploaded",
+            last_error_code=None,
+        )
         self.media[(asset_id, media_id)] = completed
+        self.media_status[(asset_id, media_id)] = "uploaded"
         return completed
 
     async def fail_media(self, asset_id, media_id, error_code):
-        self.media.pop((asset_id, media_id), None)
+        current = self.media[(asset_id, media_id)]
+        self.media[(asset_id, media_id)] = replace(
+            current,
+            status="failed",
+            last_error_code=error_code,
+        )
+        self.media_status[(asset_id, media_id)] = "failed"
+
+    async def mark_media_cleanup_pending(self, asset_id, media_id, error_code):
+        current = self.media[(asset_id, media_id)]
+        pending = replace(
+            current,
+            status="cleanup_pending",
+            last_error_code=error_code,
+        )
+        self.media[(asset_id, media_id)] = pending
+        self.media_status[(asset_id, media_id)] = "cleanup_pending"
+        self.cleanup_transitions.append("cleanup_pending")
+        return pending
+
+    async def finish_media_cleanup(self, asset_id, media_id, error_code):
+        current = self.media[(asset_id, media_id)]
+        self.media[(asset_id, media_id)] = replace(
+            current,
+            object_revision=None,
+            status="failed",
+            last_error_code=error_code,
+        )
+        self.media_status[(asset_id, media_id)] = "failed"
+        self.cleanup_transitions.append("failed")
+
+    async def get_media_receipt(self, asset_id, media_id):
+        return self.media.get((asset_id, media_id))
 
     async def get_media(self, asset_id, media_id):
         return self.media.get((asset_id, media_id))
@@ -279,10 +364,14 @@ class _Generation:
         self,
         *,
         context,
+        asset_id,
+        draft_id,
         job_id,
         confirmed_outline,
         confirmed_outline_sha256,
     ) -> GenerationStage:
+        assert asset_id
+        assert draft_id
         self.content_calls.append((confirmed_outline, confirmed_outline_sha256))
         if self.content_error is not None:
             raise self.content_error
@@ -292,6 +381,61 @@ class _Generation:
             outline=confirmed_outline,
             classroom_version_id=None,
         )
+
+
+class _ReplayableGeneration(_Generation):
+    def __init__(self, *, fail_first_start: bool = False) -> None:
+        super().__init__()
+        self.fail_first_start = fail_first_start
+        self.stages: dict[str, GenerationStage] = {}
+        self.return_mismatched_stage = False
+
+    async def start_outline(self, **kwargs) -> GenerationStage:
+        asset_id = kwargs["asset_id"]
+        if self.fail_first_start:
+            self.fail_first_start = False
+            self.start_calls.append(tuple(kwargs.values()))
+            raise RuntimeError("selector unavailable")
+        stage = self.stages.get(asset_id)
+        if stage is None:
+            stage = await super().start_outline(**kwargs)
+            self.stages[asset_id] = stage
+        else:
+            self.start_calls.append(tuple(kwargs.values()))
+        return stage
+
+    async def get_stage(self, *, context, job_id):
+        for stage in self.stages.values():
+            if stage.job_id == job_id:
+                if self.return_mismatched_stage:
+                    return replace(stage, job_id="job-mismatched-binding")
+                return stage
+        raise AssertionError("unknown generation stage")
+
+
+class _AttachFailsOnceRepository(_Repository):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_next_attach = True
+
+    async def attach_outline_job(self, asset_id: str, job_id: str):
+        if self.fail_next_attach:
+            self.fail_next_attach = False
+            raise RuntimeError("attach response lost")
+        return await super().attach_outline_job(asset_id, job_id)
+
+
+class _AttachCommitsThenFailsOnceRepository(_Repository):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_next_attach = True
+
+    async def attach_outline_job(self, asset_id: str, job_id: str):
+        record = await super().attach_outline_job(asset_id, job_id)
+        if self.fail_next_attach:
+            self.fail_next_attach = False
+            raise RuntimeError("attach response lost after commit")
+        return record
 
 
 class _Upload:
@@ -336,6 +480,32 @@ class _Store:
             yield self.content[key]
 
         return stream()
+
+    async def reconcile_verified(
+        self,
+        key,
+        sha256,
+        size,
+        *,
+        content_type,
+        ownership_token,
+    ):
+        payload = self.content.get(key)
+        if payload is None:
+            return None
+        assert hashlib.sha256(payload).hexdigest() == sha256
+        assert len(payload) == size
+        return StoredArtifact(
+            key=key,
+            sha256=sha256,
+            size=size,
+            content_type=content_type,
+            ownership_token=ownership_token,
+            revision="revision-1",
+        )
+
+    async def delete_owned(self, artifact: StoredArtifact) -> None:
+        self.content.pop(artifact.key, None)
 
 
 class _StoreProvider:
@@ -389,6 +559,175 @@ async def test_full_creation_uses_brief_builder_and_enqueues_outline_only() -> N
 
 
 @pytest.mark.asyncio
+async def test_create_retry_after_selector_failure_reuses_durable_workflow() -> None:
+    context = _context()
+    repository = _Repository()
+    generation = _ReplayableGeneration(fail_first_start=True)
+    service = ClassroomService(
+        repository,
+        TeachingBriefBuilder(context, object()),
+        generation,
+        None,
+        clock=lambda: NOW,
+    )
+    request = _request()
+
+    with pytest.raises(RuntimeError, match="selector unavailable"):
+        await service.create(context, request)
+    first = repository.new_workflows[0]
+
+    recovered = await service.create(context, request)
+
+    assert recovered.asset_id == first.asset_id
+    assert recovered.draft_id == first.draft_id
+    assert len(repository.new_workflows) == 1
+
+
+@pytest.mark.asyncio
+async def test_create_retry_after_job_creation_reuses_workflow_and_job() -> None:
+    context = _context()
+    repository = _AttachFailsOnceRepository()
+    generation = _ReplayableGeneration()
+    service = ClassroomService(
+        repository,
+        TeachingBriefBuilder(context, object()),
+        generation,
+        None,
+        clock=lambda: NOW,
+    )
+    request = _request()
+
+    with pytest.raises(RuntimeError, match="attach response lost"):
+        await service.create(context, request)
+    first = repository.new_workflows[0]
+    first_stage = generation.stages[first.asset_id]
+
+    recovered = await service.create(context, request)
+
+    assert (recovered.asset_id, recovered.draft_id, recovered.job_id) == (
+        first.asset_id,
+        first.draft_id,
+        first_stage.job_id,
+    )
+    assert len(repository.new_workflows) == 1
+    assert len(generation.stages) == 1
+
+
+@pytest.mark.asyncio
+async def test_create_retry_after_committed_attach_reads_and_checks_bound_job() -> None:
+    context = _context()
+    repository = _AttachCommitsThenFailsOnceRepository()
+    generation = _ReplayableGeneration()
+    service = ClassroomService(
+        repository,
+        TeachingBriefBuilder(context, object()),
+        generation,
+        None,
+        clock=lambda: NOW,
+    )
+    request = _request()
+
+    with pytest.raises(RuntimeError, match="after commit"):
+        await service.create(context, request)
+    persisted = next(iter(repository.records.values()))
+    assert persisted.job_id is not None
+
+    recovered = await service.create(context, request)
+
+    assert recovered.job_id == persisted.job_id
+    assert len(repository.new_workflows) == 1
+    assert len(generation.start_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_create_retry_rejects_a_mismatched_durable_job_stage() -> None:
+    context = _context()
+    repository = _AttachCommitsThenFailsOnceRepository()
+    generation = _ReplayableGeneration()
+    service = ClassroomService(
+        repository,
+        TeachingBriefBuilder(context, object()),
+        generation,
+        None,
+        clock=lambda: NOW,
+    )
+    request = _request()
+
+    with pytest.raises(RuntimeError, match="after commit"):
+        await service.create(context, request)
+    persisted = next(iter(repository.records.values()))
+    assert persisted.job_id is not None
+    generation.return_mismatched_stage = True
+
+    with pytest.raises(InvalidClassroomState, match="binding"):
+        await service.create(context, request)
+
+
+@pytest.mark.asyncio
+async def test_create_idempotency_key_rejects_a_different_request() -> None:
+    context = _context()
+    service, repository, generation = _service(context)
+
+    await service.create(context, _request(), idempotency_key="classroom-request-1")
+
+    with pytest.raises(ClassroomIdempotencyConflict):
+        await service.create(
+            context,
+            _request(objective="Explain acceleration"),
+            idempotency_key="classroom-request-1",
+        )
+
+    assert len(repository.new_workflows) == 1
+    assert len(generation.start_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_different_explicit_keys_create_distinct_identical_classrooms() -> None:
+    context = _context()
+    service, repository, generation = _service(context)
+    request = _request()
+
+    first = await service.create(
+        context,
+        request,
+        idempotency_key="classroom-request-1",
+    )
+    second = await service.create(
+        context,
+        request,
+        idempotency_key="classroom-request-2",
+    )
+
+    assert first.asset_id != second.asset_id
+    assert len(repository.new_workflows) == 2
+    assert len(generation.start_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_create_without_header_derives_a_reusable_request_key() -> None:
+    context = _context()
+    repository = _Repository()
+    generation = _ReplayableGeneration()
+    service = ClassroomService(
+        repository,
+        TeachingBriefBuilder(context, object()),
+        generation,
+        None,
+        clock=lambda: NOW,
+    )
+    request = _request()
+
+    first = await service.create(context, request)
+    retried = await service.create(context, request)
+
+    assert retried.asset_id == first.asset_id
+    assert retried.draft_id == first.draft_id
+    assert retried.creation_idempotency_key.startswith("auto-")
+    assert len(repository.new_workflows) == 1
+    assert len(generation.start_calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_edited_outline_hash_is_server_computed_and_bound_to_content_stage() -> None:
     context = _context()
     service, _, generation = _service(context)
@@ -431,6 +770,273 @@ async def test_confirmed_outline_is_durable_before_content_requeue() -> None:
     assert confirmed.confirmation_metadata.status == "confirmed"
     assert persisted.confirmed_outline_sha256 == canonical_outline_sha256(confirmed)
     assert persisted.classroom_version_id is None
+
+
+class _ConcurrentConfirmationRepository(_Repository):
+    def __init__(self) -> None:
+        super().__init__()
+        self._arrived = 0
+        self._ready = asyncio.Event()
+        self._lock = asyncio.Lock()
+
+    async def confirm_outline(
+        self,
+        asset_id: str,
+        outline: dict,
+        confirmed_outline_sha256: str,
+        source_outline_sha256: str,
+    ):
+        assert len(source_outline_sha256) == 64
+        self._arrived += 1
+        if self._arrived == 2:
+            self._ready.set()
+        await self._ready.wait()
+        async with self._lock:
+            current = self.records[asset_id]
+            if current.confirmed_outline_sha256 is None:
+                self.records[asset_id] = replace(
+                    current,
+                    lifecycle_state="generating_content",
+                    status="queued",
+                    outline=outline,
+                    confirmed_outline_sha256=confirmed_outline_sha256,
+                )
+            return self.records[asset_id]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_duplicate_confirmations_reuse_server_canonical_payload() -> None:
+    context = _context()
+    repository = _ConcurrentConfirmationRepository()
+    generation = _Generation()
+    times = iter((NOW, NOW + timedelta(seconds=1)))
+    service = ClassroomService(
+        repository,
+        TeachingBriefBuilder(context, object()),
+        generation,
+        None,
+        clock=lambda: next(times),
+    )
+    created = await service.create(context, _request())
+
+    first, second = await asyncio.gather(
+        service.confirm_outline(context, created.asset_id),
+        service.confirm_outline(context, created.asset_id),
+    )
+
+    assert first.confirmed_outline_sha256 == second.confirmed_outline_sha256
+    persisted = repository.records[created.asset_id]
+    assert generation.content_calls == [
+        (
+            OutlineBundle.model_validate(persisted.outline),
+            persisted.confirmed_outline_sha256,
+        ),
+        (
+            OutlineBundle.model_validate(persisted.outline),
+            persisted.confirmed_outline_sha256,
+        ),
+    ]
+
+
+class _LostRequeueResponseRepository:
+    def __init__(self, details: GenerationJobDetails) -> None:
+        self.details = details
+        self.requeue_calls = 0
+
+    async def get_job_details(self, tenant_id: str, job_id: str):
+        assert (tenant_id, job_id) == (self.details.tenant_id, self.details.job_id)
+        return self.details
+
+    async def requeue_confirmed_content(
+        self,
+        tenant_id: str,
+        job_id: str,
+        *,
+        request_payload: str,
+        request_sha256: str,
+    ) -> bool:
+        assert (tenant_id, job_id) == (self.details.tenant_id, self.details.job_id)
+        self.requeue_calls += 1
+        self.details = replace(
+            self.details,
+            phase="content",
+            status="queued",
+            request_payload=request_payload,
+            request_sha256=request_sha256,
+        )
+        raise RuntimeError("requeue response lost")
+
+
+def _generation_details(
+    *,
+    context: TenantContext,
+    created: ClassroomRecord,
+    outline: OutlineBundle,
+) -> GenerationJobDetails:
+    assert created.job_id is not None
+    assert created.teaching_brief is not None
+    request = GenerationRequest(
+        schema_version="1.0",
+        tenant_id=context.tenant_id,
+        request_id="request-classroom-recovery",
+        job_id=created.job_id,
+        idempotency_key=f"classroom-outline-{created.asset_id}",
+        phase="outline",
+        classroom_mode="full",
+        teaching_brief_id=created.teaching_brief.brief_id,
+        teaching_brief_sha256=created.teaching_brief.content_sha256,
+        teaching_brief=created.teaching_brief,
+        confirmed_outline=None,
+        confirmed_outline_sha256=None,
+        template_id=created.teaching_brief.template_policy.template_id,
+        template_version=created.teaching_brief.template_policy.template_version,
+        scene_budget=15,
+        duration_minutes=created.teaching_brief.duration_minutes,
+        requested_exports=["classroom_zip"],
+        callback_context=created.draft_id,
+        data_plane_route_id="route-a",
+        priority="teacher",
+    )
+    payload = json.dumps(
+        request.model_dump(mode="json", by_alias=True, exclude_none=False),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return GenerationJobDetails(
+        tenant_id=context.tenant_id,
+        job_id=created.job_id,
+        job_kind="generation",
+        phase="outline",
+        export_format=None,
+        status="awaiting_confirmation",
+        priority=20,
+        quota_units=45,
+        actor_id=context.user_id,
+        owner_id=context.user_id,
+        visibility="class",
+        request_id=request.request_id,
+        idempotency_key=request.idempotency_key,
+        classroom_draft_id=created.draft_id,
+        batch_id=None,
+        resource_course_id=created.course_id,
+        resource_class_id=created.class_id,
+        public_request_sha256=hashlib.sha256(payload.encode()).hexdigest(),
+        request_sha256=hashlib.sha256(payload.encode()).hexdigest(),
+        data_plane_route_id="route-a",
+        provider_profile_id="provider-a",
+        worker_pool_ref="workers-a",
+        queue_ref="queue-a",
+        request_payload=payload,
+        progress_percent=50,
+        waiting_reason=None,
+        cancel_requested=False,
+        error_category=None,
+        error_code=None,
+        result_payload=canonical_json_bytes(outline).decode(),
+        result_ref=None,
+        retry_of_job_id=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_content_requeue_retry_recovers_after_committed_response_is_lost() -> None:
+    context = _context()
+    service, _, _ = _service(context)
+    created = await service.create(context, _request())
+    asset_id = "asset-confirmation-recovery"
+    job_id = SqlAlchemyClassroomGeneration._job_id(context.tenant_id, asset_id)
+    created = replace(
+        created,
+        asset_id=asset_id,
+        draft_id="draft-confirmation-recovery",
+        job_id=job_id,
+    )
+    issued = OutlineBundle.model_validate(created.outline).model_copy(
+        update={"outline_id": f"outline-{job_id}"}
+    )
+    confirmed = issued.model_copy(
+        update={
+            "confirmation_metadata": OutlineConfirmationMetadata(
+                status="confirmed",
+                confirmed_at=NOW,
+                confirmed_by=context.user_id,
+            )
+        }
+    )
+    repository = _LostRequeueResponseRepository(
+        _generation_details(context=context, created=created, outline=issued)
+    )
+    generation = SqlAlchemyClassroomGeneration(repository, object())
+    digest = canonical_outline_sha256(confirmed)
+
+    with pytest.raises(RuntimeError, match="response lost"):
+        await generation.start_content(
+            context=context,
+            asset_id=created.asset_id,
+            draft_id=created.draft_id,
+            job_id=job_id,
+            confirmed_outline=confirmed,
+            confirmed_outline_sha256=digest,
+        )
+
+    recovered = await generation.start_content(
+        context=context,
+        asset_id=created.asset_id,
+        draft_id=created.draft_id,
+        job_id=job_id,
+        confirmed_outline=confirmed,
+        confirmed_outline_sha256=digest,
+    )
+
+    assert recovered.status == "queued"
+    assert repository.requeue_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("binding", ["asset", "draft"])
+async def test_content_confirmation_rejects_mismatched_classroom_binding(
+    binding: str,
+) -> None:
+    context = _context()
+    service, _, _ = _service(context)
+    created = await service.create(context, _request())
+    asset_id = "asset-confirmation-binding"
+    job_id = SqlAlchemyClassroomGeneration._job_id(context.tenant_id, asset_id)
+    created = replace(
+        created,
+        asset_id=asset_id,
+        draft_id="draft-confirmation-binding",
+        job_id=job_id,
+    )
+    issued = OutlineBundle.model_validate(created.outline).model_copy(
+        update={"outline_id": f"outline-{job_id}"}
+    )
+    confirmed = issued.model_copy(
+        update={
+            "confirmation_metadata": OutlineConfirmationMetadata(
+                status="confirmed",
+                confirmed_at=NOW,
+                confirmed_by=context.user_id,
+            )
+        }
+    )
+    repository = _LostRequeueResponseRepository(
+        _generation_details(context=context, created=created, outline=issued)
+    )
+    generation = SqlAlchemyClassroomGeneration(repository, object())
+
+    with pytest.raises(InvalidClassroomState, match="binding"):
+        await generation.start_content(
+            context=context,
+            asset_id="asset-other" if binding == "asset" else created.asset_id,
+            draft_id="draft-other" if binding == "draft" else created.draft_id,
+            job_id=job_id,
+            confirmed_outline=confirmed,
+            confirmed_outline_sha256=canonical_outline_sha256(confirmed),
+        )
+
+    assert repository.requeue_calls == 0
 
 
 @pytest.mark.asyncio
@@ -495,7 +1101,58 @@ async def test_validation_is_persisted_with_blocking_and_warning_findings() -> N
     assert result.validation_report["valid"] is False
     assert result.validation_report["severeFindings"]
     assert result.validation_report["warnings"]
+    assert result.validation_report["draftRevision"] == current.revision
+    assert result.validation_report["documentSha256"] == hashlib.sha256(
+        canonical_json_bytes(repository.records[created.asset_id].document)
+    ).hexdigest()
     assert repository.validation_reports == [result.validation_report]
+
+
+class _StaleValidationRepository(_Repository):
+    async def save_validation_report(
+        self,
+        asset_id,
+        report,
+        report_sha256,
+        expected_revision,
+        expected_document_sha256,
+    ):
+        current = self.records[asset_id]
+        self.records[asset_id] = replace(
+            current,
+            revision=current.revision + 1,
+            document={"dslVersion": "0.1.0", "scenes": [{"title": "New draft"}]},
+            validation_report=None,
+        )
+        return None
+
+
+@pytest.mark.asyncio
+async def test_validation_report_cannot_commit_after_concurrent_draft_update() -> None:
+    context = _context()
+    repository = _StaleValidationRepository()
+    service = ClassroomService(
+        repository,
+        TeachingBriefBuilder(context, object()),
+        _Generation(),
+        None,
+        clock=lambda: NOW,
+    )
+    created = await service.create(context, _request())
+    current = repository.records[created.asset_id]
+    repository.records[created.asset_id] = replace(
+        current,
+        lifecycle_state="editing",
+        status="succeeded",
+        document={"dslVersion": "0.1.0", "scenes": [{"title": "Old draft"}]},
+    )
+
+    with pytest.raises(ClassroomRevisionConflict, match="stale"):
+        await service.validate(context, created.asset_id)
+
+    latest = repository.records[created.asset_id]
+    assert latest.validation_report is None
+    assert latest.document["scenes"][0]["title"] == "New draft"
 
 
 @pytest.mark.asyncio
@@ -544,3 +1201,209 @@ async def test_media_upload_rejects_spoofed_mime_and_sha_before_storage() -> Non
         )
 
     assert store.put_calls == []
+
+
+class _AfterWriteFailureStore(_Store):
+    def __init__(self, *, cleanup_failures: int = 0) -> None:
+        super().__init__()
+        self.cleanup_failures = cleanup_failures
+        self.reconcile_calls: list[tuple[str, str]] = []
+        self.delete_calls: list[StoredArtifact] = []
+
+    async def put_verified(
+        self,
+        key,
+        body,
+        sha256,
+        size,
+        *,
+        content_type,
+        ownership_token,
+    ):
+        payload = b"".join([chunk async for chunk in body])
+        self.content[key] = payload
+        self.put_calls.append((key, content_type, ownership_token))
+        raise RuntimeError("object store response lost")
+
+    async def reconcile_verified(
+        self,
+        key,
+        sha256,
+        size,
+        *,
+        content_type,
+        ownership_token,
+    ):
+        self.reconcile_calls.append((key, ownership_token))
+        return await super().reconcile_verified(
+            key,
+            sha256,
+            size,
+            content_type=content_type,
+            ownership_token=ownership_token,
+        )
+
+    async def delete_owned(self, artifact: StoredArtifact) -> None:
+        self.delete_calls.append(artifact)
+        if self.cleanup_failures:
+            self.cleanup_failures -= 1
+            raise RuntimeError("cleanup unavailable")
+        await super().delete_owned(artifact)
+
+
+def _service_with_custom_store(context: TenantContext, store: _Store):
+    repository = _Repository()
+    return (
+        ClassroomService(
+            repository,
+            TeachingBriefBuilder(context, object()),
+            _Generation(),
+            _StoreProvider(store),
+            clock=lambda: NOW,
+        ),
+        repository,
+    )
+
+
+@pytest.mark.asyncio
+async def test_media_after_write_failure_reconciles_owned_key_without_guessing() -> None:
+    context = _context()
+    store = _AfterWriteFailureStore()
+    service, repository = _service_with_custom_store(context, store)
+    created = await service.create(context, _request())
+    body = b"\x89PNG\r\n\x1a\nimage"
+
+    with pytest.raises(RuntimeError, match="response lost"):
+        await service.upload_media(
+            context,
+            created.asset_id,
+            _Upload(body, "image/png"),
+            hashlib.sha256(body).hexdigest(),
+        )
+
+    ((asset_id, media_id), receipt) = next(iter(repository.media.items()))
+    assert asset_id == created.asset_id
+    assert repository.cleanup_transitions == ["cleanup_pending", "failed"]
+    assert repository.media_status[(asset_id, media_id)] == "failed"
+    assert store.reconcile_calls == [(receipt.object_key, receipt.ownership_token)]
+    assert [artifact.key for artifact in store.delete_calls] == [receipt.object_key]
+    assert store.content == {}
+    assert receipt.object_key not in repr(receipt)
+
+
+@pytest.mark.asyncio
+async def test_media_cleanup_failure_stays_pending_and_can_retry_idempotently() -> None:
+    context = _context()
+    store = _AfterWriteFailureStore(cleanup_failures=1)
+    service, repository = _service_with_custom_store(context, store)
+    created = await service.create(context, _request())
+    body = b"\x89PNG\r\n\x1a\nimage"
+
+    with pytest.raises(RuntimeError, match="response lost"):
+        await service.upload_media(
+            context,
+            created.asset_id,
+            _Upload(body, "image/png"),
+            hashlib.sha256(body).hexdigest(),
+        )
+
+    ((asset_id, media_id), _) = next(iter(repository.media.items()))
+    assert repository.media_status[(asset_id, media_id)] == "cleanup_pending"
+    assert await service.reconcile_media_cleanup(context, asset_id, media_id) is True
+    assert repository.media_status[(asset_id, media_id)] == "failed"
+    assert store.content == {}
+    assert len(store.reconcile_calls) == 2
+
+
+class _BlockingAfterWriteStore(_AfterWriteFailureStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.written = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def put_verified(
+        self,
+        key,
+        body,
+        sha256,
+        size,
+        *,
+        content_type,
+        ownership_token,
+    ):
+        payload = b"".join([chunk async for chunk in body])
+        self.content[key] = payload
+        self.put_calls.append((key, content_type, ownership_token))
+        self.written.set()
+        await self.release.wait()
+        raise AssertionError("canceled upload resumed")
+
+
+class _SentinelCancellationStore(_AfterWriteFailureStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.cancellation = asyncio.CancelledError("client disconnected")
+
+    async def put_verified(
+        self,
+        key,
+        body,
+        sha256,
+        size,
+        *,
+        content_type,
+        ownership_token,
+    ):
+        payload = b"".join([chunk async for chunk in body])
+        self.content[key] = payload
+        self.put_calls.append((key, content_type, ownership_token))
+        raise self.cancellation
+
+
+@pytest.mark.asyncio
+async def test_media_upload_reraises_the_original_cancellation_instance() -> None:
+    context = _context()
+    store = _SentinelCancellationStore()
+    service, repository = _service_with_custom_store(context, store)
+    created = await service.create(context, _request())
+    body = b"\x89PNG\r\n\x1a\nimage"
+
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await service.upload_media(
+            context,
+            created.asset_id,
+            _Upload(body, "image/png"),
+            hashlib.sha256(body).hexdigest(),
+        )
+
+    assert caught.value is store.cancellation
+    ((asset_id, media_id), _) = next(iter(repository.media.items()))
+    assert repository.media_status[(asset_id, media_id)] == "failed"
+    assert store.content == {}
+
+
+@pytest.mark.asyncio
+async def test_media_upload_cancellation_shields_owned_cleanup() -> None:
+    context = _context()
+    store = _BlockingAfterWriteStore()
+    service, repository = _service_with_custom_store(context, store)
+    created = await service.create(context, _request())
+    body = b"\x89PNG\r\n\x1a\nimage"
+    task = asyncio.create_task(
+        service.upload_media(
+            context,
+            created.asset_id,
+            _Upload(body, "image/png"),
+            hashlib.sha256(body).hexdigest(),
+        )
+    )
+    await store.written.wait()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    ((asset_id, media_id), _) = next(iter(repository.media.items()))
+    assert repository.media_status[(asset_id, media_id)] == "failed"
+    assert repository.cleanup_transitions == ["cleanup_pending", "failed"]
+    assert store.content == {}

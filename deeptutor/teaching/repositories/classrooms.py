@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import hmac
 import json
 from typing import Any
 
@@ -11,7 +12,13 @@ from sqlalchemy import and_, delete, func, select, update
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
-from deeptutor.teaching.contracts import TeachingBrief, canonical_json_bytes
+from deeptutor.teaching.contracts import (
+    OutlineBundle,
+    OutlineConfirmationMetadata,
+    TeachingBrief,
+    canonical_json_bytes,
+    canonical_outline_sha256,
+)
 from deeptutor.teaching.models.classrooms import (
     ClassroomAsset,
     ClassroomDraft,
@@ -32,6 +39,8 @@ from deeptutor.teaching.repositories.classroom_version_allocation import (
 )
 from deeptutor.teaching.schema_names import tenant_schema_name
 from deeptutor.teaching.services.classrooms import (
+    ClassroomConfirmationConflict,
+    ClassroomIdempotencyConflict,
     ClassroomRecord,
     DraftMediaRecord,
     NewClassroomWorkflow,
@@ -218,6 +227,14 @@ class SqlAlchemyClassroomRepository:
             draft.validation_report,
             field="validation report",
         )
+        if validation_report is not None and (
+            draft.validation_revision != draft.revision
+            or draft.validation_document_sha256 != draft.document_sha256
+            or validation_report.get("draftRevision") != draft.validation_revision
+            or validation_report.get("documentSha256")
+            != draft.validation_document_sha256
+        ):
+            raise ClassroomPersistenceError("stored validation report binding is invalid")
         status = job.status if job is not None else asset.lifecycle_state
         if asset.lifecycle_state == "awaiting_outline":
             status = "awaiting_confirmation"
@@ -239,7 +256,45 @@ class SqlAlchemyClassroomRepository:
             classroom_version_id=version_id,
             confirmed_outline_sha256=draft.confirmed_outline_sha256,
             validation_report=validation_report,
+            validation_revision=draft.validation_revision,
+            validation_document_sha256=draft.validation_document_sha256,
+            creation_idempotency_key=draft.creation_idempotency_key,
+            creation_request_sha256=draft.creation_request_sha256,
         )
+
+    async def get_creation(self, idempotency_key: str) -> ClassroomRecord | None:
+        _required(idempotency_key, "idempotency_key", 128)
+        async with self._session_factory() as session:
+            row = (
+                await session.execute(
+                    self._workflow_statement().where(
+                        ClassroomDraft.creation_idempotency_key == idempotency_key
+                    )
+                )
+            ).one_or_none()
+            return self._workflow_record(row) if row is not None else None
+
+    @staticmethod
+    def _verify_creation_binding(
+        record: ClassroomRecord,
+        workflow: NewClassroomWorkflow,
+    ) -> ClassroomRecord:
+        if (
+            record.tenant_id != workflow.tenant_id
+            or record.asset_id != workflow.asset_id
+            or record.draft_id != workflow.draft_id
+            or record.owner_id != workflow.owner_id
+            or record.creation_idempotency_key != workflow.creation_idempotency_key
+            or record.creation_request_sha256 is None
+            or not hmac.compare_digest(
+                record.creation_request_sha256,
+                workflow.creation_request_sha256,
+            )
+        ):
+            raise ClassroomIdempotencyConflict(
+                "classroom idempotency key conflicts"
+            )
+        return record
 
     async def create_workflow(
         self,
@@ -247,84 +302,114 @@ class SqlAlchemyClassroomRepository:
     ) -> ClassroomRecord:
         if workflow.tenant_id != self._tenant_id:
             raise ValueError("workflow tenant does not match repository")
+        _required(
+            workflow.creation_idempotency_key,
+            "creation_idempotency_key",
+            128,
+        )
+        _sha256(workflow.creation_request_sha256, "creation_request_sha256")
+        existing = await self.get_creation(workflow.creation_idempotency_key)
+        if existing is not None:
+            return self._verify_creation_binding(existing, workflow)
         brief = workflow.teaching_brief
-        brief_document = canonical_json_bytes(brief).decode("utf-8")
+        brief_document = json.dumps(
+            brief.model_dump(mode="json", by_alias=True, exclude_none=False),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
         empty_document = canonical_json_bytes({}).decode("utf-8")
-        async with self._session_factory() as session:
-            async with session.begin():
-                existing_brief = await session.scalar(
-                    select(TeachingBriefModel)
-                    .where(
-                        TeachingBriefModel.id == brief.brief_id,
-                        TeachingBriefModel.tenant_id == self._tenant_id,
+        try:
+            async with self._session_factory() as session:
+                async with session.begin():
+                    existing_brief = await session.scalar(
+                        select(TeachingBriefModel)
+                        .where(
+                            TeachingBriefModel.id == brief.brief_id,
+                            TeachingBriefModel.tenant_id == self._tenant_id,
+                        )
+                        .with_for_update()
                     )
-                    .with_for_update()
-                )
-                if existing_brief is None:
+                    if existing_brief is None:
+                        session.add(
+                            TeachingBriefModel(
+                                id=brief.brief_id,
+                                tenant_id=self._tenant_id,
+                                source_snapshot_id=(
+                                    brief.source_snapshot.snapshot_id
+                                    if brief.source_snapshot is not None
+                                    else None
+                                ),
+                                course_id=brief.course_id,
+                                class_id=brief.target_class_id,
+                                brief_version=brief.brief_version,
+                                document=brief_document,
+                                document_sha256=brief.content_sha256,
+                                created_by=workflow.owner_id,
+                            )
+                        )
+                    elif (
+                        existing_brief.document != brief_document
+                        or existing_brief.document_sha256 != brief.content_sha256
+                    ):
+                        raise ClassroomPersistenceError(
+                            "teaching brief identity conflicts"
+                        )
+                    await session.flush()
                     session.add(
-                        TeachingBriefModel(
-                            id=brief.brief_id,
+                        ClassroomAsset(
+                            id=workflow.asset_id,
                             tenant_id=self._tenant_id,
-                            source_snapshot_id=(
-                                brief.source_snapshot.snapshot_id
-                                if brief.source_snapshot is not None
-                                else None
-                            ),
-                            course_id=brief.course_id,
-                            class_id=brief.target_class_id,
-                            brief_version=brief.brief_version,
-                            document=brief_document,
-                            document_sha256=brief.content_sha256,
-                            created_by=workflow.owner_id,
+                            owner_id=workflow.owner_id,
+                            title=workflow.title,
+                            lifecycle_state="generating_outline",
                         )
                     )
-                elif (
-                    existing_brief.document != brief_document
-                    or existing_brief.document_sha256 != brief.content_sha256
-                ):
-                    raise ClassroomPersistenceError("teaching brief identity conflicts")
-                session.add(
-                    ClassroomAsset(
-                        id=workflow.asset_id,
-                        tenant_id=self._tenant_id,
-                        owner_id=workflow.owner_id,
-                        title=workflow.title,
-                        lifecycle_state="generating_outline",
+                    session.add(
+                        ClassroomDraft(
+                            id=workflow.draft_id,
+                            tenant_id=self._tenant_id,
+                            classroom_id=workflow.asset_id,
+                            generation_job_id=None,
+                            teaching_brief_id=brief.brief_id,
+                            base_version_id=None,
+                            revision=1,
+                            document=empty_document,
+                            document_sha256=hashlib.sha256(
+                                empty_document.encode()
+                            ).hexdigest(),
+                            outline_document=None,
+                            outline_sha256=None,
+                            confirmed_outline_sha256=None,
+                            validation_report=None,
+                            validation_report_sha256=None,
+                            validation_revision=None,
+                            validation_document_sha256=None,
+                            creation_idempotency_key=(
+                                workflow.creation_idempotency_key
+                            ),
+                            creation_request_sha256=(
+                                workflow.creation_request_sha256
+                            ),
+                            created_by=workflow.owner_id,
+                            updated_by=workflow.owner_id,
+                        )
                     )
-                )
-                session.add(
-                    ClassroomDraft(
-                        id=workflow.draft_id,
-                        tenant_id=self._tenant_id,
-                        classroom_id=workflow.asset_id,
-                        generation_job_id=None,
-                        teaching_brief_id=brief.brief_id,
-                        base_version_id=None,
-                        revision=1,
-                        document=empty_document,
-                        document_sha256=hashlib.sha256(empty_document.encode()).hexdigest(),
-                        outline_document=None,
-                        outline_sha256=None,
-                        confirmed_outline_sha256=None,
-                        validation_report=None,
-                        validation_report_sha256=None,
-                        created_by=workflow.owner_id,
-                        updated_by=workflow.owner_id,
+                    session.add(
+                        AuditLog(
+                            tenant_id=self._tenant_id,
+                            actor_id=workflow.owner_id,
+                            action="teaching.classroom.created",
+                            resource_type="classroom_asset",
+                            resource_id=workflow.asset_id,
+                        )
                     )
-                )
-                session.add(
-                    AuditLog(
-                        tenant_id=self._tenant_id,
-                        actor_id=workflow.owner_id,
-                        action="teaching.classroom.created",
-                        resource_type="classroom_asset",
-                        resource_id=workflow.asset_id,
-                    )
-                )
-                try:
                     await session.flush()
-                except IntegrityError as exc:
-                    raise ClassroomPersistenceError("classroom workflow conflicts") from exc
+        except IntegrityError as exc:
+            existing = await self.get_creation(workflow.creation_idempotency_key)
+            if existing is not None:
+                return self._verify_creation_binding(existing, workflow)
+            raise ClassroomPersistenceError("classroom workflow conflicts") from exc
         record = await self.get_workflow(workflow.asset_id)
         if record is None:
             raise ClassroomPersistenceError("classroom workflow was not persisted")
@@ -454,28 +539,105 @@ class SqlAlchemyClassroomRepository:
         asset_id: str,
         outline: dict[str, Any],
         confirmed_outline_sha256: str,
+        source_outline_sha256: str,
     ) -> ClassroomRecord:
         payload = canonical_json_bytes(outline).decode("utf-8")
         _sha256(confirmed_outline_sha256, "confirmed_outline_sha256")
+        _sha256(source_outline_sha256, "source_outline_sha256")
+        try:
+            proposed = OutlineBundle.model_validate(outline)
+            proposed_source_sha256 = canonical_outline_sha256(
+                proposed.model_copy(
+                    update={
+                        "confirmation_metadata": OutlineConfirmationMetadata(status="draft")
+                    }
+                )
+            )
+        except Exception:
+            raise ClassroomConfirmationConflict("confirmed outline conflicts") from None
+        if (
+            proposed.confirmation_metadata.status != "confirmed"
+            or proposed.confirmation_metadata.confirmed_by is None
+            or not hmac.compare_digest(proposed_source_sha256, source_outline_sha256)
+            or not hmac.compare_digest(
+                canonical_outline_sha256(proposed),
+                confirmed_outline_sha256,
+            )
+        ):
+            raise ClassroomConfirmationConflict("confirmed outline conflicts")
         async with self._session_factory() as session:
             async with session.begin():
                 asset, draft = await self._lock_draft(session, asset_id)
+                if draft.generation_job_id is None:
+                    raise ClassroomConfirmationConflict(
+                        "confirmed outline job binding is unavailable"
+                    )
+                job = await session.scalar(
+                    select(GenerationJob)
+                    .where(
+                        GenerationJob.id == draft.generation_job_id,
+                        GenerationJob.tenant_id == self._tenant_id,
+                        GenerationJob.classroom_draft_id == draft.id,
+                        GenerationJob.job_kind == "generation",
+                    )
+                    .with_for_update()
+                )
+                if job is None:
+                    raise ClassroomConfirmationConflict(
+                        "confirmed outline job binding is unavailable"
+                    )
                 if asset.lifecycle_state == "awaiting_outline":
+                    if (
+                        draft.outline_sha256 is None
+                        or not hmac.compare_digest(
+                            draft.outline_sha256,
+                            source_outline_sha256,
+                        )
+                        or job.phase != "outline"
+                        or job.status != "awaiting_confirmation"
+                    ):
+                        raise ClassroomConfirmationConflict("confirmed outline conflicts")
                     asset.lifecycle_state = transition("awaiting_outline", "generating_content")
                 elif asset.lifecycle_state != "generating_content":
                     raise ClassroomPersistenceError("outline confirmation state is invalid")
-                if draft.confirmed_outline_sha256 not in {
-                    None,
-                    confirmed_outline_sha256,
-                }:
-                    raise ClassroomPersistenceError("confirmed outline conflicts")
                 if draft.confirmed_outline_sha256 is None:
                     draft.outline_document = payload
-                    draft.outline_sha256 = confirmed_outline_sha256
                     draft.confirmed_outline_sha256 = confirmed_outline_sha256
                     draft.revision += 1
-                elif draft.outline_document != payload:
-                    raise ClassroomPersistenceError("confirmed outline conflicts")
+                else:
+                    try:
+                        persisted = OutlineBundle.model_validate_json(draft.outline_document)
+                        persisted_source_sha256 = canonical_outline_sha256(
+                            persisted.model_copy(
+                                update={
+                                    "confirmation_metadata": OutlineConfirmationMetadata(
+                                        status="draft"
+                                    )
+                                }
+                            )
+                        )
+                    except Exception:
+                        raise ClassroomConfirmationConflict(
+                            "confirmed outline conflicts"
+                        ) from None
+                    if (
+                        draft.outline_sha256 is None
+                        or not hmac.compare_digest(
+                            draft.outline_sha256,
+                            source_outline_sha256,
+                        )
+                        or not hmac.compare_digest(
+                            persisted_source_sha256,
+                            source_outline_sha256,
+                        )
+                        or not hmac.compare_digest(
+                            draft.confirmed_outline_sha256,
+                            canonical_outline_sha256(persisted),
+                        )
+                        or persisted.confirmation_metadata.confirmed_by
+                        != proposed.confirmation_metadata.confirmed_by
+                    ):
+                        raise ClassroomConfirmationConflict("confirmed outline conflicts")
                 draft.updated_at = func.now()
                 asset.updated_at = func.now()
                 await session.flush()
@@ -532,6 +694,8 @@ class SqlAlchemyClassroomRepository:
                 draft.document_sha256 = document_sha256
                 draft.validation_report = None
                 draft.validation_report_sha256 = None
+                draft.validation_revision = None
+                draft.validation_document_sha256 = None
                 draft.revision += 1
                 draft.updated_at = func.now()
                 asset.updated_at = func.now()
@@ -554,16 +718,31 @@ class SqlAlchemyClassroomRepository:
         asset_id: str,
         report: dict[str, object],
         report_sha256: str,
-    ) -> ClassroomRecord:
+        expected_revision: int,
+        expected_document_sha256: str,
+    ) -> ClassroomRecord | None:
         payload = canonical_json_bytes(report).decode("utf-8")
         _sha256(report_sha256, "report_sha256")
+        _sha256(expected_document_sha256, "expected_document_sha256")
         async with self._session_factory() as session:
             async with session.begin():
                 asset, draft = await self._lock_draft(session, asset_id)
                 if asset.lifecycle_state != "editing":
                     raise ClassroomPersistenceError("validation state is invalid")
+                if (
+                    draft.revision != expected_revision
+                    or not hmac.compare_digest(
+                        draft.document_sha256,
+                        expected_document_sha256,
+                    )
+                    or report.get("draftRevision") != expected_revision
+                    or report.get("documentSha256") != expected_document_sha256
+                ):
+                    return None
                 draft.validation_report = payload
                 draft.validation_report_sha256 = report_sha256
+                draft.validation_revision = expected_revision
+                draft.validation_document_sha256 = expected_document_sha256
                 draft.updated_at = func.now()
                 asset.updated_at = func.now()
                 await session.flush()
@@ -583,6 +762,8 @@ class SqlAlchemyClassroomRepository:
             object_key=model.object_key,
             ownership_token=model.ownership_token,
             object_revision=model.object_revision,
+            status=model.status,
+            last_error_code=model.last_error_code,
         )
 
     async def reserve_media(self, media: NewDraftMedia) -> DraftMediaRecord:
@@ -668,6 +849,75 @@ class SqlAlchemyClassroomRepository:
                         updated_at=func.now(),
                     )
                 )
+
+    async def mark_media_cleanup_pending(
+        self,
+        asset_id: str,
+        media_id: str,
+        error_code: str,
+    ) -> DraftMediaRecord:
+        _required(error_code, "error_code", 64)
+        async with self._session_factory() as session:
+            async with session.begin():
+                model = await session.scalar(
+                    select(ClassroomDraftMedia)
+                    .where(
+                        ClassroomDraftMedia.id == media_id,
+                        ClassroomDraftMedia.classroom_id == asset_id,
+                        ClassroomDraftMedia.tenant_id == self._tenant_id,
+                        ClassroomDraftMedia.status.in_(("writing", "cleanup_pending")),
+                    )
+                    .with_for_update()
+                )
+                if model is None:
+                    raise ClassroomPersistenceError("draft media receipt is unavailable")
+                model.status = "cleanup_pending"
+                model.last_error_code = error_code
+                model.updated_at = func.now()
+                await session.flush()
+                return self._media_record(model)
+
+    async def finish_media_cleanup(
+        self,
+        asset_id: str,
+        media_id: str,
+        error_code: str,
+    ) -> None:
+        _required(error_code, "error_code", 64)
+        async with self._session_factory() as session:
+            async with session.begin():
+                model = await session.scalar(
+                    select(ClassroomDraftMedia)
+                    .where(
+                        ClassroomDraftMedia.id == media_id,
+                        ClassroomDraftMedia.classroom_id == asset_id,
+                        ClassroomDraftMedia.tenant_id == self._tenant_id,
+                        ClassroomDraftMedia.status.in_(("cleanup_pending", "failed")),
+                    )
+                    .with_for_update()
+                )
+                if model is None:
+                    raise ClassroomPersistenceError("draft media receipt is unavailable")
+                model.status = "failed"
+                model.object_revision = None
+                model.last_error_code = error_code
+                model.updated_at = func.now()
+                await session.flush()
+
+    async def get_media_receipt(
+        self,
+        asset_id: str,
+        media_id: str,
+    ) -> DraftMediaRecord | None:
+        async with self._session_factory() as session:
+            model = await session.scalar(
+                select(ClassroomDraftMedia).where(
+                    ClassroomDraftMedia.id == media_id,
+                    ClassroomDraftMedia.classroom_id == asset_id,
+                    ClassroomDraftMedia.tenant_id == self._tenant_id,
+                )
+            )
+            return self._media_record(model) if model is not None else None
 
     async def get_media(
         self,

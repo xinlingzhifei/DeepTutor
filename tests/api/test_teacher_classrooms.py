@@ -38,6 +38,7 @@ def _context(
 
 class _WorkflowService:
     def __init__(self) -> None:
+        self.last_idempotency_key: str | None = None
         self.assets = {
             "asset-1": {
                 "asset_id": "asset-1",
@@ -56,9 +57,13 @@ class _WorkflowService:
         }
         self.media: dict[tuple[str, str, str], dict[str, object]] = {}
 
-    async def create(self, _context, request):
+    async def create(self, _context, request, idempotency_key=None):
         assert request.classroom_mode == "full"
-        return self.assets["asset-1"]
+        self.last_idempotency_key = idempotency_key
+        return {
+            **self.assets["asset-1"],
+            "idempotency_key": idempotency_key or "auto-test-request-key",
+        }
 
     async def list(self, _context):
         return tuple(self.assets.values())
@@ -153,6 +158,48 @@ def test_teacher_full_classroom_stops_for_outline_confirmation() -> None:
     assert body["classroomVersionId"] is None
 
 
+def test_create_forwards_and_echoes_a_strong_idempotency_key() -> None:
+    service = _WorkflowService()
+
+    response = _client(service).post(
+        "/api/v1/classrooms",
+        headers={"Idempotency-Key": "classroom-request-1"},
+        json=_full_classroom_request(),
+    )
+
+    assert response.status_code == 202
+    assert service.last_idempotency_key == "classroom-request-1"
+    assert response.json()["idempotencyKey"] == "classroom-request-1"
+
+
+def test_create_rejects_a_malformed_idempotency_key_before_service_call() -> None:
+    service = _WorkflowService()
+
+    response = _client(service).post(
+        "/api/v1/classrooms",
+        headers={"Idempotency-Key": "bad key"},
+        json=_full_classroom_request(),
+    )
+
+    assert response.status_code == 422
+    assert service.last_idempotency_key is None
+
+
+def test_create_idempotency_conflict_is_an_explicit_409() -> None:
+    class _ConflictService(_WorkflowService):
+        async def create(self, _context, _request, idempotency_key=None):
+            raise classrooms.ClassroomIdempotencyConflict()
+
+    response = _client(_ConflictService()).post(
+        "/api/v1/classrooms",
+        headers={"Idempotency-Key": "classroom-request-1"},
+        json=_full_classroom_request(),
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Classroom idempotency key conflicts"}
+
+
 def test_stale_draft_revision_is_rejected() -> None:
     client = _client(_WorkflowService())
 
@@ -164,6 +211,19 @@ def test_stale_draft_revision_is_rejected() -> None:
 
     assert response.status_code == 409
     assert response.json() == {"detail": "Draft revision is stale"}
+
+
+def test_outline_confirmation_binding_conflict_is_an_explicit_409() -> None:
+    class _ConflictService(_WorkflowService):
+        async def confirm_outline(self, _context, _asset_id):
+            raise classrooms.ClassroomConfirmationConflict()
+
+    response = _client(_ConflictService()).post(
+        "/api/v1/classrooms/asset-1/confirm-outline"
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Outline confirmation conflicts"}
 
 
 def test_draft_media_is_bound_to_asset_and_tenant() -> None:
@@ -194,6 +254,98 @@ def test_raw_object_keys_and_arbitrary_urls_are_rejected_before_draft_save() -> 
     ):
         with pytest.raises(InvalidDraftDocument, match="unsafe reference"):
             validate_draft_document_references(document)
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        {"imageUrl": "prefix HTTPS://attacker.invalid/image.png"},
+        {"posterUri": "\tHtTpS : //attacker.invalid/video.mp4"},
+        {"audioUrl": "%68%74%74%70%73%3A%2F%2Fattacker.invalid/a.mp3"},
+        {"downloadUrl": "&#x66;tp://attacker.invalid/file"},
+        {"src": "//attacker.invalid/image.png"},
+        {"mediaPath": "../temporary/other-asset/image.png"},
+        {"content": {"html": "<p>Open https://attacker.invalid now</p>"}},
+    ],
+)
+def test_media_and_url_fields_reject_obfuscated_or_embedded_raw_references(
+    document: dict[str, object],
+) -> None:
+    with pytest.raises(InvalidDraftDocument, match="unsafe reference"):
+        validate_draft_document_references(document)
+
+
+def test_ordinary_teaching_text_may_name_a_url_without_becoming_a_reference() -> None:
+    document = {
+        "dslVersion": "0.1.0",
+        "scenes": [
+            {
+                "title": "Why https://example.edu uses TLS",
+                "content": {
+                    "type": "slide",
+                    "canvas": {"text": "Compare HTTP://example.edu in this lesson."},
+                },
+            }
+        ],
+        "mediaIds": [],
+    }
+
+    assert validate_draft_document_references(document) == frozenset()
+
+
+@pytest.mark.parametrize(
+    "html",
+    [
+        "<img src=https://attacker.invalid/pixel.png onload=steal()>",
+        "<a href='jav&#x61;script:steal()'>click</a>",
+        "<style>body{background:url(https://attacker.invalid)}</style>",
+        "<iframe srcdoc='<p>nested</p>'></iframe>",
+        "<div><span>unbalanced</div>",
+    ],
+)
+def test_interactive_html_parser_blocks_unsafe_or_malformed_markup(html: str) -> None:
+    document = {
+        "dslVersion": "0.1.0",
+        "scenes": [
+            {
+                "id": "scene-1",
+                "type": "interactive",
+                "title": "Interactive",
+                "content": {"html": html},
+            }
+        ],
+        "mediaIds": [],
+    }
+
+    with pytest.raises(InvalidDraftDocument, match="unsafe reference"):
+        validate_draft_document_references(document)
+
+    report = build_validation_report(
+        document,
+        required_knowledge_point_ids=(),
+        grounded=False,
+        available_media_ids=frozenset(),
+    )
+    assert report["sections"]["interactive_security"]["status"] == "error"
+
+
+def test_safe_interactive_fragment_and_opaque_media_id_are_accepted() -> None:
+    media_id = "media-0123456789abcdef0123456789abcdef"
+    document = {
+        "scenes": [
+            {
+                "type": "interactive",
+                "content": {
+                    "html": (
+                        "<div role='group'><button id='run' type='button'>Run</button>"
+                        f"<img data-media-id='{media_id}' alt='Graph'></div>"
+                    )
+                },
+            }
+        ]
+    }
+
+    assert validate_draft_document_references(document) == frozenset({media_id})
 
 
 def test_validation_report_has_nine_named_sections_and_explicit_severity() -> None:

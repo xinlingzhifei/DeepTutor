@@ -406,6 +406,10 @@ class ClassroomDraft(TenantBase):
     confirmed_outline_sha256: Mapped[str | None] = mapped_column(String(64))
     validation_report: Mapped[str | None] = mapped_column(Text)
     validation_report_sha256: Mapped[str | None] = mapped_column(String(64))
+    validation_revision: Mapped[int | None] = mapped_column(Integer)
+    validation_document_sha256: Mapped[str | None] = mapped_column(String(64))
+    creation_idempotency_key: Mapped[str | None] = mapped_column(String(128))
+    creation_request_sha256: Mapped[str | None] = mapped_column(String(64))
     created_by: Mapped[str] = mapped_column(String(128))
     updated_by: Mapped[str] = mapped_column(String(128))
     created_at: Mapped[datetime] = mapped_column(
@@ -419,6 +423,20 @@ class ClassroomDraft(TenantBase):
 
     __table_args__ = (
         CheckConstraint("revision > 0", name="revision"),
+        CheckConstraint(
+            "(validation_report IS NULL AND validation_report_sha256 IS NULL "
+            "AND validation_revision IS NULL AND validation_document_sha256 IS NULL) OR "
+            "(validation_report IS NOT NULL AND validation_report_sha256 IS NOT NULL "
+            "AND validation_revision IS NOT NULL AND validation_revision > 0 "
+            "AND validation_document_sha256 IS NOT NULL)",
+            name="validation_binding",
+        ),
+        CheckConstraint(
+            "(creation_idempotency_key IS NULL AND creation_request_sha256 IS NULL) OR "
+            "(creation_idempotency_key IS NOT NULL "
+            "AND creation_request_sha256 IS NOT NULL)",
+            name="creation_binding",
+        ),
         ForeignKeyConstraint(
             ["generation_job_id", "tenant_id"],
             [
@@ -452,6 +470,11 @@ class ClassroomDraft(TenantBase):
             "classroom_id",
             "tenant_id",
             name="uq_classroom_drafts_id_classroom_tenant",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "creation_idempotency_key",
+            name="uq_classroom_drafts_tenant_creation_idempotency",
         ),
         Index("ix_classroom_drafts_classroom_updated", "classroom_id", "updated_at"),
     )
@@ -494,7 +517,7 @@ class ClassroomDraftMedia(TenantBase):
             name="size_bytes",
         ),
         CheckConstraint(
-            "status IN ('writing', 'uploaded', 'failed')",
+            "status IN ('writing', 'uploaded', 'cleanup_pending', 'failed')",
             name="status",
         ),
         CheckConstraint(
@@ -506,6 +529,7 @@ class ClassroomDraftMedia(TenantBase):
             "AND last_error_code IS NULL) OR "
             "(status = 'uploaded' AND object_revision IS NOT NULL "
             "AND last_error_code IS NULL) OR "
+            "(status = 'cleanup_pending' AND last_error_code IS NOT NULL) OR "
             "(status = 'failed' AND last_error_code IS NOT NULL)",
             name="receipt_state",
         ),

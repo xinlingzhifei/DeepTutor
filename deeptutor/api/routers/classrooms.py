@@ -16,7 +16,7 @@ from fastapi import (
     status,
 )
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy.exc import SQLAlchemyError
 
 from deeptutor.api.routers.classroom_jobs import (
@@ -35,6 +35,8 @@ from deeptutor.teaching.repositories.classrooms import (
 )
 from deeptutor.teaching.services.classrooms import (
     ClassroomAccessDenied,
+    ClassroomConfirmationConflict,
+    ClassroomIdempotencyConflict,
     ClassroomNotFound,
     ClassroomRevisionConflict,
     ClassroomService,
@@ -130,6 +132,14 @@ class ClassroomResponse(_ApiModel):
     classroom_version_id: str | None = None
     confirmed_outline_sha256: str | None = None
     validation_report: dict[str, Any] | None = None
+    idempotency_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "idempotency_key",
+            "creation_idempotency_key",
+        ),
+        serialization_alias="idempotencyKey",
+    )
 
 
 class ClassroomListResponse(_ApiModel):
@@ -144,7 +154,12 @@ class DraftMediaResponse(_ApiModel):
 
 
 class ClassroomServiceLike(Protocol):
-    async def create(self, context: TenantContext, request: CreateClassroomRequest): ...
+    async def create(
+        self,
+        context: TenantContext,
+        request: CreateClassroomRequest,
+        idempotency_key: str | None = None,
+    ): ...
 
     async def list(self, context: TenantContext): ...
 
@@ -240,6 +255,16 @@ async def _call(operation):
         return await operation
     except ClassroomRevisionConflict:
         raise HTTPException(status_code=409, detail="Draft revision is stale") from None
+    except ClassroomConfirmationConflict:
+        raise HTTPException(
+            status_code=409,
+            detail="Outline confirmation conflicts",
+        ) from None
+    except ClassroomIdempotencyConflict:
+        raise HTTPException(
+            status_code=409,
+            detail="Classroom idempotency key conflicts",
+        ) from None
     except ClassroomNotFound:
         raise HTTPException(status_code=404, detail="Classroom not found") from None
     except ClassroomAccessDenied:
@@ -262,10 +287,27 @@ async def _call(operation):
 @router.post("/classrooms", response_model=ClassroomResponse, status_code=202)
 async def create_classroom(
     request: CreateClassroomRequest,
+    idempotency_key: Annotated[
+        str | None,
+        Header(
+            alias="Idempotency-Key",
+            min_length=8,
+            max_length=128,
+            pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]+$",
+        ),
+    ] = None,
     context: TenantContext = Depends(require_tenant),
     service: ClassroomServiceLike = Depends(get_classroom_service),
 ) -> ClassroomResponse:
-    return _response(await _call(service.create(context, request)))
+    return _response(
+        await _call(
+            service.create(
+                context,
+                request,
+                idempotency_key=idempotency_key,
+            )
+        )
+    )
 
 
 @router.get("/classrooms", response_model=ClassroomListResponse)

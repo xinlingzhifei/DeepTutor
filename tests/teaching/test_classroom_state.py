@@ -130,7 +130,7 @@ def test_draft_media_is_integrity_checked_and_bound_to_tenant_asset() -> None:
         "size_bytes >= 0 AND size_bytes <= 104857600"
     )
     assert checks["ck_classroom_draft_media_status"] == (
-        "status IN ('writing', 'uploaded', 'failed')"
+        "status IN ('writing', 'uploaded', 'cleanup_pending', 'failed')"
     )
     assert checks["ck_classroom_draft_media_ownership_token"] == (
         "ownership_token ~ '^[0-9a-f]{32}$'"
@@ -146,6 +146,31 @@ def test_classroom_draft_persists_outline_confirmation_and_validation_report() -
     assert columns.confirmed_outline_sha256.nullable is True
     assert columns.validation_report.nullable is True
     assert columns.validation_report_sha256.nullable is True
+    assert columns.validation_revision.nullable is True
+    assert columns.validation_document_sha256.nullable is True
+    assert columns.creation_idempotency_key.nullable is True
+    assert columns.creation_request_sha256.nullable is True
+    checks = {
+        constraint.name: str(constraint.sqltext)
+        for constraint in ClassroomDraft.__table__.constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+    assert "validation_report IS NULL" in checks["ck_classroom_drafts_validation_binding"]
+    assert "validation_revision IS NOT NULL" in checks[
+        "ck_classroom_drafts_validation_binding"
+    ]
+    assert "creation_idempotency_key IS NULL" in checks[
+        "ck_classroom_drafts_creation_binding"
+    ]
+    assert "creation_request_sha256 IS NOT NULL" in checks[
+        "ck_classroom_drafts_creation_binding"
+    ]
+    unique_columns = {
+        tuple(constraint.columns.keys())
+        for constraint in ClassroomDraft.__table__.constraints
+        if isinstance(constraint, UniqueConstraint)
+    }
+    assert ("tenant_id", "creation_idempotency_key") in unique_columns
     foreign_keys = {
         (
             tuple(constraint.columns.keys()),
