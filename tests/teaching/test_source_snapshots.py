@@ -442,6 +442,66 @@ async def test_pdf_snapshot_uses_controlled_object_reader_without_leaking_key() 
 
 
 @pytest.mark.asyncio
+async def test_initial_kb_resolver_error_is_mapped_without_path() -> None:
+    leaked_path = "C:/private/kb_config.json denied"
+
+    def fail_resolution(_kb_ref: str) -> AuthorizedKnowledgeSource:
+        raise OSError(leaked_path)
+
+    builder = SourceSnapshotBuilder(
+        _context(),
+        _Repository(),
+        knowledge_resolver=fail_resolution,
+    )
+
+    with pytest.raises(SourceSnapshotUnavailable) as captured:
+        await builder.from_kb(RESOURCE_ID, _request())
+
+    assert str(captured.value) == "knowledge source could not be resolved"
+    assert leaked_path not in str(captured.value)
+
+
+@pytest.mark.asyncio
+async def test_post_retrieval_resolver_error_is_mapped_without_path(
+    tmp_path: Path,
+) -> None:
+    leaked_path = "C:/private/kb_config.json denied"
+    resource = _resource(tmp_path)
+    resolution_count = 0
+
+    def resolve(_kb_ref: str) -> AuthorizedKnowledgeSource:
+        nonlocal resolution_count
+        resolution_count += 1
+        if resolution_count == 1:
+            return resource
+        raise OSError(leaked_path)
+
+    builder = SourceSnapshotBuilder(
+        _context(),
+        _Repository(),
+        knowledge_resolver=resolve,
+        rag_service_factory=lambda _source: _RagService(
+            {
+                "provider": "llamaindex",
+                "sources": [
+                    {
+                        "chunk_id": "chunk",
+                        "content": "Grounded context.",
+                        "source": "book.pdf",
+                    }
+                ],
+            }
+        ),
+    )
+
+    with pytest.raises(SourceAccessDenied) as captured:
+        await builder.from_kb(RESOURCE_ID, _request())
+
+    assert str(captured.value) == "knowledge source changed during retrieval"
+    assert leaked_path not in str(captured.value)
+
+
+@pytest.mark.asyncio
 async def test_generation_flip_during_retrieval_is_rejected(tmp_path: Path) -> None:
     original = _resource(tmp_path)
     replacement = AuthorizedKnowledgeSource(

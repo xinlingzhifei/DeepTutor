@@ -791,8 +791,14 @@ class SourceSnapshotBuilder:
         permission = _scope_permission(self._context, request)
         try:
             resource = self._knowledge_resolver(kb_ref)
+        except asyncio.CancelledError:
+            raise
         except HTTPException as exc:
             raise SourceAccessDenied("knowledge source is not available to this user") from exc
+        except Exception:
+            raise SourceSnapshotUnavailable(
+                "knowledge source could not be resolved"
+            ) from None
         try:
             bound = await self._repository.require_authorized_source(
                 source_type="knowledge_base",
@@ -859,8 +865,14 @@ class SourceSnapshotBuilder:
         computed_view_signature = str(result["retrieval_view_signature"])
         try:
             current_resource = self._knowledge_resolver(resource.resource_id)
+        except asyncio.CancelledError:
+            raise
         except HTTPException as exc:
             raise SourceAccessDenied("knowledge source changed during retrieval") from exc
+        except Exception:
+            raise SourceAccessDenied(
+                "knowledge source changed during retrieval"
+            ) from None
         if (
             current_resource.resource_id != resource.resource_id
             or current_resource.generation_id != resource.generation_id
