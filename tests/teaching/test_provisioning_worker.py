@@ -219,7 +219,7 @@ def test_claim_query_keeps_active_schema_upgrades_separate_from_provisioning() -
     assert "operation = 'upgrade_schema'" in sql
     assert "tenants.status = 'active'" in sql
     assert (
-        "tenant_schema_states.revision IN ('20260801_0007', '20260802_0008', '20260803_0009')"
+        "tenant_schema_states.revision IN ('20260801_0007', '20260802_0008', '20260803_0009', '20260803_0010')"
     ) in sql
     assert "FOR UPDATE OF tenant_provisioning_jobs, tenants" in sql
 
@@ -247,10 +247,13 @@ def test_schema_upgrade_reconciliation_is_locked_targeted_and_idempotent() -> No
 
     assert "tenants.status = 'active'" in sql
     assert "tenant_schema_states.status = 'active'" in sql
-    assert "tenant_schema_states.revision IN ('20260801_0007', '20260802_0008')" in sql
-    assert "tenant_schema_states.revision != '20260803_0009'" not in sql
+    assert (
+        "tenant_schema_states.revision IN ('20260801_0007', '20260802_0008', '20260803_0009')"
+        in sql
+    )
+    assert "tenant_schema_states.revision != '20260803_0010'" not in sql
     assert "tenant_provisioning_jobs.operation = 'upgrade_schema'" in sql
-    assert "tenant_provisioning_jobs.target_revision = '20260803_0009'" in sql
+    assert "tenant_provisioning_jobs.target_revision = '20260803_0010'" in sql
     assert "NOT (EXISTS" in sql
     assert "FOR UPDATE OF tenants, tenant_schema_states SKIP LOCKED" in sql
     assert schema_upgrade_job_id("tenant-a") == schema_upgrade_job_id("tenant-a")
@@ -267,9 +270,9 @@ def test_upgrade_claim_accepts_only_supported_or_current_revisions() -> None:
     ).replace("platform.", "")
 
     assert (
-        "tenant_schema_states.revision IN ('20260801_0007', '20260802_0008', '20260803_0009')"
+        "tenant_schema_states.revision IN ('20260801_0007', '20260802_0008', '20260803_0009', '20260803_0010')"
     ) in sql
-    assert "tenant_schema_states.revision != '20260803_0009'" not in sql
+    assert "tenant_schema_states.revision != '20260803_0010'" not in sql
 
 
 def test_provisioning_job_attempt_and_lease_state_are_database_constrained() -> None:
@@ -947,7 +950,7 @@ def test_worker_activation_requires_schema_policy_and_mode_specific_storage() ->
 
     for fragment in (
         "tenant_schema_states.status = 'active'",
-        "tenant_schema_states.revision = '20260803_0009'",
+        "tenant_schema_states.revision = '20260803_0010'",
         "tenant_storage_states.status = 'active'",
         "tenant_storage_states.mode = 'local'",
         "tenant_storage_states.mode = 's3'",

@@ -304,6 +304,8 @@ async def prepare_generation(
     *,
     job_id: str,
     owner_id: str = "teacher-1",
+    classroom_draft_id: str | None = None,
+    classroom_id: str | None = None,
 ) -> tuple[
     SqlAlchemyGenerationJobRepository,
     ClaimedGenerationJob,
@@ -331,6 +333,7 @@ async def prepare_generation(
             worker_pool_ref=WORKER_POOL,
             queue_ref=QUEUE_REF,
             request_payload=payload,
+            classroom_draft_id=classroom_draft_id,
         )
     )
     assert await OutboxDispatcher(context.engine).dispatch_next() is not None
@@ -363,7 +366,7 @@ async def prepare_generation(
     )
     target = await repository.prepare_promotion(
         claim,
-        classroom_id=context.asset_id,
+        classroom_id=classroom_id or context.asset_id,
     )
     return repository, claim, target
 
@@ -701,6 +704,48 @@ async def test_generation_cannot_reserve_another_owners_classroom(
 
     assert promotion is None
     assert asset is not None and asset.owner_id == "teacher-1"
+
+
+@pytest.mark.asyncio
+async def test_draft_bound_generation_cannot_promote_to_another_classroom(
+    repository_context: RepositoryContext,
+) -> None:
+    draft_id = f"bound-{repository_context.asset_id}"
+    other_asset_id = await create_other_asset(repository_context, prefix="promotion")
+    translated = repository_context.engine.execution_options(
+        schema_translate_map={
+            "tenant": tenant_schema_name(repository_context.tenant_id),
+        }
+    )
+    session_factory = async_sessionmaker(translated, expire_on_commit=False)
+    async with session_factory() as session:
+        async with session.begin():
+            session.add(
+                ClassroomDraft(
+                    id=draft_id,
+                    tenant_id=repository_context.tenant_id,
+                    classroom_id=repository_context.asset_id,
+                    generation_job_id=None,
+                    teaching_brief_id=None,
+                    base_version_id=repository_context.source_version_id,
+                    revision=1,
+                    document="{}",
+                    document_sha256=hashlib.sha256(b"{}").hexdigest(),
+                    created_by="teacher-1",
+                    updated_by="teacher-1",
+                )
+            )
+
+    with pytest.raises(
+        ValueError,
+        match="generation promotion does not match classroom draft",
+    ):
+        await prepare_generation(
+            repository_context,
+            job_id=f"bound-{repository_context.generation_job_id}",
+            classroom_draft_id=draft_id,
+            classroom_id=other_asset_id,
+        )
 
 
 @pytest.mark.asyncio

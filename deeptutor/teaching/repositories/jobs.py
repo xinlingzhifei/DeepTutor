@@ -19,7 +19,7 @@ from deeptutor.teaching.job_route_binding import (
     lock_active_job_binding,
 )
 from deeptutor.teaching.models import Tenant
-from deeptutor.teaching.models.classrooms import ClassroomAsset
+from deeptutor.teaching.models.classrooms import ClassroomAsset, ClassroomDraft
 from deeptutor.teaching.models.jobs import (
     LEASED_JOB_STATUSES,
     TERMINAL_JOB_STATUSES,
@@ -1427,6 +1427,19 @@ class SqlAlchemyGenerationJobRepository:
                     raise JobAlreadyTerminal("materialization lost cancellation race")
                 if job.job_kind != expected_job_kind:
                     raise ValueError("promotion path does not match job kind")
+                if expected_job_kind == "generation" and job.classroom_draft_id is not None:
+                    draft = await session.scalar(
+                        select(ClassroomDraft)
+                        .where(
+                            ClassroomDraft.id == job.classroom_draft_id,
+                            ClassroomDraft.tenant_id == claim.tenant_id,
+                        )
+                        .with_for_update()
+                    )
+                    if draft is None or draft.classroom_id != classroom_id:
+                        raise ValueError(
+                            "generation promotion does not match classroom draft"
+                        )
                 existing = await session.scalar(
                     select(ArtifactPromotionState)
                     .where(ArtifactPromotionState.job_id == claim.job_id)

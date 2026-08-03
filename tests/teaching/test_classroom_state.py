@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib
+
 import pytest
 from sqlalchemy import CheckConstraint, ForeignKeyConstraint, UniqueConstraint
 
@@ -9,6 +11,7 @@ from deeptutor.teaching.models.classrooms import (
     Assignment,
     ClassroomAsset,
     ClassroomDraft,
+    ClassroomDraftMedia,
     ClassroomVersion,
     InvalidClassroomTransition,
     Publication,
@@ -82,6 +85,7 @@ def test_tenant_metadata_contains_the_classroom_domain_tables() -> None:
         "tenant.teaching_briefs",
         "tenant.classroom_assets",
         "tenant.classroom_drafts",
+        "tenant.classroom_draft_media",
         "tenant.classroom_versions",
         "tenant.classroom_exports",
         "tenant.approvals",
@@ -90,6 +94,79 @@ def test_tenant_metadata_contains_the_classroom_domain_tables() -> None:
         "tenant.batch_jobs",
         "tenant.batch_items",
     }.issubset(TenantBase.metadata.tables)
+
+
+def test_draft_media_is_integrity_checked_and_bound_to_tenant_asset() -> None:
+    table = ClassroomDraftMedia.__table__
+    unique_columns = {
+        tuple(constraint.columns.keys())
+        for constraint in table.constraints
+        if isinstance(constraint, UniqueConstraint)
+    }
+    foreign_keys = {
+        (
+            tuple(constraint.columns.keys()),
+            tuple(element.target_fullname for element in constraint.elements),
+        )
+        for constraint in table.constraints
+        if isinstance(constraint, ForeignKeyConstraint)
+    }
+    checks = {
+        constraint.name: str(constraint.sqltext)
+        for constraint in table.constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+
+    assert ("id", "classroom_id", "tenant_id") in unique_columns
+    assert ("tenant_id", "object_key") in unique_columns
+    assert (
+        ("classroom_id", "tenant_id"),
+        ("tenant.classroom_assets.id", "tenant.classroom_assets.tenant_id"),
+    ) in foreign_keys
+    assert checks["ck_classroom_draft_media_sha256"] == (
+        "sha256 ~ '^[0-9a-f]{64}$'"
+    )
+    assert checks["ck_classroom_draft_media_size_bytes"] == (
+        "size_bytes >= 0 AND size_bytes <= 104857600"
+    )
+    assert checks["ck_classroom_draft_media_status"] == (
+        "status IN ('writing', 'uploaded', 'failed')"
+    )
+    assert checks["ck_classroom_draft_media_ownership_token"] == (
+        "ownership_token ~ '^[0-9a-f]{32}$'"
+    )
+
+
+def test_classroom_draft_persists_outline_confirmation_and_validation_report() -> None:
+    columns = ClassroomDraft.__table__.c
+
+    assert columns.generation_job_id.nullable is True
+    assert columns.outline_document.nullable is True
+    assert columns.outline_sha256.nullable is True
+    assert columns.confirmed_outline_sha256.nullable is True
+    assert columns.validation_report.nullable is True
+    assert columns.validation_report_sha256.nullable is True
+    foreign_keys = {
+        (
+            tuple(constraint.columns.keys()),
+            tuple(element.target_fullname for element in constraint.elements),
+        )
+        for constraint in ClassroomDraft.__table__.constraints
+        if isinstance(constraint, ForeignKeyConstraint)
+    }
+    assert (
+        ("generation_job_id", "tenant_id"),
+        ("tenant.generation_jobs.id", "tenant.generation_jobs.tenant_id"),
+    ) in foreign_keys
+
+
+def test_task4_migration_follows_knowledge_entitlements_revision() -> None:
+    migration = importlib.import_module(
+        "deeptutor.teaching.migrations.versions.20260803_0010_classroom_authoring"
+    )
+
+    assert migration.revision == "20260803_0010"
+    assert migration.down_revision == "20260803_0009"
 
 
 def test_classroom_version_is_unique_per_asset_version_number() -> None:

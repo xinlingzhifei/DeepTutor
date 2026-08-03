@@ -392,6 +392,7 @@ class ClassroomDraft(TenantBase):
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
     tenant_id: Mapped[str] = mapped_column(String(64))
     classroom_id: Mapped[str] = mapped_column(String(128))
+    generation_job_id: Mapped[str | None] = mapped_column(String(64))
     teaching_brief_id: Mapped[str | None] = mapped_column(
         String(128),
         ForeignKey("tenant.teaching_briefs.id", ondelete="RESTRICT"),
@@ -400,6 +401,11 @@ class ClassroomDraft(TenantBase):
     revision: Mapped[int] = mapped_column(Integer, server_default="1")
     document: Mapped[str] = mapped_column(Text)
     document_sha256: Mapped[str] = mapped_column(String(64))
+    outline_document: Mapped[str | None] = mapped_column(Text)
+    outline_sha256: Mapped[str | None] = mapped_column(String(64))
+    confirmed_outline_sha256: Mapped[str | None] = mapped_column(String(64))
+    validation_report: Mapped[str | None] = mapped_column(Text)
+    validation_report_sha256: Mapped[str | None] = mapped_column(String(64))
     created_by: Mapped[str] = mapped_column(String(128))
     updated_by: Mapped[str] = mapped_column(String(128))
     created_at: Mapped[datetime] = mapped_column(
@@ -413,6 +419,15 @@ class ClassroomDraft(TenantBase):
 
     __table_args__ = (
         CheckConstraint("revision > 0", name="revision"),
+        ForeignKeyConstraint(
+            ["generation_job_id", "tenant_id"],
+            [
+                "tenant.generation_jobs.id",
+                "tenant.generation_jobs.tenant_id",
+            ],
+            name="fk_classroom_drafts_job_tenant_generation_jobs",
+            ondelete="SET NULL",
+        ),
         ForeignKeyConstraint(
             ["base_version_id", "classroom_id", "tenant_id"],
             [
@@ -439,6 +454,86 @@ class ClassroomDraft(TenantBase):
             name="uq_classroom_drafts_id_classroom_tenant",
         ),
         Index("ix_classroom_drafts_classroom_updated", "classroom_id", "updated_at"),
+    )
+
+
+class ClassroomDraftMedia(TenantBase):
+    """Integrity receipt for one asset-scoped temporary editor upload."""
+
+    __tablename__ = "classroom_draft_media"
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64))
+    classroom_id: Mapped[str] = mapped_column(String(128))
+    uploaded_by: Mapped[str] = mapped_column(String(128))
+    object_key: Mapped[str] = mapped_column(String(512))
+    mime_type: Mapped[str] = mapped_column(String(128))
+    sha256: Mapped[str] = mapped_column(String(64))
+    size_bytes: Mapped[int] = mapped_column(BigInteger)
+    status: Mapped[str] = mapped_column(String(32), server_default="writing")
+    ownership_token: Mapped[str] = mapped_column(String(32))
+    object_revision: Mapped[str | None] = mapped_column(String(256))
+    last_error_code: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "sha256 ~ '^[0-9a-f]{64}$'",
+            name="sha256",
+        ),
+        CheckConstraint(
+            "size_bytes >= 0 AND size_bytes <= 104857600",
+            name="size_bytes",
+        ),
+        CheckConstraint(
+            "status IN ('writing', 'uploaded', 'failed')",
+            name="status",
+        ),
+        CheckConstraint(
+            "ownership_token ~ '^[0-9a-f]{32}$'",
+            name="ownership_token",
+        ),
+        CheckConstraint(
+            "(status = 'writing' AND object_revision IS NULL "
+            "AND last_error_code IS NULL) OR "
+            "(status = 'uploaded' AND object_revision IS NOT NULL "
+            "AND last_error_code IS NULL) OR "
+            "(status = 'failed' AND last_error_code IS NOT NULL)",
+            name="receipt_state",
+        ),
+        ForeignKeyConstraint(
+            ["classroom_id", "tenant_id"],
+            [
+                "tenant.classroom_assets.id",
+                "tenant.classroom_assets.tenant_id",
+            ],
+            name="fk_classroom_draft_media_asset_tenant_classroom_assets",
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint(
+            "id",
+            "classroom_id",
+            "tenant_id",
+            name="uq_classroom_draft_media_id_classroom_tenant",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "object_key",
+            name="uq_classroom_draft_media_tenant_object_key",
+        ),
+        Index(
+            "ix_classroom_draft_media_asset_created",
+            "classroom_id",
+            "created_at",
+        ),
     )
 
 
@@ -705,6 +800,7 @@ __all__ = [
     "CLASSROOM_STATES",
     "ClassroomAsset",
     "ClassroomDraft",
+    "ClassroomDraftMedia",
     "ClassroomExport",
     "ClassroomVersion",
     "InvalidClassroomTransition",

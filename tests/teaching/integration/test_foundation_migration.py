@@ -24,7 +24,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 FOUNDATION_REVISION = "20260728_0001"
 SCOPED_GRANTS_REVISION = "20260730_0002"
 PROVISIONING_REVISION = "20260730_0003"
-HEAD_REVISION = "20260803_0009"
+HEAD_REVISION = "20260803_0010"
 
 
 @dataclass(frozen=True)
@@ -457,6 +457,7 @@ def test_migration_runs_from_outside_repository(
         "batch_jobs",
         "classroom_artifacts",
         "classroom_assets",
+        "classroom_draft_media",
         "classroom_drafts",
         "classroom_exports",
         "classroom_versions",
@@ -510,6 +511,7 @@ def test_wheel_packages_migrations_and_full_app_entrypoint(
         "deeptutor/teaching/migrations/versions/20260801_0007_trusted_job_inputs.py",
         "deeptutor/teaching/migrations/versions/20260802_0008_classroom_lifecycle.py",
         "deeptutor/teaching/migrations/versions/20260803_0009_knowledge_entitlements.py",
+        "deeptutor/teaching/migrations/versions/20260803_0010_classroom_authoring.py",
     }.issubset(names)
     assert "deeptutor-migrate = deeptutor.teaching.migrations.cli:main" in entry_points
     assert "deeptutor-provisioner = deeptutor.teaching.provisioning_cli:main" in entry_points
@@ -583,6 +585,7 @@ def test_packaged_entrypoint_runs_platform_and_tenant_scopes(
         "batch_jobs",
         "classroom_artifacts",
         "classroom_assets",
+        "classroom_draft_media",
         "classroom_drafts",
         "classroom_exports",
         "classroom_versions",
@@ -802,6 +805,7 @@ def test_foundation_migration_is_isolated_and_repeatable(migration_database):
         "batch_jobs",
         "classroom_artifacts",
         "classroom_assets",
+        "classroom_draft_media",
         "classroom_drafts",
         "classroom_exports",
         "classroom_versions",
@@ -825,6 +829,7 @@ def test_foundation_migration_is_isolated_and_repeatable(migration_database):
         "batch_jobs",
         "classroom_artifacts",
         "classroom_assets",
+        "classroom_draft_media",
         "classroom_drafts",
         "classroom_exports",
         "classroom_versions",
