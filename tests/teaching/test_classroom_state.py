@@ -14,6 +14,7 @@ from deeptutor.teaching.models.classrooms import (
     ClassroomAsset,
     ClassroomDraft,
     ClassroomDraftMedia,
+    ClassroomPublicationMaterialization,
     ClassroomReviewPolicy,
     ClassroomReviewRequest,
     ClassroomVersion,
@@ -92,6 +93,7 @@ def test_tenant_metadata_contains_the_classroom_domain_tables() -> None:
         "tenant.classroom_draft_media",
         "tenant.classroom_review_policies",
         "tenant.classroom_review_requests",
+        "tenant.classroom_publication_materializations",
         "tenant.assignment_migrations",
         "tenant.class_learning_states",
         "tenant.classroom_versions",
@@ -106,6 +108,7 @@ def test_tenant_metadata_contains_the_classroom_domain_tables() -> None:
 
 def test_review_publication_schema_has_durable_idempotency_and_guard_fences() -> None:
     review = ClassroomReviewRequest.__table__
+    materialization = ClassroomPublicationMaterialization.__table__
     publication = Publication.__table__
     assignment = Assignment.__table__
     migration = AssignmentMigration.__table__
@@ -119,6 +122,25 @@ def test_review_publication_schema_has_durable_idempotency_and_guard_fences() ->
         }
 
     assert ("tenant_id", "idempotency_key") in unique_columns(review)
+    assert ("tenant_id", "review_request_id") in unique_columns(materialization)
+    assert ("tenant_id", "idempotency_key") in unique_columns(materialization)
+    assert ("tenant_id", "version_id") in unique_columns(materialization)
+    assert (
+        "tenant_id",
+        "classroom_id",
+        "version_number",
+    ) in unique_columns(materialization)
+    assert {
+        "source_version_id",
+        "draft_revision",
+        "document_sha256",
+        "validation_report_sha256",
+        "media_manifest_sha256",
+        "manifest_sha256",
+        "source_media_receipts",
+        "confirmed_artifacts",
+        "status",
+    }.issubset(materialization.c.keys())
     assert ("tenant_id", "idempotency_key") in unique_columns(publication)
     assert ("tenant_id", "review_request_id") in unique_columns(publication)
     assert ("tenant_id", "idempotency_key") in unique_columns(assignment)

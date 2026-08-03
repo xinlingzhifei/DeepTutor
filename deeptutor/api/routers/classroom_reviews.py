@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy.exc import SQLAlchemyError
 
+from deeptutor.api.routers.teaching_catalog import get_source_store_provider
 from deeptutor.teaching.services.publications import (
     ActiveLearningConflict,
     PublicationAccessDenied,
@@ -173,14 +174,19 @@ def get_review_service(
 
 def get_publication_service(
     context: TenantContext = Depends(require_tenant),
+    store_provider=Depends(get_source_store_provider),
 ) -> PublicationService:
     from deeptutor.teaching.database import get_platform_engine
+    from deeptutor.teaching.services.publication_materializer import (
+        ClassroomPublicationMaterializer,
+    )
     from deeptutor.teaching.services.publication_repository import (
         SqlAlchemyPublicationRepository,
     )
 
     return PublicationService(
-        SqlAlchemyPublicationRepository(get_platform_engine(), context.tenant_id)
+        SqlAlchemyPublicationRepository(get_platform_engine(), context.tenant_id),
+        ClassroomPublicationMaterializer(store_provider),
     )
 
 

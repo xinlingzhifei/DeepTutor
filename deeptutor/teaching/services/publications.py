@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import hashlib
 from typing import Literal, Protocol
 
+from deeptutor.teaching.contracts import canonical_json_bytes
 from deeptutor.teaching.permissions import ResourceScope
 from deeptutor.teaching.services.reviews import ReviewPolicy
 from deeptutor.teaching.tenant_context import TenantContext
@@ -64,6 +66,95 @@ class PublishedVersionRecord:
     publication_scope: PublicationScope
     class_id: str | None
     idempotency_key: str
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationMediaSource:
+    media_id: str
+    relative_name: str
+    mime_type: str
+    sha256: str
+    size_bytes: int
+    object_key: str = field(repr=False)
+    ownership_token: str = field(repr=False)
+    object_revision: str = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationMaterializationPlan:
+    reservation_id: str
+    tenant_id: str
+    asset_id: str
+    review_id: str
+    draft_id: str
+    draft_revision: int
+    source_version_id: str
+    version_id: str
+    version_number: int
+    document: bytes = field(repr=False)
+    document_sha256: str
+    validation_report_sha256: str
+    media_manifest_sha256: str
+    manifest_sha256: str
+    media: tuple[PublicationMediaSource, ...]
+    status: Literal["prepared", "object_committed", "finalized"]
+
+
+@dataclass(frozen=True, slots=True)
+class MaterializedPublicationArtifact:
+    relative_name: str
+    object_key: str = field(repr=False)
+    sha256: str
+    size_bytes: int
+    mime_type: str
+    artifact_kind: Literal["dsl_json", "media"]
+    media_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ConfirmedPublicationMaterialization:
+    manifest_sha256: str
+    media_manifest_sha256: str
+    artifacts: tuple[MaterializedPublicationArtifact, ...]
+
+    @property
+    def document(self) -> MaterializedPublicationArtifact:
+        matches = tuple(
+            artifact
+            for artifact in self.artifacts
+            if artifact.artifact_kind == "dsl_json"
+        )
+        if len(matches) != 1:
+            raise PublicationPersistenceError(
+                "confirmed publication document is invalid"
+            )
+        return matches[0]
+
+
+def publication_media_manifest_sha256(
+    media: tuple[PublicationMediaSource, ...],
+) -> str:
+    return hashlib.sha256(
+        canonical_json_bytes(
+            [
+                {
+                    "mediaId": item.media_id,
+                    "relativeName": item.relative_name,
+                    "mimeType": item.mime_type,
+                    "sha256": item.sha256,
+                    "sizeBytes": item.size_bytes,
+                }
+                for item in media
+            ]
+        )
+    ).hexdigest()
+
+
+class PublicationMaterializer(Protocol):
+    async def materialize(
+        self,
+        plan: PublicationMaterializationPlan,
+    ) -> ConfirmedPublicationMaterialization: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,7 +253,11 @@ class PublicationRepository(Protocol):
         asset_id: str,
     ) -> PublicationTarget | None: ...
 
-    async def publish(self, command: PublishCommand) -> PublishedVersionRecord: ...
+    async def publish(
+        self,
+        command: PublishCommand,
+        materializer: PublicationMaterializer,
+    ) -> PublishedVersionRecord: ...
 
     async def get_version_target(self, version_id: str) -> VersionTarget | None: ...
 
@@ -202,8 +297,13 @@ def _allows(
 class PublicationService:
     """Authorize immutable publication and explicit assignment movement."""
 
-    def __init__(self, repository: PublicationRepository) -> None:
+    def __init__(
+        self,
+        repository: PublicationRepository,
+        materializer: PublicationMaterializer | None = None,
+    ) -> None:
         self._repository = repository
+        self._materializer = materializer
 
     async def publish(
         self,
@@ -257,6 +357,10 @@ class PublicationService:
         elif not approved and not self_publish:
             raise PublicationAccessDenied("class publication requires approval")
 
+        if self._materializer is None:
+            raise PublicationPersistenceError(
+                "classroom publication materializer is unavailable"
+            )
         return await self._repository.publish(
             PublishCommand(
                 tenant_id=context.tenant_id,
@@ -269,7 +373,8 @@ class PublicationService:
                 review_id=target.review_id,
                 draft_revision=target.draft_revision,
                 document_sha256=target.document_sha256,
-            )
+            ),
+            self._materializer,
         )
 
     async def assign(
@@ -391,11 +496,16 @@ __all__ = [
     "AssignCommand",
     "AssignmentRecord",
     "AssignmentTarget",
+    "ConfirmedPublicationMaterialization",
+    "MaterializedPublicationArtifact",
     "MigrateAssignmentCommand",
     "MigrationRecord",
     "PublicationAccessDenied",
     "PublicationConflict",
     "PublicationError",
+    "PublicationMaterializationPlan",
+    "PublicationMaterializer",
+    "PublicationMediaSource",
     "PublicationNotFound",
     "PublicationPersistenceError",
     "PublicationService",
@@ -404,4 +514,5 @@ __all__ = [
     "PublishCommand",
     "PublishedVersionRecord",
     "VersionTarget",
+    "publication_media_manifest_sha256",
 ]

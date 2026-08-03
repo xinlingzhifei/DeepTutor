@@ -233,6 +233,126 @@ def _upgrade_tenant() -> None:
         ["status", "created_at"],
         schema=tenant_schema,
     )
+    op.create_table(
+        "classroom_publication_materializations",
+        sa.Column("id", sa.String(length=128), nullable=False),
+        sa.Column("tenant_id", sa.String(length=64), nullable=False),
+        sa.Column("review_request_id", sa.String(length=128), nullable=False),
+        sa.Column("classroom_id", sa.String(length=128), nullable=False),
+        sa.Column("classroom_draft_id", sa.String(length=128), nullable=False),
+        sa.Column("source_version_id", sa.String(length=128), nullable=False),
+        sa.Column("version_id", sa.String(length=128), nullable=False),
+        sa.Column("version_number", sa.Integer(), nullable=False),
+        sa.Column("draft_revision", sa.Integer(), nullable=False),
+        sa.Column("document_sha256", sa.String(length=64), nullable=False),
+        sa.Column("validation_report_sha256", sa.String(length=64), nullable=False),
+        sa.Column("media_manifest_sha256", sa.String(length=64), nullable=False),
+        sa.Column("manifest_sha256", sa.String(length=64), nullable=False),
+        sa.Column("manifest_document", sa.Text(), nullable=False),
+        sa.Column("source_media_receipts", sa.Text(), nullable=False),
+        sa.Column("confirmed_artifacts", sa.Text(), nullable=True),
+        sa.Column(
+            "status",
+            sa.String(length=32),
+            server_default=sa.text("'prepared'"),
+            nullable=False,
+        ),
+        sa.Column("scope", sa.String(length=16), nullable=False),
+        sa.Column("class_id", sa.String(length=64), nullable=True),
+        sa.Column("idempotency_key", sa.String(length=128), nullable=False),
+        sa.Column("request_sha256", sa.String(length=64), nullable=False),
+        sa.Column("actor_id", sa.String(length=128), nullable=False),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.Column(
+            "updated_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.CheckConstraint(
+            "version_number > 0",
+            name="ck_classroom_publication_materializations_version_number",
+        ),
+        sa.CheckConstraint(
+            "draft_revision > 0",
+            name="ck_classroom_publication_materializations_draft_revision",
+        ),
+        sa.CheckConstraint(
+            "status IN ('prepared', 'object_committed', 'finalized')",
+            name="ck_classroom_publication_materializations_status",
+        ),
+        sa.CheckConstraint(
+            "(status = 'prepared' AND confirmed_artifacts IS NULL) OR "
+            "(status IN ('object_committed', 'finalized') "
+            "AND confirmed_artifacts IS NOT NULL)",
+            name="ck_classroom_publication_materializations_confirmed_binding",
+        ),
+        sa.CheckConstraint(
+            "(scope = 'class' AND class_id IS NOT NULL) OR "
+            "(scope IN ('tenant', 'platform') AND class_id IS NULL)",
+            name="ck_classroom_publication_materializations_scope_class",
+        ),
+        sa.ForeignKeyConstraint(
+            ["review_request_id", "tenant_id"],
+            [
+                "tenant.classroom_review_requests.id",
+                "tenant.classroom_review_requests.tenant_id",
+            ],
+            name="fk_publish_materializations_review_tenant",
+            ondelete="RESTRICT",
+        ),
+        sa.ForeignKeyConstraint(
+            ["classroom_draft_id", "classroom_id", "tenant_id"],
+            [
+                "tenant.classroom_drafts.id",
+                "tenant.classroom_drafts.classroom_id",
+                "tenant.classroom_drafts.tenant_id",
+            ],
+            name="fk_publish_materializations_draft_classroom_tenant",
+            ondelete="RESTRICT",
+        ),
+        sa.ForeignKeyConstraint(
+            ["source_version_id", "classroom_id", "tenant_id"],
+            [
+                "tenant.classroom_versions.id",
+                "tenant.classroom_versions.classroom_id",
+                "tenant.classroom_versions.tenant_id",
+            ],
+            name="fk_publish_materializations_source_classroom_tenant",
+            ondelete="RESTRICT",
+        ),
+        sa.PrimaryKeyConstraint(
+            "id",
+            name="pk_classroom_publication_materializations",
+        ),
+        sa.UniqueConstraint(
+            "tenant_id",
+            "review_request_id",
+            name="uq_publish_materializations_tenant_review",
+        ),
+        sa.UniqueConstraint(
+            "tenant_id",
+            "idempotency_key",
+            name="uq_publish_materializations_tenant_idempotency",
+        ),
+        sa.UniqueConstraint(
+            "tenant_id",
+            "version_id",
+            name="uq_publish_materializations_tenant_version_id",
+        ),
+        sa.UniqueConstraint(
+            "tenant_id",
+            "classroom_id",
+            "version_number",
+            name="uq_publish_materializations_tenant_classroom_version",
+        ),
+        schema="tenant",
+    )
 
     op.add_column(
         "approvals",
@@ -472,6 +592,7 @@ def _downgrade_tenant() -> None:
     for table_name in (
         "classroom_review_requests",
         "classroom_review_policies",
+        "classroom_publication_materializations",
         "assignment_migrations",
         "class_learning_states",
     ):
@@ -598,6 +719,7 @@ def _downgrade_tenant() -> None:
         schema=tenant_schema,
     )
     op.drop_column("approvals", "review_request_id", schema=tenant_schema)
+    op.drop_table("classroom_publication_materializations", schema=tenant_schema)
     op.drop_index(
         "ix_classroom_review_requests_pending",
         table_name="classroom_review_requests",

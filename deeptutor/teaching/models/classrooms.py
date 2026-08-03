@@ -730,6 +730,114 @@ class ClassroomReviewRequest(TenantBase):
     )
 
 
+class ClassroomPublicationMaterialization(TenantBase):
+    """Durable object-store reservation for one reviewed draft publication."""
+
+    __tablename__ = "classroom_publication_materializations"
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64))
+    review_request_id: Mapped[str] = mapped_column(String(128))
+    classroom_id: Mapped[str] = mapped_column(String(128))
+    classroom_draft_id: Mapped[str] = mapped_column(String(128))
+    source_version_id: Mapped[str] = mapped_column(String(128))
+    version_id: Mapped[str] = mapped_column(String(128))
+    version_number: Mapped[int] = mapped_column(Integer)
+    draft_revision: Mapped[int] = mapped_column(Integer)
+    document_sha256: Mapped[str] = mapped_column(String(64))
+    validation_report_sha256: Mapped[str] = mapped_column(String(64))
+    media_manifest_sha256: Mapped[str] = mapped_column(String(64))
+    manifest_sha256: Mapped[str] = mapped_column(String(64))
+    manifest_document: Mapped[str] = mapped_column(Text)
+    source_media_receipts: Mapped[str] = mapped_column(Text)
+    confirmed_artifacts: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(32), server_default="prepared")
+    scope: Mapped[str] = mapped_column(String(16))
+    class_id: Mapped[str | None] = mapped_column(String(64))
+    idempotency_key: Mapped[str] = mapped_column(String(128))
+    request_sha256: Mapped[str] = mapped_column(String(64))
+    actor_id: Mapped[str] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    __table_args__ = (
+        CheckConstraint("version_number > 0", name="version_number"),
+        CheckConstraint("draft_revision > 0", name="draft_revision"),
+        CheckConstraint(
+            "status IN ('prepared', 'object_committed', 'finalized')",
+            name="status",
+        ),
+        CheckConstraint(
+            "(status = 'prepared' AND confirmed_artifacts IS NULL) OR "
+            "(status IN ('object_committed', 'finalized') "
+            "AND confirmed_artifacts IS NOT NULL)",
+            name="confirmed_binding",
+        ),
+        CheckConstraint(
+            "(scope = 'class' AND class_id IS NOT NULL) OR "
+            "(scope IN ('tenant', 'platform') AND class_id IS NULL)",
+            name="scope_class",
+        ),
+        ForeignKeyConstraint(
+            ["review_request_id", "tenant_id"],
+            [
+                "tenant.classroom_review_requests.id",
+                "tenant.classroom_review_requests.tenant_id",
+            ],
+            name="fk_publish_materializations_review_tenant",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["classroom_draft_id", "classroom_id", "tenant_id"],
+            [
+                "tenant.classroom_drafts.id",
+                "tenant.classroom_drafts.classroom_id",
+                "tenant.classroom_drafts.tenant_id",
+            ],
+            name="fk_publish_materializations_draft_classroom_tenant",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["source_version_id", "classroom_id", "tenant_id"],
+            [
+                "tenant.classroom_versions.id",
+                "tenant.classroom_versions.classroom_id",
+                "tenant.classroom_versions.tenant_id",
+            ],
+            name="fk_publish_materializations_source_classroom_tenant",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "review_request_id",
+            name="uq_publish_materializations_tenant_review",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "idempotency_key",
+            name="uq_publish_materializations_tenant_idempotency",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "version_id",
+            name="uq_publish_materializations_tenant_version_id",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "classroom_id",
+            "version_number",
+            name="uq_publish_materializations_tenant_classroom_version",
+        ),
+    )
+
+
 class Approval(TenantBase):
     """Append-only submission or review decision for one classroom draft."""
 
@@ -1107,6 +1215,7 @@ __all__ = [
     "ClassroomDraft",
     "ClassroomDraftMedia",
     "ClassroomExport",
+    "ClassroomPublicationMaterialization",
     "ClassroomReviewPolicy",
     "ClassroomReviewRequest",
     "ClassroomVersion",

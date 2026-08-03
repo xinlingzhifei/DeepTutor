@@ -8,7 +8,10 @@ from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from deeptutor.teaching.models.classrooms import ClassroomVersion
+from deeptutor.teaching.models.classrooms import (
+    ClassroomPublicationMaterialization,
+    ClassroomVersion,
+)
 from deeptutor.teaching.models.jobs import ArtifactPromotionState
 
 _VERSION_NUMBER_CONSTRAINT = "uq_classroom_versions_tenant_classroom_version"
@@ -53,7 +56,21 @@ async def allocate_classroom_version_number(
         )
         or 0
     )
-    return max(persisted_max, reserved_max) + 1
+    publication_max = int(
+        await session.scalar(
+            select(
+                func.coalesce(
+                    func.max(ClassroomPublicationMaterialization.version_number),
+                    0,
+                )
+            ).where(
+                ClassroomPublicationMaterialization.tenant_id == tenant_id,
+                ClassroomPublicationMaterialization.classroom_id == classroom_id,
+            )
+        )
+        or 0
+    )
+    return max(persisted_max, reserved_max, publication_max) + 1
 
 
 def raise_for_classroom_version_allocation_conflict(exc: IntegrityError) -> None:

@@ -76,7 +76,7 @@ class _PublicationRepository:
     async def get_publication_target(self, asset_id: str) -> PublicationTarget | None:
         return self.target if asset_id == self.target.asset_id else None
 
-    async def publish(self, command) -> PublishedVersionRecord:
+    async def publish(self, command, _materializer) -> PublishedVersionRecord:
         existing = next(
             (item for item in self.versions if item.idempotency_key == command.idempotency_key),
             None,
@@ -137,7 +137,6 @@ class _PublicationRepository:
         )
         self.assignments[record.assignment_id] = record
         return record
-
     async def get_assignment_target(self, assignment_id: str) -> AssignmentTarget | None:
         assignment = self.assignments.get(assignment_id)
         if assignment is None:
@@ -196,6 +195,10 @@ class _PublicationRepository:
         return record
 
 
+def _service(repository: _PublicationRepository) -> PublicationService:
+    return PublicationService(repository, object())  # type: ignore[arg-type]
+
+
 def _teacher() -> TenantContext:
     return _context(
         "teacher-1",
@@ -206,7 +209,7 @@ def _teacher() -> TenantContext:
 
 @pytest.mark.asyncio
 async def test_teacher_self_publish_requires_explicit_policy_and_own_class() -> None:
-    disabled = PublicationService(_PublicationRepository(self_publish=False))
+    disabled = _service(_PublicationRepository(self_publish=False))
     with pytest.raises(PublicationAccessDenied):
         await disabled.publish(
             _teacher(),
@@ -217,7 +220,7 @@ async def test_teacher_self_publish_requires_explicit_policy_and_own_class() -> 
         )
 
     enabled_repository = _PublicationRepository(self_publish=True)
-    enabled = PublicationService(enabled_repository)
+    enabled = _service(enabled_repository)
     published = await enabled.publish(
         _teacher(),
         "asset-1",
@@ -245,7 +248,7 @@ async def test_org_and_platform_publication_require_approved_review() -> None:
         review_scope="tenant",
         review_status="pending",
     )
-    service = PublicationService(repository)
+    service = _service(repository)
     publisher = _context(
         "publisher-1",
         ("classroom.publish", "tenant", "tenant-a"),
@@ -288,7 +291,7 @@ async def test_org_and_platform_publication_require_approved_review() -> None:
 @pytest.mark.asyncio
 async def test_existing_assignment_stays_on_old_version_after_new_publish() -> None:
     repository = _PublicationRepository(self_publish=True)
-    service = PublicationService(repository)
+    service = _service(repository)
     old = await service.publish(
         _teacher(),
         "asset-1",
@@ -319,7 +322,7 @@ async def test_existing_assignment_stays_on_old_version_after_new_publish() -> N
 @pytest.mark.asyncio
 async def test_assignment_is_idempotent_and_cross_class_is_denied() -> None:
     repository = _PublicationRepository(self_publish=True)
-    service = PublicationService(repository)
+    service = _service(repository)
     version = await service.publish(
         _teacher(),
         "asset-1",
@@ -353,7 +356,7 @@ async def test_assignment_is_idempotent_and_cross_class_is_denied() -> None:
 @pytest.mark.asyncio
 async def test_explicit_migration_is_audited_idempotent_and_refuses_active_learning() -> None:
     repository = _PublicationRepository(self_publish=True)
-    service = PublicationService(repository)
+    service = _service(repository)
     old = await service.publish(
         _teacher(),
         "asset-1",
@@ -420,7 +423,7 @@ async def test_explicit_migration_is_audited_idempotent_and_refuses_active_learn
 async def test_migration_guard_missing_state_fails_closed() -> None:
     repository = _PublicationRepository(self_publish=True)
     repository.guard_known = False
-    service = PublicationService(repository)
+    service = _service(repository)
     old = await service.publish(
         _teacher(),
         "asset-1",
@@ -462,7 +465,7 @@ def _client(service: PublicationService, context: TenantContext) -> TestClient:
 def test_active_learning_migration_refusal_is_fixed_safe_api_error() -> None:
     repository = _PublicationRepository(self_publish=True)
     repository.active_learning = True
-    service = PublicationService(repository)
+    service = _service(repository)
     teacher = _teacher()
 
     async def prepare() -> tuple[PublishedVersionRecord, AssignmentRecord, PublishedVersionRecord]:

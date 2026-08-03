@@ -25,6 +25,7 @@ from deeptutor.teaching.models.platform import AuditLog
 from deeptutor.teaching.schema_names import tenant_schema_name
 from deeptutor.teaching.services.reviews import (
     DecideReviewCommand,
+    ReviewAccessDenied,
     ReviewBlocked,
     ReviewConflict,
     ReviewPersistenceError,
@@ -272,6 +273,14 @@ class SqlAlchemyReviewRepository:
         try:
             async with self._session_factory() as session:
                 async with session.begin():
+                    row = (
+                        await session.execute(
+                            self._target_statement(command.asset_id).with_for_update()
+                        )
+                    ).one_or_none()
+                    if row is None:
+                        raise ReviewConflict("classroom review target is unavailable")
+                    asset, draft, brief = row
                     existing = await session.scalar(
                         select(ClassroomReviewRequest)
                         .where(
@@ -286,14 +295,6 @@ class SqlAlchemyReviewRepository:
                             existing,
                             request_sha256=request_sha256,
                         )
-                    row = (
-                        await session.execute(
-                            self._target_statement(command.asset_id).with_for_update()
-                        )
-                    ).one_or_none()
-                    if row is None:
-                        raise ReviewConflict("classroom review target is unavailable")
-                    asset, draft, brief = row
                     if brief.course_id is None or brief.class_id is None:
                         raise ReviewConflict("classroom review target is unavailable")
                     if asset.lifecycle_state != "editing":
@@ -389,6 +390,15 @@ class SqlAlchemyReviewRepository:
                         raise ReviewConflict("classroom review is unavailable")
                     if model.status != "pending":
                         raise ReviewConflict("classroom review was already decided")
+                    policy = await session.scalar(
+                        select(ClassroomReviewPolicy)
+                        .where(ClassroomReviewPolicy.tenant_id == self._tenant_id)
+                        .with_for_update()
+                    )
+                    if (
+                        policy is None or policy.prohibit_self_review
+                    ) and model.submitted_by == command.actor_id:
+                        raise ReviewAccessDenied("classroom self-review is prohibited")
                     row = (
                         await session.execute(
                             select(ClassroomAsset, ClassroomDraft)

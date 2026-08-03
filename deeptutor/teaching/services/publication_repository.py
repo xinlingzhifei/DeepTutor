@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import hashlib
 import hmac
 import json
@@ -10,6 +11,7 @@ from sqlalchemy import and_, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
+from deeptutor.teaching.artifacts import classroom_artifact_key
 from deeptutor.teaching.contracts import canonical_json_bytes
 from deeptutor.teaching.models.classrooms import (
     Assignment,
@@ -17,6 +19,8 @@ from deeptutor.teaching.models.classrooms import (
     ClassLearningState,
     ClassroomAsset,
     ClassroomDraft,
+    ClassroomDraftMedia,
+    ClassroomPublicationMaterialization,
     ClassroomReviewPolicy,
     ClassroomReviewRequest,
     ClassroomVersion,
@@ -32,19 +36,34 @@ from deeptutor.teaching.repositories.classroom_version_allocation import (
     raise_for_classroom_version_allocation_conflict,
 )
 from deeptutor.teaching.schema_names import tenant_schema_name
+from deeptutor.teaching.services.classrooms import (
+    InvalidDraftDocument,
+    validate_draft_document_references,
+)
+from deeptutor.teaching.services.publication_materializer import (
+    publication_manifest,
+    publication_manifest_document,
+    publication_manifest_sha256,
+)
 from deeptutor.teaching.services.publications import (
     AssignCommand,
     AssignmentRecord,
     AssignmentTarget,
+    ConfirmedPublicationMaterialization,
+    MaterializedPublicationArtifact,
     MigrateAssignmentCommand,
     MigrationRecord,
     PublicationConflict,
+    PublicationMaterializationPlan,
+    PublicationMaterializer,
+    PublicationMediaSource,
     PublicationPersistenceError,
     PublicationTarget,
     PublicationValidationStale,
     PublishCommand,
     PublishedVersionRecord,
     VersionTarget,
+    publication_media_manifest_sha256,
 )
 from deeptutor.teaching.services.reviews import ReviewPolicy
 
@@ -66,6 +85,19 @@ def _decode_report(value: str) -> dict[str, object]:
     if not isinstance(decoded, dict):
         raise PublicationPersistenceError("stored classroom validation is invalid")
     return decoded
+
+
+_MEDIA_SUFFIXES = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "audio/mpeg": ".mp3",
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+    "video/mp4": ".mp4",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+}
 
 
 class SqlAlchemyPublicationRepository:
@@ -257,10 +289,9 @@ class SqlAlchemyPublicationRepository:
             raise PublicationConflict("publication idempotency key conflicts")
         return SqlAlchemyPublicationRepository._published_record(version, publication)
 
-    async def publish(self, command: PublishCommand) -> PublishedVersionRecord:
-        if command.tenant_id != self._tenant_id:
-            raise PublicationConflict("publication tenant conflicts")
-        request_sha256 = _digest(
+    @staticmethod
+    def _publication_request_sha256(command: PublishCommand) -> str:
+        return _digest(
             {
                 "tenantId": command.tenant_id,
                 "assetId": command.asset_id,
@@ -272,215 +303,630 @@ class SqlAlchemyPublicationRepository:
                 "documentSha256": command.document_sha256,
             }
         )
-        existing = await self._get_publication_by_key(command.idempotency_key)
-        if existing is not None:
-            return self._verify_publication_retry(existing, request_sha256=request_sha256)
-        version_id = _identifier("version", self._tenant_id, command.idempotency_key)
-        publication_id = _identifier(
-            "publication",
-            self._tenant_id,
-            command.idempotency_key,
-        )
-        try:
-            async with self._session_factory() as session:
-                async with session.begin():
-                    row = (
-                        await session.execute(
-                            select(
-                                ClassroomAsset,
-                                ClassroomDraft,
-                                TeachingBrief,
-                                ClassroomReviewRequest,
-                            )
-                            .join(
-                                ClassroomDraft,
-                                and_(
-                                    ClassroomDraft.classroom_id == ClassroomAsset.id,
-                                    ClassroomDraft.tenant_id == ClassroomAsset.tenant_id,
-                                ),
-                            )
-                            .join(
-                                TeachingBrief,
-                                and_(
-                                    TeachingBrief.id == ClassroomDraft.teaching_brief_id,
-                                    TeachingBrief.tenant_id == ClassroomDraft.tenant_id,
-                                ),
-                            )
-                            .join(
-                                ClassroomReviewRequest,
-                                and_(
-                                    ClassroomReviewRequest.id == command.review_id,
-                                    ClassroomReviewRequest.classroom_id == ClassroomAsset.id,
-                                    ClassroomReviewRequest.classroom_draft_id
-                                    == ClassroomDraft.id,
-                                    ClassroomReviewRequest.tenant_id
-                                    == ClassroomAsset.tenant_id,
-                                ),
-                            )
-                            .where(
-                                ClassroomAsset.id == command.asset_id,
-                                ClassroomAsset.tenant_id == self._tenant_id,
-                            )
-                            .with_for_update()
-                        )
-                    ).one_or_none()
-                    if row is None:
-                        raise PublicationConflict("publication target is unavailable")
-                    asset, draft, brief, review = row
-                    if brief.class_id is None or brief.course_id is None:
-                        raise PublicationConflict("publication target is unavailable")
-                    if (
-                        review.scope != command.scope
-                        or review.class_id != command.class_id
-                        or review.draft_revision != command.draft_revision
-                        or not hmac.compare_digest(
-                            review.document_sha256,
-                            command.document_sha256,
-                        )
-                    ):
-                        raise PublicationConflict("publication review binding conflicts")
-                    self._validate_review_binding(asset, draft, review)
-                    policy = self._policy(
-                        await session.scalar(
-                            select(ClassroomReviewPolicy)
-                            .where(
-                                ClassroomReviewPolicy.tenant_id == self._tenant_id
-                            )
-                            .with_for_update()
-                        )
-                    )
-                    self_publish = (
-                        command.allow_self_publish
-                        and command.scope == "class"
-                        and policy.teacher_self_publish
-                        and asset.owner_id == command.actor_id
-                        and review.submitted_by == command.actor_id
-                        and review.class_id == brief.class_id
-                        and review.status == "pending"
-                    )
-                    if review.status != "approved" and not self_publish:
-                        raise PublicationConflict("publication approval is unavailable")
-                    if review.status == "approved":
-                        if asset.lifecycle_state not in {"approved", "published"}:
-                            raise PublicationConflict("publication lifecycle conflicts")
-                    elif asset.lifecycle_state != "submitted":
-                        raise PublicationConflict("publication lifecycle conflicts")
 
-                    materialized = (
-                        await session.execute(
-                            select(
-                                ClassroomVersion,
-                                ArtifactPromotionState,
-                                ClassroomArtifact,
-                            )
-                            .join(
-                                ArtifactPromotionState,
-                                and_(
-                                    ArtifactPromotionState.job_id
-                                    == ClassroomVersion.generation_job_id,
-                                    ArtifactPromotionState.tenant_id
-                                    == ClassroomVersion.tenant_id,
-                                    ArtifactPromotionState.classroom_id
-                                    == ClassroomVersion.classroom_id,
-                                ),
-                            )
-                            .join(
-                                ClassroomArtifact,
-                                and_(
-                                    ClassroomArtifact.classroom_version_id
-                                    == ClassroomVersion.id,
-                                    ClassroomArtifact.source_job_id
-                                    == ClassroomVersion.generation_job_id,
-                                    ClassroomArtifact.tenant_id
-                                    == ClassroomVersion.tenant_id,
-                                ),
-                            )
-                            .where(
-                                ClassroomVersion.tenant_id == self._tenant_id,
-                                ClassroomVersion.classroom_id == asset.id,
-                                ClassroomVersion.generation_job_id
-                                == draft.generation_job_id,
-                                ClassroomArtifact.artifact_kind == "dsl_json",
-                                ClassroomArtifact.mime_type == "application/json",
-                            )
-                            .with_for_update()
-                        )
-                    ).one_or_none()
-                    if materialized is None:
-                        raise PublicationConflict("materialized classroom is unavailable")
-                    source, promotion, artifact = materialized
+    async def _locked_publication_target(self, session, command: PublishCommand):
+        return (
+            await session.execute(
+                select(
+                    ClassroomAsset,
+                    ClassroomDraft,
+                    TeachingBrief,
+                    ClassroomReviewRequest,
+                )
+                .join(
+                    ClassroomDraft,
+                    and_(
+                        ClassroomDraft.classroom_id == ClassroomAsset.id,
+                        ClassroomDraft.tenant_id == ClassroomAsset.tenant_id,
+                    ),
+                )
+                .join(
+                    TeachingBrief,
+                    and_(
+                        TeachingBrief.id == ClassroomDraft.teaching_brief_id,
+                        TeachingBrief.tenant_id == ClassroomDraft.tenant_id,
+                    ),
+                )
+                .join(
+                    ClassroomReviewRequest,
+                    and_(
+                        ClassroomReviewRequest.id == command.review_id,
+                        ClassroomReviewRequest.classroom_id == ClassroomAsset.id,
+                        ClassroomReviewRequest.classroom_draft_id == ClassroomDraft.id,
+                        ClassroomReviewRequest.tenant_id == ClassroomAsset.tenant_id,
+                    ),
+                )
+                .where(
+                    ClassroomAsset.id == command.asset_id,
+                    ClassroomAsset.tenant_id == self._tenant_id,
+                )
+                .with_for_update()
+            )
+        ).one_or_none()
+
+    async def _validate_locked_publication_target(
+        self,
+        session,
+        command: PublishCommand,
+        row,
+    ):
+        if row is None:
+            raise PublicationConflict("publication target is unavailable")
+        asset, draft, brief, review = row
+        if brief.class_id is None or brief.course_id is None:
+            raise PublicationConflict("publication target is unavailable")
+        if (
+            review.scope != command.scope
+            or review.class_id != command.class_id
+            or review.draft_revision != command.draft_revision
+            or not hmac.compare_digest(review.document_sha256, command.document_sha256)
+        ):
+            raise PublicationConflict("publication review binding conflicts")
+        self._validate_review_binding(asset, draft, review)
+        policy = self._policy(
+            await session.scalar(
+                select(ClassroomReviewPolicy)
+                .where(ClassroomReviewPolicy.tenant_id == self._tenant_id)
+                .with_for_update()
+            )
+        )
+        self_publish = (
+            command.allow_self_publish
+            and command.scope == "class"
+            and policy.teacher_self_publish
+            and asset.owner_id == command.actor_id
+            and review.submitted_by == command.actor_id
+            and review.class_id == brief.class_id
+            and review.status == "pending"
+        )
+        if review.status != "approved" and not self_publish:
+            raise PublicationConflict("publication approval is unavailable")
+        if review.status == "approved":
+            if asset.lifecycle_state not in {"approved", "published"}:
+                raise PublicationConflict("publication lifecycle conflicts")
+        elif asset.lifecycle_state != "submitted":
+            raise PublicationConflict("publication lifecycle conflicts")
+        return asset, draft, brief, review
+
+    @staticmethod
+    def _media_receipts_document(media: tuple[PublicationMediaSource, ...]) -> str:
+        return canonical_json_bytes(
+            [
+                {
+                    "mediaId": item.media_id,
+                    "relativeName": item.relative_name,
+                    "mimeType": item.mime_type,
+                    "sha256": item.sha256,
+                    "sizeBytes": item.size_bytes,
+                    "objectKey": item.object_key,
+                    "ownershipToken": item.ownership_token,
+                    "objectRevision": item.object_revision,
+                }
+                for item in media
+            ]
+        ).decode()
+
+    @staticmethod
+    def _decode_media_receipts(value: str) -> tuple[PublicationMediaSource, ...]:
+        try:
+            rows = json.loads(value)
+            media = tuple(
+                PublicationMediaSource(
+                    media_id=row["mediaId"],
+                    relative_name=row["relativeName"],
+                    mime_type=row["mimeType"],
+                    sha256=row["sha256"],
+                    size_bytes=row["sizeBytes"],
+                    object_key=row["objectKey"],
+                    ownership_token=row["ownershipToken"],
+                    object_revision=row["objectRevision"],
+                )
+                for row in rows
+            )
+        except (KeyError, TypeError, ValueError):
+            raise PublicationPersistenceError(
+                "stored publication media receipts are invalid"
+            ) from None
+        if SqlAlchemyPublicationRepository._media_receipts_document(media) != value:
+            raise PublicationPersistenceError(
+                "stored publication media receipts are invalid"
+            )
+        return media
+
+    @staticmethod
+    def _plan(
+        model: ClassroomPublicationMaterialization,
+        draft: ClassroomDraft,
+    ) -> PublicationMaterializationPlan:
+        document = draft.document.encode()
+        if (
+            model.classroom_draft_id != draft.id
+            or model.draft_revision != draft.revision
+            or not hmac.compare_digest(model.document_sha256, draft.document_sha256)
+            or hashlib.sha256(document).hexdigest() != model.document_sha256
+        ):
+            raise PublicationValidationStale("classroom validation is stale")
+        media = SqlAlchemyPublicationRepository._decode_media_receipts(
+            model.source_media_receipts
+        )
+        if publication_media_manifest_sha256(media) != model.media_manifest_sha256:
+            raise PublicationPersistenceError("stored media manifest is invalid")
+        plan = PublicationMaterializationPlan(
+            reservation_id=model.id,
+            tenant_id=model.tenant_id,
+            asset_id=model.classroom_id,
+            review_id=model.review_request_id,
+            draft_id=model.classroom_draft_id,
+            draft_revision=model.draft_revision,
+            source_version_id=model.source_version_id,
+            version_id=model.version_id,
+            version_number=model.version_number,
+            document=document,
+            document_sha256=model.document_sha256,
+            validation_report_sha256=model.validation_report_sha256,
+            media_manifest_sha256=model.media_manifest_sha256,
+            manifest_sha256=model.manifest_sha256,
+            media=media,
+            status=model.status,  # type: ignore[arg-type]
+        )
+        manifest = publication_manifest(plan)
+        if (
+            publication_manifest_document(manifest).decode()
+            != model.manifest_document
+            or publication_manifest_sha256(manifest) != model.manifest_sha256
+        ):
+            raise PublicationPersistenceError("stored publication manifest is invalid")
+        return plan
+
+    async def _source_version(self, session, draft: ClassroomDraft, asset_id: str):
+        materialized = (
+            await session.execute(
+                select(ClassroomVersion, ArtifactPromotionState, ClassroomArtifact)
+                .join(
+                    ArtifactPromotionState,
+                    and_(
+                        ArtifactPromotionState.job_id
+                        == ClassroomVersion.generation_job_id,
+                        ArtifactPromotionState.tenant_id == ClassroomVersion.tenant_id,
+                        ArtifactPromotionState.classroom_id
+                        == ClassroomVersion.classroom_id,
+                    ),
+                )
+                .join(
+                    ClassroomArtifact,
+                    and_(
+                        ClassroomArtifact.classroom_version_id == ClassroomVersion.id,
+                        ClassroomArtifact.source_job_id
+                        == ClassroomVersion.generation_job_id,
+                        ClassroomArtifact.tenant_id == ClassroomVersion.tenant_id,
+                    ),
+                )
+                .where(
+                    ClassroomVersion.tenant_id == self._tenant_id,
+                    ClassroomVersion.classroom_id == asset_id,
+                    ClassroomVersion.generation_job_id == draft.generation_job_id,
+                    ClassroomArtifact.artifact_kind == "dsl_json",
+                    ClassroomArtifact.mime_type == "application/json",
+                )
+                .with_for_update()
+            )
+        ).one_or_none()
+        if materialized is None:
+            raise PublicationConflict("materialized classroom is unavailable")
+        source, promotion, artifact = materialized
+        if (
+            source.generation_job_id is None
+            or promotion.status != "finalized"
+            or promotion.manifest_sha256 is None
+            or not hmac.compare_digest(artifact.sha256, source.document_sha256)
+            or artifact.object_key != source.document_object_key
+            or artifact.size_bytes <= 0
+        ):
+            raise PublicationConflict("materialized classroom binding is invalid")
+        return source
+
+    async def _media_sources(
+        self,
+        session,
+        draft: ClassroomDraft,
+    ) -> tuple[PublicationMediaSource, ...]:
+        try:
+            document = json.loads(draft.document)
+            media_ids = validate_draft_document_references(document)
+        except (InvalidDraftDocument, TypeError, ValueError):
+            raise PublicationValidationStale("classroom validation is stale") from None
+        if not media_ids:
+            return ()
+        rows = (
+            await session.scalars(
+                select(ClassroomDraftMedia)
+                .where(
+                    ClassroomDraftMedia.tenant_id == self._tenant_id,
+                    ClassroomDraftMedia.classroom_id == draft.classroom_id,
+                    ClassroomDraftMedia.id.in_(media_ids),
+                    ClassroomDraftMedia.status == "uploaded",
+                )
+                .order_by(ClassroomDraftMedia.id)
+                .with_for_update()
+            )
+        ).all()
+        if len(rows) != len(media_ids):
+            raise PublicationValidationStale("classroom draft media is stale")
+        media: list[PublicationMediaSource] = []
+        for row in rows:
+            suffix = _MEDIA_SUFFIXES.get(row.mime_type)
+            if suffix is None or row.object_revision is None:
+                raise PublicationValidationStale("classroom draft media is stale")
+            media.append(
+                PublicationMediaSource(
+                    media_id=row.id,
+                    relative_name=f"media/{row.id}{suffix}",
+                    mime_type=row.mime_type,
+                    sha256=row.sha256,
+                    size_bytes=row.size_bytes,
+                    object_key=row.object_key,
+                    ownership_token=row.ownership_token,
+                    object_revision=row.object_revision,
+                )
+            )
+        return tuple(media)
+
+    async def _prepare_publication(
+        self,
+        command: PublishCommand,
+        request_sha256: str,
+    ) -> PublicationMaterializationPlan:
+        async with self._session_factory() as session:
+            async with session.begin():
+                row = await self._locked_publication_target(session, command)
+                asset, draft, _, review = await self._validate_locked_publication_target(
+                    session,
+                    command,
+                    row,
+                )
+                by_key = await session.scalar(
+                    select(ClassroomPublicationMaterialization)
+                    .where(
+                        ClassroomPublicationMaterialization.tenant_id
+                        == self._tenant_id,
+                        ClassroomPublicationMaterialization.idempotency_key
+                        == command.idempotency_key,
+                    )
+                    .with_for_update()
+                )
+                by_review = await session.scalar(
+                    select(ClassroomPublicationMaterialization)
+                    .where(
+                        ClassroomPublicationMaterialization.tenant_id
+                        == self._tenant_id,
+                        ClassroomPublicationMaterialization.review_request_id
+                        == review.id,
+                    )
+                    .with_for_update()
+                )
+                existing = by_key or by_review
+                if existing is not None:
                     if (
-                        source.generation_job_id is None
-                        or promotion.status != "finalized"
-                        or promotion.manifest_sha256 is None
-                        or not hmac.compare_digest(
-                            source.document_sha256,
-                            draft.document_sha256,
-                        )
-                        or not hmac.compare_digest(
-                            artifact.sha256,
-                            source.document_sha256,
-                        )
-                        or artifact.object_key != source.document_object_key
-                        or artifact.size_bytes <= 0
+                        by_key is not None
+                        and by_review is not None
+                        and by_key.id != by_review.id
+                    ) or existing.idempotency_key != command.idempotency_key or not hmac.compare_digest(
+                        existing.request_sha256,
+                        request_sha256,
                     ):
-                        raise PublicationConflict("materialized classroom binding is invalid")
-                    version_number = await allocate_classroom_version_number(
-                        session,
-                        tenant_id=self._tenant_id,
-                        classroom_id=asset.id,
+                        raise PublicationConflict("publication idempotency key conflicts")
+                    return self._plan(existing, draft)
+
+                source = await self._source_version(session, draft, asset.id)
+                media = await self._media_sources(session, draft)
+                version_number = await allocate_classroom_version_number(
+                    session,
+                    tenant_id=self._tenant_id,
+                    classroom_id=asset.id,
+                )
+                reservation_id = "pm-" + hashlib.sha256(
+                    f"{self._tenant_id}\0{review.id}".encode()
+                ).hexdigest()[:24]
+                version_id = _identifier("version", self._tenant_id, review.id)
+                plan = PublicationMaterializationPlan(
+                    reservation_id=reservation_id,
+                    tenant_id=self._tenant_id,
+                    asset_id=asset.id,
+                    review_id=review.id,
+                    draft_id=draft.id,
+                    draft_revision=draft.revision,
+                    source_version_id=source.id,
+                    version_id=version_id,
+                    version_number=version_number,
+                    document=draft.document.encode(),
+                    document_sha256=draft.document_sha256,
+                    validation_report_sha256=review.validation_report_sha256,
+                    media_manifest_sha256=publication_media_manifest_sha256(media),
+                    manifest_sha256="",
+                    media=media,
+                    status="prepared",
+                )
+                manifest = publication_manifest(plan)
+                plan = replace(
+                    plan,
+                    manifest_sha256=publication_manifest_sha256(manifest),
+                )
+                model = ClassroomPublicationMaterialization(
+                    id=reservation_id,
+                    tenant_id=self._tenant_id,
+                    review_request_id=review.id,
+                    classroom_id=asset.id,
+                    classroom_draft_id=draft.id,
+                    source_version_id=source.id,
+                    version_id=version_id,
+                    version_number=version_number,
+                    draft_revision=draft.revision,
+                    document_sha256=draft.document_sha256,
+                    validation_report_sha256=review.validation_report_sha256,
+                    media_manifest_sha256=plan.media_manifest_sha256,
+                    manifest_sha256=plan.manifest_sha256,
+                    manifest_document=publication_manifest_document(manifest).decode(),
+                    source_media_receipts=self._media_receipts_document(media),
+                    confirmed_artifacts=None,
+                    status="prepared",
+                    scope=command.scope,
+                    class_id=command.class_id,
+                    idempotency_key=command.idempotency_key,
+                    request_sha256=request_sha256,
+                    actor_id=command.actor_id,
+                )
+                session.add(model)
+                await session.flush()
+                return plan
+
+    @staticmethod
+    def _confirmed_document(
+        confirmed: ConfirmedPublicationMaterialization,
+    ) -> str:
+        return canonical_json_bytes(
+            [
+                {
+                    "relativeName": artifact.relative_name,
+                    "objectKey": artifact.object_key,
+                    "sha256": artifact.sha256,
+                    "sizeBytes": artifact.size_bytes,
+                    "mimeType": artifact.mime_type,
+                    "artifactKind": artifact.artifact_kind,
+                    "mediaId": artifact.media_id,
+                }
+                for artifact in confirmed.artifacts
+            ]
+        ).decode()
+
+    @staticmethod
+    def _validate_confirmed(
+        plan: PublicationMaterializationPlan,
+        confirmed: ConfirmedPublicationMaterialization,
+    ) -> None:
+        manifest = publication_manifest(plan)
+        if (
+            confirmed.manifest_sha256 != plan.manifest_sha256
+            or confirmed.media_manifest_sha256 != plan.media_manifest_sha256
+            or len(confirmed.artifacts) != len(manifest.entries)
+        ):
+            raise PublicationPersistenceError("confirmed publication is invalid")
+        media_by_name = {item.relative_name: item for item in plan.media}
+        for entry, artifact in zip(manifest.entries, confirmed.artifacts, strict=True):
+            media = media_by_name.get(entry.relative_name)
+            if (
+                artifact.relative_name != entry.relative_name
+                or artifact.object_key
+                != classroom_artifact_key(
+                    plan.tenant_id,
+                    plan.asset_id,
+                    plan.version_number,
+                    entry.relative_name,
+                )
+                or artifact.sha256 != entry.sha256
+                or artifact.size_bytes != entry.size
+                or artifact.mime_type != entry.content_type
+                or artifact.artifact_kind
+                != ("dsl_json" if media is None else "media")
+                or artifact.media_id != (media.media_id if media is not None else None)
+            ):
+                raise PublicationPersistenceError("confirmed publication is invalid")
+
+    @staticmethod
+    def _decode_confirmed(value: str) -> ConfirmedPublicationMaterialization:
+        try:
+            rows = json.loads(value)
+            artifacts = tuple(
+                MaterializedPublicationArtifact(
+                    relative_name=row["relativeName"],
+                    object_key=row["objectKey"],
+                    sha256=row["sha256"],
+                    size_bytes=row["sizeBytes"],
+                    mime_type=row["mimeType"],
+                    artifact_kind=row["artifactKind"],
+                    media_id=row["mediaId"],
+                )
+                for row in rows
+            )
+        except (KeyError, TypeError, ValueError):
+            raise PublicationPersistenceError(
+                "stored confirmed publication is invalid"
+            ) from None
+        return ConfirmedPublicationMaterialization(
+            manifest_sha256="",
+            media_manifest_sha256="",
+            artifacts=artifacts,
+        )
+
+    async def _mark_object_committed(
+        self,
+        plan: PublicationMaterializationPlan,
+        confirmed: ConfirmedPublicationMaterialization,
+    ) -> None:
+        self._validate_confirmed(plan, confirmed)
+        document = self._confirmed_document(confirmed)
+        async with self._session_factory() as session:
+            async with session.begin():
+                model = await session.scalar(
+                    select(ClassroomPublicationMaterialization)
+                    .where(
+                        ClassroomPublicationMaterialization.id == plan.reservation_id,
+                        ClassroomPublicationMaterialization.tenant_id
+                        == self._tenant_id,
                     )
-                    version = ClassroomVersion(
-                        id=version_id,
-                        tenant_id=self._tenant_id,
-                        classroom_id=asset.id,
-                        version_number=version_number,
-                        generation_job_id=None,
-                        source_version_id=source.id,
-                        document_sha256=source.document_sha256,
-                        media_manifest_sha256=source.media_manifest_sha256,
-                        document_object_key=source.document_object_key,
+                    .with_for_update()
+                )
+                if model is None or model.manifest_sha256 != plan.manifest_sha256:
+                    raise PublicationConflict("publication reservation conflicts")
+                if model.status == "prepared":
+                    model.confirmed_artifacts = document
+                    model.status = "object_committed"
+                    model.updated_at = func.now()
+                elif model.confirmed_artifacts != document:
+                    raise PublicationConflict("publication confirmation conflicts")
+                await session.flush()
+
+    async def _finalize_publication(
+        self,
+        command: PublishCommand,
+        request_sha256: str,
+        plan: PublicationMaterializationPlan,
+        confirmed: ConfirmedPublicationMaterialization,
+    ) -> PublishedVersionRecord:
+        self._validate_confirmed(plan, confirmed)
+        confirmed_document = self._confirmed_document(confirmed)
+        async with self._session_factory() as session:
+            async with session.begin():
+                row = await self._locked_publication_target(session, command)
+                asset, draft, _, review = await self._validate_locked_publication_target(
+                    session,
+                    command,
+                    row,
+                )
+                model = await session.scalar(
+                    select(ClassroomPublicationMaterialization)
+                    .where(
+                        ClassroomPublicationMaterialization.id == plan.reservation_id,
+                        ClassroomPublicationMaterialization.tenant_id
+                        == self._tenant_id,
                     )
-                    publication = Publication(
-                        id=publication_id,
-                        tenant_id=self._tenant_id,
-                        classroom_id=asset.id,
-                        classroom_version_id=version_id,
-                        actor_id=command.actor_id,
-                        scope=command.scope,
-                        class_id=command.class_id,
-                        review_request_id=review.id,
-                        idempotency_key=command.idempotency_key,
+                    .with_for_update()
+                )
+                if (
+                    model is None
+                    or model.review_request_id != review.id
+                    or model.classroom_draft_id != draft.id
+                    or model.idempotency_key != command.idempotency_key
+                    or not hmac.compare_digest(model.request_sha256, request_sha256)
+                    or model.status not in {"object_committed", "finalized"}
+                    or model.confirmed_artifacts != confirmed_document
+                ):
+                    raise PublicationConflict("publication reservation conflicts")
+                persisted_plan = self._plan(model, draft)
+                if persisted_plan != replace(plan, status=model.status):
+                    raise PublicationConflict("publication reservation conflicts")
+                existing = (
+                    await session.execute(
+                        select(ClassroomVersion, Publication)
+                        .join(
+                            Publication,
+                            and_(
+                                Publication.classroom_version_id
+                                == ClassroomVersion.id,
+                                Publication.tenant_id == ClassroomVersion.tenant_id,
+                            ),
+                        )
+                        .where(
+                            Publication.tenant_id == self._tenant_id,
+                            Publication.review_request_id == review.id,
+                        )
+                        .with_for_update()
+                    )
+                ).one_or_none()
+                if existing is not None:
+                    return self._verify_publication_retry(
+                        (existing[0], existing[1]),
                         request_sha256=request_sha256,
                     )
-                    session.add(version)
-                    # Persist the immutable target before advancing the asset's
-                    # foreign-key pointer; the models intentionally have no ORM
-                    # relationship that would otherwise establish this order.
-                    await session.flush([version])
-                    session.add(publication)
-                    if asset.lifecycle_state == "approved":
-                        asset.lifecycle_state = transition("approved", "published")
-                    elif asset.lifecycle_state == "submitted":
-                        asset.lifecycle_state = transition("submitted", "approved")
-                        asset.lifecycle_state = transition("approved", "published")
-                    asset.current_published_version_id = version_id
-                    asset.updated_at = func.now()
-                    session.add(
-                        AuditLog(
-                            tenant_id=self._tenant_id,
-                            actor_id=command.actor_id,
-                            action="teaching.classroom.published",
-                            resource_type="classroom_version",
-                            resource_id=version_id,
-                        )
+
+                document = confirmed.document
+                version = ClassroomVersion(
+                    id=model.version_id,
+                    tenant_id=self._tenant_id,
+                    classroom_id=asset.id,
+                    version_number=model.version_number,
+                    generation_job_id=None,
+                    source_version_id=model.source_version_id,
+                    document_sha256=document.sha256,
+                    media_manifest_sha256=confirmed.media_manifest_sha256,
+                    document_object_key=document.object_key,
+                )
+                publication = Publication(
+                    id=_identifier("publication", self._tenant_id, review.id),
+                    tenant_id=self._tenant_id,
+                    classroom_id=asset.id,
+                    classroom_version_id=model.version_id,
+                    actor_id=command.actor_id,
+                    scope=command.scope,
+                    class_id=command.class_id,
+                    review_request_id=review.id,
+                    idempotency_key=command.idempotency_key,
+                    request_sha256=request_sha256,
+                )
+                session.add(version)
+                await session.flush([version])
+                session.add(publication)
+                if asset.lifecycle_state == "approved":
+                    asset.lifecycle_state = transition("approved", "published")
+                elif asset.lifecycle_state == "submitted":
+                    asset.lifecycle_state = transition("submitted", "approved")
+                    asset.lifecycle_state = transition("approved", "published")
+                asset.current_published_version_id = version.id
+                asset.updated_at = func.now()
+                model.status = "finalized"
+                model.updated_at = func.now()
+                session.add(
+                    AuditLog(
+                        tenant_id=self._tenant_id,
+                        actor_id=command.actor_id,
+                        action="teaching.classroom.published",
+                        resource_type="classroom_version",
+                        resource_id=version.id,
                     )
-                    try:
-                        await session.flush()
-                    except IntegrityError as exc:
-                        raise_for_classroom_version_allocation_conflict(exc)
-                        raise
-                    return self._published_record(version, publication)
+                )
+                try:
+                    await session.flush()
+                except IntegrityError as exc:
+                    raise_for_classroom_version_allocation_conflict(exc)
+                    raise
+                return self._published_record(version, publication)
+
+    async def publish(
+        self,
+        command: PublishCommand,
+        materializer: PublicationMaterializer,
+    ) -> PublishedVersionRecord:
+        if command.tenant_id != self._tenant_id:
+            raise PublicationConflict("publication tenant conflicts")
+        request_sha256 = self._publication_request_sha256(command)
+        existing = await self._get_publication_by_key(command.idempotency_key)
+        if existing is not None:
+            return self._verify_publication_retry(
+                existing,
+                request_sha256=request_sha256,
+            )
+        try:
+            plan = await self._prepare_publication(command, request_sha256)
+        except IntegrityError:
+            plan = await self._prepare_publication(command, request_sha256)
+        confirmed = await materializer.materialize(plan)
+        await self._mark_object_committed(plan, confirmed)
+        try:
+            return await self._finalize_publication(
+                command,
+                request_sha256,
+                plan,
+                confirmed,
+            )
         except IntegrityError as exc:
             existing = await self._get_publication_by_key(command.idempotency_key)
             if existing is not None:
@@ -572,6 +1018,22 @@ class SqlAlchemyPublicationRepository:
         try:
             async with self._session_factory() as session:
                 async with session.begin():
+                    row = (
+                        await session.execute(
+                            self._version_target_statement(command.version_id)
+                            .with_for_update()
+                        )
+                    ).one_or_none()
+                    if row is None:
+                        raise PublicationConflict("assignment target is unavailable")
+                    version, publication, brief = row
+                    teaching_class = await session.scalar(
+                        select(TeachingClass)
+                        .where(TeachingClass.id == command.class_id)
+                        .with_for_update()
+                    )
+                    if teaching_class is None:
+                        raise PublicationConflict("assignment target is unavailable")
                     existing = await session.scalar(
                         select(Assignment)
                         .where(
@@ -589,31 +1051,18 @@ class SqlAlchemyPublicationRepository:
                             )
                         ):
                             raise PublicationConflict("assignment idempotency key conflicts")
-                        version = await session.get(
+                        existing_version = await session.get(
                             ClassroomVersion,
                             existing.classroom_version_id,
                         )
-                        if version is None:
+                        if existing_version is None:
                             raise PublicationPersistenceError(
                                 "stored assignment version is unavailable"
                             )
-                        return self._assignment_record(existing, asset_id=version.classroom_id)
-                    row = (
-                        await session.execute(
-                            self._version_target_statement(command.version_id)
-                            .with_for_update()
+                        return self._assignment_record(
+                            existing,
+                            asset_id=existing_version.classroom_id,
                         )
-                    ).one_or_none()
-                    if row is None:
-                        raise PublicationConflict("assignment target is unavailable")
-                    version, publication, brief = row
-                    teaching_class = await session.scalar(
-                        select(TeachingClass)
-                        .where(TeachingClass.id == command.class_id)
-                        .with_for_update()
-                    )
-                    if teaching_class is None:
-                        raise PublicationConflict("assignment target is unavailable")
                     if version.classroom_id != command.asset_id:
                         raise PublicationConflict("assignment version binding conflicts")
                     if brief.course_id != teaching_class.course_id:
@@ -662,6 +1111,36 @@ class SqlAlchemyPublicationRepository:
                     await session.flush()
                     return self._assignment_record(model, asset_id=version.classroom_id)
         except IntegrityError as exc:
+            async with self._session_factory() as session:
+                existing = await session.scalar(
+                    select(Assignment).where(
+                        Assignment.tenant_id == self._tenant_id,
+                        Assignment.idempotency_key == command.idempotency_key,
+                    )
+                )
+                if existing is not None:
+                    if (
+                        existing.request_sha256 is None
+                        or not hmac.compare_digest(
+                            existing.request_sha256,
+                            request_sha256,
+                        )
+                    ):
+                        raise PublicationConflict(
+                            "assignment idempotency key conflicts"
+                        ) from exc
+                    version = await session.get(
+                        ClassroomVersion,
+                        existing.classroom_version_id,
+                    )
+                    if version is None:
+                        raise PublicationPersistenceError(
+                            "stored assignment version is unavailable"
+                        ) from exc
+                    return self._assignment_record(
+                        existing,
+                        asset_id=version.classroom_id,
+                    )
             raise PublicationConflict("classroom assignment conflicts") from exc
 
     async def get_assignment_target(
@@ -793,22 +1272,6 @@ class SqlAlchemyPublicationRepository:
         try:
             async with self._session_factory() as session:
                 async with session.begin():
-                    existing = await session.scalar(
-                        select(AssignmentMigration)
-                        .where(
-                            AssignmentMigration.tenant_id == self._tenant_id,
-                            AssignmentMigration.idempotency_key
-                            == command.idempotency_key,
-                        )
-                        .with_for_update()
-                    )
-                    if existing is not None:
-                        if not hmac.compare_digest(
-                            existing.request_sha256,
-                            request_sha256,
-                        ):
-                            raise PublicationConflict("migration idempotency key conflicts")
-                        return self._migration_record(existing)
                     old_row = (
                         await session.execute(
                             select(Assignment, ClassroomVersion)
@@ -826,6 +1289,22 @@ class SqlAlchemyPublicationRepository:
                     if old_row is None:
                         raise PublicationConflict("migration assignment is unavailable")
                     old_assignment, old_version = old_row
+                    existing = await session.scalar(
+                        select(AssignmentMigration)
+                        .where(
+                            AssignmentMigration.tenant_id == self._tenant_id,
+                            AssignmentMigration.idempotency_key
+                            == command.idempotency_key,
+                        )
+                        .with_for_update()
+                    )
+                    if existing is not None:
+                        if not hmac.compare_digest(
+                            existing.request_sha256,
+                            request_sha256,
+                        ):
+                            raise PublicationConflict("migration idempotency key conflicts")
+                        return self._migration_record(existing)
                     if (
                         old_assignment.revoked_at is not None
                         or old_assignment.class_id != command.class_id
@@ -937,9 +1416,23 @@ class SqlAlchemyPublicationRepository:
                     await session.flush()
                     return self._migration_record(migration)
         except IntegrityError as exc:
-            existing = await self.get_migration(command.idempotency_key)
-            if existing is not None:
-                return existing
+            async with self._session_factory() as session:
+                existing = await session.scalar(
+                    select(AssignmentMigration).where(
+                        AssignmentMigration.tenant_id == self._tenant_id,
+                        AssignmentMigration.idempotency_key
+                        == command.idempotency_key,
+                    )
+                )
+                if existing is not None:
+                    if not hmac.compare_digest(
+                        existing.request_sha256,
+                        request_sha256,
+                    ):
+                        raise PublicationConflict(
+                            "migration idempotency key conflicts"
+                        ) from exc
+                    return self._migration_record(existing)
             raise PublicationConflict("classroom migration conflicts") from exc
 
 
