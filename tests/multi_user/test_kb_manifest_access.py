@@ -10,11 +10,18 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from fastapi import HTTPException
+import pytest
+
 from deeptutor.knowledge.manager import KnowledgeBaseManager
+import deeptutor.multi_user.knowledge_access as knowledge_access_module
 from deeptutor.multi_user.knowledge_access import (
+    AuthorizedKnowledgeSource,
     resolve_authorized_source,
     resolve_kb_manifest,
 )
+from deeptutor.multi_user.models import CurrentUser, KnowledgeResource, UserScope
+from deeptutor.services.rag.retrieval_view import stamp_retrieval_view_signature
 
 
 def _make_kb(manager: KnowledgeBaseManager, name: str, *files: str) -> None:
@@ -95,3 +102,142 @@ def test_authorized_source_exposes_only_generation_pinned_identity(
         assert not hasattr(source, "add_documents")
         assert not hasattr(source, "delete")
         assert str(mu_isolated_root.resolve()) not in repr(source)
+
+
+def _current_user(tmp_path: Path, user_id: str = "u_alice") -> CurrentUser:
+    return CurrentUser(
+        id=user_id,
+        username=user_id,
+        role="user",
+        scope=UserScope("user", user_id, tmp_path),
+    )
+
+
+def _knowledge_resource(
+    tmp_path: Path,
+    generation: str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+) -> KnowledgeResource:
+    return KnowledgeResource(
+        id=f"user:kb:{generation}",
+        name="alice-kb",
+        base_dir=tmp_path,
+        source="user",
+        generation_id=generation,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ("revoke", "generation", "owner", "provider"))
+async def test_authorized_search_revalidates_identity_after_await(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+) -> None:
+    original = _knowledge_resource(tmp_path)
+    replacement = (
+        None
+        if change == "revoke"
+        else _knowledge_resource(
+            tmp_path,
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+            if change == "generation"
+            else original.generation_id,
+        )
+    )
+    resources = iter((original, replacement))
+    users = iter(
+        (
+            _current_user(tmp_path),
+            _current_user(tmp_path, "u_bob") if change == "owner" else _current_user(tmp_path),
+        )
+    )
+    providers = iter(("llamaindex", "pageindex" if change == "provider" else "llamaindex"))
+
+    class _Service:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        async def search_grounded(self, _query: str, _kb_name: str):
+            return stamp_retrieval_view_signature(
+                {
+                    "provider": "llamaindex",
+                    "sources": [
+                        {
+                            "chunk_id": "chunk",
+                            "content": "grounded",
+                            "file_path": "C:/private/book.pdf",
+                        }
+                    ],
+                }
+            )
+
+    monkeypatch.setattr(knowledge_access_module, "resolve_for_rag", lambda _ref: next(resources))
+    monkeypatch.setattr(knowledge_access_module, "get_current_user", lambda: next(users))
+    monkeypatch.setattr(
+        "deeptutor.services.rag.provider_binding.resolve_bound_provider",
+        lambda *_args: next(providers),
+    )
+    monkeypatch.setattr("deeptutor.services.rag.service.RAGService", _Service)
+    descriptor = AuthorizedKnowledgeSource(
+        resource_id=original.id,
+        generation_id=original.generation_id,
+        name=original.name,
+        source="user",
+        resource_owner_id="u_alice",
+        read_only=True,
+        retrieval_provider="llamaindex",
+    )
+
+    with pytest.raises(HTTPException, match="changed|stale"):
+        await descriptor.search("query")
+
+
+@pytest.mark.asyncio
+async def test_authorized_search_returns_bounded_path_free_view(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resource = _knowledge_resource(tmp_path)
+
+    class _Service:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        async def search_grounded(self, _query: str, _kb_name: str):
+            return stamp_retrieval_view_signature(
+                {
+                    "provider": "llamaindex",
+                    "sources": [
+                        {
+                            "chunk_id": "chunk",
+                            "content": "grounded",
+                            "file_path": "C:/private/book.pdf",
+                        }
+                    ],
+                }
+            )
+
+    monkeypatch.setattr(knowledge_access_module, "resolve_for_rag", lambda _ref: resource)
+    monkeypatch.setattr(knowledge_access_module, "get_current_user", lambda: _current_user(tmp_path))
+    monkeypatch.setattr(
+        "deeptutor.services.rag.provider_binding.resolve_bound_provider",
+        lambda *_args: "llamaindex",
+    )
+    monkeypatch.setattr("deeptutor.services.rag.service.RAGService", _Service)
+    descriptor = AuthorizedKnowledgeSource(
+        resource_id=resource.id,
+        generation_id=resource.generation_id,
+        name=resource.name,
+        source="user",
+        resource_owner_id="u_alice",
+        read_only=True,
+        retrieval_provider="llamaindex",
+    )
+
+    result = await descriptor.search("query")
+    encoded = str(result)
+
+    assert result["retrieval_view_signature"]
+    assert "file_path" not in encoded
+    assert "C:/private" not in encoded
+    assert len(result["sources"]) <= 20

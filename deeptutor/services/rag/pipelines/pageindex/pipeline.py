@@ -226,6 +226,8 @@ class PageIndexPipeline:
             "query": query,
             "answer": content,
             "content": content,
+            "content_kind": "retrieval_context",
+            "retrieval_provenance": sources,
             "sources": sources,
             "provider": storage.PROVIDER,
         }
@@ -259,7 +261,7 @@ class PageIndexPipeline:
                     sources.append(
                         {
                             "title": title,
-                            "content": summary[:200],
+                            "content": (summary or title)[:200],
                             "source": file_name,
                             "page": page if page is not None else "",
                             "chunk_id": node.get("node_id") or doc_id,

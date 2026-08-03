@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import pytest
@@ -176,3 +177,83 @@ async def test_pdf_brief_uses_the_same_grounded_contract_mapping() -> None:
     assert snapshots.calls[0][0] == "pdf-binding-a"
     assert "Newton's second law" in snapshots.calls[0][1].query
     assert "Relate net force, mass, and acceleration." in snapshots.calls[0][1].query
+
+
+@pytest.mark.asyncio
+async def test_brief_id_covers_full_semantics_and_snapshot_identity() -> None:
+    baseline_snapshot = _snapshot()
+    baseline = await TeachingBriefBuilder(
+        _context(),
+        _SnapshotBuilder(baseline_snapshot),
+    ).from_kb("kb", _spec())
+
+    variants = (
+        _spec(grade_band="middle_school"),
+        _spec(audience="advanced"),
+        _spec(duration_minutes=45),
+        _spec(classroom_mode="micro"),
+        _spec(web_policy="enabled", allowed_web_domains=("example.edu",)),
+        _spec(template_version="2"),
+        _spec(
+            knowledge_points=(
+                KnowledgePointSpec("kp-newton-2", "Dynamics", "Different meaning."),
+            )
+        ),
+    )
+    ids = []
+    for variant in variants:
+        built = await TeachingBriefBuilder(
+            _context(),
+            _SnapshotBuilder(baseline_snapshot),
+        ).from_kb("kb", variant)
+        ids.append(built.contract.brief_id)
+
+    other_snapshot = replace(baseline_snapshot, snapshot_id="source-snapshot-other")
+    other = await TeachingBriefBuilder(
+        _context(),
+        _SnapshotBuilder(other_snapshot),
+    ).from_kb("kb", _spec())
+    repeated = await TeachingBriefBuilder(
+        _context(),
+        _SnapshotBuilder(baseline_snapshot),
+    ).from_kb("kb", _spec())
+
+    assert all(brief_id != baseline.contract.brief_id for brief_id in ids)
+    assert len(set(ids)) == len(ids)
+    assert other.contract.brief_id != baseline.contract.brief_id
+    assert repeated.contract.brief_id == baseline.contract.brief_id
+
+
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"duration_minutes": "20"},
+        {"duration_minutes": 20.5},
+        {"classroom_mode": "invalid"},
+        {"web_policy": "invalid"},
+        {"content_mode": "invalid"},
+    ),
+)
+def test_teaching_brief_spec_rejects_invalid_runtime_literals(changes) -> None:
+    with pytest.raises(ValueError):
+        _spec(**changes)
+
+
+def test_open_creation_brief_id_is_semantic_and_deterministic() -> None:
+    builder = TeachingBriefBuilder(_context(), _SnapshotBuilder(_snapshot()))
+    baseline = builder.open_creation(
+        _spec(content_mode="open_creation", open_creation_acknowledged=True)
+    )
+    repeated = builder.open_creation(
+        _spec(content_mode="open_creation", open_creation_acknowledged=True)
+    )
+    changed = builder.open_creation(
+        _spec(
+            content_mode="open_creation",
+            open_creation_acknowledged=True,
+            duration_minutes=45,
+        )
+    )
+
+    assert repeated.contract.brief_id == baseline.contract.brief_id
+    assert changed.contract.brief_id != baseline.contract.brief_id

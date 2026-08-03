@@ -142,6 +142,23 @@ def test_search_returns_document_outline(tmp_path) -> None:
     assert res["sources"][0]["chunk_id"] == "n1"
 
 
+def test_search_marks_title_only_outline_as_traceable_retrieval_context(tmp_path) -> None:
+    client = FakeClient()
+    pipe = _pipe(tmp_path, client)
+    pdf = tmp_path / "a.pdf"
+    pdf.write_text("x")
+    asyncio.run(pipe.initialize("kb", [str(pdf)]))
+    client.trees["pi-a.pdf"] = [
+        {"title": "Title without summary", "node_id": "n1", "page_index": 7}
+    ]
+
+    res = asyncio.run(pipe.search("what?", "kb", retrieval_context_only=True))
+
+    assert res["content_kind"] == "retrieval_context"
+    assert res["sources"][0]["content"] == "Title without summary"
+    assert res["sources"][0]["source"] == "a.pdf"
+
+
 def test_document_map_exposes_manifest(tmp_path) -> None:
     client = FakeClient()
     pipe = _pipe(tmp_path, client)

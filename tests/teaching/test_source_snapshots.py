@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 import hashlib
+import inspect
 import json
 import multiprocessing
 from pathlib import Path
@@ -13,6 +14,10 @@ import pytest
 
 from deeptutor.multi_user.knowledge_access import AuthorizedKnowledgeSource
 from deeptutor.services.rag.retrieval_view import stamp_retrieval_view_signature
+from deeptutor.teaching.object_store import (
+    LocalClassroomArtifactStore,
+    S3ClassroomArtifactStore,
+)
 from deeptutor.teaching.permissions import ScopedPermission
 from deeptutor.teaching.repositories.sources import (
     BoundSourceRecord,
@@ -20,6 +25,7 @@ from deeptutor.teaching.repositories.sources import (
     SourceEntitlementDeniedError,
     SourceNotFoundError,
 )
+import deeptutor.teaching.source_snapshots as source_snapshots_module
 from deeptutor.teaching.source_snapshots import (
     SnapshotRequest,
     SourceAccessDenied,
@@ -88,6 +94,11 @@ def test_authorized_knowledge_source_rejects_alias_identity(tmp_path: Path) -> N
             read_only=True,
             retrieval_provider="llamaindex",
         )
+
+
+def test_local_and_s3_open_contracts_are_coroutines_returning_streams() -> None:
+    assert inspect.iscoroutinefunction(LocalClassroomArtifactStore.open)
+    assert inspect.iscoroutinefunction(S3ClassroomArtifactStore.open)
 
 
 def _bound_source() -> BoundSourceRecord:
@@ -399,7 +410,11 @@ async def test_pdf_snapshot_uses_controlled_object_reader_without_leaking_key() 
     class _Store:
         async def open(self, key: str):
             assert key == bound.object_key
-            yield pdf_bytes
+
+            async def chunks():
+                yield pdf_bytes
+
+            return chunks()
 
     class _StoreProvider:
         async def store_for_tenant(self, tenant_id: str):
@@ -592,6 +607,103 @@ async def test_pdf_extraction_cancellation_reaps_child(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_pdf_pipe_construction_failure_releases_slot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Slot:
+        releases = 0
+
+        def release(self) -> None:
+            self.releases += 1
+
+    class _Context:
+        def Pipe(self, *, duplex):
+            assert duplex is False
+            raise RuntimeError("C:/private/pipe failure")
+
+    slot = _Slot()
+
+    async def acquire(_deadline: float) -> None:
+        return None
+
+    monkeypatch.setattr(
+        "deeptutor.teaching.services.sources._acquire_pdf_inspection_slot",
+        acquire,
+    )
+    monkeypatch.setattr(
+        "deeptutor.teaching.services.sources._PDF_INSPECTION_SLOTS",
+        slot,
+    )
+    monkeypatch.setattr(
+        source_snapshots_module.multiprocessing,
+        "get_context",
+        lambda _method: _Context(),
+    )
+
+    with pytest.raises(SourceSnapshotUnavailable, match="could not be started") as exc_info:
+        await _run_pdf_extraction_process(tmp_path / "private.pdf")
+
+    assert "private" not in str(exc_info.value)
+    assert slot.releases == 1
+
+
+@pytest.mark.asyncio
+async def test_pdf_process_construction_failure_closes_pipe_and_releases_slot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _Endpoint:
+        closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    class _Slot:
+        releases = 0
+
+        def release(self) -> None:
+            self.releases += 1
+
+    receiver = _Endpoint()
+    sender = _Endpoint()
+
+    class _Context:
+        def Pipe(self, *, duplex):
+            assert duplex is False
+            return receiver, sender
+
+        def Process(self, **_kwargs):
+            raise RuntimeError("E:/secret/process failure")
+
+    slot = _Slot()
+
+    async def acquire(_deadline: float) -> None:
+        return None
+
+    monkeypatch.setattr(
+        "deeptutor.teaching.services.sources._acquire_pdf_inspection_slot",
+        acquire,
+    )
+    monkeypatch.setattr(
+        "deeptutor.teaching.services.sources._PDF_INSPECTION_SLOTS",
+        slot,
+    )
+    monkeypatch.setattr(
+        source_snapshots_module.multiprocessing,
+        "get_context",
+        lambda _method: _Context(),
+    )
+
+    with pytest.raises(SourceSnapshotUnavailable, match="could not be started") as exc_info:
+        await _run_pdf_extraction_process(tmp_path / "private.pdf")
+
+    assert "secret" not in str(exc_info.value)
+    assert receiver.closed and sender.closed
+    assert slot.releases == 1
+
+
+@pytest.mark.asyncio
 async def test_pdf_worker_selects_relevant_pages_after_old_400k_cutoff(
     tmp_path: Path,
 ) -> None:
@@ -780,6 +892,36 @@ async def test_context_only_provider_without_provenance_fails_actionably(
 
 
 @pytest.mark.asyncio
+async def test_pageindex_title_only_shape_builds_grounded_snapshot(tmp_path: Path) -> None:
+    result = {
+        "provider": "pageindex",
+        "content_kind": "retrieval_context",
+        "content": "## a.pdf\n- Title without summary (p.7)",
+        "sources": [
+            {
+                "title": "Title without summary",
+                "content": "Title without summary",
+                "source": "a.pdf",
+                "page": 7,
+                "chunk_id": "n1",
+            }
+        ],
+    }
+    builder = SourceSnapshotBuilder(
+        _context(),
+        _Repository(),
+        knowledge_resolver=lambda _kb_ref: _resource(tmp_path, provider="pageindex"),
+        rag_service_factory=lambda _source: _RagService(result),
+    )
+
+    snapshot = await builder.from_kb(RESOURCE_ID, _request())
+
+    assert snapshot.retrieval_provider == "pageindex"
+    assert snapshot.fragments[0].text == "Title without summary"
+    assert snapshot.retrieval_view_signature
+
+
+@pytest.mark.asyncio
 async def test_claimed_retrieval_view_signature_cannot_hide_content_flip(
     tmp_path: Path,
 ) -> None:
@@ -803,3 +945,64 @@ async def test_claimed_retrieval_view_signature_cannot_hide_content_flip(
 
     with pytest.raises(SourceAccessDenied, match="retrieval view changed"):
         await builder.from_kb(RESOURCE_ID, _request())
+
+
+@pytest.mark.asyncio
+async def test_kb_search_error_is_mapped_without_leaking_local_path(tmp_path: Path) -> None:
+    class _FailingRag:
+        async def search(self, query: str, kb_name: str):
+            raise RuntimeError("failed at C:/private/kb/index.json")
+
+    builder = SourceSnapshotBuilder(
+        _context(),
+        _Repository(),
+        knowledge_resolver=lambda _kb_ref: _resource(tmp_path),
+        rag_service_factory=lambda _source: _FailingRag(),
+    )
+
+    with pytest.raises(SourceSnapshotUnavailable, match="knowledge retrieval failed") as exc_info:
+        await builder.from_kb(RESOURCE_ID, _request())
+
+    assert "private" not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_pdf_store_error_and_cleanup_error_do_not_leak_or_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bound = BoundSourceRecord(
+        binding_id="pdf-binding-a",
+        snapshot_id="pdf-source-a",
+        source_type="pdf",
+        source_id="upload-a",
+        resource_owner_id="tenant-workspace",
+        source_revision="pdf-v1",
+        content_sha256="1" * 64,
+        permission_sha256="2" * 64,
+        display_name="mechanics.pdf",
+        upload_id="upload-a",
+        object_key="tenants/tenant-a/sources/upload-a/private.pdf",
+    )
+
+    class _Store:
+        async def open(self, _key: str):
+            raise RuntimeError("S3 tenants/tenant-a/sources/upload-a/private.pdf")
+
+    class _StoreProvider:
+        async def store_for_tenant(self, _tenant_id: str):
+            return _Store()
+
+    async def fail_cleanup(*_args, **_kwargs):
+        raise RuntimeError("C:/private/temp.pdf")
+
+    monkeypatch.setattr(source_snapshots_module.asyncio, "to_thread", fail_cleanup)
+    builder = SourceSnapshotBuilder(
+        _context(),
+        _Repository(bound),
+        store_provider=_StoreProvider(),
+    )
+
+    with pytest.raises(SourceSnapshotUnavailable, match="PDF source could not be read") as exc_info:
+        await builder.from_pdf("pdf-binding-a", _request())
+
+    assert "private" not in str(exc_info.value)

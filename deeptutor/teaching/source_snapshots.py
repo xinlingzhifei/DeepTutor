@@ -28,6 +28,7 @@ from deeptutor.multi_user.knowledge_access import (
     resolve_authorized_source,
 )
 from deeptutor.services.rag.retrieval_view import (
+    bounded_retrieval_view,
     canonical_retrieval_fragments,
     canonical_retrieval_view_signature,
 )
@@ -325,6 +326,7 @@ async def _run_pdf_extraction_process(
     from deeptutor.teaching.services.sources import (
         _MAX_OBJECTS_INSPECTED,
         _PDF_INSPECTION_MEMORY_BYTES,
+        _PDF_INSPECTION_SLOTS,
         MAX_PDF_PAGES,
         InvalidPdfSourceError,
         _acquire_pdf_inspection_slot,
@@ -337,22 +339,32 @@ async def _run_pdf_extraction_process(
         await _acquire_pdf_inspection_slot(deadline)
     except InvalidPdfSourceError as exc:
         raise SourceSnapshotUnavailable("PDF extraction timed out") from exc
-    context = multiprocessing.get_context("spawn")
-    receiver, sender = context.Pipe(duplex=False)
-    process = context.Process(
-        name="yfeistai-pdf-extractor",
-        target=worker,
-        args=(
-            os.fspath(path),
-            sender,
-            MAX_PDF_PAGES,
-            _MAX_OBJECTS_INSPECTED,
-            memory_limit_bytes or _PDF_INSPECTION_MEMORY_BYTES,
-            query,
-        ),
-    )
+    receiver = None
+    sender = None
+    process = None
+    primary_error: BaseException | None = None
     try:
-        process.start()
+        try:
+            context = multiprocessing.get_context("spawn")
+            receiver, sender = context.Pipe(duplex=False)
+            process = context.Process(
+                name="yfeistai-pdf-extractor",
+                target=worker,
+                args=(
+                    os.fspath(path),
+                    sender,
+                    MAX_PDF_PAGES,
+                    _MAX_OBJECTS_INSPECTED,
+                    memory_limit_bytes or _PDF_INSPECTION_MEMORY_BYTES,
+                    query,
+                ),
+            )
+        except Exception:
+            raise SourceSnapshotUnavailable("PDF extraction could not be started") from None
+        try:
+            process.start()
+        except Exception:
+            raise SourceSnapshotUnavailable("PDF extraction could not be started") from None
         sender.close()
         message: tuple[str, str] | None = None
         while True:
@@ -380,16 +392,41 @@ async def _run_pdf_extraction_process(
         ):
             raise SourceSnapshotUnavailable("PDF could not be safely extracted")
         return message[1]
+    except asyncio.CancelledError as exc:
+        primary_error = exc
+        raise
+    except SourceSnapshotUnavailable as exc:
+        primary_error = exc
+        raise
+    except Exception:
+        primary_error = SourceSnapshotUnavailable("PDF extraction failed")
+        raise primary_error from None
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        receiver.close()
-        sender.close()
-        if process.pid is not None:
-            _terminate_and_reap_pdf_process(process)
-        else:
-            process.close()
-        from deeptutor.teaching.services.sources import _PDF_INSPECTION_SLOTS
-
-        _PDF_INSPECTION_SLOTS.release()
+        cleanup_failed = False
+        for endpoint in (receiver, sender):
+            if endpoint is None:
+                continue
+            try:
+                endpoint.close()
+            except Exception:
+                cleanup_failed = True
+        if process is not None:
+            try:
+                if process.pid is not None:
+                    _terminate_and_reap_pdf_process(process)
+                else:
+                    process.close()
+            except Exception:
+                cleanup_failed = True
+        try:
+            _PDF_INSPECTION_SLOTS.release()
+        except Exception:
+            cleanup_failed = True
+        if cleanup_failed and primary_error is None:
+            raise SourceSnapshotUnavailable("PDF extraction cleanup failed") from None
 
 
 def _digest(*values: str) -> str:
@@ -772,13 +809,20 @@ class SourceSnapshotBuilder:
             or bound.resource_owner_id != resource.resource_owner_id
         ):
             raise SourceAccessDenied("knowledge source identity does not match its binding")
-        if self._rag_service_factory is None:
-            result = await resource.search(request.query)
-        else:
-            result = await self._rag_service_factory(resource).search(
-                request.query,
-                resource.name,
-            )
+        try:
+            if self._rag_service_factory is None:
+                result = await resource.search(request.query)
+            else:
+                result = await self._rag_service_factory(resource).search(
+                    request.query,
+                    resource.name,
+                )
+        except asyncio.CancelledError:
+            raise
+        except HTTPException as exc:
+            raise SourceAccessDenied("knowledge source changed during retrieval") from exc
+        except Exception:
+            raise SourceSnapshotUnavailable("knowledge retrieval failed") from None
         if result.get("error_type") or result.get("needs_reindex"):
             raise SourceSnapshotUnavailable("knowledge retrieval is unavailable")
         provider = str(result.get("provider") or "").strip()
@@ -786,7 +830,11 @@ class SourceSnapshotBuilder:
             raise SourceSnapshotUnavailable("knowledge retrieval provider is missing")
         if provider != resource.retrieval_provider:
             raise SourceAccessDenied("knowledge source changed during retrieval")
-        computed_view_signature = canonical_retrieval_view_signature(result)
+        try:
+            computed_view_signature = canonical_retrieval_view_signature(result)
+            bounded_result = bounded_retrieval_view(result)
+        except ValueError:
+            raise SourceSnapshotUnavailable("knowledge retrieval view is invalid") from None
         if not computed_view_signature:
             if (
                 result.get("content_kind") == "retrieval_context"
@@ -807,6 +855,8 @@ class SourceSnapshotBuilder:
             computed_view_signature,
         ):
             raise SourceAccessDenied("knowledge retrieval view changed during retrieval")
+        result = bounded_result
+        computed_view_signature = str(result["retrieval_view_signature"])
         try:
             current_resource = self._knowledge_resolver(resource.resource_id)
         except HTTPException as exc:
@@ -852,17 +902,20 @@ class SourceSnapshotBuilder:
             raise SourceAccessDenied("PDF source is not bound to this tenant scope") from exc
         if self._store_provider is None or bound.object_key is None:
             raise SourceSnapshotUnavailable("PDF source reader is not configured")
-        store = await self._store_provider.store_for_tenant(self._context.tenant_id)
-        handle = tempfile.NamedTemporaryFile(
-            mode="w+b",
-            prefix="yfeistai-source-extract-",
-            suffix=".pdf",
-            delete=False,
-        )
+        handle = None
+        operation_error: BaseException | None = None
         received = 0
         digest = hashlib.sha256()
         try:
-            async for chunk in store.open(bound.object_key):
+            store = await self._store_provider.store_for_tenant(self._context.tenant_id)
+            stream = await store.open(bound.object_key)
+            handle = tempfile.NamedTemporaryFile(
+                mode="w+b",
+                prefix="yfeistai-source-extract-",
+                suffix=".pdf",
+                delete=False,
+            )
+            async for chunk in stream:
                 if not isinstance(chunk, bytes):
                     raise SourceSnapshotUnavailable("PDF source stream is invalid")
                 received += len(chunk)
@@ -882,13 +935,31 @@ class SourceSnapshotBuilder:
                 )
             else:
                 text = await self._pdf_extractor(handle.name, filename)
+        except asyncio.CancelledError as exc:
+            operation_error = exc
+            raise
+        except SourceSnapshotUnavailable as exc:
+            operation_error = exc
+            raise
+        except Exception as exc:
+            operation_error = exc
+            raise SourceSnapshotUnavailable("PDF source could not be read") from None
         finally:
-            if not handle.closed:
-                await asyncio.to_thread(handle.close)
-            try:
-                await asyncio.to_thread(os.unlink, handle.name)
-            except FileNotFoundError:
-                pass
+            cleanup_failed = False
+            if handle is not None:
+                if not handle.closed:
+                    try:
+                        await asyncio.to_thread(handle.close)
+                    except Exception:
+                        cleanup_failed = True
+                try:
+                    await asyncio.to_thread(os.unlink, handle.name)
+                except FileNotFoundError:
+                    pass
+                except Exception:
+                    cleanup_failed = True
+            if cleanup_failed and operation_error is None:
+                raise SourceSnapshotUnavailable("PDF source cleanup failed") from None
         fragments, references = _pdf_fragments(
             bound.source_id,
             text,

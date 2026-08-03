@@ -16,7 +16,7 @@ from deeptutor.runtime.home import get_runtime_data_root
 
 from .factory import DEFAULT_PROVIDER, get_pipeline, list_pipelines, normalize_provider_name
 from .provider_binding import resolve_bound_provider
-from .retrieval_view import stamp_retrieval_view_signature
+from .retrieval_view import bounded_retrieval_view
 
 DEFAULT_KB_BASE_DIR = str(get_runtime_data_root() / "knowledge_bases")
 
@@ -192,7 +192,7 @@ class RAGService:
         )
         if result.get("error_type") or result.get("needs_reindex"):
             return result
-        return stamp_retrieval_view_signature(result)
+        return bounded_retrieval_view(result)
 
     async def _emit_tool_event(
         self,

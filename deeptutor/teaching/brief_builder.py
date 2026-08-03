@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import json
 from typing import Literal
 
 from deeptutor.teaching.contracts import (
@@ -52,6 +53,9 @@ class KnowledgePointSpec:
             for value in (self.knowledge_point_id, self.title, self.description)
         ):
             raise ValueError("knowledge point is incomplete")
+        object.__setattr__(self, "knowledge_point_id", self.knowledge_point_id.strip())
+        object.__setattr__(self, "title", self.title.strip())
+        object.__setattr__(self, "description", self.description.strip())
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,12 +87,46 @@ class TeachingBriefSpec:
         )
         if not all(isinstance(value, str) and value.strip() for value in strings):
             raise ValueError("teaching brief specification is incomplete")
-        if isinstance(self.duration_minutes, bool) or self.duration_minutes < 1:
+        if (
+            isinstance(self.duration_minutes, bool)
+            or not isinstance(self.duration_minutes, int)
+            or self.duration_minutes < 1
+        ):
             raise ValueError("teaching duration is invalid")
-        if not self.knowledge_points:
+        if self.classroom_mode not in {"micro", "full"}:
+            raise ValueError("classroom mode is invalid")
+        if self.web_policy not in {"disabled", "enabled"}:
+            raise ValueError("web policy is invalid")
+        if self.content_mode not in {None, "source_grounded", "open_creation"}:
+            raise ValueError("content mode is invalid")
+        if not isinstance(self.open_creation_acknowledged, bool):
+            raise ValueError("open creation acknowledgement is invalid")
+        if not isinstance(self.knowledge_points, tuple) or not self.knowledge_points:
             raise ValueError("teaching brief requires knowledge points")
+        if not all(isinstance(point, KnowledgePointSpec) for point in self.knowledge_points):
+            raise ValueError("teaching brief knowledge points are invalid")
+        if not isinstance(self.allowed_web_domains, tuple) or not all(
+            isinstance(domain, str) and domain.strip()
+            for domain in self.allowed_web_domains
+        ):
+            raise ValueError("allowed web domains are invalid")
         if self.web_policy == "disabled" and self.allowed_web_domains:
             raise ValueError("disabled web policy cannot allow domains")
+        for field_name in (
+            "course_id",
+            "class_id",
+            "objective",
+            "grade_band",
+            "audience",
+            "template_id",
+            "template_version",
+        ):
+            object.__setattr__(self, field_name, getattr(self, field_name).strip())
+        object.__setattr__(
+            self,
+            "allowed_web_domains",
+            tuple(sorted({domain.strip().lower() for domain in self.allowed_web_domains})),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,9 +158,51 @@ def _brief_id(
     context: TenantContext,
     spec: TeachingBriefSpec,
     content_mode: ContentMode,
-    snapshot_sha256: str | None,
+    snapshot: SourceSnapshot | None,
 ) -> str:
-    return f"brief-{_digest(context.tenant_id, spec.course_id, spec.class_id, spec.objective, content_mode, snapshot_sha256 or '')}"
+    payload = {
+        "allowed_web_domains": sorted(
+            {domain.strip().lower() for domain in spec.allowed_web_domains}
+        ),
+        "audience": spec.audience.strip(),
+        "class_id": spec.class_id.strip(),
+        "classroom_mode": spec.classroom_mode,
+        "content_mode": content_mode,
+        "course_id": spec.course_id.strip(),
+        "duration_minutes": spec.duration_minutes,
+        "grade_band": spec.grade_band.strip(),
+        "knowledge_points": [
+            {
+                "description": point.description.strip(),
+                "id": point.knowledge_point_id.strip(),
+                "title": point.title.strip(),
+            }
+            for point in spec.knowledge_points
+        ],
+        "objective": spec.objective.strip(),
+        "schema_version": 1,
+        "snapshot": (
+            {
+                "id": snapshot.snapshot_id,
+                "sha256": snapshot.snapshot_sha256,
+                "source_id": snapshot.stable_source_id,
+                "source_revision": snapshot.source_revision,
+            }
+            if snapshot is not None
+            else None
+        ),
+        "template_id": spec.template_id.strip(),
+        "template_version": spec.template_version.strip(),
+        "tenant_id": context.tenant_id,
+        "web_policy": spec.web_policy,
+    }
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return f"brief-{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"
 
 
 def _grounding_query(spec: TeachingBriefSpec) -> str:
@@ -241,7 +321,7 @@ class TeachingBriefBuilder:
                 self._context,
                 spec,
                 content_mode,
-                snapshot.snapshot_sha256 if snapshot is not None else None,
+                snapshot,
             ),
             brief_version=1,
             tenant_id=self._context.tenant_id,

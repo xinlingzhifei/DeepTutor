@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -404,25 +405,51 @@ async def _search_authorized_source(
     """Resolve the physical service internally without putting it on the descriptor."""
 
     from deeptutor.services.rag.provider_binding import resolve_bound_provider
+    from deeptutor.services.rag.retrieval_view import bounded_retrieval_view
     from deeptutor.services.rag.service import RAGService
 
-    resource = resolve_for_rag(descriptor.resource_id)
-    if resource is None or not _has_stable_resource_identity(resource):
-        raise HTTPException(status_code=404, detail="Knowledge base identity is stale")
-    user = get_current_user()
-    owner_id = ADMIN_KNOWLEDGE_OWNER_ID if resource.source == "admin" else user.id
-    provider = resolve_bound_provider(resource.base_dir.resolve(), resource.name)
-    if (
-        resource.id != descriptor.resource_id
-        or resource.generation_id != descriptor.generation_id
-        or resource.name != descriptor.name
-        or resource.source != descriptor.source
-        or owner_id != descriptor.resource_owner_id
-        or provider != descriptor.retrieval_provider
-    ):
-        raise HTTPException(status_code=409, detail="Knowledge base changed during retrieval")
+    def current_resource() -> KnowledgeResource:
+        resource = resolve_for_rag(descriptor.resource_id)
+        if resource is None or not _has_stable_resource_identity(resource):
+            raise HTTPException(status_code=404, detail="Knowledge base identity is stale")
+        user = get_current_user()
+        owner_id = ADMIN_KNOWLEDGE_OWNER_ID if resource.source == "admin" else user.id
+        provider = resolve_bound_provider(resource.base_dir.resolve(), resource.name)
+        if (
+            resource.id != descriptor.resource_id
+            or resource.generation_id != descriptor.generation_id
+            or resource.name != descriptor.name
+            or resource.source != descriptor.source
+            or owner_id != descriptor.resource_owner_id
+            or provider != descriptor.retrieval_provider
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Knowledge base changed during retrieval",
+            )
+        return resource
+
+    resource = current_resource()
     service = RAGService(kb_base_dir=str(resource.base_dir.resolve()))
-    return await service.search_grounded(query, resource.name)
+    try:
+        result = await service.search_grounded(query, resource.name)
+    except asyncio.CancelledError:
+        raise
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(
+            status_code=503,
+            detail="Knowledge retrieval is unavailable",
+        ) from None
+    current_resource()
+    try:
+        return bounded_retrieval_view(result)
+    except ValueError:
+        raise HTTPException(
+            status_code=503,
+            detail="Knowledge retrieval returned an invalid view",
+        ) from None
 
 
 def resolve_kb_metadata(kb_ref: str | None) -> dict[str, Any] | None:
