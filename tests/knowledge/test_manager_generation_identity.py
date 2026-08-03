@@ -130,10 +130,61 @@ def test_mutation_does_not_overwrite_existing_unreadable_config(
 
     monkeypatch.setattr(builtins, "open", fail_config_read)
 
-    with pytest.raises(KnowledgeBaseConfigError, match="config is unreadable or invalid"):
+    with pytest.raises(KnowledgeBaseConfigError) as exc_info:
         manager.register_knowledge_base("new-kb")
 
+    assert str(exc_info.value) == "Knowledge-base config is unreadable or invalid."
     assert config_path.read_bytes() == original_bytes
+
+
+@pytest.mark.parametrize("path_method", ["exists", "stat"])
+def test_mutation_wraps_config_path_metadata_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    path_method: str,
+) -> None:
+    config_path = tmp_path / "kb_config.json"
+    original_bytes = json.dumps({"knowledge_bases": {}}).encode()
+    config_path.write_bytes(original_bytes)
+    (tmp_path / "new-kb").mkdir()
+    manager = KnowledgeBaseManager(base_dir=tmp_path)
+    original_method = getattr(Path, path_method)
+
+    def fail_config_metadata(path: Path, *args, **kwargs):
+        if path == config_path:
+            raise PermissionError("C:/secret/config metadata denied")
+        return original_method(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, path_method, fail_config_metadata)
+
+    with pytest.raises(KnowledgeBaseConfigError) as exc_info:
+        manager.register_knowledge_base("new-kb")
+
+    assert str(exc_info.value) == "Knowledge-base config is unreadable or invalid."
+    assert config_path.read_bytes() == original_bytes
+    assert b"generation_id" not in config_path.read_bytes()
+
+
+def test_open_file_not_found_race_bootstraps_missing_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "kb_config.json"
+    (tmp_path / "new-kb").mkdir()
+    manager = KnowledgeBaseManager(base_dir=tmp_path)
+    original_exists = Path.exists
+
+    def stale_exists(path: Path) -> bool:
+        if path == config_path:
+            return True
+        return original_exists(path)
+
+    monkeypatch.setattr(Path, "exists", stale_exists)
+
+    manager.register_knowledge_base("new-kb")
+
+    persisted = json.loads(config_path.read_text(encoding="utf-8"))
+    _assert_generation(persisted["knowledge_bases"]["new-kb"]["generation_id"])
 
 
 def test_concurrent_legacy_loaders_publish_one_shared_generation(tmp_path: Path) -> None:

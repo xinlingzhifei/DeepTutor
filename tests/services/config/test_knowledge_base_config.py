@@ -215,6 +215,55 @@ class TestPersistence:
 
         assert config_path.read_bytes() == original_bytes
 
+    @pytest.mark.parametrize("path_method", ["exists", "stat"])
+    def test_mutation_wraps_config_path_metadata_errors(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        path_method: str,
+    ) -> None:
+        config_path = tmp_path / "kb_config.json"
+        original_bytes = json.dumps({"knowledge_bases": {}}).encode()
+        config_path.write_bytes(original_bytes)
+        service = KnowledgeBaseConfigService(config_path=config_path)
+        original_method = getattr(Path, path_method)
+
+        def fail_config_metadata(path: Path, *args, **kwargs):
+            if path == config_path:
+                raise PermissionError("C:/secret/config metadata denied")
+            return original_method(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, path_method, fail_config_metadata)
+
+        with pytest.raises(KnowledgeBaseConfigError) as exc_info:
+            service.set_kb_config("new-kb", {"description": "new"})
+
+        assert str(exc_info.value) == "Knowledge-base config is unreadable or invalid."
+        assert config_path.read_bytes() == original_bytes
+        assert b"generation_id" not in config_path.read_bytes()
+
+    def test_open_file_not_found_race_bootstraps_missing_config(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        config_path = tmp_path / "kb_config.json"
+        service = KnowledgeBaseConfigService(config_path=config_path)
+        original_exists = Path.exists
+
+        def stale_exists(path: Path) -> bool:
+            if path == config_path:
+                return True
+            return original_exists(path)
+
+        monkeypatch.setattr(Path, "exists", stale_exists)
+
+        service.set_kb_config("new-kb", {"description": "new"})
+
+        persisted = json.loads(config_path.read_text(encoding="utf-8"))
+        generation = persisted["knowledge_bases"]["new-kb"]["generation_id"]
+        assert str(uuid.UUID(generation)) == generation
+
     def test_set_kb_config_publishes_generation_identity(self, tmp_path: Path) -> None:
         config_path = tmp_path / "kb_config.json"
         service = KnowledgeBaseConfigService(config_path=config_path)

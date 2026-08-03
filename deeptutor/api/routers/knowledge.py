@@ -1777,11 +1777,6 @@ async def list_knowledge_bases():
                 except Exception as fallback_err:
                     logger.error(f"Fallback also failed for KB '{name}': {fallback_err}")
 
-        if errors and not result:
-            error_detail = f"Failed to load knowledge bases. Errors: {'; '.join(errors)}"
-            logger.error(error_detail)
-            raise HTTPException(status_code=500, detail="Failed to load knowledge bases.")
-
         if errors:
             logger.warning(
                 f"Some KBs had errors, returning {len(result)} results. Errors: {errors}"
@@ -1813,8 +1808,16 @@ async def list_knowledge_bases():
                         )
                     )
                     continue
-                resource = resolve_kb(access_id)
-                assigned_manager = manager_for_resource(resource)
+                try:
+                    resource = resolve_kb(access_id)
+                    assigned_manager = manager_for_resource(resource)
+                except Exception as exc:
+                    error_msg = (
+                        f"Error resolving assigned KB '{access.get('name') or ''}': {exc}"
+                    )
+                    errors.append(error_msg)
+                    logger.warning(error_msg)
+                    continue
                 try:
                     info = assigned_manager.get_info(resource.name)
                     result.append(
@@ -1855,6 +1858,10 @@ async def list_knowledge_bases():
                             provenance_label=str(access.get("provenance_label") or ""),
                         )
                     )
+        if errors and not result:
+            error_detail = f"Failed to load knowledge bases. Errors: {'; '.join(errors)}"
+            logger.error(error_detail)
+            raise HTTPException(status_code=500, detail="Failed to load knowledge bases.")
         return result
     except HTTPException:
         raise

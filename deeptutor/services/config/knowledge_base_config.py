@@ -56,9 +56,20 @@ class KnowledgeBaseConfigService:
     def _load_config(self, *, strict: bool = False) -> dict[str, Any]:
         payload = _default_payload()
         try:
-            if self.config_path.exists():
-                with open(self.config_path, "r", encoding="utf-8") as handle:
-                    loaded = json.load(handle)
+            config_exists = self.config_path.exists()
+            if not config_exists:
+                try:
+                    self.config_path.stat()
+                except FileNotFoundError:
+                    config_exists = False
+                else:
+                    config_exists = True
+            if config_exists:
+                try:
+                    with open(self.config_path, "r", encoding="utf-8") as handle:
+                        loaded = json.load(handle)
+                except FileNotFoundError:
+                    loaded = {}
                 if not isinstance(loaded, dict):
                     raise ValueError("KB config root must be an object")
                 payload.update({k: v for k, v in loaded.items() if k != "defaults"})

@@ -345,14 +345,33 @@ class KnowledgeBaseManager:
         return config
 
     def _load_config_locked(self, *, strict: bool = False) -> dict:
-        if self.config_file.exists():
+        try:
+            config_exists = self.config_file.exists()
+            if not config_exists:
+                try:
+                    self.config_file.stat()
+                except FileNotFoundError:
+                    return {"knowledge_bases": {}}
+                config_exists = True
+        except FileNotFoundError:
+            return {"knowledge_bases": {}}
+        except OSError as e:
+            logger.warning(f"Error checking config path: {e}")
+            if strict:
+                raise KnowledgeBaseConfigError(_INVALID_CONFIG_MESSAGE) from e
+            return {"knowledge_bases": {}}
+
+        if config_exists:
             config_changed = False
             try:
-                with open(self.config_file, encoding="utf-8") as f:
-                    content = f.read()
-                    if not content.strip():
-                        raise KnowledgeBaseConfigError(_INVALID_CONFIG_MESSAGE)
-                    config = json.loads(content)
+                try:
+                    with open(self.config_file, encoding="utf-8") as f:
+                        content = f.read()
+                except FileNotFoundError:
+                    return {"knowledge_bases": {}}
+                if not content.strip():
+                    raise KnowledgeBaseConfigError(_INVALID_CONFIG_MESSAGE)
+                config = json.loads(content)
 
                 if not isinstance(config, dict) or (
                     "knowledge_bases" in config

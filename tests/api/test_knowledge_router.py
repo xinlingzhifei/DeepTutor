@@ -615,6 +615,49 @@ def test_list_top_level_failure_returns_sanitized_detail(monkeypatch) -> None:
     assert "super-secret" not in response.text
 
 
+def test_list_assigned_resolution_failure_is_contained(monkeypatch, tmp_path: Path) -> None:
+    from fastapi import HTTPException
+
+    manager = _FakeKBManager(tmp_path / "knowledge_bases")
+    generation = str(uuid4())
+    resource_id = f"admin:kb:{generation}"
+    private_detail = r"D:\private\grant.db token=assigned-secret"
+    monkeypatch.setattr(knowledge_router_module, "get_kb_manager", lambda: manager)
+    monkeypatch.setattr(
+        knowledge_router_module,
+        "get_current_user",
+        lambda: SimpleNamespace(is_admin=False),
+    )
+    monkeypatch.setattr(
+        knowledge_router_module,
+        "list_visible_kb_access",
+        lambda: [
+            {
+                "id": resource_id,
+                "name": "assigned-kb",
+                "source": "admin",
+                "assigned": True,
+                "available": True,
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        knowledge_router_module,
+        "resolve_kb",
+        lambda _resource_id: (_ for _ in ()).throw(
+            HTTPException(status_code=403, detail=private_detail)
+        ),
+    )
+
+    with TestClient(_build_app()) as client:
+        response = client.get("/api/v1/knowledge/list")
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Failed to load knowledge bases."}
+    assert private_detail not in response.text
+    assert "assigned-secret" not in response.text
+
+
 def _ready_kb_manager(tmp_path: Path, name: str = "kb") -> "_FakeKBManager":
     manager = _FakeKBManager(tmp_path / "knowledge_bases")
     manager.config["knowledge_bases"][name] = {
