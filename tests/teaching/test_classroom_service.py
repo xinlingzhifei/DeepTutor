@@ -25,10 +25,19 @@ from deeptutor.teaching.contracts import (
 )
 from deeptutor.teaching.permissions import permissions_for_roles
 from deeptutor.teaching.repositories.jobs import GenerationJobDetails
+from deeptutor.teaching.services.batches import (
+    BatchItemRecord,
+    BatchJobRecord,
+    BatchOutlineConflict,
+    BatchService,
+    SqlAlchemyBatchClassroomGateway,
+)
 from deeptutor.teaching.services.classrooms import (
     ClassroomAccessDenied,
+    ClassroomConfirmationConflict,
     ClassroomIdempotencyConflict,
     ClassroomMediaBinding,
+    ClassroomPreflightRejected,
     ClassroomRecord,
     ClassroomRevisionConflict,
     ClassroomService,
@@ -196,12 +205,15 @@ class _Repository:
 
     async def save_outline(self, asset_id: str, outline: dict, outline_sha256: str):
         current = self.records[asset_id]
+        if current.lifecycle_state not in {"generating_outline", "awaiting_outline"}:
+            raise InvalidClassroomState("outline state is invalid")
+        changed = current.outline != outline
         self.records[asset_id] = replace(
             current,
             lifecycle_state="awaiting_outline",
             status="awaiting_confirmation",
             outline=outline,
-            revision=current.revision + 1,
+            revision=current.revision + 1 if changed else current.revision,
         )
         return self.records[asset_id]
 
@@ -224,15 +236,28 @@ class _Repository:
         outline: dict,
         confirmed_outline_sha256: str,
         source_outline_sha256: str,
+        *,
+        expected_revision: int | None = None,
+        expected_outline_sha256: str | None = None,
     ):
         assert len(source_outline_sha256) == 64
         current = self.records[asset_id]
+        if (expected_revision is None) != (expected_outline_sha256 is None):
+            raise ClassroomConfirmationConflict("confirmed outline conflicts")
+        first_confirmation = current.confirmed_outline_sha256 is None
+        if expected_revision is not None:
+            required_revision = (
+                expected_revision if first_confirmation else expected_revision + 1
+            )
+            if current.revision != required_revision:
+                raise ClassroomConfirmationConflict("confirmed outline conflicts")
         self.records[asset_id] = replace(
             current,
             lifecycle_state="generating_content",
             status="queued",
             outline=outline,
             confirmed_outline_sha256=confirmed_outline_sha256,
+            revision=current.revision + 1 if first_confirmation else current.revision,
         )
         return self.records[asset_id]
 
@@ -622,6 +647,35 @@ async def test_full_creation_uses_brief_builder_and_enqueues_outline_only() -> N
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "classroom_request",
+    (
+        _request(classroom_mode="compact"),
+        _request(duration_minutes=0),
+        _request(content_mode="source_grounded", source_type=None, source_ref=None),
+    ),
+)
+async def test_invalid_creation_input_is_explicit_preflight_without_workflow_or_job(
+    classroom_request,
+) -> None:
+    context = _context()
+    repository = _Repository()
+    generation = _Generation()
+    service = ClassroomService(
+        repository,
+        TeachingBriefBuilder(context, object()),
+        generation,
+        None,
+    )
+
+    with pytest.raises(ClassroomPreflightRejected):
+        await service.create(context, classroom_request)
+
+    assert repository.new_workflows == []
+    assert generation.start_calls == []
+
+
+@pytest.mark.asyncio
 async def test_create_retry_after_selector_failure_reuses_durable_workflow() -> None:
     context = _context()
     repository = _Repository()
@@ -833,6 +887,224 @@ async def test_confirmed_outline_is_durable_before_content_requeue() -> None:
     assert confirmed.confirmation_metadata.status == "confirmed"
     assert persisted.confirmed_outline_sha256 == canonical_outline_sha256(confirmed)
     assert persisted.classroom_version_id is None
+
+
+@pytest.mark.asyncio
+async def test_review_bound_confirmation_retries_after_content_requeue_failure() -> None:
+    context = _context()
+    service, repository, generation = _service(context)
+    created = await service.create(context, _request())
+    reviewed_revision = created.revision
+    reviewed_sha256 = canonical_outline_sha256(
+        OutlineBundle.model_validate(created.outline)
+    )
+    generation.content_error = RuntimeError("queue unavailable")
+
+    with pytest.raises(RuntimeError, match="queue unavailable"):
+        await service.confirm_outline(
+            context,
+            created.asset_id,
+            expected_revision=reviewed_revision,
+            expected_outline_sha256=reviewed_sha256,
+        )
+
+    persisted = repository.records[created.asset_id]
+    assert persisted.lifecycle_state == "generating_content"
+    assert persisted.revision == reviewed_revision + 1
+    generation.content_error = None
+
+    recovered = await service.confirm_outline(
+        context,
+        created.asset_id,
+        expected_revision=reviewed_revision,
+        expected_outline_sha256=reviewed_sha256,
+    )
+
+    assert recovered.revision == reviewed_revision + 1
+    assert len(generation.content_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_review_bound_confirmation_recovery_rejects_tampered_confirmed_outline() -> None:
+    context = _context()
+    service, repository, generation = _service(context)
+    created = await service.create(context, _request())
+    reviewed_revision = created.revision
+    reviewed_sha256 = canonical_outline_sha256(
+        OutlineBundle.model_validate(created.outline)
+    )
+    generation.content_error = RuntimeError("queue unavailable")
+    with pytest.raises(RuntimeError, match="queue unavailable"):
+        await service.confirm_outline(
+            context,
+            created.asset_id,
+            expected_revision=reviewed_revision,
+            expected_outline_sha256=reviewed_sha256,
+        )
+    persisted = repository.records[created.asset_id]
+    confirmed = OutlineBundle.model_validate(persisted.outline)
+    tampered = confirmed.model_copy(update={"title": "Tampered after confirmation"})
+    repository.records[created.asset_id] = replace(
+        persisted,
+        outline=tampered.model_dump(mode="json", by_alias=True, exclude_none=True),
+        confirmed_outline_sha256=canonical_outline_sha256(tampered),
+    )
+    generation.content_error = None
+
+    with pytest.raises(ClassroomConfirmationConflict):
+        await service.confirm_outline(
+            context,
+            created.asset_id,
+            expected_revision=reviewed_revision,
+            expected_outline_sha256=reviewed_sha256,
+        )
+
+
+class _SingleRecoveryBatchRepository:
+    def __init__(self, batch: BatchJobRecord) -> None:
+        self.batch = batch
+
+    async def get(self, batch_id: str):
+        return self.batch if self.batch.id == batch_id else None
+
+    async def set_item_status(self, batch_id: str, item_id: str, status: str):
+        assert batch_id == self.batch.id
+        items = tuple(
+            replace(item, status=status) if item.id == item_id else item
+            for item in self.batch.items
+        )
+        self.batch = replace(self.batch, status=status, items=items)
+        return next(item for item in items if item.id == item_id)
+
+
+async def _batch_confirmation_recovery_fixture(
+    context: TenantContext,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    repository = _Repository()
+    generation = _ReplayableGeneration()
+    classroom_service = ClassroomService(
+        repository,
+        TeachingBriefBuilder(context, object()),
+        generation,
+        None,
+        clock=lambda: NOW,
+    )
+    created = await classroom_service.create(context, _request())
+    batch = BatchJobRecord(
+        id="batch-confirm-recovery",
+        tenant_id=context.tenant_id,
+        actor_id=context.user_id,
+        status="awaiting_confirmation",
+        item_count=1,
+        succeeded_count=0,
+        failed_count=0,
+        items=(
+            BatchItemRecord(
+                id="item-a",
+                batch_id="batch-confirm-recovery",
+                status="awaiting_confirmation",
+                generation_job_id=created.job_id,
+                classroom_draft_id=created.draft_id,
+                classroom_asset_id=created.asset_id,
+                resource_course_id="course-a",
+                resource_class_id="class-a",
+            ),
+        ),
+    )
+    batch_repository = _SingleRecoveryBatchRepository(batch)
+    gateway = SqlAlchemyBatchClassroomGateway(None, None, None, None, None)
+    monkeypatch.setattr(gateway, "_service", lambda **kwargs: classroom_service)
+    return (
+        BatchService(batch_repository, gateway),
+        batch_repository,
+        repository,
+        generation,
+        created,
+    )
+
+
+@pytest.mark.asyncio
+async def test_batch_gateway_recovers_confirmation_after_precommit_requeue_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _context()
+    service, batch_repository, repository, generation, created = (
+        await _batch_confirmation_recovery_fixture(context, monkeypatch)
+    )
+    reviewed_revision = created.revision
+    reviewed_sha256 = canonical_outline_sha256(
+        OutlineBundle.model_validate(created.outline)
+    )
+    generation.content_error = RuntimeError("content requeue failed before commit")
+
+    with pytest.raises(RuntimeError, match="before commit"):
+        await service.confirm_outline(
+            context,
+            batch_repository.batch.id,
+            "item-a",
+            revision=reviewed_revision,
+            outline_sha256=reviewed_sha256,
+        )
+
+    persisted = repository.records[created.asset_id]
+    assert persisted.lifecycle_state == "generating_content"
+    assert persisted.revision == reviewed_revision + 1
+    assert batch_repository.batch.items[0].status == "awaiting_confirmation"
+    generation.content_error = None
+
+    recovered = await service.confirm_outline(
+        context,
+        batch_repository.batch.id,
+        "item-a",
+        revision=reviewed_revision,
+        outline_sha256=reviewed_sha256,
+    )
+
+    assert recovered.items[0].status == "queued"
+    assert repository.records[created.asset_id].revision == reviewed_revision + 1
+    assert len(generation.content_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_batch_gateway_recovery_rejects_tampered_persisted_confirmation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = _context()
+    service, batch_repository, repository, generation, created = (
+        await _batch_confirmation_recovery_fixture(context, monkeypatch)
+    )
+    reviewed_revision = created.revision
+    reviewed_sha256 = canonical_outline_sha256(
+        OutlineBundle.model_validate(created.outline)
+    )
+    generation.content_error = RuntimeError("content requeue failed before commit")
+    with pytest.raises(RuntimeError, match="before commit"):
+        await service.confirm_outline(
+            context,
+            batch_repository.batch.id,
+            "item-a",
+            revision=reviewed_revision,
+            outline_sha256=reviewed_sha256,
+        )
+    persisted = repository.records[created.asset_id]
+    confirmed = OutlineBundle.model_validate(persisted.outline)
+    tampered = confirmed.model_copy(update={"title": "Tampered confirmed outline"})
+    repository.records[created.asset_id] = replace(
+        persisted,
+        outline=tampered.model_dump(mode="json", by_alias=True, exclude_none=True),
+        confirmed_outline_sha256=canonical_outline_sha256(tampered),
+    )
+    generation.content_error = None
+
+    with pytest.raises(BatchOutlineConflict):
+        await service.confirm_outline(
+            context,
+            batch_repository.batch.id,
+            "item-a",
+            revision=reviewed_revision,
+            outline_sha256=reviewed_sha256,
+        )
 
 
 class _ConcurrentConfirmationRepository(_Repository):

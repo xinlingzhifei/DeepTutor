@@ -47,6 +47,7 @@ from deeptutor.teaching.services.classrooms import (
     DraftMediaRecord,
     NewClassroomWorkflow,
     NewDraftMedia,
+    matches_reviewed_outline_binding,
 )
 
 _LOWER_HEX_DIGITS = frozenset("0123456789abcdef")
@@ -540,10 +541,20 @@ class SqlAlchemyClassroomRepository:
         outline: dict[str, Any],
         confirmed_outline_sha256: str,
         source_outline_sha256: str,
+        *,
+        expected_revision: int | None = None,
+        expected_outline_sha256: str | None = None,
     ) -> ClassroomRecord:
         payload = canonical_json_bytes(outline).decode("utf-8")
         _sha256(confirmed_outline_sha256, "confirmed_outline_sha256")
         _sha256(source_outline_sha256, "source_outline_sha256")
+        if (expected_revision is None) != (expected_outline_sha256 is None):
+            raise ValueError("outline review binding is incomplete")
+        if expected_revision is not None:
+            if expected_revision < 1:
+                raise ValueError("expected_revision is invalid")
+            assert expected_outline_sha256 is not None
+            _sha256(expected_outline_sha256, "expected_outline_sha256")
         try:
             proposed = OutlineBundle.model_validate(outline)
             proposed_source_sha256 = canonical_outline_sha256(
@@ -566,6 +577,39 @@ class SqlAlchemyClassroomRepository:
         async with self._session_factory() as session:
             async with session.begin():
                 asset, draft = await self._lock_draft(session, asset_id)
+                locked_outline = None
+                if expected_revision is not None:
+                    assert expected_outline_sha256 is not None
+                    try:
+                        locked_outline = OutlineBundle.model_validate_json(
+                            draft.outline_document
+                        )
+                    except Exception:
+                        raise ClassroomConfirmationConflict(
+                            "confirmed outline conflicts"
+                        ) from None
+                    if (
+                        draft.outline_sha256 is None
+                        or not hmac.compare_digest(
+                            draft.outline_sha256,
+                            expected_outline_sha256,
+                        )
+                        or not hmac.compare_digest(
+                            source_outline_sha256,
+                            expected_outline_sha256,
+                        )
+                        or not matches_reviewed_outline_binding(
+                            lifecycle_state=asset.lifecycle_state,
+                            revision=draft.revision,
+                            outline=locked_outline,
+                            confirmed_outline_sha256=draft.confirmed_outline_sha256,
+                            expected_revision=expected_revision,
+                            expected_outline_sha256=expected_outline_sha256,
+                        )
+                    ):
+                        raise ClassroomConfirmationConflict(
+                            "confirmed outline conflicts"
+                        )
                 if draft.generation_job_id is None:
                     raise ClassroomConfirmationConflict(
                         "confirmed outline job binding is unavailable"
@@ -604,7 +648,9 @@ class SqlAlchemyClassroomRepository:
                     draft.revision += 1
                 else:
                     try:
-                        persisted = OutlineBundle.model_validate_json(draft.outline_document)
+                        persisted = locked_outline or OutlineBundle.model_validate_json(
+                            draft.outline_document
+                        )
                         persisted_source_sha256 = canonical_outline_sha256(
                             persisted.model_copy(
                                 update={

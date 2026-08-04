@@ -81,6 +81,10 @@ class InvalidClassroomState(ClassroomServiceError):
     """The requested authoring operation is invalid in the current lifecycle state."""
 
 
+class ClassroomPreflightRejected(InvalidClassroomState):
+    """Creation input was rejected before a workflow or generation job existed."""
+
+
 class InvalidDraftMedia(ClassroomServiceError, ValueError):
     """An uploaded draft media file failed the bounded integrity checks."""
 
@@ -206,6 +210,9 @@ class ClassroomRepository(Protocol):
         outline: dict[str, Any],
         confirmed_outline_sha256: str,
         source_outline_sha256: str,
+        *,
+        expected_revision: int | None = None,
+        expected_outline_sha256: str | None = None,
     ) -> ClassroomRecord: ...
 
     async def mark_generation_succeeded(
@@ -1217,6 +1224,73 @@ def _draft_outline_sha256(outline: OutlineBundle) -> str:
     return canonical_outline_sha256(draft)
 
 
+def matches_reviewed_outline_binding(
+    *,
+    lifecycle_state: str,
+    revision: int,
+    outline: OutlineBundle,
+    confirmed_outline_sha256: str | None,
+    expected_revision: int,
+    expected_outline_sha256: str,
+) -> bool:
+    """Accept a reviewed draft or its one-step durable confirmation recovery."""
+
+    if revision == expected_revision:
+        return hmac.compare_digest(
+            canonical_outline_sha256(outline),
+            expected_outline_sha256,
+        )
+    metadata = outline.confirmation_metadata
+    return (
+        lifecycle_state == "generating_content"
+        and revision == expected_revision + 1
+        and metadata.status == "confirmed"
+        and metadata.confirmed_at is not None
+        and metadata.confirmed_by is not None
+        and confirmed_outline_sha256 is not None
+        and hmac.compare_digest(
+            _draft_outline_sha256(outline),
+            expected_outline_sha256,
+        )
+        and hmac.compare_digest(
+            canonical_outline_sha256(outline),
+            confirmed_outline_sha256,
+        )
+    )
+
+
+def _is_durable_confirmed_outline_recovery(
+    record: ClassroomRecord,
+    stage_outline: OutlineBundle,
+) -> bool:
+    if (
+        record.lifecycle_state != "generating_content"
+        or record.revision <= 1
+        or record.outline is None
+        or record.confirmed_outline_sha256 is None
+        or stage_outline.confirmation_metadata.status != "draft"
+    ):
+        return False
+    try:
+        persisted = OutlineBundle.model_validate(record.outline)
+    except Exception:
+        return False
+    metadata = persisted.confirmation_metadata
+    return (
+        metadata.status == "confirmed"
+        and metadata.confirmed_at is not None
+        and metadata.confirmed_by is not None
+        and hmac.compare_digest(
+            canonical_outline_sha256(persisted),
+            record.confirmed_outline_sha256,
+        )
+        and hmac.compare_digest(
+            _draft_outline_sha256(persisted),
+            canonical_outline_sha256(stage_outline),
+        )
+    )
+
+
 def _sha256_payload(value: object) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
@@ -1308,9 +1382,22 @@ class SqlAlchemyClassroomGeneration:
         self,
         repository: SqlAlchemyGenerationJobRepository,
         selector: DataPlaneSelector,
+        *,
+        priority: str = "teacher",
+        batch_id: str | None = None,
+        retry_of_job_id: str | None = None,
     ) -> None:
+        if priority not in {"teacher", "batch"}:
+            raise ValueError("classroom generation priority is invalid")
+        if (priority == "batch") != (batch_id is not None):
+            raise ValueError("batch generation requires a batch id")
+        if retry_of_job_id is not None and batch_id is None:
+            raise ValueError("classroom generation retry requires a batch id")
         self._repository = repository
         self._selector = selector
+        self._priority = priority
+        self._batch_id = batch_id
+        self._retry_of_job_id = retry_of_job_id
 
     @staticmethod
     def _job_id(tenant_id: str, asset_id: str) -> str:
@@ -1365,7 +1452,7 @@ class SqlAlchemyClassroomGeneration:
             requested_exports=list(requested_exports),
             callback_context=draft_id,
             data_plane_route_id=selection.route_ref,
-            priority="teacher",
+            priority=self._priority,
         )
         payload = _generation_request_payload(generation)
         payload_sha256 = hashlib.sha256(payload.encode()).hexdigest()
@@ -1376,7 +1463,7 @@ class SqlAlchemyClassroomGeneration:
                 job_kind="generation",
                 phase="outline",
                 export_format=None,
-                priority="teacher",
+                priority=self._priority,
                 quota_units=max(1, teaching_brief.duration_minutes),
                 actor_id=context.user_id,
                 owner_id=context.user_id,
@@ -1390,6 +1477,8 @@ class SqlAlchemyClassroomGeneration:
                 queue_ref=selection.queue_ref,
                 request_payload=payload,
                 classroom_draft_id=draft_id,
+                batch_id=self._batch_id,
+                retry_of_job_id=self._retry_of_job_id,
                 resource_course_id=teaching_brief.course_id,
                 resource_class_id=teaching_brief.target_class_id,
                 public_request_sha256=payload_sha256,
@@ -1622,10 +1711,13 @@ class ClassroomService:
         ):
             raise ClassroomAccessDenied("classroom creation is denied")
         if getattr(request, "classroom_mode") != "full":
-            raise InvalidClassroomState("teacher classroom must use full mode")
+            raise ClassroomPreflightRejected("teacher classroom must use full mode")
 
-        request_sha256 = _creation_request_sha256(request)
-        creation_key = _creation_key(context, request_sha256, idempotency_key)
+        try:
+            request_sha256 = _creation_request_sha256(request)
+            creation_key = _creation_key(context, request_sha256, idempotency_key)
+        except ValueError as exc:
+            raise ClassroomPreflightRejected(str(exc)) from None
         existing = await self._repository.get_creation(creation_key)
         if existing is not None:
             self._validate_creation_binding(
@@ -1640,46 +1732,58 @@ class ClassroomService:
                 tuple(getattr(request, "requested_exports")),
             )
 
-        points = tuple(
-            KnowledgePointSpec(
-                knowledge_point_id=point.knowledge_point_id,
-                title=point.title,
-                description=point.description,
+        try:
+            points = tuple(
+                KnowledgePointSpec(
+                    knowledge_point_id=point.knowledge_point_id,
+                    title=point.title,
+                    description=point.description,
+                )
+                for point in getattr(request, "knowledge_points")
             )
-            for point in getattr(request, "knowledge_points")
-        )
-        brief_spec = TeachingBriefSpec(
-            course_id=course_id,
-            class_id=class_id,
-            objective=getattr(request, "objective"),
-            grade_band=getattr(request, "grade_band"),
-            audience=getattr(request, "audience"),
-            duration_minutes=getattr(request, "duration_minutes"),
-            classroom_mode="full",
-            web_policy=getattr(request, "web_policy"),
-            template_id=getattr(request, "template_id"),
-            template_version=getattr(request, "template_version"),
-            knowledge_points=points,
-            content_mode=getattr(request, "content_mode"),
-            open_creation_acknowledged=getattr(request, "open_creation_acknowledged"),
-            allowed_web_domains=tuple(getattr(request, "allowed_web_domains")),
-        )
-        content_mode = getattr(request, "content_mode")
-        source_type = getattr(request, "source_type")
-        source_ref = getattr(request, "source_ref")
-        if content_mode == "open_creation":
-            if source_type is not None or source_ref is not None:
-                raise InvalidClassroomState("open creation cannot select a source")
-            built = self._brief_builder.open_creation(brief_spec)
-        else:
-            if source_type is None or source_ref is None:
-                raise InvalidClassroomState("source-grounded creation requires a source")
-            if source_type == "knowledge_base":
-                built = await self._brief_builder.from_kb(source_ref, brief_spec)
-            elif source_type == "pdf":
-                built = await self._brief_builder.from_pdf(source_ref, brief_spec)
+            brief_spec = TeachingBriefSpec(
+                course_id=course_id,
+                class_id=class_id,
+                objective=getattr(request, "objective"),
+                grade_band=getattr(request, "grade_band"),
+                audience=getattr(request, "audience"),
+                duration_minutes=getattr(request, "duration_minutes"),
+                classroom_mode="full",
+                web_policy=getattr(request, "web_policy"),
+                template_id=getattr(request, "template_id"),
+                template_version=getattr(request, "template_version"),
+                knowledge_points=points,
+                content_mode=getattr(request, "content_mode"),
+                open_creation_acknowledged=getattr(
+                    request,
+                    "open_creation_acknowledged",
+                ),
+                allowed_web_domains=tuple(getattr(request, "allowed_web_domains")),
+            )
+            content_mode = getattr(request, "content_mode")
+            source_type = getattr(request, "source_type")
+            source_ref = getattr(request, "source_ref")
+            if content_mode == "open_creation":
+                if source_type is not None or source_ref is not None:
+                    raise ClassroomPreflightRejected(
+                        "open creation cannot select a source"
+                    )
+                built = self._brief_builder.open_creation(brief_spec)
             else:
-                raise InvalidClassroomState("classroom source is invalid")
+                if source_type is None or source_ref is None:
+                    raise ClassroomPreflightRejected(
+                        "source-grounded creation requires a source"
+                    )
+                if source_type == "knowledge_base":
+                    built = await self._brief_builder.from_kb(source_ref, brief_spec)
+                elif source_type == "pdf":
+                    built = await self._brief_builder.from_pdf(source_ref, brief_spec)
+                else:
+                    raise ClassroomPreflightRejected("classroom source is invalid")
+        except ClassroomPreflightRejected:
+            raise
+        except ValueError as exc:
+            raise ClassroomPreflightRejected(str(exc)) from None
 
         asset_id = _creation_identifier("asset", context.tenant_id, creation_key)
         draft_id = _creation_identifier("draft", context.tenant_id, creation_key)
@@ -1798,11 +1902,19 @@ class ClassroomService:
             if stage.classroom_version_id is not None and stage.status not in {"succeeded"}:
                 raise InvalidClassroomState("classroom version has invalid job state")
             if stage.status == "awaiting_confirmation" and stage.outline is not None:
-                record = await self._repository.save_outline(
-                    asset_id,
-                    _outline_payload(stage.outline),
-                    canonical_outline_sha256(stage.outline),
-                )
+                if stage.outline.confirmation_metadata.status != "draft":
+                    raise InvalidClassroomState("outline recovery state is invalid")
+                if record.lifecycle_state in {"generating_outline", "awaiting_outline"}:
+                    record = await self._repository.save_outline(
+                        asset_id,
+                        _outline_payload(stage.outline),
+                        canonical_outline_sha256(stage.outline),
+                    )
+                elif not _is_durable_confirmed_outline_recovery(
+                    record,
+                    stage.outline,
+                ):
+                    raise InvalidClassroomState("outline recovery state is invalid")
             elif stage.status == "succeeded" and record.classroom_version_id is not None:
                 record = await self._repository.mark_generation_succeeded(
                     asset_id,
@@ -1873,6 +1985,9 @@ class ClassroomService:
         self,
         context: TenantContext,
         asset_id: str,
+        *,
+        expected_revision: int | None = None,
+        expected_outline_sha256: str | None = None,
     ) -> ClassroomRecord:
         record = await self._editable_record(context, asset_id)
         if (
@@ -1882,6 +1997,19 @@ class ClassroomService:
         ):
             raise InvalidClassroomState("outline cannot be confirmed")
         outline = OutlineBundle.model_validate(record.outline)
+        if (expected_revision is None) != (expected_outline_sha256 is None):
+            raise InvalidClassroomState("outline review binding is incomplete")
+        if expected_revision is not None:
+            assert expected_outline_sha256 is not None
+            if not matches_reviewed_outline_binding(
+                lifecycle_state=record.lifecycle_state,
+                revision=record.revision,
+                outline=outline,
+                confirmed_outline_sha256=record.confirmed_outline_sha256,
+                expected_revision=expected_revision,
+                expected_outline_sha256=expected_outline_sha256,
+            ):
+                raise ClassroomConfirmationConflict("confirmed outline conflicts")
         if record.lifecycle_state == "awaiting_outline":
             confirmed = outline.model_copy(
                 update={
@@ -1901,11 +2029,20 @@ class ClassroomService:
                 raise InvalidClassroomState("confirmed outline is unavailable")
         source_outline_sha256 = _draft_outline_sha256(outline)
         outline_sha256 = canonical_outline_sha256(confirmed)
+        review_binding = (
+            {
+                "expected_revision": expected_revision,
+                "expected_outline_sha256": expected_outline_sha256,
+            }
+            if expected_revision is not None
+            else {}
+        )
         persisted = await self._repository.confirm_outline(
             asset_id,
             _outline_payload(confirmed),
             outline_sha256,
             source_outline_sha256,
+            **review_binding,
         )
         if persisted.outline is None or persisted.confirmed_outline_sha256 is None:
             raise InvalidClassroomState("confirmed outline is unavailable")
@@ -2208,6 +2345,7 @@ __all__ = [
     "ClassroomConfirmationConflict",
     "ClassroomIdempotencyConflict",
     "ClassroomNotFound",
+    "ClassroomPreflightRejected",
     "ClassroomRecord",
     "ClassroomRevisionConflict",
     "ClassroomService",
@@ -2222,5 +2360,6 @@ __all__ = [
     "NewDraftMedia",
     "SqlAlchemyClassroomGeneration",
     "build_validation_report",
+    "matches_reviewed_outline_binding",
     "validate_draft_document_references",
 ]

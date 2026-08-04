@@ -578,6 +578,108 @@ class SqlAlchemyGenerationJobRepository:
     ) -> GenerationJobRecord:
         return await self._create_job_and_reserve(request, export_id=None)
 
+    async def create_rejected_batch_job(
+        self,
+        request: GenerationJobRequest,
+    ) -> GenerationJobRecord:
+        """Persist a terminal batch attempt that never entered the worker queue."""
+
+        if (
+            request.job_kind != "generation"
+            or request.phase != "outline"
+            or request.priority != "batch"
+            or request.batch_id is None
+            or request.classroom_draft_id is not None
+            or request.public_request_sha256 is None
+        ):
+            raise ValueError("rejected batch job request is invalid")
+        session_factory = self._session_factory(request.tenant_id)
+        async with session_factory() as session:
+            async with session.begin():
+                await session.execute(
+                    text(
+                        "SELECT pg_advisory_xact_lock("
+                        "hashtextextended(:idempotency_lock_key, 0))"
+                    ),
+                    {
+                        "idempotency_lock_key": hashlib.sha256(
+                            (
+                                "generation-job-idempotency\0"
+                                f"{request.tenant_id}\0{request.idempotency_key}"
+                            ).encode()
+                        ).hexdigest()
+                    },
+                )
+                existing = await session.scalar(
+                    select(GenerationJob)
+                    .where(
+                        GenerationJob.tenant_id == request.tenant_id,
+                        GenerationJob.idempotency_key == request.idempotency_key,
+                    )
+                    .with_for_update()
+                )
+                if existing is not None:
+                    if (
+                        not self._matches_idempotent_request(existing, request)
+                        or existing.status != "failed"
+                        or existing.error_code != "batch_item_rejected"
+                    ):
+                        raise IdempotencyConflict()
+                    return self._record(existing)
+                await self._lock_active_tenant(session, request.tenant_id)
+                if request.retry_of_job_id is not None:
+                    parent = await session.scalar(
+                        select(GenerationJob)
+                        .where(
+                            GenerationJob.id == request.retry_of_job_id,
+                            GenerationJob.tenant_id == request.tenant_id,
+                        )
+                        .with_for_update()
+                    )
+                    if (
+                        parent is None
+                        or parent.batch_id != request.batch_id
+                        or parent.status != "failed"
+                        or parent.error_code != "batch_item_rejected"
+                    ):
+                        raise ValueError("rejected batch retry lineage is invalid")
+                now = await _database_now(session)
+                job = GenerationJob(
+                    id=request.job_id,
+                    tenant_id=request.tenant_id,
+                    job_kind=request.job_kind,
+                    phase=request.phase,
+                    export_format=None,
+                    status="failed",
+                    priority=request.priority_rank,
+                    quota_units=request.quota_units,
+                    actor_id=request.actor_id,
+                    owner_id=request.owner_id,
+                    visibility=request.visibility,
+                    request_id=request.request_id,
+                    idempotency_key=request.idempotency_key,
+                    classroom_draft_id=None,
+                    batch_id=request.batch_id,
+                    resource_course_id=request.resource_course_id,
+                    resource_class_id=request.resource_class_id,
+                    public_request_sha256=request.public_request_sha256,
+                    request_sha256=request.request_sha256,
+                    data_plane_route_id=request.data_plane_route_id,
+                    provider_profile_id=request.provider_profile_id,
+                    worker_pool_ref=request.worker_pool_ref,
+                    queue_ref=request.queue_ref,
+                    request_payload=request.request_payload,
+                    max_attempts=request.max_attempts,
+                    retry_of_job_id=request.retry_of_job_id,
+                    error_category="request",
+                    error_code="batch_item_rejected",
+                    completed_at=now,
+                    next_attempt_at=now,
+                )
+                session.add(job)
+                await session.flush()
+                return self._record(job)
+
     async def create_export_job_and_reserve(
         self,
         request: GenerationJobRequest,
@@ -1406,6 +1508,8 @@ class SqlAlchemyGenerationJobRepository:
         self,
         tenant_id: str,
         job_id: str,
+        *,
+        only_if_unstarted: bool = False,
     ) -> CancellationRequest | None:
         session_factory = self._session_factory(tenant_id)
         async with session_factory() as session:
@@ -1431,7 +1535,14 @@ class SqlAlchemyGenerationJobRepository:
                     )
                     .with_for_update()
                 )
-                if job is None or job.status in TERMINAL_JOB_STATUSES:
+                if (
+                    job is None
+                    or job.status in TERMINAL_JOB_STATUSES
+                    or (
+                        only_if_unstarted
+                        and job.status not in {"created", "quota_reserved", "queued"}
+                    )
+                ):
                     return None
                 job.cancel_requested = True
                 job.updated_at = now
