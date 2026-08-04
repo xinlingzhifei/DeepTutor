@@ -25,6 +25,7 @@ from deeptutor.teaching.artifacts import (
     ClassroomArtifactManifest,
     StoredArtifact,
     classroom_artifact_key,
+    export_input_key,
     source_upload_key,
     temporary_artifact_key,
     tenant_artifact_prefix,
@@ -274,6 +275,13 @@ def _canonical_artifact_kind(key: str, tenant_id: str) -> str | None:
         if len(parts) == 5 and parts[:3] == ["tenants", tenant_id, "sources"]:
             rebuilt = source_upload_key(tenant_id, parts[3])
             return "source" if rebuilt == key else None
+        if len(parts) >= 5 and parts[:3] == ["tenants", tenant_id, "export-inputs"]:
+            rebuilt = export_input_key(
+                tenant_id,
+                parts[3],
+                "/".join(parts[4:]),
+            )
+            return "export_input" if rebuilt == key else None
         if (
             len(parts) >= 7
             and parts[:3] == ["tenants", tenant_id, "classrooms"]
@@ -309,6 +317,10 @@ def _is_canonical_artifact_prefix(prefix: str, tenant_id: str) -> bool:
         completions = {1: "/__upload__/source.pdf", 2: "/source.pdf"}
         candidate = normalized + completions.get(len(parts), "")
         return _canonical_artifact_kind(candidate, tenant_id) == "source"
+    if parts[0] == "export-inputs":
+        completions = {1: "/__export__/__name__", 2: "/__name__"}
+        candidate = normalized + completions.get(len(parts), "")
+        return _canonical_artifact_kind(candidate, tenant_id) == "export_input"
     if parts[0] == "classrooms":
         completions = {
             1: "/__asset__/versions/1/__name__",
@@ -554,11 +566,12 @@ class _TenantScopedStore:
     def _require_direct_upload_key(self, key: str) -> str:
         validated = self._require_scoped_key(key)
         if _canonical_artifact_kind(validated, self.tenant_id) not in {
+            "export_input",
             "temporary",
             "source",
         }:
             raise ObjectStoreAccessDenied(
-                "uploads must use a canonical tenant temporary or source key"
+                "uploads must use a canonical tenant input key"
             )
         return validated
 
@@ -769,7 +782,11 @@ class _TenantScopedStore:
         key: str,
     ) -> tuple[str, StoredArtifact | None]:
         safe_key = self._require_key(key)
-        if _canonical_artifact_kind(safe_key, self.tenant_id) in {"temporary", "source"}:
+        if _canonical_artifact_kind(safe_key, self.tenant_id) in {
+            "export_input",
+            "temporary",
+            "source",
+        }:
             return safe_key, None
         if _is_internal_key(safe_key, self.tenant_id):
             raise ObjectStoreNotFound("object was not found")
@@ -792,7 +809,7 @@ class _TenantScopedStore:
             if not safe_key.startswith(prefix):
                 raise ObjectStoreAccessDenied("backend returned an object outside the prefix")
             kind = _canonical_artifact_kind(safe_key, self.tenant_id)
-            if kind in {"temporary", "source"}:
+            if kind in {"export_input", "temporary", "source"}:
                 visible.append(safe_key)
                 continue
             if _is_internal_key(safe_key, self.tenant_id):
@@ -1047,6 +1064,7 @@ class LocalClassroomArtifactStore(_TenantScopedStore):
     def _source_receipt_path(self, key: str) -> Path:
         safe_key = self._require_scoped_key(key)
         if _canonical_artifact_kind(safe_key, self.tenant_id) not in {
+            "export_input",
             "source",
             "temporary",
         }:
@@ -1114,7 +1132,10 @@ class LocalClassroomArtifactStore(_TenantScopedStore):
         ownership_token: str | None = None,
     ) -> StoredArtifact:
         safe_key = self._require_direct_upload_key(key)
-        create_only = _canonical_artifact_kind(safe_key, self.tenant_id) == "source"
+        create_only = _canonical_artifact_kind(safe_key, self.tenant_id) in {
+            "export_input",
+            "source",
+        }
         destination = self._path_for(safe_key)
         expected_sha256 = _validate_sha256(sha256)
         expected_size = _validate_size(size)
@@ -1695,7 +1716,10 @@ class S3ClassroomArtifactStore(_TenantScopedStore):
         ownership_token: str | None = None,
     ) -> StoredArtifact:
         safe_key = self._require_direct_upload_key(key)
-        create_only = _canonical_artifact_kind(safe_key, self.tenant_id) == "source"
+        create_only = _canonical_artifact_kind(safe_key, self.tenant_id) in {
+            "export_input",
+            "source",
+        }
         expected_sha256 = _validate_sha256(sha256)
         expected_size = _validate_size(size)
         safe_content_type = _validate_content_type(content_type)

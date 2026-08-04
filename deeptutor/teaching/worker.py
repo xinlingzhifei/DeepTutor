@@ -27,7 +27,13 @@ from deeptutor.teaching.contracts import (
     canonical_json_bytes,
     validate_outline_binding,
 )
-from deeptutor.teaching.export_worker import submit_pinned_export
+from deeptutor.teaching.export_worker import (
+    ExportInputCommitReceipt,
+    ExportInputDeclaration,
+    ExportInputFileDeclaration,
+    load_export_input_bundle,
+    stage_and_submit_pinned_export,
+)
 from deeptutor.teaching.job_errors import (
     JobFailure,
     can_repair_dsl,
@@ -67,6 +73,23 @@ class WorkerClient(Protocol):
     async def submit_content(self, request: GenerationRequest) -> EngineJob: ...
 
     async def submit_export(self, request: ExportRequest) -> EngineJob: ...
+
+    async def reserve_export_input(
+        self,
+        declaration: ExportInputDeclaration,
+    ) -> None: ...
+
+    async def upload_export_input_file(
+        self,
+        declaration: ExportInputDeclaration,
+        file: ExportInputFileDeclaration,
+        body: AsyncIterator[bytes],
+    ) -> None: ...
+
+    async def commit_export_input(
+        self,
+        declaration: ExportInputDeclaration,
+    ) -> ExportInputCommitReceipt: ...
 
     async def poll(self, engine_job_id: str) -> EngineJob: ...
 
@@ -319,7 +342,29 @@ class GenerationWorker:
                 return
             if claim.job_kind == "export":
                 request = ExportRequest.model_validate(request_payload)
-                submitted = await submit_pinned_export(client, request)
+                location = await self._repository.get_export_input_location(
+                    claim.tenant_id,
+                    claim.job_id,
+                )
+                if location is None:
+                    raise ArtifactValidationError("source_invalid")
+                store = await self._stores.store_for_tenant(claim.tenant_id)
+                try:
+                    bundle = await load_export_input_bundle(
+                        store,
+                        tenant_id=claim.tenant_id,
+                        job_id=claim.job_id,
+                        manifest_object_key=location.manifest_object_key,
+                        manifest_sha256=location.manifest_sha256,
+                    )
+                    submitted = await stage_and_submit_pinned_export(
+                        client,
+                        store,
+                        request,
+                        bundle,
+                    )
+                except ValueError:
+                    raise ArtifactValidationError("source_invalid") from None
             else:
                 request = GenerationRequest.model_validate(request_payload)
                 if request.tenant_id != claim.tenant_id or request.job_id != claim.job_id:

@@ -2,6 +2,7 @@
 
 from deeptutor.teaching.openmaic.auth import (
     MountedServiceSecretResolver,
+    PrehashedServiceRequest,
     ServiceRequest,
 )
 from deeptutor.teaching.openmaic.client import (
@@ -13,5 +14,6 @@ __all__ = [
     "MountedServiceSecretResolver",
     "OpenMAICClient",
     "OpenMAICClientFactory",
+    "PrehashedServiceRequest",
     "ServiceRequest",
 ]

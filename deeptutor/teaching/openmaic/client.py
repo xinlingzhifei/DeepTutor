@@ -11,7 +11,7 @@ import math
 import random
 import re
 import time
-from typing import Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 from urllib.parse import urlsplit
 
 import httpx
@@ -19,7 +19,9 @@ from pydantic import BaseModel, SecretStr
 
 from deeptutor.teaching.contracts import ExportRequest, GenerationRequest, canonical_json_bytes
 from deeptutor.teaching.openmaic.auth import (
+    PrehashedServiceRequest,
     ServiceRequest,
+    signed_prehashed_service_headers,
     signed_service_headers,
 )
 from deeptutor.teaching.openmaic.data_planes import (
@@ -29,6 +31,13 @@ from deeptutor.teaching.openmaic.data_planes import (
 )
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from deeptutor.teaching.export_worker import (
+        ExportInputCommitReceipt,
+        ExportInputDeclaration,
+        ExportInputFileDeclaration,
+    )
 
 SUPPORTED_CONTRACT_VERSION = "1.0"
 EXPECTED_UPSTREAM_COMMIT = "0cf2a330411681190e89f48e20f305345ff99f87"
@@ -353,6 +362,54 @@ class OpenMAICClient:
             return response
         raise mapped_error
 
+    async def _request_stream(
+        self,
+        method: str,
+        path: str,
+        *,
+        job_id: str,
+        idempotency_key: str,
+        body_sha256: str,
+        body: AsyncIterator[bytes],
+        content_type: str,
+    ) -> httpx.Response:
+        timestamp = int(self._now_seconds())
+        headers = signed_prehashed_service_headers(
+            PrehashedServiceRequest(
+                method=method,
+                path=path,
+                tenant_id=self._tenant_id,
+                job_id=job_id,
+                timestamp=timestamp,
+                idempotency_key=idempotency_key,
+                body_sha256=body_sha256,
+            ),
+            self._service_secret,
+        )
+        headers["content-type"] = content_type
+        self._log_request(job_id)
+        mapped_error: OpenMAICError
+        try:
+            async with asyncio.timeout(self._timeouts.total):
+                response = await self._http.request(
+                    method,
+                    f"{self._base_url}{path}",
+                    content=body,
+                    headers=headers,
+                    timeout=self._timeouts.httpx_timeout(),
+                    follow_redirects=False,
+                )
+                response.raise_for_status()
+        except (TimeoutError, httpx.TimeoutException):
+            mapped_error = OpenMAICTimeout()
+        except httpx.HTTPStatusError as exc:
+            mapped_error = OpenMAICRequestFailed(exc.response.status_code)
+        except httpx.RequestError:
+            mapped_error = OpenMAICUnavailable()
+        else:
+            return response
+        raise mapped_error
+
     @staticmethod
     def _json_object(response: httpx.Response) -> dict[str, Any]:
         mapped_error: InvalidOpenMAICResponse
@@ -472,6 +529,142 @@ class OpenMAICClient:
             path="/api/yfeistai/v1/exports",
             kind="export",
         )
+
+    def _validate_staging_declaration(
+        self,
+        declaration: ExportInputDeclaration,
+    ) -> None:
+        if declaration.tenant_id != self._tenant_id:
+            raise ValueError("export input tenant does not match the data plane")
+        self._validate_job_id(declaration.job_id)
+        _required_string(declaration.idempotency_key)
+
+    async def reserve_export_input(
+        self,
+        declaration: ExportInputDeclaration,
+    ) -> None:
+        self._validate_staging_declaration(declaration)
+        path = f"/api/yfeistai/v1/export-inputs/{declaration.job_id}"
+        response = await self._request(
+            "POST",
+            path,
+            job_id=declaration.job_id,
+            idempotency_key=declaration.idempotency_key,
+            body=declaration.canonical_payload(),
+            content_type="application/json",
+        )
+        payload = self._json_object(response)
+        if (
+            set(payload)
+            != {
+                "tenantId",
+                "jobId",
+                "idempotencyKey",
+                "declarationSha256",
+                "status",
+            }
+            or payload.get("tenantId") != self._tenant_id
+            or payload.get("jobId") != declaration.job_id
+            or payload.get("idempotencyKey") != declaration.idempotency_key
+            or payload.get("declarationSha256") != declaration.declaration_sha256
+            or payload.get("status") != "reserved"
+        ):
+            raise InvalidOpenMAICResponse()
+
+    async def upload_export_input_file(
+        self,
+        declaration: ExportInputDeclaration,
+        file: ExportInputFileDeclaration,
+        body: AsyncIterator[bytes],
+    ) -> None:
+        self._validate_staging_declaration(declaration)
+        if file not in declaration.files:
+            raise ValueError("export input file is outside the declaration")
+        file_id = self._validate_job_id(file.file_id)
+        path = (
+            f"/api/yfeistai/v1/export-inputs/{declaration.job_id}/files/{file_id}"
+        )
+        response = await self._request_stream(
+            "PUT",
+            path,
+            job_id=declaration.job_id,
+            idempotency_key=declaration.idempotency_key,
+            body_sha256=file.sha256,
+            body=body,
+            content_type=file.mime_type,
+        )
+        payload = self._json_object(response)
+        if (
+            set(payload)
+            != {
+                "tenantId",
+                "jobId",
+                "fileId",
+                "sha256",
+                "sizeBytes",
+                "status",
+            }
+            or payload.get("tenantId") != self._tenant_id
+            or payload.get("jobId") != declaration.job_id
+            or payload.get("fileId") != file.file_id
+            or payload.get("sha256") != file.sha256
+            or payload.get("sizeBytes") != file.size_bytes
+            or payload.get("status") != "uploaded"
+        ):
+            raise InvalidOpenMAICResponse()
+
+    async def commit_export_input(
+        self,
+        declaration: ExportInputDeclaration,
+    ) -> ExportInputCommitReceipt:
+        self._validate_staging_declaration(declaration)
+        path = f"/api/yfeistai/v1/export-inputs/{declaration.job_id}/commit"
+        body = canonical_json_bytes(
+            {"declarationSha256": declaration.declaration_sha256}
+        )
+        response = await self._request(
+            "POST",
+            path,
+            job_id=declaration.job_id,
+            idempotency_key=declaration.idempotency_key,
+            body=body,
+            content_type="application/json",
+        )
+        payload = self._json_object(response)
+        if set(payload) != {
+            "schemaVersion",
+            "tenantId",
+            "jobId",
+            "idempotencyKey",
+            "declarationSha256",
+            "classroomDocumentSha256",
+            "mediaManifestSha256",
+            "status",
+            "receiptSha256",
+        } or payload.get("schemaVersion") != 1 or payload.get("status") != "committed":
+            raise InvalidOpenMAICResponse()
+        from deeptutor.teaching.export_worker import ExportInputCommitReceipt
+
+        try:
+            receipt = ExportInputCommitReceipt(
+                tenant_id=_required_string(payload.get("tenantId")),
+                job_id=_required_string(payload.get("jobId")),
+                idempotency_key=_required_string(payload.get("idempotencyKey")),
+                declaration_sha256=_required_string(
+                    payload.get("declarationSha256")
+                ),
+                classroom_document_sha256=_required_string(
+                    payload.get("classroomDocumentSha256")
+                ),
+                media_manifest_sha256=_required_string(
+                    payload.get("mediaManifestSha256")
+                ),
+                receipt_sha256=_required_string(payload.get("receiptSha256")),
+            )
+            receipt.validate(declaration)
+        except ValueError:
+            raise InvalidOpenMAICResponse() from None
+        return receipt
 
     async def poll(self, engine_job_id: str) -> EngineJob:
         kind = self._job_kinds.get(engine_job_id)

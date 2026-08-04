@@ -42,6 +42,19 @@ class ServiceRequest:
     body: str | bytes
 
 
+@dataclass(frozen=True, slots=True)
+class PrehashedServiceRequest:
+    """A signed request whose streamed body is bound by a declared SHA-256."""
+
+    method: str
+    path: str
+    tenant_id: str
+    job_id: str
+    timestamp: int
+    idempotency_key: str
+    body_sha256: str
+
+
 def _canonical_line(
     name: str,
     value: str,
@@ -111,6 +124,55 @@ def canonical_service_request(request: ServiceRequest) -> str:
     )
 
 
+def _normalized_prehashed_request(
+    request: PrehashedServiceRequest,
+) -> PrehashedServiceRequest:
+    normalized = _normalized_request(
+        ServiceRequest(
+            method=request.method,
+            path=request.path,
+            tenant_id=request.tenant_id,
+            job_id=request.job_id,
+            timestamp=request.timestamp,
+            idempotency_key=request.idempotency_key,
+            body=b"",
+        )
+    )
+    digest = request.body_sha256
+    if (
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        raise ValueError("body_sha256 must be a lowercase SHA-256 hex digest")
+    return PrehashedServiceRequest(
+        method=normalized.method,
+        path=normalized.path,
+        tenant_id=normalized.tenant_id,
+        job_id=normalized.job_id,
+        timestamp=normalized.timestamp,
+        idempotency_key=normalized.idempotency_key,
+        body_sha256=digest,
+    )
+
+
+def canonical_prehashed_service_request(request: PrehashedServiceRequest) -> str:
+    """Return the seven-line signature input for a bounded streamed body."""
+
+    normalized = _normalized_prehashed_request(request)
+    return "\n".join(
+        (
+            normalized.method,
+            normalized.path,
+            normalized.tenant_id,
+            normalized.job_id,
+            str(normalized.timestamp),
+            normalized.idempotency_key,
+            normalized.body_sha256,
+        )
+    )
+
+
 def _secret_value(secret: SecretStr | str) -> str:
     value = secret.get_secret_value() if isinstance(secret, SecretStr) else secret
     return _canonical_line("secret", value)
@@ -129,6 +191,19 @@ def sign_service_request(
     ).hexdigest()
 
 
+def sign_prehashed_service_request(
+    request: PrehashedServiceRequest,
+    secret: SecretStr | str,
+) -> str:
+    """Sign a streamed request without reading its body into memory."""
+
+    return hmac.new(
+        _secret_value(secret).encode("utf-8"),
+        canonical_prehashed_service_request(request).encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
 def signed_service_headers(
     request: ServiceRequest,
     secret: SecretStr | str,
@@ -142,6 +217,26 @@ def signed_service_headers(
         "x-yfeistai-timestamp": str(normalized.timestamp),
         "x-yfeistai-idempotency-key": normalized.idempotency_key,
         "x-yfeistai-signature": sign_service_request(normalized, secret),
+    }
+
+
+def signed_prehashed_service_headers(
+    request: PrehashedServiceRequest,
+    secret: SecretStr | str,
+) -> dict[str, str]:
+    """Return trusted headers for a streamed body with a declared digest."""
+
+    normalized = _normalized_prehashed_request(request)
+    return {
+        "x-yfeistai-tenant-id": normalized.tenant_id,
+        "x-yfeistai-job-id": normalized.job_id,
+        "x-yfeistai-timestamp": str(normalized.timestamp),
+        "x-yfeistai-idempotency-key": normalized.idempotency_key,
+        "x-yfeistai-content-sha256": normalized.body_sha256,
+        "x-yfeistai-signature": sign_prehashed_service_request(
+            normalized,
+            secret,
+        ),
     }
 
 

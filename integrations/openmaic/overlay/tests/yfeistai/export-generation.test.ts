@@ -370,7 +370,7 @@ describe("controlled export boundary", () => {
     expect(exporter).toHaveBeenCalledTimes(1);
   });
 
-  test("rejects a media download route bound to another source job", async () => {
+  test("accepts an immutable document path from an earlier controlled job", async () => {
     const mediaManifest = validMediaManifest({
       temporaryDownloadPath:
         "/api/yfeistai/v1/artifacts/other-source-job/media/lesson.png",
@@ -389,8 +389,8 @@ describe("controlled export boundary", () => {
         },
         { exportOfflineHtml: exporter },
       ),
-    ).rejects.toThrow(/media manifest artifact metadata/i);
-    expect(exporter).not.toHaveBeenCalled();
+    ).resolves.toMatchObject({ status: "succeeded" });
+    expect(exporter).toHaveBeenCalledTimes(1);
   });
 
   test("rejects aggregate media over the artifact budget before exporting", async () => {

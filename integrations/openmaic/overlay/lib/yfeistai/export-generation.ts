@@ -1025,6 +1025,34 @@ export function controlledArtifactDownloadPath(
   );
 }
 
+function isControlledArtifactDownloadPath(
+  value: unknown,
+  relativePath: string,
+): boolean {
+  if (typeof value !== "string") {
+    return false;
+  }
+  const prefix = "/api/yfeistai/v1/artifacts/";
+  if (!value.startsWith(prefix)) {
+    return false;
+  }
+  const separator = value.indexOf("/", prefix.length);
+  if (separator < 0) {
+    return false;
+  }
+  const encodedJobId = value.slice(prefix.length, separator);
+  let jobId: string;
+  try {
+    jobId = decodeURIComponent(encodedJobId);
+  } catch {
+    return false;
+  }
+  return (
+    encodeURIComponent(jobId) === encodedJobId &&
+    value === controlledArtifactDownloadPath(jobId, relativePath)
+  );
+}
+
 function validateMediaManifest(
   value: unknown,
   sourceJobId?: string | null,
@@ -1060,8 +1088,10 @@ function validateMediaManifest(
       (entry.sizeBytes as number) < 0 ||
       typeof entry.mimeType !== "string" ||
       !/^[^\s/]+\/[^\s/]+(?:\s*;\s*[^\r\n]+)?$/.test(entry.mimeType) ||
-      entry.temporaryDownloadPath !==
-        controlledArtifactDownloadPath(sourceJobId as string, relativePath) ||
+      !isControlledArtifactDownloadPath(
+        entry.temporaryDownloadPath,
+        relativePath,
+      ) ||
       !/(?:Z|[+-]\d{2}:\d{2})$/.test(
         nonEmptyString(entry.expiresAt, "media expiry"),
       ) ||

@@ -9,12 +9,15 @@ import pytest
 from deeptutor.teaching.openmaic.auth import (
     MAX_CLOCK_SKEW_SECONDS,
     MountedServiceSecretResolver,
+    PrehashedServiceRequest,
     ServiceRequest,
     ServiceSecretAccessDenied,
     ServiceSecretUnavailable,
+    canonical_prehashed_service_request,
     canonical_service_request,
     read_service_secret,
     sign_service_request,
+    signed_prehashed_service_headers,
     signed_service_headers,
     verify_service_request,
 )
@@ -73,6 +76,51 @@ def test_signed_headers_bind_every_overlay_auth_field() -> None:
             SecretStr("service-secret"),
         ),
     }
+
+
+def test_prehashed_signature_binds_stream_digest_without_buffering_the_body() -> None:
+    request = PrehashedServiceRequest(
+        method="PUT",
+        path="/api/yfeistai/v1/export-inputs/job-1/files/file-1",
+        tenant_id="tenant-a",
+        job_id="job-1",
+        timestamp=1_770_000_001,
+        idempotency_key="idem-1",
+        body_sha256="a" * 64,
+    )
+
+    assert canonical_prehashed_service_request(request) == (
+        "PUT\n"
+        "/api/yfeistai/v1/export-inputs/job-1/files/file-1\n"
+        "tenant-a\n"
+        "job-1\n"
+        "1770000001\n"
+        "idem-1\n"
+        f"{'a' * 64}"
+    )
+    headers = signed_prehashed_service_headers(
+        request,
+        SecretStr("service-secret"),
+    )
+
+    assert headers["x-yfeistai-content-sha256"] == "a" * 64
+    assert len(headers["x-yfeistai-signature"]) == 64
+
+
+@pytest.mark.parametrize("digest", ["A" * 64, "a" * 63, "g" * 64])
+def test_prehashed_signature_rejects_a_noncanonical_digest(digest: str) -> None:
+    request = PrehashedServiceRequest(
+        method="PUT",
+        path="/api/yfeistai/v1/export-inputs/job-1/files/file-1",
+        tenant_id="tenant-a",
+        job_id="job-1",
+        timestamp=1_770_000_001,
+        idempotency_key="idem-1",
+        body_sha256=digest,
+    )
+
+    with pytest.raises(ValueError):
+        canonical_prehashed_service_request(request)
 
 
 def test_service_signature_uses_the_overlay_sixty_second_validity_window() -> None:

@@ -308,6 +308,40 @@ def test_task4_files_are_mandatory_overlay_inputs() -> None:
     assert expected <= verifier.REQUIRED_OVERLAY_FILES
 
 
+def test_task6_staging_files_are_mandatory_overlay_inputs() -> None:
+    verifier = _load_verifier()
+    expected = {
+        Path("lib/yfeistai/export-input-staging.ts"),
+        Path("app/api/yfeistai/v1/export-inputs/[jobId]/route.ts"),
+        Path("app/api/yfeistai/v1/export-inputs/[jobId]/commit/route.ts"),
+        Path("app/api/yfeistai/v1/export-inputs/[jobId]/files/[fileId]/route.ts"),
+        Path("tests/yfeistai/export-input-staging.test.ts"),
+    }
+
+    assert expected <= verifier.REQUIRED_OVERLAY_FILES
+
+
+def test_task6_static_verifier_requires_streamed_hash_only_staging(
+    tmp_path: Path,
+) -> None:
+    verifier = _load_verifier()
+    source_root = INTEGRATION_ROOT / "overlay"
+    overlay_root = tmp_path / "overlay"
+    for relative in verifier.TASK6_SOURCE_FILES:
+        source = source_root / relative
+        target = overlay_root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, target)
+
+    verifier.verify_task6_staging(overlay_root)
+
+    staging = overlay_root / "lib/yfeistai/export-input-staging.ts"
+    source = staging.read_text(encoding="utf-8")
+    staging.write_text(source.replace("sourceManifestSha256", "objectKey", 1), encoding="utf-8")
+    with pytest.raises(verifier.OverlayVerificationError):
+        verifier.verify_task6_staging(overlay_root)
+
+
 def test_task4_static_verifier_requires_security_and_lifecycle_controls(
     tmp_path: Path,
 ) -> None:
@@ -375,6 +409,24 @@ def test_cli_dispatches_each_task4_suite(monkeypatch: pytest.MonkeyPatch) -> Non
         (verifier.DEFAULT_INTEGRATION_ROOT, "cancel"),
         (verifier.DEFAULT_INTEGRATION_ROOT, "artifact-manifest"),
         (verifier.DEFAULT_INTEGRATION_ROOT, "export-generation"),
+    ]
+
+
+def test_cli_dispatches_export_input_staging_suite(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    verifier = _load_verifier()
+    called: list[tuple[Path, str]] = []
+    monkeypatch.setattr(verifier, "verify_overlay", lambda: None)
+    monkeypatch.setattr(
+        verifier,
+        "_run_task4_tests",
+        lambda root, name: called.append((root, name)) or 0,
+    )
+
+    assert verifier.main(["--test", "export-input-staging"]) == 0
+    assert called == [
+        (verifier.DEFAULT_INTEGRATION_ROOT, "export-input-staging")
     ]
 
 

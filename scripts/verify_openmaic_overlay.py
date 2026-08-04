@@ -26,6 +26,9 @@ REQUIRED_OVERLAY_FILES = {
     Path("app/api/yfeistai/v1/classrooms/route.ts"),
     Path("app/api/yfeistai/v1/exports/[jobId]/route.ts"),
     Path("app/api/yfeistai/v1/exports/route.ts"),
+    Path("app/api/yfeistai/v1/export-inputs/[jobId]/route.ts"),
+    Path("app/api/yfeistai/v1/export-inputs/[jobId]/commit/route.ts"),
+    Path("app/api/yfeistai/v1/export-inputs/[jobId]/files/[fileId]/route.ts"),
     Path("app/api/yfeistai/v1/outlines/[jobId]/route.ts"),
     Path("app/api/yfeistai/v1/outlines/route.ts"),
     Path("app/api/yfeistai/v1/health/route.ts"),
@@ -35,6 +38,7 @@ REQUIRED_OVERLAY_FILES = {
     Path("lib/yfeistai/contracts.ts"),
     Path("lib/yfeistai/durable-state.ts"),
     Path("lib/yfeistai/export-generation.ts"),
+    Path("lib/yfeistai/export-input-staging.ts"),
     Path("lib/yfeistai/generation-adapter.ts"),
     Path("lib/yfeistai/job-store.ts"),
     Path("lib/yfeistai/outline-generation.ts"),
@@ -46,6 +50,7 @@ REQUIRED_OVERLAY_FILES = {
     Path("tests/yfeistai/cancel.test.ts"),
     Path("tests/yfeistai/content-generation.test.ts"),
     Path("tests/yfeistai/export-generation.test.ts"),
+    Path("tests/yfeistai/export-input-staging.test.ts"),
     Path("tests/yfeistai/outline-generation.test.ts"),
     Path("tests/yfeistai/service-auth.test.ts"),
 }
@@ -62,6 +67,15 @@ TASK4_SOURCE_FILES = {
     Path("lib/yfeistai/export-generation.ts"),
     Path("lib/yfeistai/job-store.ts"),
     Path("lib/yfeistai/portable-classroom.ts"),
+    Path("lib/yfeistai/service-boundary.ts"),
+}
+TASK6_SOURCE_FILES = {
+    Path("app/api/yfeistai/v1/export-inputs/[jobId]/route.ts"),
+    Path("app/api/yfeistai/v1/export-inputs/[jobId]/commit/route.ts"),
+    Path("app/api/yfeistai/v1/export-inputs/[jobId]/files/[fileId]/route.ts"),
+    Path("lib/yfeistai/artifact-manifest.ts"),
+    Path("lib/yfeistai/export-input-staging.ts"),
+    Path("lib/yfeistai/service-auth.ts"),
     Path("lib/yfeistai/service-boundary.ts"),
 }
 JAVASCRIPT_SUFFIXES = {".cjs", ".cts", ".js", ".jsx", ".mjs", ".mts", ".ts", ".tsx"}
@@ -272,7 +286,10 @@ def verify_service_auth_source(source: str) -> None:
             r"normalized\.jobId,\s*"
             r"String\(normalized\.timestamp\),\s*"
             r"normalized\.idempotencyKey,\s*"
-            r"sha256Body\(input\.body\),?\s*\]"
+            r"input\.bodySha256,?\s*\]"
+        ),
+        "prehashed body verification": (
+            r"export\s+function\s+verifyServiceRequestDigest\s*\("
         ),
         "canonical newline join": (r'return\s+canonicalParts\.join\(["\']\\n["\']\)'),
         "signature shape validation": (r"!SHA256_HEX\.test\(signed\.signature\)"),
@@ -768,6 +785,104 @@ def verify_task4_sources(overlay_root: Path) -> None:
     )
 
 
+def verify_task6_staging(overlay_root: Path) -> None:
+    """Verify immutable, streamed export-input staging controls."""
+
+    staging = _strip_javascript_comments(
+        _read_text(overlay_root / "lib/yfeistai/export-input-staging.ts")
+    )
+    artifact = _strip_javascript_comments(
+        _read_text(overlay_root / "lib/yfeistai/artifact-manifest.ts")
+    )
+    boundary = _strip_javascript_comments(
+        _read_text(overlay_root / "lib/yfeistai/service-boundary.ts")
+    )
+    reserve_route = _strip_javascript_comments(
+        _read_text(
+            overlay_root
+            / "app/api/yfeistai/v1/export-inputs/[jobId]/route.ts"
+        )
+    )
+    upload_route = _strip_javascript_comments(
+        _read_text(
+            overlay_root
+            / "app/api/yfeistai/v1/export-inputs/[jobId]/files/[fileId]/route.ts"
+        )
+    )
+    commit_route = _strip_javascript_comments(
+        _read_text(
+            overlay_root
+            / "app/api/yfeistai/v1/export-inputs/[jobId]/commit/route.ts"
+        )
+    )
+    _require_tokens(
+        staging,
+        "export-input-staging.ts",
+        (
+            "parseExportInputDeclaration(",
+            "canonicalJson(value) !== body",
+            "authenticateServiceRequest(request, body",
+            "authenticatePrehashedServiceRequest(request",
+            "await requestChunks(request)",
+            "this.artifacts.putStream({",
+            "expectedSha256: file.sha256",
+            "expectedBytes: file.sizeBytes",
+            "await this.artifacts.verify(",
+            "canonicalJson(parsed) !== body",
+            "this.outputs.registerPayload(",
+            "writeDurableJsonExclusive(this.receiptPath",
+            "sourceManifestSha256",
+            "declarationSha256",
+            "receiptSha256",
+        ),
+    )
+    if "objectKey" in staging:
+        raise OverlayVerificationError(
+            "export input staging must not receive yFeiSTAI physical object keys"
+        )
+    if staging.index("this.outputs.registerPayload(") > staging.index(
+        "writeDurableJsonExclusive(this.receiptPath"
+    ):
+        raise OverlayVerificationError(
+            "export input receipt must be published after content registration"
+        )
+    _require_tokens(
+        artifact,
+        "artifact-manifest.ts streamed staging",
+        (
+            "async putStream(",
+            "for await (const rawChunk of input.body)",
+            "bytes > input.expectedBytes",
+            'createHash("sha256")',
+            "await handle.sync()",
+            "inspectArtifactFromSameHandle(",
+        ),
+    )
+    _require_tokens(
+        boundary,
+        "service-boundary.ts prehashed authentication",
+        (
+            "verifyServiceRequestDigest(signed",
+            'request.headers.get("x-yfeistai-content-sha256")',
+        ),
+    )
+    _require_tokens(
+        reserve_route,
+        "export input reserve route",
+        ("createExportInputReserveHandler(", "readServiceSecret"),
+    )
+    _require_tokens(
+        upload_route,
+        "export input upload route",
+        ("createExportInputUploadHandler(", "readServiceSecret"),
+    )
+    _require_tokens(
+        commit_route,
+        "export input commit route",
+        ("createExportInputCommitHandler(", "readServiceSecret"),
+    )
+
+
 def verify_overlay(integration_root: Path = DEFAULT_INTEGRATION_ROOT) -> None:
     integration_root = integration_root.resolve()
     overlay_root = integration_root / "overlay"
@@ -783,6 +898,7 @@ def verify_overlay(integration_root: Path = DEFAULT_INTEGRATION_ROOT) -> None:
     _verify_health_contract(overlay_root)
     _verify_outline_generation(overlay_root)
     verify_task4_sources(overlay_root)
+    verify_task6_staging(overlay_root)
 
 
 def resolve_package_runner() -> list[str]:
@@ -883,6 +999,7 @@ def main(argv: list[str] | None = None) -> int:
             "cancel",
             "artifact-manifest",
             "export-generation",
+            "export-input-staging",
             "static",
         ),
         default="static",
@@ -912,6 +1029,7 @@ def main(argv: list[str] | None = None) -> int:
         "cancel",
         "artifact-manifest",
         "export-generation",
+        "export-input-staging",
     }:
         result = _run_task4_tests(DEFAULT_INTEGRATION_ROOT, args.test)
         if result:

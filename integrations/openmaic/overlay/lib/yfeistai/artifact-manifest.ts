@@ -288,6 +288,77 @@ async function readArtifactFromSameHandle(input: {
   }
 }
 
+async function inspectArtifactFromSameHandle(input: {
+  root: string;
+  relativePath: string;
+  manifest: readonly ArtifactEntry[];
+}): Promise<{ bytes: number; sha256: string; prefix: Uint8Array }> {
+  const target = await assertArtifactReadTarget({ ...input, now: new Date(0) });
+  const root = path.resolve(input.root);
+  const realRoot = await fs.realpath(root);
+  if (!sameResolvedPath(root, realRoot)) {
+    throw new Error("artifact task root must not be a symbolic link");
+  }
+  const flags =
+    fsConstants.O_RDONLY |
+    (typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0);
+  const handle = await fs.open(target, flags);
+  try {
+    const [before, targetLstat, realTarget] = await Promise.all([
+      handle.stat(),
+      fs.lstat(target),
+      fs.realpath(target),
+    ]);
+    const relation = path.relative(realRoot, realTarget);
+    if (
+      targetLstat.isSymbolicLink() ||
+      !before.isFile() ||
+      !sameResolvedPath(target, realTarget) ||
+      relation === ".." ||
+      relation.startsWith(`..${path.sep}`) ||
+      path.isAbsolute(relation)
+    ) {
+      throw new Error("artifact changed during secure open");
+    }
+    const digest = createHash("sha256");
+    const buffer = Buffer.allocUnsafe(64 * 1024);
+    const prefix = Buffer.alloc(16);
+    let prefixBytes = 0;
+    let bytes = 0;
+    for (;;) {
+      const result = await handle.read(buffer, 0, buffer.byteLength, null);
+      if (result.bytesRead === 0) {
+        break;
+      }
+      const chunk = buffer.subarray(0, result.bytesRead);
+      digest.update(chunk);
+      if (prefixBytes < prefix.byteLength) {
+        const copied = Math.min(prefix.byteLength - prefixBytes, chunk.byteLength);
+        chunk.copy(prefix, prefixBytes, 0, copied);
+        prefixBytes += copied;
+      }
+      bytes += chunk.byteLength;
+    }
+    const after = await handle.stat();
+    if (
+      before.size !== after.size ||
+      before.size !== bytes ||
+      (before.ino !== 0 &&
+        after.ino !== 0 &&
+        (before.ino !== after.ino || before.dev !== after.dev))
+    ) {
+      throw new Error("artifact changed during secure read");
+    }
+    return {
+      bytes,
+      sha256: digest.digest("hex"),
+      prefix: prefix.subarray(0, prefixBytes),
+    };
+  } finally {
+    await handle.close();
+  }
+}
+
 async function createDirectory(target: string): Promise<void> {
   try {
     await fs.mkdir(target, { mode: 0o700 });
@@ -595,6 +666,157 @@ export class ArtifactStore {
     return (await recoverPersisted()) ?? entry;
   }
 
+  async putStream(input: {
+    tenantId: string;
+    jobId: string;
+    relativePath: string;
+    body: AsyncIterable<Uint8Array>;
+    mime: string;
+    expiresAt: string;
+    expectedSha256: string;
+    expectedBytes: number;
+  }): Promise<ArtifactEntry> {
+    const relativePath = normalizeArtifactPath(input.relativePath);
+    const mime = normalizeMime(input.mime);
+    parseExpiry(input.expiresAt);
+    if (
+      !SHA256_HEX.test(input.expectedSha256) ||
+      !Number.isSafeInteger(input.expectedBytes) ||
+      input.expectedBytes <= 0 ||
+      input.expectedBytes > MAX_ARTIFACT_BYTES
+    ) {
+      throw new Error("streamed artifact declaration is invalid");
+    }
+    const entry: ArtifactEntry = {
+      relativePath,
+      sha256: input.expectedSha256,
+      bytes: input.expectedBytes,
+      mime,
+      downloadPath:
+        `/api/yfeistai/v1/artifacts/${encodeURIComponent(input.jobId)}/` +
+        relativePath.split("/").map(encodeURIComponent).join("/"),
+      expiresAt: input.expiresAt,
+    };
+    const target = await assertArtifactWriteTarget({
+      baseRoot: this.baseRoot,
+      tenantId: input.tenantId,
+      jobId: input.jobId,
+      relativePath,
+    });
+    const parent = path.dirname(target);
+    const parentReal = await fs.realpath(parent);
+    if (!sameResolvedPath(parent, parentReal)) {
+      throw new Error("artifact write path contains an unsafe parent");
+    }
+    const temporary = path.join(parent, `.artifact-stream-${randomUUID()}.tmp`);
+    const digest = createHash("sha256");
+    const prefix = Buffer.alloc(16);
+    let prefixBytes = 0;
+    let bytes = 0;
+    const handle = await fs.open(temporary, "wx", 0o600);
+    try {
+      try {
+        for await (const rawChunk of input.body) {
+          if (!(rawChunk instanceof Uint8Array)) {
+            throw new Error("artifact stream contains an invalid chunk");
+          }
+          const chunk = Buffer.from(
+            rawChunk.buffer,
+            rawChunk.byteOffset,
+            rawChunk.byteLength,
+          );
+          bytes += chunk.byteLength;
+          if (bytes > input.expectedBytes || bytes > MAX_ARTIFACT_BYTES) {
+            throw new Error("artifact stream exceeds its declared size");
+          }
+          digest.update(chunk);
+          if (prefixBytes < prefix.byteLength) {
+            const copied = Math.min(
+              prefix.byteLength - prefixBytes,
+              chunk.byteLength,
+            );
+            chunk.copy(prefix, prefixBytes, 0, copied);
+            prefixBytes += copied;
+          }
+          await handle.write(chunk);
+        }
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      if (
+        bytes !== input.expectedBytes ||
+        digest.digest("hex") !== input.expectedSha256
+      ) {
+        throw new Error("artifact stream integrity validation failed");
+      }
+      assertArtifactMimeBytes(prefix.subarray(0, prefixBytes), mime);
+      const temporaryStat = await fs.lstat(temporary);
+      if (
+        temporaryStat.isSymbolicLink() ||
+        !temporaryStat.isFile() ||
+        !sameResolvedPath(parentReal, await fs.realpath(parent))
+      ) {
+        throw new Error("artifact write path changed during staged write");
+      }
+      try {
+        await fs.link(temporary, target);
+      } catch (error) {
+        if (
+          !(
+            error !== null &&
+            typeof error === "object" &&
+            "code" in error &&
+            error.code === "EEXIST"
+          )
+        ) {
+          throw error;
+        }
+      }
+    } finally {
+      await fs.unlink(temporary).catch(() => undefined);
+    }
+    const inspected = await inspectArtifactFromSameHandle({
+      root: this.rootFor(input.tenantId, input.jobId),
+      relativePath,
+      manifest: [entry],
+    });
+    if (
+      inspected.bytes !== entry.bytes ||
+      inspected.sha256 !== entry.sha256
+    ) {
+      throw new Error("artifact replay conflicts with persisted bytes");
+    }
+    assertArtifactMimeBytes(inspected.prefix, mime);
+    const manifestRoot = this.manifestRoot(input.tenantId, input.jobId);
+    mkdirSync(manifestRoot, { recursive: true, mode: 0o700 });
+    const manifestStat = await fs.lstat(manifestRoot);
+    if (manifestStat.isSymbolicLink() || !manifestStat.isDirectory()) {
+      throw new Error("artifact manifest root is unsafe");
+    }
+    const manifestPath = this.manifestPath(
+      input.tenantId,
+      input.jobId,
+      relativePath,
+    );
+    writeDurableJsonExclusive(manifestPath, entry);
+    const persisted = this.readManifestEntry(
+      input.tenantId,
+      input.jobId,
+      relativePath,
+    );
+    if (
+      !persisted ||
+      persisted.sha256 !== entry.sha256 ||
+      persisted.bytes !== entry.bytes ||
+      persisted.mime !== entry.mime ||
+      persisted.expiresAt !== entry.expiresAt
+    ) {
+      throw new Error("artifact replay conflicts with persisted manifest");
+    }
+    return persisted;
+  }
+
   get(
     tenantId: string,
     jobId: string,
@@ -681,6 +903,30 @@ export class ArtifactStore {
       throw new Error("artifact integrity validation failed");
     }
     return { ...stored, entry: { ...stored.entry }, bytes };
+  }
+
+  async verify(
+    tenantId: string,
+    jobId: string,
+    relativePath: string,
+  ): Promise<ArtifactEntry | null> {
+    const stored = this.get(tenantId, jobId, relativePath);
+    if (!stored) {
+      return null;
+    }
+    const inspected = await inspectArtifactFromSameHandle({
+      root: stored.root,
+      relativePath: stored.entry.relativePath,
+      manifest: [stored.entry],
+    });
+    if (
+      inspected.bytes !== stored.entry.bytes ||
+      inspected.sha256 !== stored.entry.sha256
+    ) {
+      throw new Error("artifact integrity validation failed");
+    }
+    assertArtifactMimeBytes(inspected.prefix, stored.entry.mime);
+    return { ...stored.entry };
   }
 
   async readBySha256(

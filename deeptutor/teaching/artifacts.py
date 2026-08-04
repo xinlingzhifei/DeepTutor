@@ -103,6 +103,19 @@ def source_upload_key(tenant_id: str, upload_id: str) -> str:
     return f"tenants/{tenant}/sources/{upload}/source.pdf"
 
 
+def export_input_key(
+    tenant_id: str,
+    export_id: str,
+    relative_name: str,
+) -> str:
+    """Derive one immutable, internal-only export input object key."""
+
+    tenant = _identifier(tenant_id, "tenant_id")
+    export = _identifier(export_id, "export_id")
+    name = _relative_name(relative_name)
+    return f"tenants/{tenant}/export-inputs/{export}/{name}"
+
+
 def tenant_artifact_prefix(tenant_id: str) -> str:
     """Return the sole object-store prefix assigned to a tenant."""
 

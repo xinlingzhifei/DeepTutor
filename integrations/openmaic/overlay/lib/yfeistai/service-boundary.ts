@@ -1,6 +1,7 @@
 import {
   type SignedServiceRequest,
   verifyServiceRequest,
+  verifyServiceRequestDigest,
 } from "./service-auth";
 
 export interface ServiceBoundaryDependencies {
@@ -53,6 +54,33 @@ export function authenticateServiceRequest(
     secret,
     nowSeconds: dependencies.nowSeconds?.() ?? Math.floor(Date.now() / 1_000),
     body,
+  });
+  return result.ok ? signed : null;
+}
+
+export function authenticatePrehashedServiceRequest(
+  request: Request,
+  dependencies: ServiceBoundaryDependencies,
+): SignedServiceRequest | null {
+  let secret: string;
+  try {
+    secret = dependencies.readSecret();
+  } catch {
+    return null;
+  }
+  const signed: SignedServiceRequest = {
+    method: request.method,
+    path: new URL(request.url).pathname,
+    tenantId: request.headers.get("x-yfeistai-tenant-id") ?? "",
+    jobId: request.headers.get("x-yfeistai-job-id") ?? "",
+    timestamp: Number(request.headers.get("x-yfeistai-timestamp")),
+    idempotencyKey: request.headers.get("x-yfeistai-idempotency-key") ?? "",
+    signature: request.headers.get("x-yfeistai-signature") ?? "",
+  };
+  const result = verifyServiceRequestDigest(signed, {
+    secret,
+    nowSeconds: dependencies.nowSeconds?.() ?? Math.floor(Date.now() / 1_000),
+    bodySha256: request.headers.get("x-yfeistai-content-sha256") ?? "",
   });
   return result.ok ? signed : null;
 }

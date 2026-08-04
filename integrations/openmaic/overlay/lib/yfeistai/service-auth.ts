@@ -44,6 +44,22 @@ export interface ServiceVerificationOptions {
   body: string | Uint8Array;
 }
 
+export interface ServiceDigestVerificationOptions {
+  secret: string;
+  nowSeconds: number;
+  bodySha256: string;
+}
+
+export interface ServiceRequestDigestParts {
+  method: string;
+  path: string;
+  tenantId: string;
+  jobId: string;
+  timestamp: number;
+  idempotencyKey?: string;
+  bodySha256: string;
+}
+
 function requireCanonicalLine(
   name: string,
   value: string,
@@ -107,7 +123,19 @@ function sha256Body(body: string | Uint8Array): string {
 }
 
 export function canonicalServiceRequest(input: ServiceRequestParts): string {
+  return canonicalServiceRequestDigest({
+    ...input,
+    bodySha256: sha256Body(input.body),
+  });
+}
+
+export function canonicalServiceRequestDigest(
+  input: ServiceRequestDigestParts,
+): string {
   const normalized = normalizeRequestParts(input);
+  if (!SHA256_HEX.test(input.bodySha256)) {
+    throw new Error("body digest must be a lowercase SHA-256 digest");
+  }
   const canonicalParts = [
     normalized.method,
     normalized.path,
@@ -115,7 +143,7 @@ export function canonicalServiceRequest(input: ServiceRequestParts): string {
     normalized.jobId,
     String(normalized.timestamp),
     normalized.idempotencyKey,
-    sha256Body(input.body),
+    input.bodySha256,
   ];
   return canonicalParts.join("\n");
 }
@@ -165,6 +193,48 @@ export function verifyServiceRequest(
     .digest();
   const received = Buffer.from(signed.signature, "hex");
 
+  return timingSafeEqual(expected, received)
+    ? { ok: true }
+    : { ok: false, reason: "signature" };
+}
+
+export function verifyServiceRequestDigest(
+  signed: SignedServiceRequest,
+  options: ServiceDigestVerificationOptions,
+): ServiceAuthResult {
+  let normalized;
+  try {
+    normalized = normalizeRequestParts({ ...signed, body: "" });
+    requireCanonicalLine("secret", options.secret);
+    normalizeTimestamp(options.nowSeconds);
+    if (!SHA256_HEX.test(options.bodySha256)) {
+      throw new Error("body digest is invalid");
+    }
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      error.message.toLowerCase().includes("idempotency")
+    ) {
+      return { ok: false, reason: "idempotency" };
+    }
+    return { ok: false, reason: "invalid" };
+  }
+  if (Math.abs(options.nowSeconds - normalized.timestamp) > MAX_CLOCK_SKEW_SECONDS) {
+    return { ok: false, reason: "expired" };
+  }
+  if (!SHA256_HEX.test(signed.signature)) {
+    return { ok: false, reason: "signature" };
+  }
+  const expected = createHmac("sha256", options.secret)
+    .update(
+      canonicalServiceRequestDigest({
+        ...normalized,
+        bodySha256: options.bodySha256,
+      }),
+      "utf8",
+    )
+    .digest();
+  const received = Buffer.from(signed.signature, "hex");
   return timingSafeEqual(expected, received)
     ? { ok: true }
     : { ok: false, reason: "signature" };

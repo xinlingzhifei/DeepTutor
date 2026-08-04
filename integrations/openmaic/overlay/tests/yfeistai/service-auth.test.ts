@@ -6,8 +6,10 @@ import { GET as getHealth } from "../../app/api/yfeistai/v1/health/route";
 import {
   SERVICE_SECRET_PATH,
   canonicalServiceRequest,
+  canonicalServiceRequestDigest,
   signServiceRequest,
   verifyServiceRequest,
+  verifyServiceRequestDigest,
 } from "../../lib/yfeistai/service-auth";
 
 const SECRET = "test-service-secret";
@@ -95,6 +97,45 @@ describe("yFeiSTAI service authentication", () => {
         body: BODY,
       }),
     ).toEqual({ ok: true });
+  });
+
+  test("authenticates a streamed request from its predeclared body digest", () => {
+    const bodySha256 = createHash("sha256").update("streamed-body").digest("hex");
+    const canonical = canonicalServiceRequestDigest({
+      method: "PUT",
+      path: "/api/yfeistai/v1/export-inputs/job-a/files/file-a",
+      tenantId: "tenant-a",
+      jobId: "job-a",
+      timestamp: NOW_SECONDS,
+      idempotencyKey: "idem-a",
+      bodySha256,
+    });
+    const signed = {
+      method: "PUT",
+      path: "/api/yfeistai/v1/export-inputs/job-a/files/file-a",
+      tenantId: "tenant-a",
+      jobId: "job-a",
+      timestamp: NOW_SECONDS,
+      idempotencyKey: "idem-a",
+      signature: createHmac("sha256", SECRET)
+        .update(canonical, "utf8")
+        .digest("hex"),
+    };
+
+    expect(
+      verifyServiceRequestDigest(signed, {
+        secret: SECRET,
+        nowSeconds: NOW_SECONDS,
+        bodySha256,
+      }),
+    ).toEqual({ ok: true });
+    expect(
+      verifyServiceRequestDigest(signed, {
+        secret: SECRET,
+        nowSeconds: NOW_SECONDS,
+        bodySha256: "f".repeat(64),
+      }),
+    ).toEqual({ ok: false, reason: "signature" });
   });
 
   test.each([

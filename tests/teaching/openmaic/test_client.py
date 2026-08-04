@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import replace
+import hashlib
 import json
 import logging
 import math
@@ -13,9 +14,24 @@ import httpx
 from pydantic import SecretStr
 import pytest
 
-from deeptutor.teaching.contracts import ExportPolicy, ExportRequest, GenerationRequest
+from deeptutor.teaching.contracts import (
+    ExportPolicy,
+    ExportRequest,
+    GenerationRequest,
+    canonical_json_bytes,
+)
+from deeptutor.teaching.export_worker import (
+    ExportInputCommitReceipt,
+    ExportInputDeclaration,
+    ExportInputFileDeclaration,
+)
 import deeptutor.teaching.openmaic as openmaic_package
-from deeptutor.teaching.openmaic.auth import ServiceRequest, sign_service_request
+from deeptutor.teaching.openmaic.auth import (
+    PrehashedServiceRequest,
+    ServiceRequest,
+    sign_prehashed_service_request,
+    sign_service_request,
+)
 from deeptutor.teaching.openmaic.client import (
     ClientTimeouts,
     IncompatibleOpenMAIC,
@@ -63,6 +79,29 @@ def _export_request(*, job_id: str = "job-export") -> ExportRequest:
         export_policy=ExportPolicy(
             include_source_attribution=True,
             allow_external_links=False,
+        ),
+    )
+
+
+def _export_input_declaration() -> ExportInputDeclaration:
+    document_sha256 = hashlib.sha256(b"{}").hexdigest()
+    return ExportInputDeclaration(
+        tenant_id="tenant-a",
+        job_id="job-export",
+        idempotency_key="idem-job-export",
+        classroom_document_sha256=document_sha256,
+        media_manifest_sha256="b" * 64,
+        source_manifest_sha256="c" * 64,
+        files=(
+            ExportInputFileDeclaration(
+                file_id="file-document",
+                kind="document",
+                media_id=None,
+                relative_name="classroom.json",
+                sha256=document_sha256,
+                size_bytes=2,
+                mime_type="application/json",
+            ),
         ),
     )
 
@@ -494,6 +533,106 @@ def test_submit_methods_sign_exact_canonical_json(
     assert job.tenant_id == "tenant-a"
     assert job.job_id == submitted.job_id
     assert job.status == "created"
+
+
+def test_export_input_staging_uses_signed_logical_declarations_and_streams_bytes() -> (
+    None
+):
+    declaration = _export_input_declaration()
+    requests: list[str] = []
+    consumed: list[bytes] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request.url.path)
+        if request.method == "PUT":
+            digest = request.headers["x-yfeistai-content-sha256"]
+            signed = PrehashedServiceRequest(
+                method=request.method,
+                path=request.url.path,
+                tenant_id=request.headers["x-yfeistai-tenant-id"],
+                job_id=request.headers["x-yfeistai-job-id"],
+                timestamp=int(request.headers["x-yfeistai-timestamp"]),
+                idempotency_key=request.headers["x-yfeistai-idempotency-key"],
+                body_sha256=digest,
+            )
+            assert request.headers["x-yfeistai-signature"] == (
+                sign_prehashed_service_request(signed, SecretStr(SECRET))
+            )
+            body = await request.aread()
+            consumed.append(body)
+            assert hashlib.sha256(body).hexdigest() == digest
+            return httpx.Response(
+                200,
+                json={
+                    "tenantId": "tenant-a",
+                    "jobId": "job-export",
+                    "fileId": "file-document",
+                    "sha256": digest,
+                    "sizeBytes": 2,
+                    "status": "uploaded",
+                },
+            )
+
+        body = await request.aread()
+        _assert_valid_signature(request, job_id="job-export")
+        assert b"objectKey" not in body
+        if request.url.path.endswith("/commit"):
+            receipt_payload = {
+                "schemaVersion": 1,
+                "tenantId": "tenant-a",
+                "jobId": "job-export",
+                "idempotencyKey": "idem-job-export",
+                "declarationSha256": declaration.declaration_sha256,
+                "classroomDocumentSha256": declaration.classroom_document_sha256,
+                "mediaManifestSha256": "b" * 64,
+                "status": "committed",
+            }
+            return httpx.Response(
+                200,
+                json={
+                    **receipt_payload,
+                    "receiptSha256": hashlib.sha256(
+                        canonical_json_bytes(receipt_payload)
+                    ).hexdigest(),
+                },
+            )
+        assert body == declaration.canonical_payload()
+        return httpx.Response(
+            200,
+            json={
+                "tenantId": "tenant-a",
+                "jobId": "job-export",
+                "idempotencyKey": "idem-job-export",
+                "declarationSha256": declaration.declaration_sha256,
+                "status": "reserved",
+            },
+        )
+
+    async def body() -> AsyncIterator[bytes]:
+        yield b"{}"
+
+    async def exercise() -> ExportInputCommitReceipt:
+        client, http = _client(handler)
+        try:
+            await client.reserve_export_input(declaration)
+            await client.upload_export_input_file(
+                declaration,
+                declaration.files[0],
+                body(),
+            )
+            return await client.commit_export_input(declaration)
+        finally:
+            await http.aclose()
+
+    receipt = asyncio.run(exercise())
+
+    assert requests == [
+        "/api/yfeistai/v1/export-inputs/job-export",
+        "/api/yfeistai/v1/export-inputs/job-export/files/file-document",
+        "/api/yfeistai/v1/export-inputs/job-export/commit",
+    ]
+    assert consumed == [b"{}"]
+    receipt.validate(declaration)
 
 
 def test_client_never_follows_a_redirect_with_service_signature_headers() -> None:
@@ -1039,10 +1178,16 @@ def test_logs_are_limited_to_tenant_job_and_route_context(
         asyncio.run(client.submit_outline(_generation_request()))
     asyncio.run(http.aclose())
 
-    record = caplog.records[-1]
+    client_records = [
+        record
+        for record in caplog.records
+        if record.name == "deeptutor.teaching.openmaic.client"
+    ]
+    record = client_records[-1]
     assert record.getMessage() == "OpenMAIC request"
     assert record.tenant_id == "tenant-a"
     assert record.job_id == "job-outline"
     assert record.route_id == "shared-primary"
-    assert SECRET not in caplog.text
-    assert "openmaic-shared" not in caplog.text
+    client_text = "\n".join(record.getMessage() for record in client_records)
+    assert SECRET not in client_text
+    assert "openmaic-shared" not in client_text

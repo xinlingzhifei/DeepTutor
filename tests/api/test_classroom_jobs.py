@@ -11,8 +11,10 @@ from fastapi.testclient import TestClient
 import pytest
 
 from deeptutor.api.routers import auth as auth_router
+from deeptutor.api.routers import classroom_exports as exports_router
 from deeptutor.api.routers import classroom_jobs as jobs_router
 from deeptutor.teaching.contracts import (
+    ExportRequest,
     GenerationRequest,
     TeachingBrief,
     canonical_json_bytes,
@@ -23,6 +25,7 @@ from deeptutor.teaching.object_store import ObjectStoreConfigurationError
 from deeptutor.teaching.openmaic.data_planes import DataPlaneSelection, DataPlaneUnavailable
 from deeptutor.teaching.permissions import ResourceScope, permissions_for_roles
 from deeptutor.teaching.repositories.jobs import GenerationJobRecord
+from deeptutor.teaching.services.exports import ExportRecord
 from deeptutor.teaching.tenant_context import TenantContext, require_tenant
 from tests.teaching.test_contracts import (
     valid_generation_request,
@@ -375,6 +378,54 @@ class FakeStores:
         return self.store
 
 
+class FakeExportService:
+    def __init__(self, repository: FakeRepository) -> None:
+        self.repository = repository
+
+    async def get(self, context: TenantContext, export_id: str):
+        details = await self.repository.get_job_details(context.tenant_id, export_id)
+        if (
+            details is None
+            or details.job_kind != "export"
+            or details.owner_id != context.user_id
+        ):
+            return None
+        request = ExportRequest.model_validate_json(details.request_payload)
+        artifact = await self.repository.get_export_artifact(
+            context.tenant_id,
+            export_id,
+        )
+        return ExportRecord(
+            tenant_id=details.tenant_id,
+            export_id=details.job_id,
+            job_id=details.job_id,
+            idempotency_key=details.idempotency_key,
+            request_sha256=details.request_sha256,
+            created_by=details.actor_id,
+            owner_id=details.owner_id,
+            course_id=details.resource_course_id,
+            class_id=details.resource_class_id,
+            asset_id="fixture-asset",
+            export_format=request.format,
+            classroom_draft_id=None,
+            classroom_version_id="fixture-version",
+            draft_revision=None,
+            input_document_sha256=request.classroom_document_sha256,
+            input_media_manifest_sha256=request.media_manifest_sha256,
+            status=details.status,
+            progress_percent=details.progress_percent,
+            waiting_reason=details.waiting_reason,
+            error_category=details.error_category,
+            error_code=details.error_code,
+            retry_of_job_id=details.retry_of_job_id,
+            relative_name=artifact.relative_name if artifact is not None else None,
+            object_key=artifact.object_key if artifact is not None else None,
+            sha256="a" * 64 if artifact is not None else None,
+            size_bytes=15 if artifact is not None else None,
+            mime_type=artifact.mime_type if artifact is not None else None,
+        )
+
+
 @pytest.fixture
 def api_harness():
     FakeSelector.resolve_calls = []
@@ -384,14 +435,17 @@ def api_harness():
     stores = FakeStores(store)
     app = FastAPI()
     app.include_router(jobs_router.router, prefix="/api/v1")
+    app.include_router(exports_router.router, prefix="/api/v1")
     app.dependency_overrides[jobs_router.get_job_repository] = lambda: repository
     app.dependency_overrides[jobs_router.get_data_plane_selector] = FakeSelector
     app.dependency_overrides[jobs_router.get_trusted_teaching_brief_resolver] = lambda: (
         FakeTrustedTeachingBriefResolver()
     )
     app.dependency_overrides[jobs_router.get_cancellation_gateway] = lambda: cancellation
-    app.dependency_overrides[jobs_router.get_download_store_provider] = lambda: stores
-    app.dependency_overrides[jobs_router.get_public_download_origins] = lambda: frozenset()
+    app.dependency_overrides[exports_router.get_classroom_export_service] = (
+        lambda: FakeExportService(repository)
+    )
+    app.dependency_overrides[exports_router.get_export_store_provider] = lambda: stores
     app.dependency_overrides[auth_router.require_platform_enabled] = lambda: None
     app.dependency_overrides[require_tenant] = lambda: _context("teacher-1", "teacher")
     return app, repository, cancellation, stores, store
@@ -1165,7 +1219,7 @@ def test_export_download_streams_by_default_and_hides_internal_object_key(
     assert object_key not in download_response.text
 
 
-def test_export_download_redirects_only_to_an_allowlisted_public_https_origin(
+def test_export_download_never_redirects_to_object_storage(
     api_harness,
 ) -> None:
     app, repository, _cancellation, _stores, store = api_harness
@@ -1179,22 +1233,19 @@ def test_export_download_redirects_only_to_an_allowlisted_public_https_origin(
         result_ref=object_key,
         export_format="pptx",
     )
-    app.dependency_overrides[jobs_router.get_public_download_origins] = lambda: frozenset(
-        {"https://signed.example"}
-    )
-
     response = TestClient(app).get(
         "/api/v1/classroom-exports/export-public/download",
         follow_redirects=False,
     )
 
-    assert response.status_code == 307
-    assert response.headers["location"] == "https://signed.example/download-token"
-    assert store.presign_calls == [(object_key, 60)]
-    assert store.open_calls == []
+    assert response.status_code == 200
+    assert "location" not in response.headers
+    assert response.content == b"verified-export"
+    assert store.presign_calls == []
+    assert store.open_calls == [object_key]
 
 
-def test_export_download_streams_when_signed_url_is_not_public_https(
+def test_export_download_does_not_request_a_signed_url(
     api_harness,
 ) -> None:
     app, repository, _cancellation, _stores, store = api_harness
@@ -1214,15 +1265,11 @@ def test_export_download_streams_when_signed_url_is_not_public_https(
         return "http://minio:9000/private-download-token"
 
     store.presign_download = internal_presign
-    app.dependency_overrides[jobs_router.get_public_download_origins] = lambda: frozenset(
-        {"https://downloads.example"}
-    )
-
     response = TestClient(app).get("/api/v1/classroom-exports/export-http/download")
 
     assert response.status_code == 200
     assert response.content == b"verified-export"
-    assert store.presign_calls == [(object_key, 60)]
+    assert store.presign_calls == []
     assert store.open_calls == [object_key]
 
 

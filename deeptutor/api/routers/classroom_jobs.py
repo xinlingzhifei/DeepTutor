@@ -6,12 +6,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import hmac
-from pathlib import PurePosixPath
 from typing import Any, Literal, Protocol
-from urllib.parse import quote, urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.responses import RedirectResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from deeptutor.api.routers.auth import require_platform_enabled
@@ -33,11 +30,6 @@ from deeptutor.teaching.contracts import (
 )
 from deeptutor.teaching.job_route_binding import DataPlaneBindingUnavailable
 from deeptutor.teaching.models.jobs import TERMINAL_JOB_STATUSES
-from deeptutor.teaching.object_store import (
-    ClassroomArtifactStore,
-    ObjectStoreConfigurationError,
-    ObjectStoreNotFound,
-)
 from deeptutor.teaching.openmaic.auth import ServiceSecretUnavailable
 from deeptutor.teaching.openmaic.client import OpenMAICError
 from deeptutor.teaching.openmaic.data_planes import (
@@ -61,7 +53,6 @@ from deeptutor.teaching.scheduler import PRIORITY_RANK
 from deeptutor.teaching.tenant_context import TenantContext, require_tenant
 
 router = APIRouter(dependencies=[Depends(require_platform_enabled)])
-_DOWNLOAD_TTL_SECONDS = 60
 
 
 def _to_camel(value: str) -> str:
@@ -198,10 +189,6 @@ class JobCancellationGateway(Protocol):
     async def cancel(self, request: CancellationRequest) -> None: ...
 
 
-class DownloadStoreProvider(Protocol):
-    async def store_for_tenant(self, tenant_id: str) -> ClassroomArtifactStore: ...
-
-
 def get_job_repository() -> SqlAlchemyGenerationJobRepository:
     return SqlAlchemyGenerationJobRepository()
 
@@ -221,31 +208,6 @@ def get_cancellation_gateway() -> JobCancellationGateway:
     from deeptutor.teaching.processes import RuntimeCancellationGateway
 
     return RuntimeCancellationGateway(load_platform_settings())
-
-
-def get_download_store_provider() -> DownloadStoreProvider:
-    from deeptutor.teaching.processes import RuntimeStoreProvider
-
-    return RuntimeStoreProvider(load_platform_settings())
-
-
-def _public_https_origin(value: str) -> str | None:
-    parsed = urlsplit(value)
-    if (
-        parsed.scheme != "https"
-        or not parsed.hostname
-        or parsed.username is not None
-        or parsed.password is not None
-    ):
-        return None
-    return f"https://{parsed.netloc.lower()}"
-
-
-def get_public_download_origins() -> frozenset[str]:
-    origins = load_platform_settings().object_store_public_download_origins
-    return frozenset(
-        origin for value in origins if (origin := _public_https_origin(value)) is not None
-    )
 
 
 def _server_job_id(tenant_id: str, idempotency_key: str) -> str:
@@ -787,74 +749,12 @@ async def retry_job(
     return _response(updated)
 
 
-@router.get("/classroom-exports/{job_id}", response_model=JobStatusResponse)
-async def get_classroom_export(
-    job_id: str,
-    context: TenantContext = Depends(require_tenant),
-    repository: SqlAlchemyGenerationJobRepository = Depends(get_job_repository),
-) -> JobStatusResponse:
-    details = await _authorized_job(repository, context, job_id)
-    if details.job_kind != "export":
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Export not found")
-    return _response(details)
-
-
-@router.get("/classroom-exports/{job_id}/download")
-async def download_classroom_export(
-    job_id: str,
-    context: TenantContext = Depends(require_tenant),
-    repository: SqlAlchemyGenerationJobRepository = Depends(get_job_repository),
-    stores: DownloadStoreProvider = Depends(get_download_store_provider),
-    public_download_origins: frozenset[str] = Depends(get_public_download_origins),
-):
-    details = await _authorized_job(repository, context, job_id)
-    if details.job_kind != "export":
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Export not found")
-    if details.status != "succeeded":
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Export is not ready")
-    artifact = await repository.get_export_artifact(context.tenant_id, job_id)
-    if artifact is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Export not found")
-    store = await stores.store_for_tenant(context.tenant_id)
-    if public_download_origins:
-        try:
-            signed_url = await store.presign_download(
-                artifact.object_key,
-                _DOWNLOAD_TTL_SECONDS,
-            )
-        except ObjectStoreConfigurationError:
-            pass
-        except ObjectStoreNotFound:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Export not found",
-            ) from None
-        else:
-            if _public_https_origin(signed_url) in public_download_origins:
-                return RedirectResponse(
-                    signed_url,
-                    status_code=status.HTTP_307_TEMPORARY_REDIRECT,
-                )
-    try:
-        stream = await store.open(artifact.object_key)
-    except ObjectStoreNotFound:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Export not found")
-    filename = quote(PurePosixPath(artifact.relative_name).name, safe="")
-    return StreamingResponse(
-        stream,
-        media_type=artifact.mime_type,
-        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"},
-    )
-
-
 __all__ = [
     "TrustedTeachingBrief",
     "TrustedTeachingBriefResolver",
     "get_cancellation_gateway",
     "get_data_plane_selector",
-    "get_download_store_provider",
     "get_job_repository",
-    "get_public_download_origins",
     "get_trusted_teaching_brief_resolver",
     "router",
 ]

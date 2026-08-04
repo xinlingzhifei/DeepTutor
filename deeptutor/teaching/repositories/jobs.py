@@ -12,6 +12,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from deeptutor.teaching.contracts import ExportRequest, canonical_json_bytes
 from deeptutor.teaching.database import get_platform_engine
 from deeptutor.teaching.job_errors import retry_delay_seconds
 from deeptutor.teaching.job_route_binding import (
@@ -19,7 +20,11 @@ from deeptutor.teaching.job_route_binding import (
     lock_active_job_binding,
 )
 from deeptutor.teaching.models import Tenant
-from deeptutor.teaching.models.classrooms import ClassroomAsset, ClassroomDraft
+from deeptutor.teaching.models.classrooms import (
+    ClassroomAsset,
+    ClassroomDraft,
+    ClassroomExport,
+)
 from deeptutor.teaching.models.jobs import (
     LEASED_JOB_STATUSES,
     TERMINAL_JOB_STATUSES,
@@ -365,6 +370,12 @@ class ExportArtifactRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class ExportInputLocation:
+    manifest_object_key: str
+    manifest_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
 class ClaimedJobPayload:
     request_payload: str
     request_sha256: str
@@ -530,6 +541,90 @@ class SqlAlchemyGenerationJobRepository:
         self,
         request: GenerationJobRequest,
     ) -> GenerationJobRecord:
+        return await self._create_job_and_reserve(request, export_id=None)
+
+    async def create_export_job_and_reserve(
+        self,
+        request: GenerationJobRequest,
+        *,
+        export_id: str,
+    ) -> GenerationJobRecord:
+        if request.job_kind != "export" or request.phase != "export":
+            raise ValueError("classroom export binding requires an export job")
+        _required(export_id, "export_id", 128)
+        return await self._create_job_and_reserve(request, export_id=export_id)
+
+    @staticmethod
+    async def _bind_export_job(
+        session: AsyncSession,
+        request: GenerationJobRequest,
+        export_id: str,
+    ) -> None:
+        exported = await session.scalar(
+            select(ClassroomExport)
+            .where(
+                ClassroomExport.id == export_id,
+                ClassroomExport.tenant_id == request.tenant_id,
+                ClassroomExport.classroom_id.is_not(None),
+            )
+            .with_for_update()
+        )
+        if (
+            exported is None
+            or exported.input_manifest_object_key is None
+            or exported.input_manifest_sha256 is None
+            or exported.export_format != request.export_format
+            or exported.input_document_sha256 is None
+            or exported.input_media_manifest_sha256 is None
+        ):
+            raise ValueError("classroom export input is not ready")
+        try:
+            raw_payload = json.loads(request.request_payload)
+            export_request = ExportRequest.model_validate(raw_payload)
+        except (ValueError, TypeError):
+            raise ValueError("classroom export request payload is invalid") from None
+        if (
+            canonical_json_bytes(export_request).decode("utf-8")
+            != request.request_payload
+            or hashlib.sha256(request.request_payload.encode("utf-8")).hexdigest()
+            != request.request_sha256
+            or export_request.tenant_id != request.tenant_id
+            or export_request.job_id != request.job_id
+            or export_request.job_id != exported.id
+            or export_request.idempotency_key != request.idempotency_key
+            or export_request.idempotency_key != exported.id
+            or export_request.classroom_document_sha256
+            != exported.input_document_sha256
+            or export_request.media_manifest_sha256
+            != exported.input_media_manifest_sha256
+            or export_request.format != exported.export_format
+        ):
+            raise ValueError("classroom export request does not match its pins")
+        if exported.generation_job_id not in {None, request.job_id}:
+            raise IdempotencyConflict()
+        if exported.generation_job_id is None:
+            if exported.status != "input_ready":
+                raise ValueError("classroom export cannot bind a job")
+            exported.generation_job_id = request.job_id
+            exported.status = "quota_reserved"
+        elif exported.status not in {
+            "quota_reserved",
+            "queued",
+            "exporting",
+            "validating",
+            "materializing",
+            "ready",
+            "failed",
+            "canceled",
+        }:
+            raise ValueError("classroom export job binding is invalid")
+
+    async def _create_job_and_reserve(
+        self,
+        request: GenerationJobRequest,
+        *,
+        export_id: str | None,
+    ) -> GenerationJobRecord:
         session_factory = self._session_factory(request.tenant_id)
         async with session_factory() as session:
             async with session.begin():
@@ -558,6 +653,8 @@ class SqlAlchemyGenerationJobRepository:
                 if existing is not None:
                     if not self._matches_idempotent_request(existing, request):
                         raise IdempotencyConflict()
+                    if export_id is not None:
+                        await self._bind_export_job(session, request, export_id)
                     return self._record(existing)
                 if not await lock_active_job_binding(
                     session,
@@ -647,6 +744,8 @@ class SqlAlchemyGenerationJobRepository:
                         available_at=now,
                     )
                 )
+                if export_id is not None:
+                    await self._bind_export_job(session, request, export_id)
                 await session.flush()
                 return GenerationJobRecord(
                     tenant_id=request.tenant_id,
@@ -946,6 +1045,31 @@ class SqlAlchemyGenerationJobRepository:
                 relative_name=artifact.relative_name,
                 object_key=artifact.object_key,
                 mime_type=artifact.mime_type,
+            )
+
+    async def get_export_input_location(
+        self,
+        tenant_id: str,
+        job_id: str,
+    ) -> ExportInputLocation | None:
+        session_factory = self._session_factory(tenant_id)
+        async with session_factory() as session:
+            exported = await session.scalar(
+                select(ClassroomExport).where(
+                    ClassroomExport.tenant_id == tenant_id,
+                    ClassroomExport.generation_job_id == job_id,
+                    ClassroomExport.classroom_id.is_not(None),
+                )
+            )
+            if (
+                exported is None
+                or exported.input_manifest_object_key is None
+                or exported.input_manifest_sha256 is None
+            ):
+                return None
+            return ExportInputLocation(
+                manifest_object_key=exported.input_manifest_object_key,
+                manifest_sha256=exported.input_manifest_sha256,
             )
 
     @staticmethod
@@ -1667,24 +1791,32 @@ class SqlAlchemyGenerationJobRepository:
                     or state.manifest_sha256 != manifest_sha256
                 ):
                     raise ValueError("object publication is not durably committed")
-                source_version = await session.scalar(
-                    select(ClassroomVersion)
+                exported = await session.scalar(
+                    select(ClassroomExport)
                     .where(
-                        ClassroomVersion.tenant_id == claim.tenant_id,
-                        ClassroomVersion.document_sha256 == input_document_sha256,
-                        ClassroomVersion.media_manifest_sha256 == input_media_manifest_sha256,
+                        ClassroomExport.tenant_id == claim.tenant_id,
+                        ClassroomExport.generation_job_id == claim.job_id,
+                        ClassroomExport.classroom_id.is_not(None),
                     )
-                    .order_by(ClassroomVersion.version_number.desc())
-                    .limit(1)
+                    .with_for_update()
                 )
-                if source_version is None:
-                    raise ValueError("pinned classroom version is unavailable")
+                if (
+                    exported is None
+                    or exported.status != "quota_reserved"
+                    or exported.input_document_sha256 != input_document_sha256
+                    or exported.input_media_manifest_sha256
+                    != input_media_manifest_sha256
+                    or exported.export_format != job.export_format
+                    or exported.input_manifest_object_key is None
+                    or exported.input_manifest_sha256 is None
+                ):
+                    raise ValueError("pinned classroom export is unavailable")
                 session.add(
                     ClassroomArtifact(
                         id=_artifact_id(claim.job_id, artifact.relative_name),
                         tenant_id=claim.tenant_id,
                         source_job_id=claim.job_id,
-                        classroom_version_id=source_version.id,
+                        classroom_version_id=exported.classroom_version_id,
                         artifact_kind="export",
                         relative_name=artifact.relative_name,
                         object_key=artifact.object_key,
@@ -1695,6 +1827,13 @@ class SqlAlchemyGenerationJobRepository:
                         input_media_manifest_sha256=input_media_manifest_sha256,
                     )
                 )
+                exported.relative_name = artifact.relative_name
+                exported.object_key = artifact.object_key
+                exported.sha256 = artifact.sha256
+                exported.size_bytes = artifact.size_bytes
+                exported.mime_type = artifact.mime_type
+                exported.status = "ready"
+                exported.updated_at = now
                 session.add(
                     QuotaLedger(
                         id=_quota_event_id("settle", job.id),
