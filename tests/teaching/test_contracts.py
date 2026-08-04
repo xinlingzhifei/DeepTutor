@@ -287,7 +287,9 @@ def valid_classroom_document() -> dict[str, object]:
                 "mime_type": "audio/mpeg",
                 "sha256": SHA256,
                 "size_bytes": 128,
-                "temporary_download_path": "downloads/media/voice.mp3",
+                "temporary_download_path": (
+                    "/api/yfeistai/v1/artifacts/content-job-1/media/voice.mp3"
+                ),
                 "expires_at": GENERATED_AT,
             }
         ],
@@ -299,7 +301,9 @@ def valid_classroom_document() -> dict[str, object]:
                 "sha256": OTHER_SHA256,
                 "size_bytes": 256,
                 "mime_type": "application/zip",
-                "temporary_download_path": "downloads/exports/classroom.zip",
+                "temporary_download_path": (
+                    "/api/yfeistai/v1/artifacts/content-job-1/exports/classroom.zip"
+                ),
                 "expires_at": GENERATED_AT,
             }
         ],

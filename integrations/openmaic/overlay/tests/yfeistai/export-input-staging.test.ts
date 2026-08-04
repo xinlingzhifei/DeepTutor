@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -7,11 +7,13 @@ import { describe, expect, test } from "vitest";
 
 import { ArtifactStore } from "../../lib/yfeistai/artifact-manifest";
 import { ContentOutputRegistry } from "../../lib/yfeistai/content-generation";
+import { durableFile } from "../../lib/yfeistai/durable-state";
 import {
   ExportInputStagingStore,
   type ExportInputDeclaration,
 } from "../../lib/yfeistai/export-input-staging";
 import { canonicalJson } from "../../lib/yfeistai/outline-generation";
+import type { PortableClassroomDocument } from "../../lib/yfeistai/portable-classroom";
 
 function sha256(value: string | Uint8Array): string {
   return createHash("sha256").update(value).digest("hex");
@@ -161,8 +163,141 @@ describe("export input staging", () => {
         declaration.tenantId,
         declaration.classroomDocumentSha256,
         declaration.mediaManifestSha256,
+        declaration.jobId,
       ),
     ).toMatchObject({ sourceJobId: declaration.jobId });
+  });
+
+  test("binds the same immutable input to independent export jobs", async () => {
+    const { outputs, staging } = stores();
+    const first = fixture("export-job-first");
+    const second = fixture("export-job-second");
+
+    for (const current of [first, second]) {
+      const reservation = staging.reserve(current.declaration);
+      await staging.upload(
+        current.declaration.tenantId,
+        current.declaration.jobId,
+        current.declaration.idempotencyKey,
+        current.declaration.files[0].fileId,
+        current.declaration.files[0].mimeType,
+        chunks(current.body),
+      );
+      await staging.commit(
+        current.declaration.tenantId,
+        current.declaration.jobId,
+        current.declaration.idempotencyKey,
+        reservation.declarationSha256,
+      );
+    }
+
+    expect(
+      outputs.resolve(
+        first.declaration.tenantId,
+        first.declaration.classroomDocumentSha256,
+        first.declaration.mediaManifestSha256,
+        first.declaration.jobId,
+      ),
+    ).toMatchObject({ sourceJobId: first.declaration.jobId });
+    expect(
+      outputs.resolve(
+        second.declaration.tenantId,
+        second.declaration.classroomDocumentSha256,
+        second.declaration.mediaManifestSha256,
+        second.declaration.jobId,
+      ),
+    ).toMatchObject({ sourceJobId: second.declaration.jobId });
+  });
+
+  test("does not conflict with the generation registry for the same hashes", async () => {
+    const { outputs, staging } = stores();
+    const current = fixture("export-job-after-generation");
+    const generated = classroomDocument() as unknown as PortableClassroomDocument;
+    outputs.registerPayload(
+      current.declaration.tenantId,
+      generated,
+      generated.mediaManifest,
+      "generation-job",
+    );
+    const reservation = staging.reserve(current.declaration);
+    await staging.upload(
+      current.declaration.tenantId,
+      current.declaration.jobId,
+      current.declaration.idempotencyKey,
+      current.declaration.files[0].fileId,
+      current.declaration.files[0].mimeType,
+      chunks(current.body),
+    );
+
+    await staging.commit(
+      current.declaration.tenantId,
+      current.declaration.jobId,
+      current.declaration.idempotencyKey,
+      reservation.declarationSha256,
+    );
+
+    expect(
+      outputs.resolve(
+        current.declaration.tenantId,
+        current.declaration.classroomDocumentSha256,
+        current.declaration.mediaManifestSha256,
+      ),
+    ).toMatchObject({ sourceJobId: "generation-job" });
+    expect(
+      outputs.resolve(
+        current.declaration.tenantId,
+        current.declaration.classroomDocumentSha256,
+        current.declaration.mediaManifestSha256,
+        current.declaration.jobId,
+      ),
+    ).toMatchObject({ sourceJobId: current.declaration.jobId });
+    expect(
+      outputs.resolve(
+        current.declaration.tenantId,
+        current.declaration.classroomDocumentSha256,
+        current.declaration.mediaManifestSha256,
+        "other-export-job",
+      ),
+    ).toBeNull();
+  });
+
+  test("rejects a bound record whose media source job was tampered", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "export-input-binding-"));
+    const outputs = new ContentOutputRegistry(root);
+    const document = classroomDocument() as unknown as PortableClassroomDocument;
+    const hashes = outputs.registerPayload(
+      "tenant-a",
+      document,
+      document.mediaManifest,
+      "export-job-a",
+      "export-job-a",
+    );
+    const target = durableFile(
+      root,
+      "content-outputs",
+      "payloads",
+      [
+        "tenant-a",
+        hashes.classroomDocumentSha256,
+        hashes.mediaManifestSha256,
+        "export-job-a",
+      ],
+      "payload.json",
+    );
+    const record = JSON.parse(readFileSync(target, "utf8")) as {
+      output: { sourceJobId: string };
+    };
+    record.output.sourceJobId = "other-export-job";
+    writeFileSync(target, canonicalJson(record), "utf8");
+
+    expect(() =>
+      outputs.resolve(
+        "tenant-a",
+        hashes.classroomDocumentSha256,
+        hashes.mediaManifestSha256,
+        "export-job-a",
+      ),
+    ).toThrow(/integrity/i);
   });
 
   test("rejects mismatched streamed bytes without publishing an input", async () => {
@@ -187,8 +322,8 @@ describe("export input staging", () => {
         declaration.tenantId,
         declaration.classroomDocumentSha256,
         declaration.mediaManifestSha256,
+        declaration.jobId,
       ),
     ).toBeNull();
   });
 });
-

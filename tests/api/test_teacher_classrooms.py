@@ -25,6 +25,7 @@ def _canonical_document(
     canvas: dict[str, object] | None = None,
     html: str | None = None,
     media_id: str | None = None,
+    media_download_path: str | None = None,
 ) -> dict[str, object]:
     payload = valid_classroom_document()
     payload["export_manifest"] = []
@@ -51,7 +52,10 @@ def _canonical_document(
             media_id=media_id,
             relative_path=f"media/{media_id}.png",
             mime_type="image/png",
-            temporary_download_path=f"downloads/media/{media_id}.png",
+            temporary_download_path=(
+                media_download_path
+                or f"/api/yfeistai/v1/artifacts/job-a/media/{media_id}.png"
+            ),
         )
     provisional = ClassroomDocument.model_validate(payload)
     unhashed = provisional.model_dump(mode="json", by_alias=True, exclude_none=True)
@@ -490,6 +494,31 @@ def test_unused_media_manifest_item_is_rejected() -> None:
     document = _canonical_document(media_id=media_id)
 
     with pytest.raises(InvalidDraftDocument, match="match referenced media exactly"):
+        validate_draft_document_references(
+            document,
+            available_media_bindings=(_media_binding(document),),
+        )
+
+
+@pytest.mark.parametrize(
+    "download_path",
+    [
+        "foo/bar",
+        "/api/yfeistai/v1/artifacts/job-a/media/other.png",
+        "/api/yfeistai/v1/artifacts/job-a/media%2Fmedia-a.png",
+    ],
+)
+def test_media_manifest_requires_controlled_path_bound_to_relative_path(
+    download_path: str,
+) -> None:
+    media_id = "media-0123456789abcdef0123456789abcdef"
+    document = _canonical_document(
+        canvas={"thumbnailMediaId": media_id},
+        media_id=media_id,
+        media_download_path=download_path,
+    )
+
+    with pytest.raises(InvalidDraftDocument, match="controlled artifact path"):
         validate_draft_document_references(
             document,
             available_media_bindings=(_media_binding(document),),

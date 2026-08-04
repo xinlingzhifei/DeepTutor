@@ -71,7 +71,13 @@ class _StoreProvider:
         return self.store
 
 
-def _document(media: bytes, *, download_path: str = "downloads/media/voice.mp3") -> bytes:
+def _document(
+    media: bytes,
+    *,
+    download_path: str = (
+        "/api/yfeistai/v1/artifacts/content-job-a/media/voice.mp3"
+    ),
+) -> bytes:
     payload = valid_classroom_document()
     payload["classroom_id"] = "asset-a"
     payload["classroom_version_id"] = "source-version-a"
@@ -145,7 +151,10 @@ def _source(document: bytes, *, kind: str, object_key: str, ownership=None, revi
 def test_media_manifest_hash_covers_exact_canonical_document_manifest() -> None:
     media = b"ID3-media"
     first = _document(media)
-    second = _document(media, download_path="downloads/media/voice-reissued.mp3")
+    second = _document(
+        media,
+        download_path="/api/yfeistai/v1/artifacts/content-job-b/media/voice.mp3",
+    )
 
     assert publication_media_manifest_sha256(first) != publication_media_manifest_sha256(second)
 

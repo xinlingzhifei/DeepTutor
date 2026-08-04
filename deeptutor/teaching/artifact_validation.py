@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import hashlib
+from pathlib import PurePosixPath
 import re
 from typing import Any
 from urllib.parse import urlsplit
@@ -35,6 +36,15 @@ _NETWORK_RESOURCE = re.compile(
 )
 _MAX_ARTIFACT_BYTES = 512 * 1024 * 1024
 _MAX_TOTAL_BYTES = 1024 * 1024 * 1024
+_EXPORT_ARTIFACT_BINDINGS = {
+    "classroom_zip": (".zip", "application/zip"),
+    "pptx": (
+        ".pptx",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ),
+    "offline_html": (".html", "text/html"),
+    "mp4": (".mp4", "video/mp4"),
+}
 
 
 class ArtifactValidationError(ValueError):
@@ -151,10 +161,13 @@ def _parse_artifact(
         or not isinstance(download_path, str)
     ):
         raise ArtifactValidationError("artifact_invalid")
+    if re.fullmatch(r"[^\s/]+/[^\s;/]+(?:\s*;\s*[^\r\n]+)?", content_type) is None:
+        raise ArtifactValidationError("artifact_invalid")
+    normalized_content_type = content_type.split(";", 1)[0].strip().lower()
     try:
         entry = ArtifactManifestEntry(
             relative_name=relative_name,
-            content_type=content_type,
+            content_type=normalized_content_type,
             sha256=sha256,
             size=size,
         )
@@ -180,7 +193,7 @@ def _parse_artifact(
         relative_name=relative_name,
         sha256=sha256,
         size=size,
-        content_type=content_type,
+        content_type=normalized_content_type,
         download_path=download_path,
         expires_at=parsed_expiry,
     )
@@ -420,6 +433,12 @@ def validate_export_result(
         job_id=job_id,
         now=reference_time,
     )
+    expected_suffix, expected_content_type = _EXPORT_ARTIFACT_BINDINGS[request.format.value]
+    if (
+        PurePosixPath(artifact.relative_name).suffix.lower() != expected_suffix
+        or artifact.content_type != expected_content_type
+    ):
+        raise ArtifactValidationError("artifact_invalid")
     return ValidatedExportOutput(
         tenant_id=tenant_id,
         format=request.format.value,

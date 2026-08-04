@@ -1338,7 +1338,8 @@ describe("signed export routes", () => {
       input.tenantId,
       input.classroomDocument as unknown as PortableClassroomDocument,
       input.mediaManifest as PortableClassroomDocument["mediaManifest"],
-      "content-source-job",
+      input.jobId,
+      input.jobId,
     );
     const handler = createExportPostHandler({
       readSecret: () => "service-secret",

@@ -797,6 +797,12 @@ def verify_task6_staging(overlay_root: Path) -> None:
     boundary = _strip_javascript_comments(
         _read_text(overlay_root / "lib/yfeistai/service-boundary.ts")
     )
+    content = _strip_javascript_comments(
+        _read_text(overlay_root / "lib/yfeistai/content-generation.ts")
+    )
+    export = _strip_javascript_comments(
+        _read_text(overlay_root / "lib/yfeistai/export-generation.ts")
+    )
     reserve_route = _strip_javascript_comments(
         _read_text(
             overlay_root
@@ -846,6 +852,20 @@ def verify_task6_staging(overlay_root: Path) -> None:
         raise OverlayVerificationError(
             "export input receipt must be published after content registration"
         )
+    _require_tokens(
+        content,
+        "content-generation.ts job-bound export inputs",
+        (
+            "bindingJobId: string | null = null",
+            "bound content output must use its binding job as source",
+            "output.sourceJobId !== binding",
+        ),
+    )
+    _require_tokens(
+        export,
+        "export-generation.ts job-bound input resolution",
+        ("parsed.mediaManifestSha256,", "parsed.jobId,"),
+    )
     _require_tokens(
         artifact,
         "artifact-manifest.ts streamed staging",

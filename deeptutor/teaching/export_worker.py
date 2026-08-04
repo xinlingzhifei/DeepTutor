@@ -12,6 +12,11 @@ from deeptutor.teaching.artifacts import export_input_key
 from deeptutor.teaching.contracts import ExportRequest, canonical_json_bytes
 from deeptutor.teaching.openmaic.client import EngineJob
 
+MAX_EXPORT_DOCUMENT_BYTES = 8 * 1024 * 1024
+MAX_EXPORT_MEDIA_BYTES = 128 * 1024 * 1024
+MAX_EXPORT_TOTAL_BYTES = 512 * 1024 * 1024
+MAX_EXPORT_MEDIA_FILES = 256
+
 
 @dataclass(frozen=True, slots=True)
 class ExportInputSnapshot:
@@ -375,14 +380,14 @@ def export_input_declaration(
         )
         or bundle.document.relative_name != "classroom.json"
         or bundle.document.mime_type != "application/json"
-        or len(bundle.media) > 256
+        or len(bundle.media) > MAX_EXPORT_MEDIA_FILES
     ):
         raise ValueError("export input bundle does not match the pinned request")
     artifacts = (bundle.document, *bundle.media)
     if (
-        bundle.document.size_bytes > 8 * 1024 * 1024
-        or any(item.size_bytes > 128 * 1024 * 1024 for item in bundle.media)
-        or sum(item.size_bytes for item in artifacts) > 512 * 1024 * 1024
+        bundle.document.size_bytes > MAX_EXPORT_DOCUMENT_BYTES
+        or any(item.size_bytes > MAX_EXPORT_MEDIA_BYTES for item in bundle.media)
+        or sum(item.size_bytes for item in artifacts) > MAX_EXPORT_TOTAL_BYTES
         or len({item.relative_name for item in artifacts}) != len(artifacts)
     ):
         raise ValueError("export input bundle exceeds the staging limits")
@@ -446,6 +451,10 @@ __all__ = [
     "ExportInputDeclaration",
     "ExportInputFileDeclaration",
     "ExportInputSnapshot",
+    "MAX_EXPORT_DOCUMENT_BYTES",
+    "MAX_EXPORT_MEDIA_BYTES",
+    "MAX_EXPORT_MEDIA_FILES",
+    "MAX_EXPORT_TOTAL_BYTES",
     "export_input_declaration",
     "load_export_input_bundle",
     "stage_and_submit_pinned_export",

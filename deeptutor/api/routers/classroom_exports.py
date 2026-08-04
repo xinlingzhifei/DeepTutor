@@ -17,8 +17,11 @@ from deeptutor.teaching.database import get_platform_engine
 from deeptutor.teaching.job_route_binding import DataPlaneBindingUnavailable
 from deeptutor.teaching.object_store import (
     ClassroomArtifactStore,
+    ObjectStoreAccessDenied,
     ObjectStoreConfigurationError,
     ObjectStoreConflictError,
+    ObjectStoreError,
+    ObjectStoreIntegrityError,
     ObjectStoreNotFound,
 )
 from deeptutor.teaching.openmaic.data_planes import (
@@ -212,12 +215,13 @@ async def _create(operation) -> ExportStatusResponse:
         raise HTTPException(status_code=409, detail="Insufficient quota") from None
     except (InvalidExportInput, ValueError):
         raise HTTPException(status_code=422, detail="Export input is invalid") from None
-    except ObjectStoreNotFound:
+    except (ObjectStoreNotFound, ObjectStoreAccessDenied, ObjectStoreIntegrityError):
         raise HTTPException(status_code=409, detail="Export input is unavailable") from None
     except (
         DataPlaneBindingUnavailable,
         DataPlaneUnavailable,
         ObjectStoreConfigurationError,
+        ObjectStoreError,
         SQLAlchemyError,
     ):
         raise HTTPException(status_code=503, detail="Export service is unavailable") from None
@@ -333,8 +337,13 @@ async def download_classroom_export(
         ) from None
     try:
         stream = await store.open(record.object_key)
-    except ObjectStoreNotFound:
+    except (ObjectStoreNotFound, ObjectStoreAccessDenied):
         raise HTTPException(status_code=404, detail="Export not found") from None
+    except (ObjectStoreIntegrityError, ObjectStoreError):
+        raise HTTPException(
+            status_code=503,
+            detail="Export download is unavailable",
+        ) from None
     filename = quote(PurePosixPath(record.relative_name).name, safe="")
     return StreamingResponse(
         stream,

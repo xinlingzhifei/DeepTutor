@@ -126,7 +126,9 @@ def _canonical_document(
             mime_type="image/png",
             sha256=hashlib.sha256(media_body).hexdigest(),
             size_bytes=len(media_body),
-            temporary_download_path=f"downloads/media/{media_id}.png",
+            temporary_download_path=(
+                f"/api/yfeistai/v1/artifacts/content-job-a/media/{media_id}.png"
+            ),
         )
         canvas = scenes[0]["content"]["canvas"]
         canvas["mediaId"] = media_id

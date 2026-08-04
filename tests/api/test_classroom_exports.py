@@ -9,6 +9,11 @@ import pytest
 
 from deeptutor.api.routers import auth as auth_router
 from deeptutor.api.routers import classroom_exports as exports_router
+from deeptutor.teaching.object_store import (
+    ObjectStoreAccessDenied,
+    ObjectStoreError,
+    ObjectStoreIntegrityError,
+)
 from deeptutor.teaching.services.exports import (
     ExportPolicyDenied,
     ExportRecord,
@@ -68,6 +73,7 @@ class FakeService:
         self.version_calls: list[tuple[object, ...]] = []
         self.policy_denied = False
         self.hidden = False
+        self.create_error: Exception | None = None
 
     async def create_for_draft(
         self,
@@ -83,6 +89,8 @@ class FakeService:
         )
         if self.policy_denied:
             raise ExportPolicyDenied("disabled")
+        if self.create_error is not None:
+            raise self.create_error
         return self.record
 
     async def create_for_version(
@@ -96,6 +104,8 @@ class FakeService:
         self.version_calls.append(
             (context, version_id, export_format, idempotency_key)
         )
+        if self.create_error is not None:
+            raise self.create_error
         return replace(
             self.record,
             classroom_draft_id=None,
@@ -115,6 +125,7 @@ class FakeStore:
         self.presign_calls: list[tuple[str, int]] = []
         self.open_calls: list[str] = []
         self.signed_url = "https://signed.example/token"
+        self.open_error: Exception | None = None
 
     async def presign_download(self, key: str, expires_seconds: int) -> str:
         self.presign_calls.append((key, expires_seconds))
@@ -122,6 +133,8 @@ class FakeStore:
 
     async def open(self, key: str):
         self.open_calls.append(key)
+        if self.open_error is not None:
+            raise self.open_error
 
         async def chunks():
             yield b"verified-export"
@@ -307,6 +320,55 @@ def test_download_rejects_an_export_that_is_not_ready_without_opening_storage(
     assert response.status_code == 409
     assert stores.tenants == []
     assert store.open_calls == []
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_status"),
+    [
+        (ObjectStoreIntegrityError("corrupt"), 409),
+        (ObjectStoreAccessDenied("wrong tenant"), 409),
+        (ObjectStoreError("storage failed"), 503),
+    ],
+)
+def test_create_maps_object_store_failures_without_exposing_details(
+    api_harness,
+    error: Exception,
+    expected_status: int,
+) -> None:
+    app, service, _stores, _store = api_harness
+    service.create_error = error
+
+    response = TestClient(app).post(
+        "/api/v1/classroom-versions/version-a/exports",
+        headers={"Idempotency-Key": "request-store-failure"},
+        json={"format": "pptx"},
+    )
+
+    assert response.status_code == expected_status
+    assert str(error) not in response.text
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_status"),
+    [
+        (ObjectStoreAccessDenied("wrong tenant"), 404),
+        (ObjectStoreIntegrityError("corrupt"), 503),
+        (ObjectStoreError("storage failed"), 503),
+    ],
+)
+def test_download_maps_object_store_failures_without_exposing_details(
+    api_harness,
+    error: Exception,
+    expected_status: int,
+) -> None:
+    app, service, _stores, store = api_harness
+    service.record = _record(status="succeeded")
+    store.open_error = error
+
+    response = TestClient(app).get("/api/v1/classroom-exports/export-a/download")
+
+    assert response.status_code == expected_status
+    assert str(error) not in response.text
 
 
 def test_disabled_teaching_does_not_register_export_routes() -> None:

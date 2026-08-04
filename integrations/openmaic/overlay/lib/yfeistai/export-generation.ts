@@ -1502,6 +1502,7 @@ export function createExportPostHandler(
       parsed.tenantId,
       parsed.classroomDocumentSha256,
       parsed.mediaManifestSha256,
+      parsed.jobId,
     );
     if (!resolved) {
       return serviceError(

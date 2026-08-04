@@ -10,6 +10,12 @@ from typing import AsyncIterator, Awaitable, Callable, Literal, Protocol, cast
 
 from deeptutor.teaching.artifacts import export_input_key
 from deeptutor.teaching.contracts import ClassroomDocument, canonical_json_bytes
+from deeptutor.teaching.export_worker import (
+    MAX_EXPORT_DOCUMENT_BYTES,
+    MAX_EXPORT_MEDIA_BYTES,
+    MAX_EXPORT_MEDIA_FILES,
+    MAX_EXPORT_TOTAL_BYTES,
+)
 from deeptutor.teaching.object_store import (
     ClassroomArtifactStore,
     ObjectStoreConflictError,
@@ -278,6 +284,21 @@ def _can_access_record(context: TenantContext, record: ExportRecord) -> bool:
 
 
 def _validate_source(source: ExportSource) -> None:
+    media_bytes = tuple(item.size_bytes for item in source.media)
+    if (
+        len(source.document) > MAX_EXPORT_DOCUMENT_BYTES
+        or len(source.media) > MAX_EXPORT_MEDIA_FILES
+        or any(
+            isinstance(size, bool)
+            or not isinstance(size, int)
+            or size < 0
+            or size > MAX_EXPORT_MEDIA_BYTES
+            for size in media_bytes
+        )
+        or len(source.document) + sum(media_bytes) > MAX_EXPORT_TOTAL_BYTES
+        or len({item.relative_name for item in source.media}) != len(source.media)
+    ):
+        raise InvalidExportInput("classroom export input exceeds staging limits")
     if hashlib.sha256(source.document).hexdigest() != source.document_sha256:
         raise InvalidExportInput("classroom document hash is invalid")
     try:

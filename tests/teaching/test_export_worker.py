@@ -53,6 +53,88 @@ def test_export_input_is_pinned_and_materialization_is_idempotent() -> None:
     assert validated.artifact.relative_name == "exports/classroom.pptx"
 
 
+def test_export_result_artifact_must_match_requested_format() -> None:
+    from deeptutor.teaching.artifact_validation import (
+        ArtifactValidationError,
+        validate_export_result,
+    )
+
+    request = {
+        "schema_version": "1.0",
+        "tenant_id": "tenant-a",
+        "job_id": "export-1",
+        "idempotency_key": "export-key-1",
+        "classroom_document_sha256": "a" * 64,
+        "media_manifest_sha256": "b" * 64,
+        "format": "pptx",
+        "language": "zh-CN",
+        "export_policy": {
+            "include_source_attribution": True,
+            "allow_external_links": False,
+        },
+    }
+    payload = {
+        "status": "succeeded",
+        "format": "pptx",
+        "artifact": {
+            "relativePath": "exports/classroom.zip",
+            "sha256": "c" * 64,
+            "bytes": 128,
+            "mime": "application/zip",
+            "downloadPath": ("/api/yfeistai/v1/artifacts/export-1/exports/classroom.zip"),
+            "expiresAt": "2030-07-30T09:00:00Z",
+        },
+    }
+
+    with pytest.raises(ArtifactValidationError, match="artifact_invalid"):
+        validate_export_result(
+            tenant_id="tenant-a",
+            job_id="export-1",
+            request_payload=request,
+            result_payload=payload,
+        )
+
+
+def test_offline_html_export_normalizes_safe_mime_parameters() -> None:
+    from deeptutor.teaching.artifact_validation import validate_export_result
+
+    request = {
+        "schema_version": "1.0",
+        "tenant_id": "tenant-a",
+        "job_id": "export-1",
+        "idempotency_key": "export-key-1",
+        "classroom_document_sha256": "a" * 64,
+        "media_manifest_sha256": "b" * 64,
+        "format": "offline_html",
+        "language": "zh-CN",
+        "export_policy": {
+            "include_source_attribution": True,
+            "allow_external_links": False,
+        },
+    }
+    payload = {
+        "status": "succeeded",
+        "format": "offline_html",
+        "artifact": {
+            "relativePath": "exports/classroom.html",
+            "sha256": "c" * 64,
+            "bytes": 128,
+            "mime": "text/html; charset=utf-8",
+            "downloadPath": ("/api/yfeistai/v1/artifacts/export-1/exports/classroom.html"),
+            "expiresAt": "2030-07-30T09:00:00Z",
+        },
+    }
+
+    validated = validate_export_result(
+        tenant_id="tenant-a",
+        job_id="export-1",
+        request_payload=request,
+        result_payload=payload,
+    )
+
+    assert validated.artifact.content_type == "text/html"
+
+
 def test_export_request_materializer_is_called_only_once_for_same_job() -> None:
     from deeptutor.teaching.export_worker import ExportInputSnapshot
 

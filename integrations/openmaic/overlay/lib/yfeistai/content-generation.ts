@@ -306,12 +306,21 @@ export class ContentOutputRegistry {
     tenantId: string,
     classroomDocumentSha256: string,
     mediaManifestSha256: string,
+    bindingJobId: string | null = null,
   ): string {
+    const identifiers = [
+      tenantId,
+      classroomDocumentSha256,
+      mediaManifestSha256,
+    ];
+    if (bindingJobId !== null) {
+      identifiers.push(nonEmptyString(bindingJobId, "content output binding job id"));
+    }
     return durableFile(
       this.stateRoot,
       "content-outputs",
       "payloads",
-      [tenantId, classroomDocumentSha256, mediaManifestSha256],
+      identifiers,
       "payload.json",
     );
   }
@@ -321,6 +330,7 @@ export class ContentOutputRegistry {
     classroomDocument: PortableClassroomDocument,
     mediaManifest: PortableClassroomDocument["mediaManifest"],
     sourceJobId: string | null = null,
+    bindingJobId: string | null = null,
   ): {
     classroomDocumentSha256: string;
     mediaManifestSha256: string;
@@ -338,8 +348,14 @@ export class ContentOutputRegistry {
       canonicalJson(portableDocument),
     );
     const mediaManifestSha256 = sha256Bytes(canonicalJson(mediaManifest));
-    const record = {
-      version: 1,
+    const binding =
+      bindingJobId === null
+        ? null
+        : nonEmptyString(bindingJobId, "content output binding job id");
+    if (binding !== null && sourceJobId !== binding) {
+      throw new Error("bound content output must use its binding job as source");
+    }
+    const common = {
       tenantId,
       classroomDocumentSha256,
       mediaManifestSha256,
@@ -349,10 +365,15 @@ export class ContentOutputRegistry {
         sourceJobId,
       },
     };
+    const record =
+      binding === null
+        ? { version: 1 as const, ...common }
+        : { version: 2 as const, ...common, bindingJobId: binding };
     const target = this.payloadPath(
       tenantId,
       classroomDocumentSha256,
       mediaManifestSha256,
+      binding,
     );
     if (!writeDurableJsonExclusive(target, record)) {
       const existing = readDurableJson(target);
@@ -390,6 +411,7 @@ export class ContentOutputRegistry {
     tenantId: string,
     classroomDocumentSha256: string,
     mediaManifestSha256: string,
+    bindingJobId: string | null = null,
   ): ControlledContentOutput | null {
     if (
       !SHA256_HEX.test(classroomDocumentSha256) ||
@@ -397,24 +419,47 @@ export class ContentOutputRegistry {
     ) {
       throw new Error("content output hash is invalid");
     }
+    const binding =
+      bindingJobId === null
+        ? null
+        : nonEmptyString(bindingJobId, "content output binding job id");
     const value = readDurableJson(
-      this.payloadPath(tenantId, classroomDocumentSha256, mediaManifestSha256),
+      this.payloadPath(
+        tenantId,
+        classroomDocumentSha256,
+        mediaManifestSha256,
+        binding,
+      ),
     );
     if (!value) {
       return null;
     }
-    const record = exactDurableRecord(value, "content output record", [
-      "version",
-      "tenantId",
-      "classroomDocumentSha256",
-      "mediaManifestSha256",
-      "output",
-    ]);
+    const record = exactDurableRecord(
+      value,
+      "content output record",
+      binding === null
+        ? [
+            "version",
+            "tenantId",
+            "classroomDocumentSha256",
+            "mediaManifestSha256",
+            "output",
+          ]
+        : [
+            "version",
+            "tenantId",
+            "classroomDocumentSha256",
+            "mediaManifestSha256",
+            "bindingJobId",
+            "output",
+          ],
+    );
     if (
-      record.version !== 1 ||
+      record.version !== (binding === null ? 1 : 2) ||
       record.tenantId !== tenantId ||
       record.classroomDocumentSha256 !== classroomDocumentSha256 ||
-      record.mediaManifestSha256 !== mediaManifestSha256
+      record.mediaManifestSha256 !== mediaManifestSha256 ||
+      (binding !== null && record.bindingJobId !== binding)
     ) {
       throw new Error("content output record binding is invalid");
     }
@@ -428,6 +473,7 @@ export class ContentOutputRegistry {
       (output.sourceJobId !== null &&
         (typeof output.sourceJobId !== "string" ||
           output.sourceJobId.length === 0)) ||
+      (binding !== null && output.sourceJobId !== binding) ||
       canonicalJson(classroomDocument.mediaManifest) !==
         canonicalJson(output.mediaManifest) ||
       sha256Bytes(canonicalJson(classroomDocument)) !==

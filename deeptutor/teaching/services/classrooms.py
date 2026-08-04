@@ -15,7 +15,7 @@ import re
 import secrets
 import tempfile
 from typing import Any, AsyncIterator, Protocol
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 import zipfile
 
 from deeptutor.teaching.artifacts import (
@@ -357,6 +357,7 @@ class DraftMediaStoreProvider(Protocol):
 
 _MEDIA_ID_PATTERN = re.compile(r"^media-[0-9a-f]{32}$")
 _CANONICAL_MEDIA_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._~-]{0,127}$")
+_CONTROLLED_ARTIFACT_PREFIX = "/api/yfeistai/v1/artifacts/"
 _MAX_OPPORTUNISTIC_MEDIA_CLEANUPS = 8
 _CREATION_IDEMPOTENCY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
 _RAW_REFERENCE_FIELDS = frozenset(
@@ -838,6 +839,35 @@ def _validate_portable_path(value: str) -> None:
         raise InvalidDraftDocument("draft document has an unsafe reference")
 
 
+def _validate_controlled_artifact_path(value: str, relative_path: str) -> None:
+    _validate_portable_path(value)
+    if not value.startswith(_CONTROLLED_ARTIFACT_PREFIX):
+        raise InvalidDraftDocument(
+            "draft document media must use a controlled artifact path"
+        )
+    remainder = value[len(_CONTROLLED_ARTIFACT_PREFIX) :]
+    encoded_job_id, separator, _encoded_path = remainder.partition("/")
+    try:
+        job_id = unquote(encoded_job_id, errors="strict")
+    except UnicodeError:
+        raise InvalidDraftDocument(
+            "draft document media must use a controlled artifact path"
+        ) from None
+    safe = "-_.!~*'()"
+    expected_path = "/".join(quote(segment, safe=safe) for segment in relative_path.split("/"))
+    expected = (
+        f"{_CONTROLLED_ARTIFACT_PREFIX}{quote(job_id, safe=safe)}/{expected_path}"
+    )
+    if (
+        not separator
+        or _CANONICAL_MEDIA_ID_PATTERN.fullmatch(job_id) is None
+        or value != expected
+    ):
+        raise InvalidDraftDocument(
+            "draft document media must use a controlled artifact path"
+        )
+
+
 def _embedded_media_ids(value: object) -> frozenset[str]:
     media_ids: set[str] = set()
     for _path, key, nested in _walk(value):
@@ -890,7 +920,10 @@ def validate_draft_document_references(
             ).validate()
         except ArtifactManifestError:
             raise InvalidDraftDocument("classroom media manifest is invalid") from None
-        _validate_portable_path(item.temporary_download_path)
+        _validate_controlled_artifact_path(
+            item.temporary_download_path,
+            item.relative_path,
+        )
         binding = bindings.get(item.media_id)
         if binding is None or (
             binding.relative_name,
@@ -916,7 +949,10 @@ def validate_draft_document_references(
             ).validate()
         except ArtifactManifestError:
             raise InvalidDraftDocument("classroom export manifest is invalid") from None
-        _validate_portable_path(item.temporary_download_path)
+        _validate_controlled_artifact_path(
+            item.temporary_download_path,
+            item.relative_path,
+        )
     referenced_ids: set[str] = set()
     for scene in parsed.openmaic.scenes:
         referenced_ids.update(

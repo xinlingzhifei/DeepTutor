@@ -36,6 +36,26 @@ def _document_bytes() -> bytes:
     return canonical_json_bytes(parsed)
 
 
+def _oversized_document_bytes() -> bytes:
+    from deeptutor.teaching.export_worker import MAX_EXPORT_DOCUMENT_BYTES
+
+    payload = valid_classroom_document()
+    payload["media_manifest"] = []
+    openmaic = payload["openmaic"]
+    assert isinstance(openmaic, dict)
+    scenes = openmaic["scenes"]
+    assert isinstance(scenes, list) and isinstance(scenes[0], dict)
+    scenes[0]["content"] = {
+        "type": "slide",
+        "canvas": {"text": "x" * MAX_EXPORT_DOCUMENT_BYTES},
+    }
+    provisional = ClassroomDocument.model_validate(payload)
+    raw = provisional.model_dump(mode="json", by_alias=True, exclude_none=True)
+    raw.pop("fileSha256")
+    payload["file_sha256"] = hashlib.sha256(canonical_json_bytes(raw)).hexdigest()
+    return canonical_json_bytes(ClassroomDocument.model_validate(payload))
+
+
 def _source(*, revision: int = 3, version_id: str | None = None):
     from deeptutor.teaching.services.exports import ExportSource
 
@@ -157,6 +177,31 @@ async def test_draft_export_rejects_stale_revision_before_materialization() -> N
             "pptx",
             expected_revision=2,
             idempotency_key="export-key-a",
+        )
+
+    assert repository.reserve_calls == []
+    assert materializer.plans == []
+    assert jobs.commands == []
+
+
+@pytest.mark.asyncio
+async def test_oversized_input_is_rejected_before_reservation_or_materialization() -> None:
+    from deeptutor.teaching.services.exports import InvalidExportInput
+
+    service, repository, materializer, jobs = _service()
+    document = _oversized_document_bytes()
+    repository.version = replace(
+        repository.version,
+        document=document,
+        document_sha256=hashlib.sha256(document).hexdigest(),
+    )
+
+    with pytest.raises(InvalidExportInput, match="staging limits"):
+        await service.create_for_version(
+            _context(),
+            "version-a",
+            "pptx",
+            idempotency_key="export-key-oversized",
         )
 
     assert repository.reserve_calls == []

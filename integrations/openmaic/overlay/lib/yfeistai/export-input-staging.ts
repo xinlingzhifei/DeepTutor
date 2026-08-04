@@ -642,6 +642,7 @@ export class ExportInputStagingStore {
       document,
       document.mediaManifest,
       jobId,
+      jobId,
     );
     if (
       registered.classroomDocumentSha256 !== declaration.classroomDocumentSha256 ||
@@ -812,4 +813,3 @@ const stagingGlobal = globalThis as typeof globalThis & {
 export const exportInputStagingStore =
   stagingGlobal[EXPORT_INPUT_STAGING_KEY] ??
   (stagingGlobal[EXPORT_INPUT_STAGING_KEY] = new ExportInputStagingStore());
-
