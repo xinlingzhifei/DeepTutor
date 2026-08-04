@@ -13,6 +13,7 @@ import pytest
 from deeptutor.teaching.artifacts import StoredArtifact
 from deeptutor.teaching.brief_builder import TeachingBriefBuilder
 from deeptutor.teaching.contracts import (
+    ClassroomDocument,
     GenerationMetadata,
     GenerationRequest,
     KnowledgeCoverage,
@@ -27,6 +28,7 @@ from deeptutor.teaching.repositories.jobs import GenerationJobDetails
 from deeptutor.teaching.services.classrooms import (
     ClassroomAccessDenied,
     ClassroomIdempotencyConflict,
+    ClassroomMediaBinding,
     ClassroomRecord,
     ClassroomRevisionConflict,
     ClassroomService,
@@ -39,8 +41,47 @@ from deeptutor.teaching.services.classrooms import (
     SqlAlchemyClassroomGeneration,
 )
 from deeptutor.teaching.tenant_context import TenantContext
+from tests.teaching_contract_fixtures import valid_classroom_document
 
 NOW = datetime(2026, 8, 3, 8, 0, tzinfo=timezone.utc)
+
+
+def _canonical_document(
+    *,
+    classroom_id: str = "classroom-1",
+    classroom_version_id: str = "classroom-version-1",
+    title: str = "Periodic signals",
+    interactive_html: str | None = None,
+) -> dict[str, object]:
+    payload = valid_classroom_document()
+    payload["classroom_id"] = classroom_id
+    payload["classroom_version_id"] = classroom_version_id
+    payload["content_mode"] = "open_creation"
+    payload["open_creation"] = True
+    payload["media_manifest"] = []
+    payload["export_manifest"] = []
+    openmaic = payload["openmaic"]
+    assert isinstance(openmaic, dict)
+    scenes = openmaic["scenes"]
+    assert isinstance(scenes, list) and isinstance(scenes[0], dict)
+    scenes[0]["title"] = title
+    if interactive_html is not None:
+        scenes[0]["type"] = "interactive"
+        scenes[0]["content"] = {
+            "type": "interactive",
+            "html": interactive_html,
+            "bridge_version": "1.0",
+            "sandbox": {"allow_scripts": True, "allow_same_origin": False},
+        }
+    provisional = ClassroomDocument.model_validate(payload)
+    unhashed = provisional.model_dump(mode="json", by_alias=True, exclude_none=True)
+    unhashed.pop("fileSha256")
+    payload["file_sha256"] = hashlib.sha256(canonical_json_bytes(unhashed)).hexdigest()
+    return ClassroomDocument.model_validate(payload).model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+    )
 
 
 def _context(
@@ -114,8 +155,7 @@ class _Repository:
         if existing is not None:
             if (
                 existing.owner_id != workflow.owner_id
-                or existing.creation_request_sha256
-                != workflow.creation_request_sha256
+                or existing.creation_request_sha256 != workflow.creation_request_sha256
             ):
                 raise ClassroomIdempotencyConflict()
             return existing
@@ -208,8 +248,22 @@ class _Repository:
         )
         return self.records[asset_id]
 
-    async def available_media_ids(self, asset_id: str):
-        return frozenset()
+    async def available_media_bindings(self, asset_id: str):
+        suffixes = {"image/png": ".png", "audio/mpeg": ".mp3", "video/mp4": ".mp4"}
+        return tuple(
+            ClassroomMediaBinding(
+                media_id=record.id,
+                relative_name=f"media/{record.id}{suffixes[record.mime_type]}",
+                mime_type=record.mime_type,
+                sha256=record.sha256,
+                size_bytes=record.size_bytes,
+            )
+            for (classroom_id, _), record in self.media.items()
+            if classroom_id == asset_id
+            and record.status == "uploaded"
+            and record.object_revision is not None
+            and record.mime_type in suffixes
+        )
 
     async def save_validation_report(
         self,
@@ -353,9 +407,7 @@ class _Generation:
                 template_id=teaching_brief.template_policy.template_id,
                 template_version=teaching_brief.template_policy.template_version,
             ),
-            contract_sha256=(
-                "a45b0310d5b58a8e2d461ccfa9d60be24615583825a1f3a4f4460672cbd19ba5"
-            ),
+            contract_sha256=("a45b0310d5b58a8e2d461ccfa9d60be24615583825a1f3a4f4460672cbd19ba5"),
         )
         return GenerationStage(
             job_id=job_id,
@@ -528,7 +580,11 @@ def _service(context: TenantContext):
     repository = _Repository()
     generation = _Generation()
     builder = TeachingBriefBuilder(context, object())
-    return ClassroomService(repository, builder, generation, None, clock=lambda: NOW), repository, generation
+    return (
+        ClassroomService(repository, builder, generation, None, clock=lambda: NOW),
+        repository,
+        generation,
+    )
 
 
 def _service_with_store(context: TenantContext):
@@ -1087,20 +1143,13 @@ async def test_validation_is_persisted_with_blocking_and_warning_findings() -> N
         current,
         lifecycle_state="editing",
         status="succeeded",
-        document={
-            "dslVersion": "0.1.0",
-            "scenes": [
-                {
-                    "id": "scene-1",
-                    "type": "interactive",
-                    "title": "Unsafe",
-                    "content": {"html": "<script>alert(1)</script>"},
-                }
-            ],
-            "mediaIds": [],
-            "knowledgePointMappings": [],
-            "sourceRefs": [],
-        },
+        classroom_version_id="classroom-version-validation",
+        document=_canonical_document(
+            classroom_id=created.asset_id,
+            classroom_version_id="classroom-version-validation",
+            title="Unsafe",
+            interactive_html="<script>alert(1)</script>",
+        ),
     )
 
     result = await service.validate(context, created.asset_id)
@@ -1109,9 +1158,12 @@ async def test_validation_is_persisted_with_blocking_and_warning_findings() -> N
     assert result.validation_report["severeFindings"]
     assert result.validation_report["warnings"]
     assert result.validation_report["draftRevision"] == current.revision
-    assert result.validation_report["documentSha256"] == hashlib.sha256(
-        canonical_json_bytes(repository.records[created.asset_id].document)
-    ).hexdigest()
+    assert (
+        result.validation_report["documentSha256"]
+        == hashlib.sha256(
+            canonical_json_bytes(repository.records[created.asset_id].document)
+        ).hexdigest()
+    )
     assert repository.validation_reports == [result.validation_report]
 
 
@@ -1128,7 +1180,11 @@ class _StaleValidationRepository(_Repository):
         self.records[asset_id] = replace(
             current,
             revision=current.revision + 1,
-            document={"dslVersion": "0.1.0", "scenes": [{"title": "New draft"}]},
+            document=_canonical_document(
+                classroom_id=current.asset_id,
+                classroom_version_id=current.classroom_version_id or "missing",
+                title="New draft",
+            ),
             validation_report=None,
         )
         return None
@@ -1151,7 +1207,12 @@ async def test_validation_report_cannot_commit_after_concurrent_draft_update() -
         current,
         lifecycle_state="editing",
         status="succeeded",
-        document={"dslVersion": "0.1.0", "scenes": [{"title": "Old draft"}]},
+        classroom_version_id="classroom-version-validation",
+        document=_canonical_document(
+            classroom_id=created.asset_id,
+            classroom_version_id="classroom-version-validation",
+            title="Old draft",
+        ),
     )
 
     with pytest.raises(ClassroomRevisionConflict, match="stale"):
@@ -1159,7 +1220,7 @@ async def test_validation_report_cannot_commit_after_concurrent_draft_update() -
 
     latest = repository.records[created.asset_id]
     assert latest.validation_report is None
-    assert latest.document["scenes"][0]["title"] == "New draft"
+    assert latest.document["openmaic"]["scenes"][0]["title"] == "New draft"
 
 
 @pytest.mark.asyncio
@@ -1286,9 +1347,7 @@ def _seed_cleanup_pending(
         mime_type="image/png",
         sha256=hashlib.sha256(body).hexdigest(),
         size_bytes=len(body),
-        object_key=(
-            f"tenants/tenant-a/temporary/draft-{asset_id}/media/{media_id}.png"
-        ),
+        object_key=(f"tenants/tenant-a/temporary/draft-{asset_id}/media/{media_id}.png"),
         ownership_token=f"{index + 1:032x}",
         object_revision=None,
         status="cleanup_pending",
@@ -1398,15 +1457,12 @@ async def test_authorized_asset_read_bounds_and_idempotently_retries_cleanup() -
         status="succeeded",
     )
     receipts = [
-        _seed_cleanup_pending(repository, store, created.asset_id, index)
-        for index in range(9)
+        _seed_cleanup_pending(repository, store, created.asset_id, index) for index in range(9)
     ]
 
     assert await service.get(context, created.asset_id) is not None
     assert len(store.reconcile_calls) == 8
-    assert repository.media_status[(created.asset_id, receipts[-1].id)] == (
-        "cleanup_pending"
-    )
+    assert repository.media_status[(created.asset_id, receipts[-1].id)] == ("cleanup_pending")
 
     assert await service.get(context, created.asset_id) is not None
     assert len(store.reconcile_calls) == 9

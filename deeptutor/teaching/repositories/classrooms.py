@@ -13,6 +13,7 @@ from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from deeptutor.teaching.contracts import (
+    ClassroomDocument,
     OutlineBundle,
     OutlineConfirmationMetadata,
     TeachingBrief,
@@ -30,7 +31,7 @@ from deeptutor.teaching.models.classrooms import (
 from deeptutor.teaching.models.classrooms import (
     TeachingBrief as TeachingBriefModel,
 )
-from deeptutor.teaching.models.jobs import GenerationJob
+from deeptutor.teaching.models.jobs import ClassroomArtifact, GenerationJob
 from deeptutor.teaching.models.platform import AuditLog
 from deeptutor.teaching.repositories.classroom_version_allocation import (
     ClassroomVersionAllocationError,
@@ -41,6 +42,7 @@ from deeptutor.teaching.schema_names import tenant_schema_name
 from deeptutor.teaching.services.classrooms import (
     ClassroomConfirmationConflict,
     ClassroomIdempotencyConflict,
+    ClassroomMediaBinding,
     ClassroomRecord,
     DraftMediaRecord,
     NewClassroomWorkflow,
@@ -49,6 +51,15 @@ from deeptutor.teaching.services.classrooms import (
 
 _LOWER_HEX_DIGITS = frozenset("0123456789abcdef")
 _IMMUTABLE_TRIGGER_MESSAGE = "immutable classroom record"
+_DRAFT_MEDIA_SUFFIXES = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "audio/mpeg": ".mp3",
+    "audio/wav": ".wav",
+    "video/mp4": ".mp4",
+}
 
 
 def _required(value: str, name: str, max_length: int) -> str:
@@ -231,8 +242,7 @@ class SqlAlchemyClassroomRepository:
             draft.validation_revision != draft.revision
             or draft.validation_document_sha256 != draft.document_sha256
             or validation_report.get("draftRevision") != draft.validation_revision
-            or validation_report.get("documentSha256")
-            != draft.validation_document_sha256
+            or validation_report.get("documentSha256") != draft.validation_document_sha256
         ):
             raise ClassroomPersistenceError("stored validation report binding is invalid")
         status = job.status if job is not None else asset.lifecycle_state
@@ -291,9 +301,7 @@ class SqlAlchemyClassroomRepository:
                 workflow.creation_request_sha256,
             )
         ):
-            raise ClassroomIdempotencyConflict(
-                "classroom idempotency key conflicts"
-            )
+            raise ClassroomIdempotencyConflict("classroom idempotency key conflicts")
         return record
 
     async def create_workflow(
@@ -352,9 +360,7 @@ class SqlAlchemyClassroomRepository:
                         existing_brief.document != brief_document
                         or existing_brief.document_sha256 != brief.content_sha256
                     ):
-                        raise ClassroomPersistenceError(
-                            "teaching brief identity conflicts"
-                        )
+                        raise ClassroomPersistenceError("teaching brief identity conflicts")
                     await session.flush()
                     session.add(
                         ClassroomAsset(
@@ -375,9 +381,7 @@ class SqlAlchemyClassroomRepository:
                             base_version_id=None,
                             revision=1,
                             document=empty_document,
-                            document_sha256=hashlib.sha256(
-                                empty_document.encode()
-                            ).hexdigest(),
+                            document_sha256=hashlib.sha256(empty_document.encode()).hexdigest(),
                             outline_document=None,
                             outline_sha256=None,
                             confirmed_outline_sha256=None,
@@ -385,12 +389,8 @@ class SqlAlchemyClassroomRepository:
                             validation_report_sha256=None,
                             validation_revision=None,
                             validation_document_sha256=None,
-                            creation_idempotency_key=(
-                                workflow.creation_idempotency_key
-                            ),
-                            creation_request_sha256=(
-                                workflow.creation_request_sha256
-                            ),
+                            creation_idempotency_key=(workflow.creation_idempotency_key),
+                            creation_request_sha256=(workflow.creation_request_sha256),
                             created_by=workflow.owner_id,
                             updated_by=workflow.owner_id,
                         )
@@ -548,9 +548,7 @@ class SqlAlchemyClassroomRepository:
             proposed = OutlineBundle.model_validate(outline)
             proposed_source_sha256 = canonical_outline_sha256(
                 proposed.model_copy(
-                    update={
-                        "confirmation_metadata": OutlineConfirmationMetadata(status="draft")
-                    }
+                    update={"confirmation_metadata": OutlineConfirmationMetadata(status="draft")}
                 )
             )
         except Exception:
@@ -617,9 +615,7 @@ class SqlAlchemyClassroomRepository:
                             )
                         )
                     except Exception:
-                        raise ClassroomConfirmationConflict(
-                            "confirmed outline conflicts"
-                        ) from None
+                        raise ClassroomConfirmationConflict("confirmed outline conflicts") from None
                     if (
                         draft.outline_sha256 is None
                         or not hmac.compare_digest(
@@ -654,14 +650,22 @@ class SqlAlchemyClassroomRepository:
         async with self._session_factory() as session:
             async with session.begin():
                 asset, draft = await self._lock_draft(session, asset_id)
-                version_id = await session.scalar(
-                    select(ClassroomVersion.id).where(
+                version = await session.scalar(
+                    select(ClassroomVersion).where(
                         ClassroomVersion.generation_job_id == job_id,
                         ClassroomVersion.classroom_id == asset_id,
                         ClassroomVersion.tenant_id == self._tenant_id,
                     )
                 )
-                if draft.generation_job_id != job_id or version_id is None:
+                if (
+                    draft.generation_job_id != job_id
+                    or version is None
+                    or draft.base_version_id != version.id
+                    or not hmac.compare_digest(
+                        draft.document_sha256,
+                        version.document_sha256,
+                    )
+                ):
                     raise ClassroomPersistenceError("generated classroom version is unavailable")
                 if asset.lifecycle_state == "generating_content":
                     asset.lifecycle_state = transition("generating_content", "editing")
@@ -702,16 +706,92 @@ class SqlAlchemyClassroomRepository:
                 await session.flush()
         return await self.get_workflow(asset_id)
 
-    async def available_media_ids(self, asset_id: str) -> frozenset[str]:
+    async def available_media_bindings(
+        self,
+        asset_id: str,
+    ) -> tuple[ClassroomMediaBinding, ...]:
         async with self._session_factory() as session:
-            values = await session.scalars(
-                select(ClassroomDraftMedia.id).where(
-                    ClassroomDraftMedia.tenant_id == self._tenant_id,
-                    ClassroomDraftMedia.classroom_id == asset_id,
-                    ClassroomDraftMedia.status == "uploaded",
+            draft = await session.scalar(
+                select(ClassroomDraft).where(
+                    ClassroomDraft.classroom_id == asset_id,
+                    ClassroomDraft.tenant_id == self._tenant_id,
                 )
             )
-            return frozenset(values)
+            if draft is None:
+                return ()
+            uploads = tuple(
+                await session.scalars(
+                    select(ClassroomDraftMedia)
+                    .where(
+                        ClassroomDraftMedia.tenant_id == self._tenant_id,
+                        ClassroomDraftMedia.classroom_id == asset_id,
+                        ClassroomDraftMedia.status == "uploaded",
+                    )
+                    .order_by(ClassroomDraftMedia.id)
+                )
+            )
+            bindings = [
+                ClassroomMediaBinding(
+                    media_id=item.id,
+                    relative_name=f"media/{item.id}{_DRAFT_MEDIA_SUFFIXES[item.mime_type]}",
+                    mime_type=item.mime_type,
+                    sha256=item.sha256,
+                    size_bytes=item.size_bytes,
+                )
+                for item in uploads
+                if item.mime_type in _DRAFT_MEDIA_SUFFIXES and item.object_revision is not None
+            ]
+            if draft.base_version_id is None:
+                return tuple(bindings)
+            try:
+                payload = json.loads(draft.document)
+                document = ClassroomDocument.model_validate(payload)
+                canonical_payload = canonical_json_bytes(document)
+                raw = document.model_dump(mode="json", by_alias=True, exclude_none=True)
+                file_sha256 = raw.pop("fileSha256")
+                if (
+                    canonical_json_bytes(payload) != canonical_payload
+                    or not hmac.compare_digest(
+                        hashlib.sha256(canonical_json_bytes(raw)).hexdigest(),
+                        file_sha256,
+                    )
+                    or not hmac.compare_digest(
+                        hashlib.sha256(canonical_payload).hexdigest(),
+                        draft.document_sha256,
+                    )
+                ):
+                    return tuple(bindings)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return tuple(bindings)
+            artifacts = tuple(
+                await session.scalars(
+                    select(ClassroomArtifact)
+                    .where(
+                        ClassroomArtifact.tenant_id == self._tenant_id,
+                        ClassroomArtifact.classroom_version_id == draft.base_version_id,
+                        ClassroomArtifact.artifact_kind == "media",
+                    )
+                    .order_by(ClassroomArtifact.relative_name)
+                )
+            )
+            artifacts_by_name = {item.relative_name: item for item in artifacts}
+            for item in document.media_manifest:
+                artifact = artifacts_by_name.get(item.relative_path)
+                if artifact is not None and (
+                    artifact.mime_type,
+                    artifact.sha256,
+                    artifact.size_bytes,
+                ) == (item.mime_type, item.sha256, item.size_bytes):
+                    bindings.append(
+                        ClassroomMediaBinding(
+                            media_id=item.media_id,
+                            relative_name=item.relative_path,
+                            mime_type=item.mime_type,
+                            sha256=item.sha256,
+                            size_bytes=item.size_bytes,
+                        )
+                    )
+            return tuple(bindings)
 
     async def save_validation_report(
         self,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from io import BytesIO
 
 from fastapi import FastAPI
@@ -7,13 +8,73 @@ from fastapi.testclient import TestClient
 import pytest
 
 from deeptutor.api.routers import classrooms
+from deeptutor.teaching.contracts import ClassroomDocument, canonical_json_bytes
 from deeptutor.teaching.permissions import permissions_for_roles
 from deeptutor.teaching.services.classrooms import (
+    ClassroomMediaBinding,
     InvalidDraftDocument,
     build_validation_report,
     validate_draft_document_references,
 )
 from deeptutor.teaching.tenant_context import TenantContext, require_tenant
+from tests.teaching_contract_fixtures import valid_classroom_document
+
+
+def _canonical_document(
+    *,
+    canvas: dict[str, object] | None = None,
+    html: str | None = None,
+    media_id: str | None = None,
+) -> dict[str, object]:
+    payload = valid_classroom_document()
+    payload["export_manifest"] = []
+    openmaic = payload["openmaic"]
+    assert isinstance(openmaic, dict)
+    scenes = openmaic["scenes"]
+    assert isinstance(scenes, list) and isinstance(scenes[0], dict)
+    if html is not None:
+        scenes[0]["type"] = "interactive"
+        scenes[0]["content"] = {
+            "type": "interactive",
+            "html": html,
+            "bridge_version": "1.0",
+            "sandbox": {"allow_scripts": True, "allow_same_origin": False},
+        }
+    elif canvas is not None:
+        scenes[0]["content"] = {"type": "slide", "canvas": canvas}
+    manifest = payload["media_manifest"]
+    assert isinstance(manifest, list) and isinstance(manifest[0], dict)
+    if media_id is None:
+        payload["media_manifest"] = []
+    else:
+        manifest[0].update(
+            media_id=media_id,
+            relative_path=f"media/{media_id}.png",
+            mime_type="image/png",
+            temporary_download_path=f"downloads/media/{media_id}.png",
+        )
+    provisional = ClassroomDocument.model_validate(payload)
+    unhashed = provisional.model_dump(mode="json", by_alias=True, exclude_none=True)
+    unhashed.pop("fileSha256")
+    payload["file_sha256"] = hashlib.sha256(canonical_json_bytes(unhashed)).hexdigest()
+    return ClassroomDocument.model_validate(payload).model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+    )
+
+
+def _media_binding(document: dict[str, object]) -> ClassroomMediaBinding:
+    manifest = document["mediaManifest"]
+    assert isinstance(manifest, list) and isinstance(manifest[0], dict)
+    item = manifest[0]
+    return ClassroomMediaBinding(
+        media_id=str(item["mediaId"]),
+        relative_name=str(item["relativePath"]),
+        mime_type=str(item["mimeType"]),
+        sha256=str(item["sha256"]),
+        size_bytes=int(item["sizeBytes"]),
+    )
 
 
 def _context(
@@ -218,9 +279,7 @@ def test_outline_confirmation_binding_conflict_is_an_explicit_409() -> None:
         async def confirm_outline(self, _context, _asset_id):
             raise classrooms.ClassroomConfirmationConflict()
 
-    response = _client(_ConflictService()).post(
-        "/api/v1/classrooms/asset-1/confirm-outline"
-    )
+    response = _client(_ConflictService()).post("/api/v1/classrooms/asset-1/confirm-outline")
 
     assert response.status_code == 409
     assert response.json() == {"detail": "Outline confirmation conflicts"}
@@ -238,9 +297,7 @@ def test_draft_media_is_bound_to_asset_and_tenant() -> None:
     )
     assert media.status_code == 201
 
-    response = client.get(
-        f"/api/v1/classrooms/asset-b/draft-media/{media.json()['id']}"
-    )
+    response = client.get(f"/api/v1/classrooms/asset-b/draft-media/{media.json()['id']}")
 
     assert response.status_code == 404
     assert "asset-1" not in response.text
@@ -253,7 +310,7 @@ def test_raw_object_keys_and_arbitrary_urls_are_rejected_before_draft_save() -> 
         {"mediaIds": ["tenants/tenant-a/temporary/secret"]},
     ):
         with pytest.raises(InvalidDraftDocument, match="unsafe reference"):
-            validate_draft_document_references(document)
+            validate_draft_document_references(_canonical_document(canvas=document))
 
 
 @pytest.mark.parametrize(
@@ -272,74 +329,73 @@ def test_media_and_url_fields_reject_obfuscated_or_embedded_raw_references(
     document: dict[str, object],
 ) -> None:
     with pytest.raises(InvalidDraftDocument, match="unsafe reference"):
-        validate_draft_document_references(document)
+        validate_draft_document_references(_canonical_document(canvas=document))
 
 
 def test_resource_url_reference_semantics_are_rejected_fail_closed() -> None:
     with pytest.raises(InvalidDraftDocument, match="unsafe reference"):
         validate_draft_document_references(
-            {"resourceUrl": "https://attacker.invalid/resource.json"}
+            _canonical_document(canvas={"resourceUrl": "https://attacker.invalid/resource.json"})
         )
 
 
 def test_thumbnail_path_rejects_a_relative_object_reference() -> None:
     with pytest.raises(InvalidDraftDocument, match="unsafe reference"):
         validate_draft_document_references(
-            {"thumbnailPath": "previews/chapter-1.png"}
+            _canonical_document(canvas={"thumbnailPath": "previews/chapter-1.png"})
         )
 
 
 def test_thumbnail_path_field_is_rejected_without_url_syntax() -> None:
     with pytest.raises(InvalidDraftDocument, match="unsafe reference"):
-        validate_draft_document_references({"thumbnailPath": "chapter-one"})
+        validate_draft_document_references(
+            _canonical_document(canvas={"thumbnailPath": "chapter-one"})
+        )
 
 
 def test_reference_values_are_recursively_decoded_to_a_bounded_fixed_point() -> None:
     with pytest.raises(InvalidDraftDocument, match="unsafe reference"):
         validate_draft_document_references(
-            {"thumbnailPath": "%2525252e%2525252e%2525252fsecret"}
+            _canonical_document(canvas={"thumbnailPath": "%2525252e%2525252e%2525252fsecret"})
         )
 
 
 def test_asset_url_reference_semantics_are_rejected_fail_closed() -> None:
     with pytest.raises(InvalidDraftDocument, match="unsafe reference"):
         validate_draft_document_references(
-            {"assetUrl": "//attacker.invalid/asset.png"}
+            _canonical_document(canvas={"assetUrl": "//attacker.invalid/asset.png"})
         )
 
 
 def test_image_srcset_reference_semantics_are_rejected_fail_closed() -> None:
     with pytest.raises(InvalidDraftDocument, match="unsafe reference"):
         validate_draft_document_references(
-            {"imageSrcSet": "preview.png 1x, https://attacker.invalid/preview.png 2x"}
+            _canonical_document(
+                canvas={"imageSrcSet": "preview.png 1x, https://attacker.invalid/preview.png 2x"}
+            )
         )
 
 
 def test_ordinary_teaching_text_may_name_a_url_without_becoming_a_reference() -> None:
-    document = {
-        "dslVersion": "0.1.0",
-        "scenes": [
-            {
-                "title": "Why https://example.edu uses TLS",
-                "content": {
-                    "type": "slide",
-                    "canvas": {"text": "Compare HTTP://example.edu in this lesson."},
-                },
-            }
-        ],
-        "mediaIds": [],
-    }
+    document = _canonical_document(
+        canvas={
+            "title": "Why https://example.edu uses TLS",
+            "text": "Compare HTTP://example.edu in this lesson.",
+        }
+    )
 
     assert validate_draft_document_references(document) == frozenset()
 
 
 def test_path_like_field_names_do_not_reject_svg_or_teaching_text() -> None:
-    document = {
-        "path": "M 10 10 L 20 20 Z",
-        "learningPath": "Compare speed/distance, then explain the result.",
-        "resourceTitle": "Chapter 2 classroom discussion",
-        "thumbnailLabel": "Lesson preview",
-    }
+    document = _canonical_document(
+        canvas={
+            "path": "M 10 10 L 20 20 Z",
+            "learningPath": "Compare speed/distance, then explain the result.",
+            "resourceTitle": "Chapter 2 classroom discussion",
+            "thumbnailLabel": "Lesson preview",
+        }
+    )
 
     assert validate_draft_document_references(document) == frozenset()
 
@@ -355,18 +411,7 @@ def test_path_like_field_names_do_not_reject_svg_or_teaching_text() -> None:
     ],
 )
 def test_interactive_html_parser_blocks_unsafe_or_malformed_markup(html: str) -> None:
-    document = {
-        "dslVersion": "0.1.0",
-        "scenes": [
-            {
-                "id": "scene-1",
-                "type": "interactive",
-                "title": "Interactive",
-                "content": {"html": html},
-            }
-        ],
-        "mediaIds": [],
-    }
+    document = _canonical_document(html=html)
 
     with pytest.raises(InvalidDraftDocument, match="unsafe reference"):
         validate_draft_document_references(document)
@@ -375,27 +420,20 @@ def test_interactive_html_parser_blocks_unsafe_or_malformed_markup(html: str) ->
         document,
         required_knowledge_point_ids=(),
         grounded=False,
-        available_media_ids=frozenset(),
+        available_media_bindings=(),
     )
     assert report["sections"]["interactive_security"]["status"] == "error"
 
 
 def test_svg_presentation_attributes_cannot_load_external_url_resources() -> None:
-    document = {
-        "scenes": [
-            {
-                "type": "interactive",
-                "content": {
-                    "html": (
-                        '<svg viewBox="0 0 10 10">'
-                        '<circle cx="5" cy="5" r="4" '
-                        'fill="url(//evil.invalid/pixel.svg)"></circle>'
-                        "</svg>"
-                    )
-                },
-            }
-        ]
-    }
+    document = _canonical_document(
+        html=(
+            '<svg viewBox="0 0 10 10">'
+            '<circle cx="5" cy="5" r="4" '
+            'fill="url(//evil.invalid/pixel.svg)"></circle>'
+            "</svg>"
+        )
+    )
 
     with pytest.raises(InvalidDraftDocument, match="unsafe reference"):
         validate_draft_document_references(document)
@@ -410,20 +448,9 @@ def test_svg_presentation_attributes_cannot_load_external_url_resources() -> Non
     ],
 )
 def test_svg_css_url_obfuscation_is_rejected(fill: str) -> None:
-    document = {
-        "scenes": [
-            {
-                "type": "interactive",
-                "content": {
-                    "html": (
-                        '<svg viewBox="0 0 10 10">'
-                        f'<circle cx="5" cy="5" r="4" fill="{fill}"></circle>'
-                        "</svg>"
-                    )
-                },
-            }
-        ]
-    }
+    document = _canonical_document(
+        html=(f'<svg viewBox="0 0 10 10"><circle cx="5" cy="5" r="4" fill="{fill}"></circle></svg>')
+    )
 
     with pytest.raises(InvalidDraftDocument, match="unsafe reference"):
         validate_draft_document_references(document)
@@ -431,50 +458,50 @@ def test_svg_css_url_obfuscation_is_rejected(fill: str) -> None:
 
 def test_safe_interactive_fragment_and_opaque_media_id_are_accepted() -> None:
     media_id = "media-0123456789abcdef0123456789abcdef"
-    document = {
-        "scenes": [
-            {
-                "type": "interactive",
-                "content": {
-                    "html": (
-                        "<div role='group'><button id='run' type='button'>Run</button>"
-                        f"<img data-media-id='{media_id}' alt='Graph'></div>"
-                    )
-                },
-            }
-        ]
-    }
+    document = _canonical_document(
+        html=(
+            "<div role='group'><button id='run' type='button'>Run</button>"
+            f"<img data-media-id='{media_id}' alt='Graph'></div>"
+        ),
+        media_id=media_id,
+    )
 
-    assert validate_draft_document_references(document) == frozenset({media_id})
+    assert validate_draft_document_references(
+        document,
+        available_media_bindings=(_media_binding(document),),
+    ) == frozenset({media_id})
 
 
 def test_semantic_media_id_suffix_is_validated_and_collected() -> None:
     media_id = "media-0123456789abcdef0123456789abcdef"
+    document = _canonical_document(
+        canvas={"thumbnailMediaId": media_id},
+        media_id=media_id,
+    )
 
     assert validate_draft_document_references(
-        {"thumbnailMediaId": media_id}
+        document,
+        available_media_bindings=(_media_binding(document),),
     ) == frozenset({media_id})
+
+
+def test_unused_media_manifest_item_is_rejected() -> None:
+    media_id = "media-0123456789abcdef0123456789abcdef"
+    document = _canonical_document(media_id=media_id)
+
+    with pytest.raises(InvalidDraftDocument, match="match referenced media exactly"):
+        validate_draft_document_references(
+            document,
+            available_media_bindings=(_media_binding(document),),
+        )
 
 
 def test_validation_report_has_nine_named_sections_and_explicit_severity() -> None:
     report = build_validation_report(
-        {
-            "dslVersion": "0.1.0",
-            "scenes": [
-                {
-                    "id": "scene-1",
-                    "type": "interactive",
-                    "title": "Unsafe demo",
-                    "content": {"html": "<script>alert(1)</script>"},
-                }
-            ],
-            "mediaIds": [],
-            "knowledgePointMappings": [],
-            "sourceRefs": [],
-        },
+        _canonical_document(html="<script>alert(1)</script>"),
         required_knowledge_point_ids=("kp-motion",),
         grounded=True,
-        available_media_ids=frozenset(),
+        available_media_bindings=(),
     )
 
     assert set(report["sections"]) == {

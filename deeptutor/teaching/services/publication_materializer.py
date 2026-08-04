@@ -22,6 +22,7 @@ from deeptutor.teaching.services.publications import (
     PublicationMaterializationPlan,
     PublicationPersistenceError,
     publication_media_manifest_sha256,
+    validated_publication_document,
 )
 
 
@@ -96,7 +97,9 @@ class ClassroomPublicationMaterializer:
     def _matches_media_receipt(artifact, media) -> bool:
         revision = artifact.revision or artifact.version_id
         return (
-            artifact.key == media.object_key
+            media.ownership_token is not None
+            and media.object_revision is not None
+            and artifact.key == media.object_key
             and hmac.compare_digest(artifact.sha256, media.sha256)
             and artifact.size == media.size_bytes
             and artifact.content_type == media.mime_type
@@ -115,7 +118,31 @@ class ClassroomPublicationMaterializer:
     ) -> ConfirmedPublicationMaterialization:
         if hashlib.sha256(plan.document).hexdigest() != plan.document_sha256:
             raise PublicationPersistenceError("reviewed draft document is invalid")
-        if publication_media_manifest_sha256(plan.media) != plan.media_manifest_sha256:
+        document = validated_publication_document(plan.document)
+        expected_media = tuple(
+            (
+                item.media_id,
+                item.relative_path,
+                item.mime_type,
+                item.sha256,
+                item.size_bytes,
+            )
+            for item in document.media_manifest
+        )
+        actual_media = tuple(
+            (
+                item.media_id,
+                item.relative_name,
+                item.mime_type,
+                item.sha256,
+                item.size_bytes,
+            )
+            for item in plan.media
+        )
+        if (
+            actual_media != expected_media
+            or publication_media_manifest_sha256(plan.document) != plan.media_manifest_sha256
+        ):
             raise PublicationPersistenceError("reviewed draft media manifest is invalid")
         manifest = publication_manifest(plan)
         manifest.validate_for_tenant(plan.tenant_id)
@@ -129,15 +156,18 @@ class ClassroomPublicationMaterializer:
                 "classroom.json": _document_body(plan.document)
             }
             for media in plan.media:
-                source = await store.reconcile_verified(
-                    media.object_key,
-                    media.sha256,
-                    media.size_bytes,
-                    content_type=media.mime_type,
-                    ownership_token=media.ownership_token,
-                )
-                if source is None or not self._matches_media_receipt(source, media):
-                    raise PublicationConflict("draft media receipt conflicts")
+                if media.source_kind == "draft_upload":
+                    if media.ownership_token is None:
+                        raise PublicationConflict("draft media receipt conflicts")
+                    source = await store.reconcile_verified(
+                        media.object_key,
+                        media.sha256,
+                        media.size_bytes,
+                        content_type=media.mime_type,
+                        ownership_token=media.ownership_token,
+                    )
+                    if source is None or not self._matches_media_receipt(source, media):
+                        raise PublicationConflict("draft media receipt conflicts")
                 bodies[media.relative_name] = await store.open(media.object_key)
             try:
                 await ClassroomArtifactPromotionService(store).promote(
@@ -161,9 +191,7 @@ class ClassroomPublicationMaterializer:
                 or artifact.size != entry.size
                 or artifact.content_type != entry.content_type
             ):
-                raise PublicationPersistenceError(
-                    "confirmed publication artifact is invalid"
-                )
+                raise PublicationPersistenceError("confirmed publication artifact is invalid")
             media = media_by_name.get(entry.relative_name)
             artifacts.append(
                 MaterializedPublicationArtifact(
@@ -178,7 +206,7 @@ class ClassroomPublicationMaterializer:
             )
         result = ConfirmedPublicationMaterialization(
             manifest_sha256=plan.manifest_sha256,
-            media_manifest_sha256=publication_media_manifest_sha256(plan.media),
+            media_manifest_sha256=plan.media_manifest_sha256,
             artifacts=tuple(artifacts),
         )
         result.document

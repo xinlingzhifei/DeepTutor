@@ -10,6 +10,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
+from deeptutor.teaching.contracts import ClassroomDocument, canonical_json_bytes
 from deeptutor.teaching.dispatcher import OutboxDispatcher
 from deeptutor.teaching.models import DataPlaneRoute, ProviderProfile, Tenant
 from deeptutor.teaching.models.jobs import (
@@ -28,8 +29,30 @@ from deeptutor.teaching.repositories.jobs import (
 )
 from deeptutor.teaching.scheduler import FairScheduler
 from deeptutor.teaching.schema_names import tenant_schema_name
+from tests.teaching_contract_fixtures import valid_classroom_document
 
 pytest_plugins = ("tests.teaching.integration.conftest",)
+
+
+def _document_payload(media_body: bytes) -> tuple[str, str, str]:
+    raw = valid_classroom_document()
+    raw["classroom_id"] = "classroom-recovery"
+    raw["classroom_version_id"] = "classroom-recovery-v1"
+    media = raw["media_manifest"][0]
+    media["sha256"] = hashlib.sha256(media_body).hexdigest()
+    media["size_bytes"] = len(media_body)
+    raw["openmaic"]["scenes"][0]["actions"].append(
+        {"type": "play_audio", "mediaId": media["media_id"]}
+    )
+    provisional = ClassroomDocument.model_validate(raw)
+    normalized = provisional.model_dump(mode="json", by_alias=True, exclude_none=True)
+    without_hash = dict(normalized)
+    without_hash.pop("fileSha256")
+    normalized["fileSha256"] = hashlib.sha256(canonical_json_bytes(without_hash)).hexdigest()
+    document = ClassroomDocument.model_validate(normalized)
+    payload = canonical_json_bytes(document).decode()
+    media_sha256 = hashlib.sha256(canonical_json_bytes(normalized["mediaManifest"])).hexdigest()
+    return payload, hashlib.sha256(payload.encode()).hexdigest(), media_sha256
 
 
 async def _seed_binding(engine, tenant_id: str) -> None:
@@ -352,26 +375,29 @@ def test_expired_lease_and_object_commit_are_recovered_exactly_once(
                 f"tenants/{tenant_id}/classrooms/classroom-recovery/"
                 f"versions/{target.version_number}/media/voice.mp3"
             )
+            media_body = b"recovered-media" * 4
+            document_payload, document_sha256, media_manifest_sha256 = _document_payload(media_body)
             await repository.finalize_generation(
                 claim3,
                 classroom_version_id="classroom-recovery-v1",
-                document_sha256="a" * 64,
-                media_manifest_sha256="b" * 64,
+                document_payload=document_payload,
+                document_sha256=document_sha256,
+                media_manifest_sha256=media_manifest_sha256,
                 manifest_sha256=manifest_sha256,
                 artifacts=(
                     MaterializedArtifactInput(
                         relative_name="classroom.json",
                         object_key=document_key,
-                        sha256="a" * 64,
-                        size_bytes=128,
+                        sha256=document_sha256,
+                        size_bytes=len(document_payload.encode()),
                         mime_type="application/json",
                         artifact_kind="dsl_json",
                     ),
                     MaterializedArtifactInput(
                         relative_name="media/voice.mp3",
                         object_key=media_key,
-                        sha256="d" * 64,
-                        size_bytes=64,
+                        sha256=hashlib.sha256(media_body).hexdigest(),
+                        size_bytes=len(media_body),
                         mime_type="audio/mpeg",
                         artifact_kind="media",
                     ),

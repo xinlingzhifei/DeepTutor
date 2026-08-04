@@ -12,7 +12,11 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
-from deeptutor.teaching.contracts import ExportRequest, canonical_json_bytes
+from deeptutor.teaching.contracts import (
+    ClassroomDocument,
+    ExportRequest,
+    canonical_json_bytes,
+)
 from deeptutor.teaching.database import get_platform_engine
 from deeptutor.teaching.job_errors import retry_delay_seconds
 from deeptutor.teaching.job_route_binding import (
@@ -77,6 +81,37 @@ def _quota_event_id(entry_type: str, job_id: str) -> str:
 
 def _artifact_id(job_id: str, relative_name: str) -> str:
     return hashlib.sha256(f"{job_id}\0{relative_name}".encode()).hexdigest()
+
+
+def _validate_generation_document_payload(
+    payload: str,
+    *,
+    classroom_id: str,
+    classroom_version_id: str,
+    document_sha256: str,
+    media_manifest_sha256: str,
+) -> ClassroomDocument:
+    try:
+        document = ClassroomDocument.model_validate_json(payload)
+    except Exception:
+        raise ValueError("generated classroom document is invalid") from None
+    encoded = payload.encode("utf-8")
+    if (
+        canonical_json_bytes(document) != encoded
+        or hashlib.sha256(encoded).hexdigest() != document_sha256
+        or document.classroom_id != classroom_id
+        or document.classroom_version_id != classroom_version_id
+    ):
+        raise ValueError("generated classroom document binding is invalid")
+    raw = document.model_dump(mode="json", by_alias=True, exclude_none=True)
+    file_sha256 = raw.pop("fileSha256")
+    if (
+        hashlib.sha256(canonical_json_bytes(raw)).hexdigest() != file_sha256
+        or hashlib.sha256(canonical_json_bytes(raw["mediaManifest"])).hexdigest()
+        != media_manifest_sha256
+    ):
+        raise ValueError("generated classroom document binding is invalid")
+    return document
 
 
 def _tenant_table(tenant_id: str, table_name: str) -> str:
@@ -584,8 +619,7 @@ class SqlAlchemyGenerationJobRepository:
         except (ValueError, TypeError):
             raise ValueError("classroom export request payload is invalid") from None
         if (
-            canonical_json_bytes(export_request).decode("utf-8")
-            != request.request_payload
+            canonical_json_bytes(export_request).decode("utf-8") != request.request_payload
             or hashlib.sha256(request.request_payload.encode("utf-8")).hexdigest()
             != request.request_sha256
             or export_request.tenant_id != request.tenant_id
@@ -593,10 +627,8 @@ class SqlAlchemyGenerationJobRepository:
             or export_request.job_id != exported.id
             or export_request.idempotency_key != request.idempotency_key
             or export_request.idempotency_key != exported.id
-            or export_request.classroom_document_sha256
-            != exported.input_document_sha256
-            or export_request.media_manifest_sha256
-            != exported.input_media_manifest_sha256
+            or export_request.classroom_document_sha256 != exported.input_document_sha256
+            or export_request.media_manifest_sha256 != exported.input_media_manifest_sha256
             or export_request.format != exported.export_format
         ):
             raise ValueError("classroom export request does not match its pins")
@@ -630,8 +662,7 @@ class SqlAlchemyGenerationJobRepository:
             async with session.begin():
                 await session.execute(
                     text(
-                        "SELECT pg_advisory_xact_lock("
-                        "hashtextextended(:idempotency_lock_key, 0))"
+                        "SELECT pg_advisory_xact_lock(hashtextextended(:idempotency_lock_key, 0))"
                     ),
                     {
                         "idempotency_lock_key": hashlib.sha256(
@@ -1561,9 +1592,7 @@ class SqlAlchemyGenerationJobRepository:
                         .with_for_update()
                     )
                     if draft is None or draft.classroom_id != classroom_id:
-                        raise ValueError(
-                            "generation promotion does not match classroom draft"
-                        )
+                        raise ValueError("generation promotion does not match classroom draft")
                 existing = await session.scalar(
                     select(ArtifactPromotionState)
                     .where(ArtifactPromotionState.job_id == claim.job_id)
@@ -1673,6 +1702,7 @@ class SqlAlchemyGenerationJobRepository:
         claim: ClaimedGenerationJob,
         *,
         classroom_version_id: str,
+        document_payload: str,
         document_sha256: str,
         media_manifest_sha256: str,
         manifest_sha256: str,
@@ -1696,11 +1726,24 @@ class SqlAlchemyGenerationJobRepository:
                     or state.manifest_sha256 != manifest_sha256
                 ):
                     raise ValueError("object publication is not durably committed")
+                document = _validate_generation_document_payload(
+                    document_payload,
+                    classroom_id=state.classroom_id,
+                    classroom_version_id=classroom_version_id,
+                    document_sha256=document_sha256,
+                    media_manifest_sha256=media_manifest_sha256,
+                )
                 document_artifact = next(
                     (item for item in artifacts if item.artifact_kind == "dsl_json"),
                     None,
                 )
-                if document_artifact is None or document_artifact.sha256 != document_sha256:
+                if (
+                    document_artifact is None
+                    or document_artifact.relative_name != "classroom.json"
+                    or document_artifact.mime_type != "application/json"
+                    or document_artifact.sha256 != document_sha256
+                    or document_artifact.size_bytes != len(document_payload.encode("utf-8"))
+                ):
                     raise ValueError("document artifact is missing")
                 await _lock_or_create_classroom_asset(
                     session,
@@ -1725,6 +1768,31 @@ class SqlAlchemyGenerationJobRepository:
                 except IntegrityError as exc:
                     raise_for_classroom_version_allocation_conflict(exc)
                     raise
+                if job.classroom_draft_id is not None:
+                    draft = await session.scalar(
+                        select(ClassroomDraft)
+                        .where(
+                            ClassroomDraft.id == job.classroom_draft_id,
+                            ClassroomDraft.tenant_id == claim.tenant_id,
+                        )
+                        .with_for_update()
+                    )
+                    if (
+                        draft is None
+                        or draft.classroom_id != state.classroom_id
+                        or draft.generation_job_id != job.id
+                        or document.classroom_id != draft.classroom_id
+                    ):
+                        raise ValueError("generated classroom draft binding is invalid")
+                    draft.base_version_id = classroom_version_id
+                    draft.document = document_payload
+                    draft.document_sha256 = document_sha256
+                    draft.validation_report = None
+                    draft.validation_report_sha256 = None
+                    draft.validation_revision = None
+                    draft.validation_document_sha256 = None
+                    draft.revision += 1
+                    draft.updated_at = now
                 for artifact in artifacts:
                     session.add(
                         ClassroomArtifact(
@@ -1804,8 +1872,7 @@ class SqlAlchemyGenerationJobRepository:
                     exported is None
                     or exported.status != "quota_reserved"
                     or exported.input_document_sha256 != input_document_sha256
-                    or exported.input_media_manifest_sha256
-                    != input_media_manifest_sha256
+                    or exported.input_media_manifest_sha256 != input_media_manifest_sha256
                     or exported.export_format != job.export_format
                     or exported.input_manifest_object_key is None
                     or exported.input_manifest_sha256 is None

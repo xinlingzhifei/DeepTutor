@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 import hashlib
 from typing import Literal, Protocol
 
-from deeptutor.teaching.contracts import canonical_json_bytes
+from deeptutor.teaching.contracts import ClassroomDocument, canonical_json_bytes
 from deeptutor.teaching.permissions import ResourceScope
 from deeptutor.teaching.services.reviews import ReviewPolicy
 from deeptutor.teaching.tenant_context import TenantContext
@@ -75,9 +75,20 @@ class PublicationMediaSource:
     mime_type: str
     sha256: str
     size_bytes: int
+    source_kind: Literal["draft_upload", "version_artifact"]
     object_key: str = field(repr=False)
-    ownership_token: str = field(repr=False)
-    object_revision: str = field(repr=False)
+    ownership_token: str | None = field(default=None, repr=False)
+    object_revision: str | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.source_kind == "draft_upload":
+            if self.ownership_token is None or self.object_revision is None:
+                raise ValueError("draft upload publication source is incomplete")
+        elif self.source_kind == "version_artifact":
+            if self.ownership_token is not None or self.object_revision is not None:
+                raise ValueError("version artifact publication source has mutable ownership")
+        else:
+            raise ValueError("publication source kind is unsupported")
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,34 +131,31 @@ class ConfirmedPublicationMaterialization:
     @property
     def document(self) -> MaterializedPublicationArtifact:
         matches = tuple(
-            artifact
-            for artifact in self.artifacts
-            if artifact.artifact_kind == "dsl_json"
+            artifact for artifact in self.artifacts if artifact.artifact_kind == "dsl_json"
         )
         if len(matches) != 1:
-            raise PublicationPersistenceError(
-                "confirmed publication document is invalid"
-            )
+            raise PublicationPersistenceError("confirmed publication document is invalid")
         return matches[0]
 
 
-def publication_media_manifest_sha256(
-    media: tuple[PublicationMediaSource, ...],
-) -> str:
-    return hashlib.sha256(
-        canonical_json_bytes(
-            [
-                {
-                    "mediaId": item.media_id,
-                    "relativeName": item.relative_name,
-                    "mimeType": item.mime_type,
-                    "sha256": item.sha256,
-                    "sizeBytes": item.size_bytes,
-                }
-                for item in media
-            ]
-        )
-    ).hexdigest()
+def validated_publication_document(document: bytes) -> ClassroomDocument:
+    try:
+        parsed = ClassroomDocument.model_validate_json(document)
+    except Exception:
+        raise PublicationPersistenceError("reviewed draft document is invalid") from None
+    if canonical_json_bytes(parsed) != document:
+        raise PublicationPersistenceError("reviewed draft document is not canonical")
+    raw = parsed.model_dump(mode="json", by_alias=True, exclude_none=True)
+    file_sha256 = raw.pop("fileSha256")
+    if hashlib.sha256(canonical_json_bytes(raw)).hexdigest() != file_sha256:
+        raise PublicationPersistenceError("reviewed draft document file hash is invalid")
+    return parsed
+
+
+def publication_media_manifest_sha256(document: bytes) -> str:
+    parsed = validated_publication_document(document)
+    payload = parsed.model_dump(mode="json", by_alias=True, exclude_none=True)
+    return hashlib.sha256(canonical_json_bytes(payload["mediaManifest"])).hexdigest()
 
 
 class PublicationMaterializer(Protocol):
@@ -288,10 +296,7 @@ def _allows(
         course_id=course_id,
         class_id=class_id,
     )
-    return any(
-        grant.allows_resource(permission, resource)
-        for grant in context.permissions
-    )
+    return any(grant.allows_resource(permission, resource) for grant in context.permissions)
 
 
 class PublicationService:
@@ -358,9 +363,7 @@ class PublicationService:
             raise PublicationAccessDenied("class publication requires approval")
 
         if self._materializer is None:
-            raise PublicationPersistenceError(
-                "classroom publication materializer is unavailable"
-            )
+            raise PublicationPersistenceError("classroom publication materializer is unavailable")
         return await self._repository.publish(
             PublishCommand(
                 tenant_id=context.tenant_id,
@@ -390,10 +393,7 @@ class PublicationService:
             raise PublicationNotFound("classroom version was not found")
         if target.publication_scope == "private":
             raise PublicationAccessDenied("private classroom cannot be assigned")
-        if (
-            target.publication_scope == "class"
-            and target.publication_class_id != class_id
-        ):
+        if target.publication_scope == "class" and target.publication_class_id != class_id:
             raise PublicationAccessDenied("classroom version is not published to class")
         if not _allows(
             context,
@@ -458,8 +458,7 @@ class PublicationService:
         ):
             raise PublicationAccessDenied("migration target is not accessible")
         if target.publication_scope == "private" or (
-            target.publication_scope == "class"
-            and target.publication_class_id != class_id
+            target.publication_scope == "class" and target.publication_class_id != class_id
         ):
             raise PublicationAccessDenied("migration target is not published to class")
         if not _allows(

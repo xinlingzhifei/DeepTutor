@@ -17,8 +17,22 @@ from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async
 from sqlalchemy.pool import NullPool
 from sqlalchemy.schema import DropSchema
 
-from deeptutor.teaching.contracts import ExportRequest, canonical_json_bytes
+from deeptutor.teaching.artifacts import (
+    ArtifactManifestEntry,
+    ClassroomArtifactManifest,
+    classroom_artifact_key,
+)
+from deeptutor.teaching.contracts import (
+    ClassroomDocument,
+    ExportRequest,
+    canonical_json_bytes,
+)
 from deeptutor.teaching.dispatcher import OutboxDispatcher
+from deeptutor.teaching.export_worker import (
+    ExportInputCommitReceipt,
+    ExportInputDeclaration,
+    ExportInputFileDeclaration,
+)
 from deeptutor.teaching.models import (
     AuditLog,
     DataPlaneRoute,
@@ -38,8 +52,12 @@ from deeptutor.teaching.models.jobs import (
     ClassroomArtifact,
     GenerationJob,
 )
-from deeptutor.teaching.object_store import LocalClassroomArtifactStore
+from deeptutor.teaching.object_store import (
+    ClassroomArtifactPromotionService,
+    LocalClassroomArtifactStore,
+)
 from deeptutor.teaching.openmaic.client import EngineJob
+from deeptutor.teaching.openmaic.data_planes import DataPlaneSelection
 from deeptutor.teaching.repositories.classrooms import (
     ClassroomDocumentReference,
     ClassroomVersionAllocationError,
@@ -47,6 +65,7 @@ from deeptutor.teaching.repositories.classrooms import (
     PublishedClassroomVersion,
     SqlAlchemyClassroomRepository,
 )
+from deeptutor.teaching.repositories.exports import SqlAlchemyClassroomExportRepository
 from deeptutor.teaching.repositories.jobs import (
     GenerationJobRequest,
     MaterializedArtifactInput,
@@ -55,13 +74,59 @@ from deeptutor.teaching.repositories.jobs import (
 )
 from deeptutor.teaching.scheduler import ClaimedGenerationJob, FairScheduler
 from deeptutor.teaching.schema_names import tenant_schema_name
+from deeptutor.teaching.services.export_jobs import SqlAlchemyExportJobGateway
+from deeptutor.teaching.services.exports import (
+    ClassroomExportInputMaterializer,
+    ClassroomExportService,
+)
+from deeptutor.teaching.tenant_context import TenantContext
 from deeptutor.teaching.worker import GenerationWorker
+from tests.teaching_contract_fixtures import valid_classroom_document
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 PROVIDER_ID = "classroom-lifecycle-provider"
 ROUTE_ID = "classroom-lifecycle-route"
 WORKER_POOL = "classroom-lifecycle-workers"
 QUEUE_REF = "openmaic.classroom.lifecycle"
+
+
+def _canonical_document_payload(
+    classroom_id: str,
+    version_id: str,
+    *,
+    media_body: bytes | None = None,
+) -> tuple[str, str, str, ClassroomDocument]:
+    raw = valid_classroom_document()
+    raw["classroom_id"] = classroom_id
+    raw["classroom_version_id"] = version_id
+    if media_body is None:
+        raw["media_manifest"] = []
+    else:
+        media = raw["media_manifest"][0]
+        media["media_id"] = "media-generated"
+        media["relative_path"] = "media/generated.mp3"
+        media["sha256"] = hashlib.sha256(media_body).hexdigest()
+        media["size_bytes"] = len(media_body)
+        openmaic = raw["openmaic"]
+        openmaic["scenes"][0]["actions"].append(
+            {"type": "play_audio", "mediaId": "media-generated"}
+        )
+    normalized = ClassroomDocument.model_validate(raw).model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+    )
+    without_hash = dict(normalized)
+    without_hash.pop("fileSha256")
+    normalized["fileSha256"] = hashlib.sha256(canonical_json_bytes(without_hash)).hexdigest()
+    document = ClassroomDocument.model_validate(normalized)
+    payload = canonical_json_bytes(document).decode()
+    media_sha256 = hashlib.sha256(canonical_json_bytes(normalized["mediaManifest"])).hexdigest()
+    return payload, hashlib.sha256(payload.encode()).hexdigest(), media_sha256, document
+
+
+async def _body(value: bytes) -> AsyncIterator[bytes]:
+    yield value
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,14 +265,23 @@ async def repository_context(generation_database) -> RepositoryContext:
         manifest_sha256=manifest_sha256,
     )
     source_version_id = f"{asset_id}:generated-v{target.version_number}"
+    document_payload, document_sha256, media_manifest_sha256, _ = _canonical_document_payload(
+        asset_id, source_version_id
+    )
     document = ClassroomDocumentReference(
-        sha256="2" * 64,
-        media_manifest_sha256="3" * 64,
-        object_key=f"classrooms/{asset_id}/generated-v1/classroom.json",
+        sha256=document_sha256,
+        media_manifest_sha256=media_manifest_sha256,
+        object_key=classroom_artifact_key(
+            tenant_id,
+            asset_id,
+            target.version_number,
+            "classroom.json",
+        ),
     )
     await generation_repository.finalize_generation(
         claim,
         classroom_version_id=source_version_id,
+        document_payload=document_payload,
         document_sha256=document.sha256,
         media_manifest_sha256=document.media_manifest_sha256,
         manifest_sha256=manifest_sha256,
@@ -216,7 +290,7 @@ async def repository_context(generation_database) -> RepositoryContext:
                 relative_name="classroom.json",
                 object_key=document.object_key,
                 sha256=document.sha256,
-                size_bytes=128,
+                size_bytes=len(document_payload.encode()),
                 mime_type="application/json",
                 artifact_kind="dsl_json",
             ),
@@ -253,9 +327,7 @@ async def repository_context(generation_database) -> RepositoryContext:
                     ),
                     {"worker_pool_ref": WORKER_POOL},
                 )
-                await connection.execute(
-                    DropSchema(tenant_schema_name(tenant_id), cascade=True)
-                )
+                await connection.execute(DropSchema(tenant_schema_name(tenant_id), cascade=True))
                 await connection.execute(
                     text("DELETE FROM platform.tenants WHERE id = :tenant_id"),
                     {"tenant_id": tenant_id},
@@ -265,10 +337,7 @@ async def repository_context(generation_database) -> RepositoryContext:
                     {"route_id": ROUTE_ID},
                 )
                 await connection.execute(
-                    text(
-                        "DELETE FROM platform.provider_profiles "
-                        "WHERE id = :provider_profile_id"
-                    ),
+                    text("DELETE FROM platform.provider_profiles WHERE id = :provider_profile_id"),
                     {"provider_profile_id": PROVIDER_ID},
                 )
         finally:
@@ -499,9 +568,7 @@ async def test_plan02_versions_are_backfilled_to_stable_assets(generation_databa
     finally:
         try:
             async with engine.begin() as connection:
-                await connection.execute(
-                    DropSchema(tenant_schema_name(tenant_id), cascade=True)
-                )
+                await connection.execute(DropSchema(tenant_schema_name(tenant_id), cascade=True))
                 await connection.execute(
                     text("DELETE FROM platform.tenants WHERE id = :tenant_id"),
                     {"tenant_id": tenant_id},
@@ -583,11 +650,15 @@ async def test_publication_allocates_around_a_pending_generation_reservation(
         manifest_sha256=manifest_sha256,
     )
     generated_version_id = f"{repository_context.asset_id}:generated-v2"
+    document_payload, document_sha256, media_manifest_sha256, _ = _canonical_document_payload(
+        repository_context.asset_id, generated_version_id
+    )
     await generation_repository.finalize_generation(
         claim,
         classroom_version_id=generated_version_id,
-        document_sha256="6" * 64,
-        media_manifest_sha256="7" * 64,
+        document_payload=document_payload,
+        document_sha256=document_sha256,
+        media_manifest_sha256=media_manifest_sha256,
         manifest_sha256=manifest_sha256,
         artifacts=(
             MaterializedArtifactInput(
@@ -595,8 +666,8 @@ async def test_publication_allocates_around_a_pending_generation_reservation(
                 object_key=(
                     f"classrooms/{repository_context.asset_id}/generated-v2/classroom.json"
                 ),
-                sha256="6" * 64,
-                size_bytes=128,
+                sha256=document_sha256,
+                size_bytes=len(document_payload.encode()),
                 mime_type="application/json",
                 artifact_kind="dsl_json",
             ),
@@ -659,11 +730,16 @@ async def test_stale_generation_allocation_raises_a_domain_error(
         ClassroomVersionAllocationError,
         match="classroom version allocation is stale",
     ):
+        stale_version_id = f"{repository_context.asset_id}:generated-stale-v2"
+        document_payload, document_sha256, media_manifest_sha256, _ = _canonical_document_payload(
+            repository_context.asset_id, stale_version_id
+        )
         await generation_repository.finalize_generation(
             claim,
-            classroom_version_id=f"{repository_context.asset_id}:generated-stale-v2",
-            document_sha256="c" * 64,
-            media_manifest_sha256="d" * 64,
+            classroom_version_id=stale_version_id,
+            document_payload=document_payload,
+            document_sha256=document_sha256,
+            media_manifest_sha256=media_manifest_sha256,
             manifest_sha256=manifest_sha256,
             artifacts=(
                 MaterializedArtifactInput(
@@ -672,8 +748,8 @@ async def test_stale_generation_allocation_raises_a_domain_error(
                         f"classrooms/{repository_context.asset_id}/generated-stale-v2/"
                         "classroom.json"
                     ),
-                    sha256="c" * 64,
-                    size_bytes=128,
+                    sha256=document_sha256,
+                    size_bytes=len(document_payload.encode()),
                     mime_type="application/json",
                     artifact_kind="dsl_json",
                 ),
@@ -749,50 +825,221 @@ async def test_draft_bound_generation_cannot_promote_to_another_classroom(
 
 
 @pytest.mark.asyncio
+async def test_generation_atomically_replaces_draft_with_canonical_media_snapshot(
+    repository_context: RepositoryContext,
+) -> None:
+    draft_id = f"canonical-{repository_context.asset_id}"
+    job_id = f"canonical-{repository_context.generation_job_id}"
+    translated = repository_context.engine.execution_options(
+        schema_translate_map={
+            "tenant": tenant_schema_name(repository_context.tenant_id),
+        }
+    )
+    session_factory = async_sessionmaker(translated, expire_on_commit=False)
+    async with session_factory() as session:
+        async with session.begin():
+            session.add(
+                ClassroomDraft(
+                    id=draft_id,
+                    tenant_id=repository_context.tenant_id,
+                    classroom_id=repository_context.asset_id,
+                    generation_job_id=None,
+                    teaching_brief_id=None,
+                    base_version_id=repository_context.source_version_id,
+                    revision=4,
+                    document="{}",
+                    document_sha256=hashlib.sha256(b"{}").hexdigest(),
+                    validation_report="{}",
+                    validation_report_sha256=hashlib.sha256(b"{}").hexdigest(),
+                    validation_revision=4,
+                    validation_document_sha256=hashlib.sha256(b"{}").hexdigest(),
+                    created_by="teacher-1",
+                    updated_by="teacher-1",
+                )
+            )
+
+    repository, claim, target = await prepare_generation(
+        repository_context,
+        job_id=job_id,
+        classroom_draft_id=draft_id,
+    )
+    version_id = f"{repository_context.asset_id}:generated-v{target.version_number}"
+    media_body = b"ID3-generated-media"
+    payload, document_sha256, media_manifest_sha256, document = _canonical_document_payload(
+        repository_context.asset_id,
+        version_id,
+        media_body=media_body,
+    )
+    document_key = classroom_artifact_key(
+        repository_context.tenant_id,
+        repository_context.asset_id,
+        target.version_number,
+        "classroom.json",
+    )
+    media_entry = document.media_manifest[0]
+    media_key = classroom_artifact_key(
+        repository_context.tenant_id,
+        repository_context.asset_id,
+        target.version_number,
+        media_entry.relative_path,
+    )
+    async with session_factory() as session:
+        async with session.begin():
+            draft = await session.get(ClassroomDraft, draft_id)
+            assert draft is not None
+            draft.generation_job_id = job_id
+
+    manifest_sha256 = "e" * 64
+    await repository.bind_promotion_manifest(
+        claim,
+        manifest_sha256=manifest_sha256,
+    )
+    await repository.mark_object_committed(
+        claim,
+        manifest_sha256=manifest_sha256,
+    )
+    await repository.finalize_generation(
+        claim,
+        classroom_version_id=version_id,
+        document_payload=payload,
+        document_sha256=document_sha256,
+        media_manifest_sha256=media_manifest_sha256,
+        manifest_sha256=manifest_sha256,
+        artifacts=(
+            MaterializedArtifactInput(
+                relative_name="classroom.json",
+                object_key=document_key,
+                sha256=document_sha256,
+                size_bytes=len(payload.encode()),
+                mime_type="application/json",
+                artifact_kind="dsl_json",
+            ),
+            MaterializedArtifactInput(
+                relative_name=media_entry.relative_path,
+                object_key=media_key,
+                sha256=media_entry.sha256,
+                size_bytes=media_entry.size_bytes,
+                mime_type=media_entry.mime_type,
+                artifact_kind="media",
+            ),
+        ),
+    )
+
+    async with session_factory() as session:
+        draft = await session.get(ClassroomDraft, draft_id)
+        version = await session.get(ClassroomVersion, version_id)
+    assert draft is not None and version is not None
+    assert draft.base_version_id == version.id
+    assert draft.document == payload
+    assert draft.document_sha256 == document_sha256
+    assert draft.revision == 5
+    assert draft.validation_report is None
+    bindings = await repository_context.repository.available_media_bindings(
+        repository_context.asset_id
+    )
+    assert [(item.media_id, item.relative_name, item.sha256) for item in bindings] == [
+        (media_entry.media_id, media_entry.relative_path, media_entry.sha256)
+    ]
+
+
+@pytest.mark.asyncio
 async def test_export_worker_does_not_create_or_modify_classroom_assets_or_versions(
     repository_context: RepositoryContext,
     tmp_path: Path,
 ) -> None:
-    export_job_id = f"export-{uuid.uuid4().hex[:12]}"
     artifact_body = b"exported classroom"
     artifact_sha256 = hashlib.sha256(artifact_body).hexdigest()
+    store = LocalClassroomArtifactStore(tmp_path, repository_context.tenant_id)
+
+    class StoreProvider:
+        async def store_for_tenant(self, tenant_id: str) -> LocalClassroomArtifactStore:
+            assert tenant_id == repository_context.tenant_id
+            return store
+
+    translated = repository_context.engine.execution_options(
+        schema_translate_map={"tenant": tenant_schema_name(repository_context.tenant_id)}
+    )
+    session_factory = async_sessionmaker(translated, expire_on_commit=False)
+    async with session_factory() as session:
+        source_version = await session.get(
+            ClassroomVersion,
+            repository_context.source_version_id,
+        )
+    assert source_version is not None
+    source_payload, source_sha256, _, _ = _canonical_document_payload(
+        repository_context.asset_id,
+        repository_context.source_version_id,
+    )
+    assert source_version.document_sha256 == source_sha256
+    source_bytes = source_payload.encode()
+    await ClassroomArtifactPromotionService(store).promote(
+        ClassroomArtifactManifest(
+            tenant_id=repository_context.tenant_id,
+            job_id=repository_context.generation_job_id,
+            asset_id=repository_context.asset_id,
+            version=source_version.version_number,
+            entries=(
+                ArtifactManifestEntry(
+                    relative_name="classroom.json",
+                    content_type="application/json",
+                    sha256=source_sha256,
+                    size=len(source_bytes),
+                ),
+            ),
+        ),
+        {"classroom.json": _body(source_bytes)},
+    )
+
+    repository = SqlAlchemyGenerationJobRepository(repository_context.engine)
+    exports = SqlAlchemyClassroomExportRepository(
+        repository_context.engine,
+        repository_context.tenant_id,
+        StoreProvider(),
+    )
+
+    class Selector:
+        async def resolve(self, tenant_id: str) -> DataPlaneSelection:
+            assert tenant_id == repository_context.tenant_id
+            return DataPlaneSelection(
+                tenant_id=tenant_id,
+                route_ref=ROUTE_ID,
+                provider_profile_ref=PROVIDER_ID,
+                mode="shared",
+                worker_pool_ref=WORKER_POOL,
+                queue_ref=QUEUE_REF,
+            )
+
+    export = await ClassroomExportService(
+        exports,
+        ClassroomExportInputMaterializer(StoreProvider()),
+        SqlAlchemyExportJobGateway(repository, exports, Selector()),
+        mp4_enabled=lambda _tenant_id: False,
+    ).create_for_version(
+        TenantContext(
+            tenant_id=repository_context.tenant_id,
+            schema_name=tenant_schema_name(repository_context.tenant_id),
+            user_id="teacher-1",
+            permissions=frozenset(),
+        ),
+        repository_context.source_version_id,
+        "pptx",
+        idempotency_key="export-worker-immutability",
+    )
+    export_job_id = export.job_id
+    assert export_job_id is not None
     request = ExportRequest(
         schema_version="1.0",
         tenant_id=repository_context.tenant_id,
         job_id=export_job_id,
-        idempotency_key=f"idempotency-{export_job_id}",
-        classroom_document_sha256="2" * 64,
-        media_manifest_sha256="3" * 64,
+        idempotency_key=export_job_id,
+        classroom_document_sha256=export.input_document_sha256,
+        media_manifest_sha256=export.input_media_manifest_sha256,
         format="pptx",
         language="zh-CN",
         export_policy={
             "include_source_attribution": True,
             "allow_external_links": False,
         },
-    )
-    request_payload = canonical_json_bytes(request).decode()
-    repository = SqlAlchemyGenerationJobRepository(repository_context.engine)
-    await repository.create_job_and_reserve(
-        GenerationJobRequest(
-            tenant_id=repository_context.tenant_id,
-            job_id=export_job_id,
-            job_kind="export",
-            phase="export",
-            export_format="pptx",
-            priority="teacher",
-            quota_units=1,
-            actor_id="teacher-1",
-            owner_id="teacher-1",
-            visibility="private",
-            request_id=f"request-{export_job_id}",
-            idempotency_key=request.idempotency_key,
-            request_sha256=hashlib.sha256(request_payload.encode()).hexdigest(),
-            data_plane_route_id=ROUTE_ID,
-            provider_profile_id=PROVIDER_ID,
-            worker_pool_ref=WORKER_POOL,
-            queue_ref=QUEUE_REF,
-            request_payload=request_payload,
-        )
     )
     assert await OutboxDispatcher(repository_context.engine).dispatch_next() is not None
     scheduler = FairScheduler(repository_context.engine)
@@ -802,7 +1049,65 @@ async def test_export_worker_does_not_create_or_modify_classroom_assets_or_versi
     )
 
     class ExportClient:
+        def __init__(self) -> None:
+            self.declaration: ExportInputDeclaration | None = None
+            self.uploads: dict[str, bytes] = {}
+            self.committed = False
+
+        async def reserve_export_input(
+            self,
+            declaration: ExportInputDeclaration,
+        ) -> None:
+            assert declaration.tenant_id == request.tenant_id
+            assert declaration.job_id == request.job_id
+            assert declaration.idempotency_key == request.idempotency_key
+            assert declaration.classroom_document_sha256 == request.classroom_document_sha256
+            assert declaration.media_manifest_sha256 == request.media_manifest_sha256
+            self.declaration = declaration
+
+        async def upload_export_input_file(
+            self,
+            declaration: ExportInputDeclaration,
+            file: ExportInputFileDeclaration,
+            body: AsyncIterator[bytes],
+        ) -> None:
+            assert declaration is self.declaration
+            payload = b"".join([chunk async for chunk in body])
+            assert len(payload) == file.size_bytes
+            assert hashlib.sha256(payload).hexdigest() == file.sha256
+            self.uploads[file.file_id] = payload
+
+        async def commit_export_input(
+            self,
+            declaration: ExportInputDeclaration,
+        ) -> ExportInputCommitReceipt:
+            assert declaration is self.declaration
+            assert set(self.uploads) == {item.file_id for item in declaration.files}
+            receipt_payload = canonical_json_bytes(
+                {
+                    "schemaVersion": 1,
+                    "tenantId": declaration.tenant_id,
+                    "jobId": declaration.job_id,
+                    "idempotencyKey": declaration.idempotency_key,
+                    "declarationSha256": declaration.declaration_sha256,
+                    "classroomDocumentSha256": (declaration.classroom_document_sha256),
+                    "mediaManifestSha256": declaration.media_manifest_sha256,
+                    "status": "committed",
+                }
+            )
+            self.committed = True
+            return ExportInputCommitReceipt(
+                tenant_id=declaration.tenant_id,
+                job_id=declaration.job_id,
+                idempotency_key=declaration.idempotency_key,
+                declaration_sha256=declaration.declaration_sha256,
+                classroom_document_sha256=declaration.classroom_document_sha256,
+                media_manifest_sha256=declaration.media_manifest_sha256,
+                receipt_sha256=hashlib.sha256(receipt_payload).hexdigest(),
+            )
+
         async def submit_export(self, submitted: ExportRequest) -> EngineJob:
+            assert self.committed is True
             assert submitted == request
             return EngineJob(
                 tenant_id=submitted.tenant_id,
@@ -822,8 +1127,7 @@ async def test_export_worker_does_not_create_or_modify_classroom_assets_or_versi
                                 "presentationml.presentation"
                             ),
                             "downloadPath": (
-                                f"/api/yfeistai/v1/artifacts/{export_job_id}/"
-                                "exports/classroom.pptx"
+                                f"/api/yfeistai/v1/artifacts/{export_job_id}/exports/classroom.pptx"
                             ),
                             "expiresAt": "2030-07-30T09:00:00Z",
                         },
@@ -848,7 +1152,6 @@ async def test_export_worker_does_not_create_or_modify_classroom_assets_or_versi
             yield artifact_body
 
     client = ExportClient()
-    store = LocalClassroomArtifactStore(tmp_path, repository_context.tenant_id)
 
     class ClientProvider:
         async def client_for_claim(self, claim: ClaimedGenerationJob) -> ExportClient:
@@ -856,16 +1159,6 @@ async def test_export_worker_does_not_create_or_modify_classroom_assets_or_versi
 
         async def client_for_cancellation(self, request: object) -> ExportClient:
             return client
-
-    class StoreProvider:
-        async def store_for_tenant(self, tenant_id: str) -> LocalClassroomArtifactStore:
-            assert tenant_id == repository_context.tenant_id
-            return store
-
-    translated = repository_context.engine.execution_options(
-        schema_translate_map={"tenant": tenant_schema_name(repository_context.tenant_id)}
-    )
-    session_factory = async_sessionmaker(translated, expire_on_commit=False)
 
     async def classroom_rows() -> tuple[tuple[object, ...], ...]:
         async with session_factory() as session:
@@ -884,9 +1177,7 @@ async def test_export_worker_does_not_create_or_modify_classroom_assets_or_versi
 
     assets_before = await classroom_rows()
     async with session_factory() as session:
-        versions_before = await session.scalar(
-            select(func.count()).select_from(ClassroomVersion)
-        )
+        versions_before = await session.scalar(select(func.count()).select_from(ClassroomVersion))
 
     worker = GenerationWorker(
         scheduler=scheduler,
@@ -896,18 +1187,19 @@ async def test_export_worker_does_not_create_or_modify_classroom_assets_or_versi
         worker_id=f"worker-{export_job_id}",
         job_kind="export",
     )
-    assert await worker.run_once(
-        slot_pool="generation",
-        data_plane_route_id=ROUTE_ID,
-        provider_profile_id=PROVIDER_ID,
-        worker_pool_ref=WORKER_POOL,
-        queue_ref=QUEUE_REF,
-    ) is True
+    assert (
+        await worker.run_once(
+            slot_pool="generation",
+            data_plane_route_id=ROUTE_ID,
+            provider_profile_id=PROVIDER_ID,
+            worker_pool_ref=WORKER_POOL,
+            queue_ref=QUEUE_REF,
+        )
+        is True
+    )
 
     async with session_factory() as session:
-        versions_after = await session.scalar(
-            select(func.count()).select_from(ClassroomVersion)
-        )
+        versions_after = await session.scalar(select(func.count()).select_from(ClassroomVersion))
         fake_asset = await session.get(ClassroomAsset, f"export-{export_job_id}")
         promotion = await session.get(ArtifactPromotionState, export_job_id)
         artifact = await session.scalar(
@@ -924,6 +1216,11 @@ async def test_export_worker_does_not_create_or_modify_classroom_assets_or_versi
     assert artifact is not None
     assert artifact.classroom_version_id == repository_context.source_version_id
     assert job is not None and job.status == "succeeded"
+    completed_export = await exports.get(export.export_id)
+    assert completed_export is not None
+    assert completed_export.status == "succeeded"
+    assert completed_export.job_id == export_job_id
+    assert completed_export.sha256 == artifact_sha256
 
 
 @pytest.mark.asyncio

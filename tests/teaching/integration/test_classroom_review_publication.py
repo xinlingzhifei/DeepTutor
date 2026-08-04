@@ -29,7 +29,7 @@ from deeptutor.teaching.brief_builder import (
     TeachingBriefBuilder,
     TeachingBriefSpec,
 )
-from deeptutor.teaching.contracts import canonical_json_bytes
+from deeptutor.teaching.contracts import ClassroomDocument, canonical_json_bytes
 from deeptutor.teaching.models import AuditLog, Tenant
 from deeptutor.teaching.models.classrooms import (
     Approval,
@@ -82,6 +82,64 @@ from deeptutor.teaching.services.reviews import (
     SubmitReviewCommand,
 )
 from deeptutor.teaching.tenant_context import TenantContext
+from tests.teaching_contract_fixtures import valid_classroom_document
+
+
+def _canonical_document(
+    asset_id: str,
+    version_id: str,
+    *,
+    title: str,
+    text_content: str,
+    media_id: str | None = None,
+    media_body: bytes | None = None,
+) -> dict[str, object]:
+    payload = valid_classroom_document()
+    payload["classroom_id"] = asset_id
+    payload["classroom_version_id"] = version_id
+    payload["content_mode"] = "open_creation"
+    payload["open_creation"] = True
+    payload["source_refs"] = []
+    payload["export_manifest"] = []
+    mappings = payload["knowledge_point_mappings"]
+    assert isinstance(mappings, list) and isinstance(mappings[0], dict)
+    mappings[0]["knowledge_point_id"] = "kp-motion"
+    mappings[0]["source_refs"] = []
+    openmaic = payload["openmaic"]
+    assert isinstance(openmaic, dict)
+    scenes = openmaic["scenes"]
+    assert isinstance(scenes, list) and isinstance(scenes[0], dict)
+    scenes[0]["title"] = title
+    scenes[0]["content"] = {
+        "type": "slide",
+        "canvas": {"text": text_content},
+    }
+    if media_id is None:
+        payload["media_manifest"] = []
+    else:
+        assert media_body is not None
+        manifest = payload["media_manifest"]
+        assert isinstance(manifest, list) and isinstance(manifest[0], dict)
+        manifest[0].update(
+            media_id=media_id,
+            relative_path=f"media/{media_id}.png",
+            mime_type="image/png",
+            sha256=hashlib.sha256(media_body).hexdigest(),
+            size_bytes=len(media_body),
+            temporary_download_path=f"downloads/media/{media_id}.png",
+        )
+        canvas = scenes[0]["content"]["canvas"]
+        canvas["mediaId"] = media_id
+    provisional = ClassroomDocument.model_validate(payload)
+    normalized = provisional.model_dump(mode="json", by_alias=True, exclude_none=True)
+    without_hash = dict(normalized)
+    without_hash.pop("fileSha256")
+    normalized["fileSha256"] = hashlib.sha256(canonical_json_bytes(without_hash)).hexdigest()
+    return ClassroomDocument.model_validate(normalized).model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,9 +197,7 @@ class _ChangeDraftAfterMaterialization:
     async def materialize(self, plan):
         confirmed = await self._delegate.materialize(plan)
         translated = self._database.engine.execution_options(
-            schema_translate_map={
-                "tenant": tenant_schema_name(self._database.tenant_id)
-            }
+            schema_translate_map={"tenant": tenant_schema_name(self._database.tenant_id)}
         )
         sessions = async_sessionmaker(translated, expire_on_commit=False)
         async with sessions() as session:
@@ -255,20 +311,15 @@ async def review_database(generation_database, tmp_path: Path) -> ReviewDatabase
         schema_translate_map={"tenant": tenant_schema_name(tenant_id)}
     )
     sessions = async_sessionmaker(translated, expire_on_commit=False)
-    source_document = {
-        "dslVersion": "0.1.0",
-        "scenes": [
-            {
-                "id": "scene-source",
-                "type": "slide",
-                "title": "Generated source",
-                "content": {"text": "Original generated lesson"},
-            }
-        ],
-        "mediaIds": [],
-        "knowledgePointMappings": [],
-        "sourceRefs": [],
-    }
+    generated_media = b"\x89PNG\r\n\x1a\ngenerated-media"
+    source_document = _canonical_document(
+        asset_id,
+        source_version_id,
+        title="Generated source",
+        text_content="Original generated lesson",
+        media_id="media-generated",
+        media_body=generated_media,
+    )
     document = canonical_json_bytes(source_document).decode()
     document_sha256 = hashlib.sha256(document.encode()).hexdigest()
     report = {
@@ -294,11 +345,27 @@ async def review_database(generation_database, tmp_path: Path) -> ReviewDatabase
                 sha256=document_sha256,
                 size=len(document.encode()),
             ),
+            ArtifactManifestEntry(
+                relative_name="media/media-generated.png",
+                content_type="image/png",
+                sha256=hashlib.sha256(generated_media).hexdigest(),
+                size=len(generated_media),
+            ),
         ),
     )
-    (source_artifact,) = await ClassroomArtifactPromotionService(store).promote(
+    source_artifacts = await ClassroomArtifactPromotionService(store).promote(
         source_manifest,
-        {"classroom.json": _body(document.encode())},
+        {
+            "classroom.json": _body(document.encode()),
+            "media/media-generated.png": _body(generated_media),
+        },
+    )
+    source_artifacts_by_name = {
+        item.key.rsplit("/", maxsplit=1)[-1]: item for item in source_artifacts
+    }
+    source_artifact = source_artifacts_by_name["classroom.json"]
+    media_artifact = next(
+        item for item in source_artifacts if item.key.endswith("/media/media-generated.png")
     )
     object_key = source_artifact.key
     brief_context = TenantContext(
@@ -307,29 +374,33 @@ async def review_database(generation_database, tmp_path: Path) -> ReviewDatabase
         user_id="author-1",
         permissions=frozenset(),
     )
-    brief = TeachingBriefBuilder(brief_context, object()).open_creation(
-        TeachingBriefSpec(
-            course_id="course-a",
-            class_id="class-a",
-            objective="Explain motion",
-            grade_band="grade-8",
-            audience="intermediate",
-            duration_minutes=45,
-            classroom_mode="full",
-            web_policy="disabled",
-            template_id="template-1",
-            template_version="1",
-            knowledge_points=(
-                KnowledgePointSpec(
-                    knowledge_point_id="kp-motion",
-                    title="Motion",
-                    description="Describe motion.",
+    brief = (
+        TeachingBriefBuilder(brief_context, object())
+        .open_creation(
+            TeachingBriefSpec(
+                course_id="course-a",
+                class_id="class-a",
+                objective="Explain motion",
+                grade_band="grade-8",
+                audience="intermediate",
+                duration_minutes=45,
+                classroom_mode="full",
+                web_policy="disabled",
+                template_id="template-1",
+                template_version="1",
+                knowledge_points=(
+                    KnowledgePointSpec(
+                        knowledge_point_id="kp-motion",
+                        title="Motion",
+                        description="Describe motion.",
+                    ),
                 ),
-            ),
-            content_mode="open_creation",
-            open_creation_acknowledged=True,
+                content_mode="open_creation",
+                open_creation_acknowledged=True,
+            )
         )
-    ).contract
+        .contract
+    )
     brief_document = json.dumps(
         brief.model_dump(mode="json", by_alias=True, exclude_none=False),
         ensure_ascii=False,
@@ -421,10 +492,15 @@ async def review_database(generation_database, tmp_path: Path) -> ReviewDatabase
                     generation_job_id=job_id,
                     source_version_id=None,
                     document_sha256=document_sha256,
-                    media_manifest_sha256="4" * 64,
+                    media_manifest_sha256=hashlib.sha256(
+                        canonical_json_bytes(source_document["mediaManifest"])
+                    ).hexdigest(),
                     document_object_key=object_key,
                 )
             )
+            draft = await session.get(ClassroomDraft, draft_id)
+            assert draft is not None
+            draft.base_version_id = source_version_id
             await session.flush()
             session.add(
                 ArtifactPromotionState(
@@ -450,6 +526,22 @@ async def review_database(generation_database, tmp_path: Path) -> ReviewDatabase
                     sha256=document_sha256,
                     size_bytes=len(document.encode()),
                     mime_type="application/json",
+                    input_document_sha256=None,
+                    input_media_manifest_sha256=None,
+                )
+            )
+            session.add(
+                ClassroomArtifact(
+                    id=f"artifact-media-{suffix}",
+                    tenant_id=tenant_id,
+                    source_job_id=job_id,
+                    classroom_version_id=source_version_id,
+                    artifact_kind="media",
+                    relative_name="media/media-generated.png",
+                    object_key=media_artifact.key,
+                    sha256=hashlib.sha256(generated_media).hexdigest(),
+                    size_bytes=len(generated_media),
+                    mime_type="image/png",
                     input_document_sha256=None,
                     input_media_manifest_sha256=None,
                 )
@@ -607,12 +699,11 @@ async def _approve_edited_draft(
     )
     validated = await classrooms.validate(context, database.asset_id)
     assert validated.revision == updated.revision == 2
-    assert validated.validation_document_sha256 == hashlib.sha256(
-        canonical_json_bytes(updated.document)
-    ).hexdigest()
-    reviews = ReviewService(
-        SqlAlchemyReviewRepository(database.engine, database.tenant_id)
+    assert (
+        validated.validation_document_sha256
+        == hashlib.sha256(canonical_json_bytes(updated.document)).hexdigest()
     )
+    reviews = ReviewService(SqlAlchemyReviewRepository(database.engine, database.tenant_id))
     review = await reviews.submit(
         context,
         database.asset_id,
@@ -633,9 +724,7 @@ async def _publish_approved_baseline(
     *,
     key_prefix: str,
 ):
-    reviews = ReviewService(
-        SqlAlchemyReviewRepository(database.engine, database.tenant_id)
-    )
+    reviews = ReviewService(SqlAlchemyReviewRepository(database.engine, database.tenant_id))
     review = await reviews.submit(
         _context(database, "author-1", "classroom.submit"),
         database.asset_id,
@@ -703,6 +792,38 @@ async def _seed_published_version(
                 )
             )
     return version_id
+
+
+@pytest.mark.asyncio
+async def test_generated_media_is_published_from_the_exact_base_version_artifact(
+    review_database: ReviewDatabase,
+) -> None:
+    _, published = await _publish_approved_baseline(
+        review_database,
+        key_prefix="generated-media",
+    )
+
+    media_key = classroom_artifact_key(
+        review_database.tenant_id,
+        review_database.asset_id,
+        published.version_number,
+        "media/media-generated.png",
+    )
+    assert await _read_all(await review_database.store.open(media_key)) == (
+        b"\x89PNG\r\n\x1a\ngenerated-media"
+    )
+    sessions = _tenant_sessions(review_database)
+    async with sessions() as session:
+        reservation = await session.scalar(
+            select(ClassroomPublicationMaterialization).where(
+                ClassroomPublicationMaterialization.idempotency_key == "generated-media-publish"
+            )
+        )
+    assert reservation is not None
+    receipts = json.loads(reservation.source_media_receipts)
+    assert [(item["mediaId"], item["sourceKind"]) for item in receipts] == [
+        ("media-generated", "version_artifact")
+    ]
 
 
 @pytest.mark.asyncio
@@ -1069,9 +1190,7 @@ async def test_concurrent_migration_rechecks_idempotency_after_target_locks(
         return_exceptions=True,
     )
     errors = [result for result in different_results if isinstance(result, Exception)]
-    migrations = [
-        result for result in different_results if not isinstance(result, Exception)
-    ]
+    migrations = [result for result in different_results if not isinstance(result, Exception)]
     assert len(migrations) == 1
     assert len(errors) == 1
     assert isinstance(errors[0], PublicationConflict)
@@ -1092,9 +1211,7 @@ async def test_concurrent_migration_rechecks_idempotency_after_target_locks(
     async with sessions() as blocker:
         async with blocker.begin():
             await blocker.execute(
-                select(Assignment)
-                .where(Assignment.id == migrated_assignment_id)
-                .with_for_update()
+                select(Assignment).where(Assignment.id == migrated_assignment_id).with_for_update()
             )
             same_tasks = (
                 asyncio.create_task(repository.migrate(same)),
@@ -1114,22 +1231,12 @@ async def test_concurrent_migration_rechecks_idempotency_after_target_locks(
 async def test_edited_approved_draft_is_materialized_as_the_published_version(
     review_database: ReviewDatabase,
 ) -> None:
-    edited_document = {
-        "dslVersion": "0.1.0",
-        "scenes": [
-            {
-                "id": "scene-edited",
-                "type": "slide",
-                "title": "Reviewed lesson",
-                "content": {"text": "The approved edited lesson"},
-            }
-        ],
-        "mediaIds": [],
-        "knowledgePointMappings": [
-            {"knowledgePointId": "kp-motion", "sceneIds": ["scene-edited"]}
-        ],
-        "sourceRefs": [],
-    }
+    edited_document = _canonical_document(
+        review_database.asset_id,
+        review_database.source_version_id,
+        title="Reviewed lesson",
+        text_content="The approved edited lesson",
+    )
     await _approve_edited_draft(
         review_database,
         edited_document,
@@ -1163,31 +1270,22 @@ async def test_edited_approved_draft_is_materialized_as_the_published_version(
         f"tenants/{review_database.tenant_id}/classrooms/"
         f"{review_database.asset_id}/versions/1/classroom.json"
     )
-    assert await _read_all(
-        await review_database.store.open(version.document_object_key)
-    ) == canonical_document
+    assert (
+        await _read_all(await review_database.store.open(version.document_object_key))
+        == canonical_document
+    )
 
 
 @pytest.mark.asyncio
 async def test_materialization_response_loss_retries_the_same_reserved_version(
     review_database: ReviewDatabase,
 ) -> None:
-    edited_document = {
-        "dslVersion": "0.1.0",
-        "scenes": [
-            {
-                "id": "scene-retry",
-                "type": "slide",
-                "title": "Retry-safe lesson",
-                "content": {"text": "Publish this exact reviewed revision once"},
-            }
-        ],
-        "mediaIds": [],
-        "knowledgePointMappings": [
-            {"knowledgePointId": "kp-motion", "sceneIds": ["scene-retry"]}
-        ],
-        "sourceRefs": [],
-    }
+    edited_document = _canonical_document(
+        review_database.asset_id,
+        review_database.source_version_id,
+        title="Retry-safe lesson",
+        text_content="Publish this exact reviewed revision once",
+    )
     await _approve_edited_draft(
         review_database,
         edited_document,
@@ -1197,9 +1295,7 @@ async def test_materialization_response_loss_retries_the_same_reserved_version(
         review_database.engine,
         review_database.tenant_id,
     )
-    materializer = ClassroomPublicationMaterializer(
-        _StoreProvider(review_database.store)
-    )
+    materializer = ClassroomPublicationMaterializer(_StoreProvider(review_database.store))
     publisher = _context(review_database, "publisher-1", "classroom.publish")
     with pytest.raises(RuntimeError, match="response lost"):
         await PublicationService(
@@ -1242,8 +1338,7 @@ async def test_materialization_response_loss_retries_the_same_reserved_version(
         )
         reservation = await session.scalar(
             select(ClassroomPublicationMaterialization).where(
-                ClassroomPublicationMaterialization.idempotency_key
-                == "publish-response-loss"
+                ClassroomPublicationMaterialization.idempotency_key == "publish-response-loss"
             )
         )
     assert version_count == 2
@@ -1255,42 +1350,24 @@ async def test_materialization_response_loss_retries_the_same_reserved_version(
 async def test_publish_refuses_a_draft_changed_after_object_materialization(
     review_database: ReviewDatabase,
 ) -> None:
-    approved_document = {
-        "dslVersion": "0.1.0",
-        "scenes": [
-            {
-                "id": "scene-approved",
-                "type": "slide",
-                "title": "Approved lesson",
-                "content": {"text": "This exact revision was approved"},
-            }
-        ],
-        "mediaIds": [],
-        "knowledgePointMappings": [
-            {"knowledgePointId": "kp-motion", "sceneIds": ["scene-approved"]}
-        ],
-        "sourceRefs": [],
-    }
-    changed_document = {
-        **approved_document,
-        "scenes": [
-            {
-                "id": "scene-changed",
-                "type": "slide",
-                "title": "Unreviewed change",
-                "content": {"text": "This revision was not approved"},
-            }
-        ],
-        "knowledgePointMappings": [],
-    }
+    approved_document = _canonical_document(
+        review_database.asset_id,
+        review_database.source_version_id,
+        title="Approved lesson",
+        text_content="This exact revision was approved",
+    )
+    changed_document = _canonical_document(
+        review_database.asset_id,
+        review_database.source_version_id,
+        title="Unreviewed change",
+        text_content="This revision was not approved",
+    )
     await _approve_edited_draft(
         review_database,
         approved_document,
         submit_key="submit-finalize-race",
     )
-    materializer = ClassroomPublicationMaterializer(
-        _StoreProvider(review_database.store)
-    )
+    materializer = ClassroomPublicationMaterializer(_StoreProvider(review_database.store))
     with pytest.raises(PublicationValidationStale):
         await PublicationService(
             SqlAlchemyPublicationRepository(
@@ -1323,8 +1400,7 @@ async def test_publish_refuses_a_draft_changed_after_object_materialization(
         asset = await session.get(ClassroomAsset, review_database.asset_id)
         reservation = await session.scalar(
             select(ClassroomPublicationMaterialization).where(
-                ClassroomPublicationMaterialization.idempotency_key
-                == "publish-finalize-race"
+                ClassroomPublicationMaterialization.idempotency_key == "publish-finalize-race"
             )
         )
     assert version_count == 1
@@ -1366,22 +1442,14 @@ async def test_publish_promotes_only_receipt_verified_media_referenced_by_the_dr
         _Upload(unused_body, "image/png"),
         hashlib.sha256(unused_body).hexdigest(),
     )
-    edited_document = {
-        "dslVersion": "0.1.0",
-        "scenes": [
-            {
-                "id": "scene-media",
-                "type": "slide",
-                "title": "Reviewed media lesson",
-                "content": {"mediaId": referenced.id},
-            }
-        ],
-        "mediaIds": [referenced.id],
-        "knowledgePointMappings": [
-            {"knowledgePointId": "kp-motion", "sceneIds": ["scene-media"]}
-        ],
-        "sourceRefs": [],
-    }
+    edited_document = _canonical_document(
+        review_database.asset_id,
+        review_database.source_version_id,
+        title="Reviewed media lesson",
+        text_content="Use the reviewed diagram",
+        media_id=referenced.id,
+        media_body=referenced_body,
+    )
     await _approve_edited_draft(
         review_database,
         edited_document,
@@ -1413,9 +1481,7 @@ async def test_publish_promotes_only_receipt_verified_media_referenced_by_the_dr
         published.version_number,
         f"media/{unused.id}.png",
     )
-    assert await _read_all(
-        await review_database.store.open(referenced_key)
-    ) == referenced_body
+    assert await _read_all(await review_database.store.open(referenced_key)) == referenced_body
     assert not await review_database.store.exists(unused_key)
 
     translated = review_database.engine.execution_options(
@@ -1426,8 +1492,7 @@ async def test_publish_promotes_only_receipt_verified_media_referenced_by_the_dr
         version = await session.get(ClassroomVersion, published.version_id)
         reservation = await session.scalar(
             select(ClassroomPublicationMaterialization).where(
-                ClassroomPublicationMaterialization.idempotency_key
-                == "publish-edited-media"
+                ClassroomPublicationMaterialization.idempotency_key == "publish-edited-media"
             )
         )
     assert version is not None and reservation is not None

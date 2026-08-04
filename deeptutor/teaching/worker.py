@@ -21,6 +21,7 @@ from deeptutor.teaching.artifact_validation import (
 )
 from deeptutor.teaching.artifacts import ClassroomArtifactManifest, classroom_artifact_key
 from deeptutor.teaching.contracts import (
+    ClassroomDocument,
     ExportRequest,
     GenerationRequest,
     OutlineBundle,
@@ -56,6 +57,7 @@ from deeptutor.teaching.scheduler import ClaimedGenerationJob, FairScheduler
 
 LEASE_SECONDS = 60
 HEARTBEAT_SECONDS = 15
+_MAX_CLASSROOM_DOCUMENT_BYTES = 8 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,6 +209,54 @@ def _manifest_sha256(manifest: ClassroomArtifactManifest) -> str:
             }
         )
     ).hexdigest()
+
+
+async def _load_promoted_classroom_document(
+    store: ClassroomArtifactStore,
+    *,
+    object_key: str,
+    expected_sha256: str,
+    expected_size: int,
+    expected_media_manifest_sha256: str,
+    expected_classroom_id: str,
+    expected_classroom_version_id: str,
+) -> str:
+    """Read back the committed object and return only exact canonical DSL bytes."""
+
+    if (
+        isinstance(expected_size, bool)
+        or not isinstance(expected_size, int)
+        or expected_size < 1
+        or expected_size > _MAX_CLASSROOM_DOCUMENT_BYTES
+    ):
+        raise ArtifactValidationError("artifact_invalid")
+    body = bytearray()
+    async for chunk in await store.open(object_key):
+        if not isinstance(chunk, bytes):
+            raise ArtifactValidationError("artifact_invalid")
+        body.extend(chunk)
+        if len(body) > expected_size or len(body) > _MAX_CLASSROOM_DOCUMENT_BYTES:
+            raise ArtifactValidationError("artifact_invalid")
+    payload = bytes(body)
+    if len(payload) != expected_size or hashlib.sha256(payload).hexdigest() != expected_sha256:
+        raise ArtifactValidationError("hash_invalid")
+    try:
+        document = ClassroomDocument.model_validate_json(payload)
+    except (ValidationError, ValueError, UnicodeError):
+        raise ArtifactValidationError("dsl_invalid") from None
+    if canonical_json_bytes(document) != payload:
+        raise ArtifactValidationError("hash_invalid")
+    raw = document.model_dump(mode="json", by_alias=True, exclude_none=True)
+    file_sha256 = raw.pop("fileSha256")
+    if (
+        hashlib.sha256(canonical_json_bytes(raw)).hexdigest() != file_sha256
+        or hashlib.sha256(canonical_json_bytes(raw["mediaManifest"])).hexdigest()
+        != expected_media_manifest_sha256
+        or document.classroom_id != expected_classroom_id
+        or document.classroom_version_id != expected_classroom_version_id
+    ):
+        raise ArtifactValidationError("hash_invalid")
+    return payload.decode("utf-8")
 
 
 def _validation_failure(error: ArtifactValidationError) -> JobFailure:
@@ -553,9 +603,23 @@ class GenerationWorker:
             target_keys=target_keys,
             heartbeat=heartbeat,
         )
+        document_artifact = output.document_artifact
+        document_key = dict(zip(output.artifacts, target_keys, strict=True))[document_artifact]
+        store = await self._stores.store_for_tenant(claim.tenant_id)
+        document_payload = await _load_promoted_classroom_document(
+            store,
+            object_key=document_key,
+            expected_sha256=document_artifact.sha256,
+            expected_size=document_artifact.size,
+            expected_media_manifest_sha256=output.media_manifest_sha256,
+            expected_classroom_id=output.classroom_id,
+            expected_classroom_version_id=output.classroom_version_id,
+        )
+        heartbeat.assert_current()
         await self._repository.finalize_generation(
             claim,
             classroom_version_id=output.classroom_version_id,
+            document_payload=document_payload,
             document_sha256=output.document_sha256,
             media_manifest_sha256=output.media_manifest_sha256,
             manifest_sha256=manifest_sha256,

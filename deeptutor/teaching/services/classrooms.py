@@ -15,16 +15,22 @@ import re
 import secrets
 import tempfile
 from typing import Any, AsyncIterator, Protocol
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 import zipfile
 
-from deeptutor.teaching.artifacts import StoredArtifact, temporary_artifact_key
+from deeptutor.teaching.artifacts import (
+    ArtifactManifestEntry,
+    ArtifactManifestError,
+    StoredArtifact,
+    temporary_artifact_key,
+)
 from deeptutor.teaching.brief_builder import (
     KnowledgePointSpec,
     TeachingBriefBuilder,
     TeachingBriefSpec,
 )
 from deeptutor.teaching.contracts import (
+    ClassroomDocument,
     GenerationRequest,
     OutlineBundle,
     OutlineConfirmationMetadata,
@@ -159,6 +165,15 @@ class DraftMediaContent:
     body: AsyncIterator[bytes] = field(repr=False)
 
 
+@dataclass(frozen=True, slots=True)
+class ClassroomMediaBinding:
+    media_id: str
+    relative_name: str
+    mime_type: str
+    sha256: str
+    size_bytes: int
+
+
 class ClassroomRepository(Protocol):
     async def get_creation(self, idempotency_key: str) -> ClassroomRecord | None: ...
 
@@ -207,7 +222,10 @@ class ClassroomRepository(Protocol):
         expected_revision: int,
     ) -> ClassroomRecord | None: ...
 
-    async def available_media_ids(self, asset_id: str) -> frozenset[str]: ...
+    async def available_media_bindings(
+        self,
+        asset_id: str,
+    ) -> tuple[ClassroomMediaBinding, ...]: ...
 
     async def save_validation_report(
         self,
@@ -338,10 +356,9 @@ class DraftMediaStoreProvider(Protocol):
 
 
 _MEDIA_ID_PATTERN = re.compile(r"^media-[0-9a-f]{32}$")
+_CANONICAL_MEDIA_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._~-]{0,127}$")
 _MAX_OPPORTUNISTIC_MEDIA_CLEANUPS = 8
-_CREATION_IDEMPOTENCY_KEY_PATTERN = re.compile(
-    r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$"
-)
+_CREATION_IDEMPOTENCY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
 _RAW_REFERENCE_FIELDS = frozenset(
     {
         "action",
@@ -617,8 +634,7 @@ def _contains_css_url(value: str) -> bool:
 
 def _looks_like_reference_value(value: object) -> bool:
     if isinstance(value, Mapping) or (
-        isinstance(value, Sequence)
-        and not isinstance(value, (str, bytes, bytearray))
+        isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray))
     ):
         return True
     if not isinstance(value, str):
@@ -722,7 +738,7 @@ class _InteractiveHtmlValidator(HTMLParser):
             elif _is_raw_reference_field(name) or _contains_unsafe_reference(value):
                 raise self._unsafe()
             if name == "data-media-id":
-                if _MEDIA_ID_PATTERN.fullmatch(value) is None:
+                if _CANONICAL_MEDIA_ID_PATTERN.fullmatch(value) is None:
                     raise self._unsafe()
                 self.media_ids.add(value)
             elif normalized_name.endswith(("url", "uri", "src", "href", "path")):
@@ -788,31 +804,136 @@ def _validate_interactive_html(value: object) -> frozenset[str]:
     return _InteractiveHtmlValidator().validated_media_ids(value)
 
 
-def validate_draft_document_references(document: Mapping[str, Any]) -> frozenset[str]:
-    """Reject client object-store identities and return opaque media references."""
-
+def _canonical_classroom_document(document: Mapping[str, Any]) -> ClassroomDocument:
     if not isinstance(document, Mapping):
         raise InvalidDraftDocument("draft document is invalid")
+    try:
+        parsed = ClassroomDocument.model_validate(document)
+    except Exception:
+        raise InvalidDraftDocument("draft document is not a portable classroom") from None
+    if canonical_json_bytes(document) != canonical_json_bytes(parsed):
+        raise InvalidDraftDocument("draft document is not canonical")
+    raw = parsed.model_dump(mode="json", by_alias=True, exclude_none=True)
+    file_sha256 = raw.pop("fileSha256")
+    if hashlib.sha256(canonical_json_bytes(raw)).hexdigest() != file_sha256:
+        raise InvalidDraftDocument("draft document file hash is invalid")
+    return parsed
+
+
+def _validate_portable_path(value: str) -> None:
+    decoded = _decoded_reference(value)
+    parsed = urlsplit(decoded)
+    if (
+        not decoded
+        or "\\" in decoded
+        or "\x00" in decoded
+        or parsed.scheme
+        or parsed.netloc
+        or parsed.query
+        or parsed.fragment
+        or decoded.startswith("//")
+        or _contains_unsafe_reference(decoded)
+        or any(segment in {"", ".", ".."} for segment in decoded.strip("/").split("/"))
+    ):
+        raise InvalidDraftDocument("draft document has an unsafe reference")
+
+
+def _embedded_media_ids(value: object) -> frozenset[str]:
     media_ids: set[str] = set()
-    for _path, key, value in _walk(document):
+    for _path, key, nested in _walk(value):
         normalized_key = _normalized_field_name(key) if isinstance(key, str) else None
         media_id_kind = _media_id_field_kind(key) if isinstance(key, str) else None
         if normalized_key == "html":
-            media_ids.update(_validate_interactive_html(value))
+            media_ids.update(_validate_interactive_html(nested))
         elif media_id_kind == "singular":
-            if not isinstance(value, str) or _MEDIA_ID_PATTERN.fullmatch(value) is None:
+            if not isinstance(nested, str) or _CANONICAL_MEDIA_ID_PATTERN.fullmatch(nested) is None:
                 raise InvalidDraftDocument("draft document has an unsafe reference")
-            media_ids.add(value)
+            media_ids.add(nested)
         elif media_id_kind == "plural":
-            if not isinstance(value, list) or any(
-                not isinstance(item, str) or _MEDIA_ID_PATTERN.fullmatch(item) is None
-                for item in value
+            if not isinstance(nested, list) or any(
+                not isinstance(item, str) or _CANONICAL_MEDIA_ID_PATTERN.fullmatch(item) is None
+                for item in nested
             ):
                 raise InvalidDraftDocument("draft document has an unsafe reference")
-            media_ids.update(value)
-        elif normalized_key is not None and _is_reference_semantic_field(key, value):
+            media_ids.update(nested)
+        elif normalized_key is not None and _is_reference_semantic_field(key, nested):
             raise InvalidDraftDocument("draft document has an unsafe reference")
     return frozenset(media_ids)
+
+
+def validate_draft_document_references(
+    document: Mapping[str, Any],
+    *,
+    available_media_bindings: tuple[ClassroomMediaBinding, ...] = (),
+) -> frozenset[str]:
+    """Validate one canonical document against trusted immutable media receipts."""
+
+    parsed = _canonical_classroom_document(document)
+    bindings = {item.media_id: item for item in available_media_bindings}
+    if len(bindings) != len(available_media_bindings):
+        raise InvalidDraftDocument("available classroom media bindings conflict")
+    declared_ids: set[str] = set()
+    declared_paths: set[str] = set()
+    for item in parsed.media_manifest:
+        if (
+            _CANONICAL_MEDIA_ID_PATTERN.fullmatch(item.media_id) is None
+            or item.media_id in declared_ids
+            or item.relative_path in declared_paths
+        ):
+            raise InvalidDraftDocument("classroom media manifest conflicts")
+        try:
+            ArtifactManifestEntry(
+                relative_name=item.relative_path,
+                content_type=item.mime_type,
+                sha256=item.sha256,
+                size=item.size_bytes,
+            ).validate()
+        except ArtifactManifestError:
+            raise InvalidDraftDocument("classroom media manifest is invalid") from None
+        _validate_portable_path(item.temporary_download_path)
+        binding = bindings.get(item.media_id)
+        if binding is None or (
+            binding.relative_name,
+            binding.mime_type,
+            binding.sha256,
+            binding.size_bytes,
+        ) != (
+            item.relative_path,
+            item.mime_type,
+            item.sha256,
+            item.size_bytes,
+        ):
+            raise InvalidDraftDocument("draft document references unavailable media")
+        declared_ids.add(item.media_id)
+        declared_paths.add(item.relative_path)
+    for item in parsed.export_manifest:
+        try:
+            ArtifactManifestEntry(
+                relative_name=item.relative_path,
+                content_type=item.mime_type,
+                sha256=item.sha256,
+                size=item.size_bytes,
+            ).validate()
+        except ArtifactManifestError:
+            raise InvalidDraftDocument("classroom export manifest is invalid") from None
+        _validate_portable_path(item.temporary_download_path)
+    referenced_ids: set[str] = set()
+    for scene in parsed.openmaic.scenes:
+        referenced_ids.update(
+            _embedded_media_ids(
+                {
+                    "content": scene.content.model_dump(
+                        mode="json", by_alias=True, exclude_none=True
+                    ),
+                    "actions": scene.actions,
+                }
+            )
+        )
+    if referenced_ids != declared_ids:
+        raise InvalidDraftDocument(
+            "draft document media manifest must match referenced media exactly"
+        )
+    return frozenset(declared_ids)
 
 
 def _issue(severity: str, code: str, message: str, path: str) -> dict[str, str]:
@@ -838,16 +959,32 @@ def build_validation_report(
     *,
     required_knowledge_point_ids: tuple[str, ...],
     grounded: bool,
-    available_media_ids: frozenset[str],
+    available_media_bindings: tuple[ClassroomMediaBinding, ...],
 ) -> dict[str, object]:
     """Build the persisted, actionable nine-section Task 4 quality report."""
 
+    parsed = _canonical_classroom_document(document)
+    document_view = {
+        "dslVersion": parsed.openmaic.dsl_version,
+        "scenes": [
+            scene.model_dump(mode="json", by_alias=True, exclude_none=True)
+            for scene in parsed.openmaic.scenes
+        ],
+        "knowledgePointMappings": [
+            item.model_dump(mode="json", by_alias=True, exclude_none=True)
+            for item in parsed.knowledge_point_mappings
+        ],
+        "sourceRefs": [
+            item.model_dump(mode="json", by_alias=True, exclude_none=True)
+            for item in parsed.source_refs
+        ],
+    }
     sections: dict[str, dict[str, object]] = {
         name: _section([]) for name in _VALIDATION_SECTION_NAMES
     }
     dsl_issues: list[dict[str, str]] = []
-    scenes = document.get("scenes")
-    if document.get("dslVersion") != "0.1.0":
+    scenes = document_view["scenes"]
+    if document_view["dslVersion"] != "0.1.0":
         dsl_issues.append(
             _issue("error", "dsl_version_invalid", "Use DSL version 0.1.0.", "$.dslVersion")
         )
@@ -860,9 +997,11 @@ def build_validation_report(
 
     media_issues: list[dict[str, str]] = []
     try:
-        referenced_media = validate_draft_document_references(document)
+        validate_draft_document_references(
+            document,
+            available_media_bindings=available_media_bindings,
+        )
     except InvalidDraftDocument:
-        referenced_media = frozenset()
         media_issues.append(
             _issue(
                 "error",
@@ -871,23 +1010,18 @@ def build_validation_report(
                 "$",
             )
         )
-    for media_id in sorted(referenced_media - available_media_ids):
-        media_issues.append(
-            _issue(
-                "error",
-                "media_missing",
-                "Upload the referenced media again.",
-                f"$.mediaIds[{media_id}]",
-            )
-        )
     sections["media_integrity"] = _section(media_issues)
 
-    mappings = document.get("knowledgePointMappings")
-    mapped_ids = {
-        item.get("knowledgePointId")
-        for item in mappings
-        if isinstance(item, Mapping) and isinstance(item.get("knowledgePointId"), str)
-    } if isinstance(mappings, list) else set()
+    mappings = document_view["knowledgePointMappings"]
+    mapped_ids = (
+        {
+            item.get("knowledgePointId")
+            for item in mappings
+            if isinstance(item, Mapping) and isinstance(item.get("knowledgePointId"), str)
+        }
+        if isinstance(mappings, list)
+        else set()
+    )
     coverage_issues = [
         _issue(
             "warning",
@@ -900,7 +1034,7 @@ def build_validation_report(
     ]
     sections["knowledge_point_coverage"] = _section(coverage_issues)
 
-    source_refs = document.get("sourceRefs")
+    source_refs = document_view["sourceRefs"]
     traceability_issues: list[dict[str, str]] = []
     if grounded and (not isinstance(source_refs, list) or not source_refs):
         traceability_issues.append(
@@ -1033,9 +1167,7 @@ def _allows(
         course_id=course_id,
         class_id=class_id,
     )
-    return any(
-        grant.allows_resource(permission, resource) for grant in context.permissions
-    )
+    return any(grant.allows_resource(permission, resource) for grant in context.permissions)
 
 
 def _outline_payload(outline: OutlineBundle) -> dict[str, Any]:
@@ -1102,7 +1234,9 @@ async def _stage_media(upload: DraftMediaUpload, mime_type: str):
                 with zipfile.ZipFile(handle) as archive:
                     names = frozenset(archive.namelist())
             except (OSError, zipfile.BadZipFile):
-                raise InvalidDraftMedia("draft media content does not match its MIME type") from None
+                raise InvalidDraftMedia(
+                    "draft media content does not match its MIME type"
+                ) from None
             if "[Content_Types].xml" not in names or not any(
                 name.startswith("ppt/") for name in names
             ):
@@ -1491,9 +1625,7 @@ class ClassroomService:
             template_version=getattr(request, "template_version"),
             knowledge_points=points,
             content_mode=getattr(request, "content_mode"),
-            open_creation_acknowledged=getattr(
-                request, "open_creation_acknowledged"
-            ),
+            open_creation_acknowledged=getattr(request, "open_creation_acknowledged"),
             allowed_web_domains=tuple(getattr(request, "allowed_web_domains")),
         )
         content_mode = getattr(request, "content_mode")
@@ -1555,14 +1687,10 @@ class ClassroomService:
                 record.creation_request_sha256,
                 request_sha256,
             )
-            or record.asset_id
-            != _creation_identifier("asset", context.tenant_id, idempotency_key)
-            or record.draft_id
-            != _creation_identifier("draft", context.tenant_id, idempotency_key)
+            or record.asset_id != _creation_identifier("asset", context.tenant_id, idempotency_key)
+            or record.draft_id != _creation_identifier("draft", context.tenant_id, idempotency_key)
         ):
-            raise ClassroomIdempotencyConflict(
-                "classroom idempotency key conflicts"
-            )
+            raise ClassroomIdempotencyConflict("classroom idempotency key conflicts")
 
     async def _resume_creation(
         self,
@@ -1582,9 +1710,7 @@ class ClassroomService:
                 requested_exports=requested_exports,
             )
             if stage.classroom_version_id is not None:
-                raise InvalidClassroomState(
-                    "outline stage cannot create a classroom version"
-                )
+                raise InvalidClassroomState("outline stage cannot create a classroom version")
             record = await self._repository.attach_outline_job(
                 record.asset_id,
                 stage.job_id,
@@ -1608,14 +1734,11 @@ class ClassroomService:
         return record
 
     def _can_edit(self, context: TenantContext, record: ClassroomRecord) -> bool:
-        return (
-            record.tenant_id == context.tenant_id
-            and _allows(
-                context,
-                "classroom.edit",
-                course_id=record.course_id,
-                class_id=record.class_id,
-            )
+        return record.tenant_id == context.tenant_id and _allows(
+            context,
+            "classroom.edit",
+            course_id=record.course_id,
+            class_id=record.class_id,
         )
 
     async def list(self, context: TenantContext) -> tuple[ClassroomRecord, ...]:
@@ -1636,9 +1759,7 @@ class ClassroomService:
                 context=context,
                 job_id=record.job_id,
             )
-            if stage.classroom_version_id is not None and stage.status not in {
-                "succeeded"
-            }:
+            if stage.classroom_version_id is not None and stage.status not in {"succeeded"}:
                 raise InvalidClassroomState("classroom version has invalid job state")
             if stage.status == "awaiting_confirmation" and stage.outline is not None:
                 record = await self._repository.save_outline(
@@ -1750,10 +1871,7 @@ class ClassroomService:
             outline_sha256,
             source_outline_sha256,
         )
-        if (
-            persisted.outline is None
-            or persisted.confirmed_outline_sha256 is None
-        ):
+        if persisted.outline is None or persisted.confirmed_outline_sha256 is None:
             raise InvalidClassroomState("confirmed outline is unavailable")
         try:
             persisted_outline = OutlineBundle.model_validate(persisted.outline)
@@ -1793,17 +1911,27 @@ class ClassroomService:
         record = await self._editable_record(context, asset_id)
         if record.lifecycle_state != "editing":
             raise InvalidClassroomState("classroom draft is not editable")
-        media_ids = validate_draft_document_references(document)
-        available = await self._repository.available_media_ids(asset_id)
-        if not media_ids.issubset(available):
-            raise InvalidDraftDocument("draft document references unavailable media")
-        try:
-            document_sha256 = _sha256_payload(document)
-        except (TypeError, ValueError):
-            raise InvalidDraftDocument("draft document is invalid") from None
+        parsed = _canonical_classroom_document(document)
+        if (
+            record.classroom_version_id is None
+            or parsed.classroom_id != asset_id
+            or parsed.classroom_version_id != record.classroom_version_id
+        ):
+            raise InvalidDraftDocument("draft document classroom binding is invalid")
+        available = await self._repository.available_media_bindings(asset_id)
+        validate_draft_document_references(
+            document,
+            available_media_bindings=available,
+        )
+        canonical_document = parsed.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+        )
+        document_sha256 = _sha256_payload(canonical_document)
         updated = await self._repository.update_document(
             asset_id,
-            document,
+            canonical_document,
             document_sha256,
             expected_revision,
         )
@@ -1819,19 +1947,31 @@ class ClassroomService:
         record = await self._editable_record(context, asset_id)
         if record.lifecycle_state != "editing":
             raise InvalidClassroomState("classroom draft cannot be validated")
-        available = await self._repository.available_media_ids(asset_id)
+        available = await self._repository.available_media_bindings(asset_id)
         brief = record.teaching_brief
         if brief is None:
             raise InvalidClassroomState("teaching brief is unavailable")
+        parsed = _canonical_classroom_document(record.document)
+        if (
+            record.classroom_version_id is None
+            or parsed.classroom_id != asset_id
+            or parsed.classroom_version_id != record.classroom_version_id
+        ):
+            raise InvalidDraftDocument("draft document classroom binding is invalid")
+        canonical_document = parsed.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+        )
         report = build_validation_report(
-            record.document,
+            canonical_document,
             required_knowledge_point_ids=tuple(
                 point.knowledge_point_id for point in brief.knowledge_points
             ),
             grounded=brief.content_mode == "source_grounded",
-            available_media_ids=available,
+            available_media_bindings=available,
         )
-        document_sha256 = _sha256_payload(record.document)
+        document_sha256 = _sha256_payload(canonical_document)
         report.update(
             draftRevision=record.revision,
             documentSha256=document_sha256,
