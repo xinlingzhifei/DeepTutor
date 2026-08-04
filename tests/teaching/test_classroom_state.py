@@ -14,6 +14,8 @@ from deeptutor.teaching.models.classrooms import (
     ClassroomAsset,
     ClassroomDraft,
     ClassroomDraftMedia,
+    ClassroomExport,
+    ClassroomExportPolicy,
     ClassroomPublicationMaterialization,
     ClassroomReviewPolicy,
     ClassroomReviewRequest,
@@ -98,6 +100,7 @@ def test_tenant_metadata_contains_the_classroom_domain_tables() -> None:
         "tenant.class_learning_states",
         "tenant.classroom_versions",
         "tenant.classroom_exports",
+        "tenant.classroom_export_policies",
         "tenant.approvals",
         "tenant.publications",
         "tenant.assignments",
@@ -172,12 +175,130 @@ def test_review_events_link_to_request_and_terminal_decision_is_unique() -> None
     assert "uq_approvals_terminal_review_decision" in terminal_indexes
 
 
-def test_review_publication_migration_is_the_tenant_head() -> None:
+def test_review_publication_migration_follows_classroom_authoring() -> None:
     migration = importlib.import_module(
         "deeptutor.teaching.migrations.versions.20260803_0011_review_publication"
     )
     assert migration.revision == "20260803_0011"
     assert migration.down_revision == "20260803_0010"
+
+
+def test_classroom_export_schema_pins_one_source_and_durable_receipts() -> None:
+    table = ClassroomExport.__table__
+    columns = table.c
+    assert {
+        "classroom_id",
+        "classroom_version_id",
+        "classroom_draft_id",
+        "draft_revision",
+        "generation_job_id",
+        "export_format",
+        "input_document_sha256",
+        "input_media_manifest_sha256",
+        "idempotency_key",
+        "request_sha256",
+        "input_manifest_object_key",
+        "input_manifest_sha256",
+        "relative_name",
+        "object_key",
+        "sha256",
+        "size_bytes",
+        "mime_type",
+        "status",
+        "created_by",
+        "created_at",
+        "updated_at",
+    }.issubset(columns.keys())
+    assert columns.classroom_version_id.nullable is True
+    assert columns.classroom_draft_id.nullable is True
+    assert columns.draft_revision.nullable is True
+    assert columns.generation_job_id.nullable is True
+    assert columns.object_key.nullable is True
+    assert columns.sha256.nullable is True
+
+    checks = {
+        constraint.name: str(constraint.sqltext)
+        for constraint in table.constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+    assert "classroom_id IS NULL OR" in checks[
+        "ck_classroom_exports_target"
+    ]
+    assert "classroom_version_id IS NOT NULL" in checks[
+        "ck_classroom_exports_target"
+    ]
+    assert "classroom_draft_id IS NOT NULL" in checks[
+        "ck_classroom_exports_target"
+    ]
+    assert "draft_revision > 0" in checks[
+        "ck_classroom_exports_draft_revision"
+    ]
+    assert "classroom_zip" in checks["ck_classroom_exports_format"]
+    assert "mp4" in checks["ck_classroom_exports_format"]
+    assert "input_manifest_object_key IS NULL" in checks[
+        "ck_classroom_exports_input_receipt"
+    ]
+    assert "status = 'ready'" in checks[
+        "ck_classroom_exports_output_receipt"
+    ]
+
+    unique_columns = {
+        tuple(constraint.columns.keys())
+        for constraint in table.constraints
+        if isinstance(constraint, UniqueConstraint)
+    }
+    assert ("tenant_id", "idempotency_key") in unique_columns
+    assert ("tenant_id", "generation_job_id") in unique_columns
+
+    foreign_keys = {
+        (
+            tuple(constraint.columns.keys()),
+            tuple(element.target_fullname for element in constraint.elements),
+        )
+        for constraint in table.constraints
+        if isinstance(constraint, ForeignKeyConstraint)
+    }
+    assert (
+        ("classroom_id", "tenant_id"),
+        ("tenant.classroom_assets.id", "tenant.classroom_assets.tenant_id"),
+    ) in foreign_keys
+    assert (
+        ("classroom_version_id", "classroom_id", "tenant_id"),
+        (
+            "tenant.classroom_versions.id",
+            "tenant.classroom_versions.classroom_id",
+            "tenant.classroom_versions.tenant_id",
+        ),
+    ) in foreign_keys
+    assert (
+        ("classroom_draft_id", "classroom_id", "tenant_id"),
+        (
+            "tenant.classroom_drafts.id",
+            "tenant.classroom_drafts.classroom_id",
+            "tenant.classroom_drafts.tenant_id",
+        ),
+    ) in foreign_keys
+    assert (
+        ("generation_job_id", "tenant_id"),
+        ("tenant.generation_jobs.id", "tenant.generation_jobs.tenant_id"),
+    ) in foreign_keys
+
+
+def test_classroom_export_policy_defaults_mp4_to_denied() -> None:
+    policy = ClassroomExportPolicy.__table__
+    assert policy.c.tenant_id.primary_key is True
+    assert policy.c.allow_mp4.nullable is False
+    assert policy.c.allow_mp4.server_default is not None
+    assert str(policy.c.allow_mp4.server_default.arg) == "false"
+    assert {"updated_by", "updated_at"}.issubset(policy.c.keys())
+
+
+def test_classroom_export_migration_is_the_tenant_head() -> None:
+    migration = importlib.import_module(
+        "deeptutor.teaching.migrations.versions.20260804_0012_classroom_exports"
+    )
+    assert migration.revision == "20260804_0012"
+    assert migration.down_revision == "20260803_0011"
 
 
 def test_draft_media_is_integrity_checked_and_bound_to_tenant_asset() -> None:

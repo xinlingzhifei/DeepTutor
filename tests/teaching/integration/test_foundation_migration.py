@@ -24,7 +24,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 FOUNDATION_REVISION = "20260728_0001"
 SCOPED_GRANTS_REVISION = "20260730_0002"
 PROVISIONING_REVISION = "20260730_0003"
-HEAD_REVISION = "20260803_0011"
+HEAD_REVISION = "20260804_0012"
 
 
 @dataclass(frozen=True)
@@ -460,6 +460,7 @@ def test_migration_runs_from_outside_repository(
         "classroom_assets",
         "classroom_draft_media",
         "classroom_drafts",
+        "classroom_export_policies",
         "classroom_exports",
         "classroom_publication_materializations",
         "classroom_review_policies",
@@ -518,6 +519,7 @@ def test_wheel_packages_migrations_and_full_app_entrypoint(
         "deeptutor/teaching/migrations/versions/20260803_0009_knowledge_entitlements.py",
         "deeptutor/teaching/migrations/versions/20260803_0010_classroom_authoring.py",
         "deeptutor/teaching/migrations/versions/20260803_0011_review_publication.py",
+        "deeptutor/teaching/migrations/versions/20260804_0012_classroom_exports.py",
     }.issubset(names)
     assert "deeptutor-migrate = deeptutor.teaching.migrations.cli:main" in entry_points
     assert "deeptutor-provisioner = deeptutor.teaching.provisioning_cli:main" in entry_points
@@ -594,6 +596,7 @@ def test_packaged_entrypoint_runs_platform_and_tenant_scopes(
         "classroom_assets",
         "classroom_draft_media",
         "classroom_drafts",
+        "classroom_export_policies",
         "classroom_exports",
         "classroom_publication_materializations",
         "classroom_review_policies",
@@ -819,6 +822,7 @@ def test_foundation_migration_is_isolated_and_repeatable(migration_database):
         "classroom_assets",
         "classroom_draft_media",
         "classroom_drafts",
+        "classroom_export_policies",
         "classroom_exports",
         "classroom_publication_materializations",
         "classroom_review_policies",
@@ -848,6 +852,7 @@ def test_foundation_migration_is_isolated_and_repeatable(migration_database):
         "classroom_assets",
         "classroom_draft_media",
         "classroom_drafts",
+        "classroom_export_policies",
         "classroom_exports",
         "classroom_publication_materializations",
         "classroom_review_policies",
@@ -4423,7 +4428,7 @@ def test_future_tenant_schema_revision_is_not_enqueued_or_claimed(
                         TenantSchemaState(
                             tenant_id="future-schema-tenant",
                             schema_name=tenant_schema_name("future-schema-tenant"),
-                            revision="20260803_0011",
+                            revision="20260805_9999",
                             status="active",
                         )
                     )
@@ -4967,3 +4972,320 @@ def test_migration_rejects_unrecognized_or_dangerous_scope_arguments(
     safe_output = _assert_secret_safe_output(migration_database, completed)
     assert completed.returncode != 0, safe_output
     assert expected_message in safe_output
+
+
+def test_classroom_export_migration_preserves_legacy_rows_and_guards_downgrade(
+    migration_database,
+) -> None:
+    tenant_id = "classroom-export-migration"
+    schema_name = tenant_schema_name(tenant_id)
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(migration_database, "scope=platform"),
+    )
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(
+            migration_database,
+            "scope=tenant",
+            f"tenant_schema={schema_name}",
+            revision="20260803_0011",
+        ),
+    )
+
+    async def seed_legacy_export() -> None:
+        engine = create_async_engine(migration_database.url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO platform.tenants (id, name, status)
+                        VALUES (:tenant_id, 'Classroom export migration', 'active')
+                        """
+                    ),
+                    {"tenant_id": tenant_id},
+                )
+                await connection.execute(
+                    text(
+                        """
+                        INSERT INTO platform.tenant_schema_states (
+                            tenant_id, schema_name, revision, status
+                        ) VALUES (
+                            :tenant_id, :schema_name, '20260803_0011', 'active'
+                        )
+                        """
+                    ),
+                    {"tenant_id": tenant_id, "schema_name": schema_name},
+                )
+                await connection.execute(
+                    text(
+                        f"""
+                        INSERT INTO "{schema_name}".generation_jobs (
+                            id, tenant_id, job_kind, phase, status, priority,
+                            quota_units, actor_id, owner_id, visibility,
+                            request_id, idempotency_key, request_sha256,
+                            data_plane_route_id, provider_profile_id,
+                            worker_pool_ref, queue_ref, request_payload,
+                            progress_percent
+                        ) VALUES (
+                            'generation-1', :tenant_id, 'generation', 'content',
+                            'succeeded', 10, 1, 'teacher-1', 'teacher-1',
+                            'private', 'legacy-generation-request',
+                            'legacy-generation-idempotency', :request_sha256,
+                            'legacy-route', 'legacy-provider', 'legacy-workers',
+                            'legacy.queue', '{{}}', 100
+                        )
+                        """
+                    ),
+                    {"tenant_id": tenant_id, "request_sha256": "1" * 64},
+                )
+                await connection.execute(
+                    text(
+                        f"""
+                        INSERT INTO "{schema_name}".classroom_assets (
+                            id, tenant_id, owner_id, title, lifecycle_state
+                        ) VALUES (
+                            'asset-1', :tenant_id, 'teacher-1',
+                            'Legacy export classroom', 'published'
+                        )
+                        """
+                    ),
+                    {"tenant_id": tenant_id},
+                )
+                await connection.execute(
+                    text(
+                        f"""
+                        INSERT INTO "{schema_name}".classroom_versions (
+                            id, tenant_id, classroom_id, version_number,
+                            generation_job_id, source_version_id,
+                            document_sha256, media_manifest_sha256,
+                            document_object_key
+                        ) VALUES (
+                            'version-1', :tenant_id, 'asset-1', 1,
+                            'generation-1', NULL, :document_sha256,
+                            :manifest_sha256,
+                            'classrooms/asset-1/v1/classroom.json'
+                        )
+                        """
+                    ),
+                    {
+                        "tenant_id": tenant_id,
+                        "document_sha256": "2" * 64,
+                        "manifest_sha256": "3" * 64,
+                    },
+                )
+                await connection.execute(
+                    text(
+                        f"""
+                        INSERT INTO "{schema_name}".classroom_exports (
+                            id, tenant_id, classroom_version_id,
+                            generation_job_id, export_format, object_key,
+                            sha256, status, created_by
+                        ) VALUES (
+                            'legacy-export', :tenant_id, 'version-1', NULL,
+                            'legacy_pdf', 'classrooms/asset-1/legacy.pdf',
+                            :sha256, 'ready', 'teacher-1'
+                        )
+                        """
+                    ),
+                    {"tenant_id": tenant_id, "sha256": "4" * 64},
+                )
+        finally:
+            await engine.dispose()
+
+    async def inspect_head() -> tuple[str, str, tuple[object, ...], set[str]]:
+        engine = create_async_engine(migration_database.url)
+        try:
+            async with engine.connect() as connection:
+                alembic_revision = await connection.scalar(
+                    text(f'SELECT version_num FROM "{schema_name}".alembic_version')
+                )
+                state_revision = await connection.scalar(
+                    text(
+                        "SELECT revision FROM platform.tenant_schema_states "
+                        "WHERE tenant_id = :tenant_id"
+                    ),
+                    {"tenant_id": tenant_id},
+                )
+                legacy = (
+                    await connection.execute(
+                        text(
+                            f"""
+                            SELECT classroom_id, classroom_version_id,
+                                   classroom_draft_id, draft_revision,
+                                   input_document_sha256, idempotency_key,
+                                   relative_name, object_key, sha256,
+                                   size_bytes, mime_type, status
+                            FROM "{schema_name}".classroom_exports
+                            WHERE id = 'legacy-export'
+                            """
+                        )
+                    )
+                ).one()
+                constraints = set(
+                    (
+                        await connection.execute(
+                            text(
+                                """
+                                SELECT constraint_name
+                                FROM information_schema.table_constraints
+                                WHERE constraint_schema = :schema_name
+                                  AND table_name = 'classroom_exports'
+                                """
+                            ),
+                            {"schema_name": schema_name},
+                        )
+                    ).scalars()
+                )
+                return (
+                    str(alembic_revision),
+                    str(state_revision),
+                    tuple(legacy),
+                    constraints,
+                )
+        finally:
+            await engine.dispose()
+
+    async def inspect_legacy_revision() -> tuple[str, tuple[str, str, str, str]]:
+        engine = create_async_engine(migration_database.url)
+        try:
+            async with engine.connect() as connection:
+                revision = await connection.scalar(
+                    text(f'SELECT version_num FROM "{schema_name}".alembic_version')
+                )
+                legacy = (
+                    await connection.execute(
+                        text(
+                            f"""
+                            SELECT classroom_version_id, export_format,
+                                   object_key, status
+                            FROM "{schema_name}".classroom_exports
+                            WHERE id = 'legacy-export'
+                            """
+                        )
+                    )
+                ).one()
+                return str(revision), tuple(legacy)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(seed_legacy_export())
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(
+            migration_database,
+            "scope=tenant",
+            f"tenant_schema={schema_name}",
+        ),
+    )
+    alembic_revision, state_revision, legacy, constraints = asyncio.run(
+        inspect_head()
+    )
+    assert (alembic_revision, state_revision) == (HEAD_REVISION, HEAD_REVISION)
+    assert legacy == (
+        None,
+        "version-1",
+        None,
+        None,
+        None,
+        None,
+        None,
+        "classrooms/asset-1/legacy.pdf",
+        "4" * 64,
+        None,
+        None,
+        "ready",
+    )
+    assert {
+        "ck_classroom_exports_record_shape",
+        "ck_classroom_exports_target",
+        "ck_classroom_exports_draft_revision",
+        "ck_classroom_exports_format",
+        "ck_classroom_exports_hashes",
+        "ck_classroom_exports_input_receipt",
+        "ck_classroom_exports_output_receipt",
+        "fk_classroom_exports_asset_tenant_classroom_assets",
+        "fk_classroom_exports_version_classroom_tenant",
+        "fk_classroom_exports_draft_classroom_tenant",
+        "fk_classroom_exports_job_tenant_generation_jobs",
+        "uq_classroom_exports_tenant_idempotency",
+        "uq_classroom_exports_tenant_generation_job",
+    }.issubset(constraints)
+
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(
+            migration_database,
+            "scope=tenant",
+            f"tenant_schema={schema_name}",
+            action="downgrade",
+            revision="20260803_0011",
+        ),
+    )
+    assert asyncio.run(inspect_legacy_revision()) == (
+        "20260803_0011",
+        (
+            "version-1",
+            "legacy_pdf",
+            "classrooms/asset-1/legacy.pdf",
+            "ready",
+        ),
+    )
+
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(
+            migration_database,
+            "scope=tenant",
+            f"tenant_schema={schema_name}",
+        ),
+    )
+
+    async def seed_new_export() -> None:
+        engine = create_async_engine(migration_database.url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        f"""
+                        INSERT INTO "{schema_name}".classroom_exports (
+                            id, tenant_id, classroom_id, classroom_version_id,
+                            classroom_draft_id, draft_revision,
+                            generation_job_id, export_format,
+                            input_document_sha256,
+                            input_media_manifest_sha256,
+                            idempotency_key, request_sha256, status, created_by
+                        ) VALUES (
+                            'new-export', :tenant_id, 'asset-1', 'version-1',
+                            NULL, NULL, NULL, 'pptx', :document_sha256,
+                            :manifest_sha256, 'new-export-idempotency',
+                            :request_sha256, 'preparing_input', 'teacher-1'
+                        )
+                        """
+                    ),
+                    {
+                        "tenant_id": tenant_id,
+                        "document_sha256": "2" * 64,
+                        "manifest_sha256": "3" * 64,
+                        "request_sha256": "5" * 64,
+                    },
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(seed_new_export())
+    refused = _run_alembic(
+        migration_database,
+        "scope=tenant",
+        f"tenant_schema={schema_name}",
+        action="downgrade",
+        revision="20260803_0011",
+    )
+    safe_output = _assert_secret_safe_output(migration_database, refused)
+    assert refused.returncode != 0, safe_output
+    assert (
+        "cannot downgrade classroom exports: durable task-6 data exists"
+        in safe_output
+    )
+    assert asyncio.run(inspect_head())[:2] == (HEAD_REVISION, HEAD_REVISION)

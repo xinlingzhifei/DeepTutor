@@ -564,28 +564,139 @@ class ClassroomDraftMedia(TenantBase):
 
 
 class ClassroomExport(TenantBase):
-    """Export receipt pinned to one immutable classroom version."""
+    """Durable export request pinned to exactly one draft or version."""
 
     __tablename__ = "classroom_exports"
 
     id: Mapped[str] = mapped_column(String(128), primary_key=True)
     tenant_id: Mapped[str] = mapped_column(String(64))
-    classroom_version_id: Mapped[str] = mapped_column(
-        String(128),
-        ForeignKey("tenant.classroom_versions.id", ondelete="RESTRICT"),
-    )
+    # Nullable at the storage layer only so pre-0012 rows remain representable.
+    # New records are required to set this through ``record_shape`` below.
+    classroom_id: Mapped[str] = mapped_column(String(128), nullable=True)
+    classroom_version_id: Mapped[str | None] = mapped_column(String(128))
+    classroom_draft_id: Mapped[str | None] = mapped_column(String(128))
+    draft_revision: Mapped[int | None] = mapped_column(Integer)
     generation_job_id: Mapped[str | None] = mapped_column(String(64))
     export_format: Mapped[str] = mapped_column(String(32))
-    object_key: Mapped[str] = mapped_column(String(512))
-    sha256: Mapped[str] = mapped_column(String(64))
-    status: Mapped[str] = mapped_column(String(32), server_default="ready")
+    input_document_sha256: Mapped[str] = mapped_column(String(64), nullable=True)
+    input_media_manifest_sha256: Mapped[str] = mapped_column(
+        String(64),
+        nullable=True,
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=True)
+    request_sha256: Mapped[str] = mapped_column(String(64), nullable=True)
+    input_manifest_object_key: Mapped[str | None] = mapped_column(String(512))
+    input_manifest_sha256: Mapped[str | None] = mapped_column(String(64))
+    relative_name: Mapped[str | None] = mapped_column(String(512))
+    object_key: Mapped[str | None] = mapped_column(String(512))
+    sha256: Mapped[str | None] = mapped_column(String(64))
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    mime_type: Mapped[str | None] = mapped_column(String(255))
+    status: Mapped[str] = mapped_column(
+        String(32),
+        server_default="preparing_input",
+    )
     created_by: Mapped[str] = mapped_column(String(128))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
     )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
 
     __table_args__ = (
+        CheckConstraint(
+            "(classroom_id IS NULL AND classroom_version_id IS NOT NULL "
+            "AND classroom_draft_id IS NULL AND draft_revision IS NULL "
+            "AND input_document_sha256 IS NULL "
+            "AND input_media_manifest_sha256 IS NULL "
+            "AND idempotency_key IS NULL AND request_sha256 IS NULL "
+            "AND input_manifest_object_key IS NULL "
+            "AND input_manifest_sha256 IS NULL "
+            "AND relative_name IS NULL AND size_bytes IS NULL "
+            "AND mime_type IS NULL) OR "
+            "(classroom_id IS NOT NULL "
+            "AND input_document_sha256 IS NOT NULL "
+            "AND input_media_manifest_sha256 IS NOT NULL "
+            "AND idempotency_key IS NOT NULL AND request_sha256 IS NOT NULL)",
+            name="record_shape",
+        ),
+        CheckConstraint(
+            "classroom_id IS NULL OR ("
+            "(classroom_version_id IS NOT NULL AND classroom_draft_id IS NULL) OR "
+            "(classroom_version_id IS NULL AND classroom_draft_id IS NOT NULL))",
+            name="target",
+        ),
+        CheckConstraint(
+            "classroom_id IS NULL OR ("
+            "(classroom_draft_id IS NULL AND draft_revision IS NULL) OR "
+            "(classroom_draft_id IS NOT NULL AND draft_revision IS NOT NULL "
+            "AND draft_revision > 0))",
+            name="draft_revision",
+        ),
+        CheckConstraint(
+            "classroom_id IS NULL OR export_format IN "
+            "('classroom_zip', 'pptx', 'offline_html', 'mp4')",
+            name="format",
+        ),
+        CheckConstraint(
+            "classroom_id IS NULL OR ("
+            "input_document_sha256 ~ '^[0-9a-f]{64}$' AND "
+            "input_media_manifest_sha256 ~ '^[0-9a-f]{64}$' AND "
+            "request_sha256 ~ '^[0-9a-f]{64}$' AND "
+            "(input_manifest_sha256 IS NULL OR "
+            "input_manifest_sha256 ~ '^[0-9a-f]{64}$') AND "
+            "(sha256 IS NULL OR sha256 ~ '^[0-9a-f]{64}$'))",
+            name="hashes",
+        ),
+        CheckConstraint(
+            "(input_manifest_object_key IS NULL "
+            "AND input_manifest_sha256 IS NULL) OR "
+            "(input_manifest_object_key IS NOT NULL "
+            "AND input_manifest_sha256 IS NOT NULL)",
+            name="input_receipt",
+        ),
+        CheckConstraint(
+            "classroom_id IS NULL OR ("
+            "(relative_name IS NULL AND object_key IS NULL AND sha256 IS NULL "
+            "AND size_bytes IS NULL AND mime_type IS NULL AND status <> 'ready') OR "
+            "(relative_name IS NOT NULL AND object_key IS NOT NULL "
+            "AND sha256 IS NOT NULL AND size_bytes IS NOT NULL "
+            "AND size_bytes >= 0 AND mime_type IS NOT NULL "
+            "AND status = 'ready'))",
+            name="output_receipt",
+        ),
+        ForeignKeyConstraint(
+            ["classroom_id", "tenant_id"],
+            [
+                "tenant.classroom_assets.id",
+                "tenant.classroom_assets.tenant_id",
+            ],
+            name="fk_classroom_exports_asset_tenant_classroom_assets",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["classroom_version_id", "classroom_id", "tenant_id"],
+            [
+                "tenant.classroom_versions.id",
+                "tenant.classroom_versions.classroom_id",
+                "tenant.classroom_versions.tenant_id",
+            ],
+            name="fk_classroom_exports_version_classroom_tenant",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["classroom_draft_id", "classroom_id", "tenant_id"],
+            [
+                "tenant.classroom_drafts.id",
+                "tenant.classroom_drafts.classroom_id",
+                "tenant.classroom_drafts.tenant_id",
+            ],
+            name="fk_classroom_exports_draft_classroom_tenant",
+            ondelete="RESTRICT",
+        ),
         ForeignKeyConstraint(
             ["generation_job_id", "tenant_id"],
             [
@@ -597,9 +708,37 @@ class ClassroomExport(TenantBase):
         ),
         UniqueConstraint(
             "tenant_id",
+            "idempotency_key",
+            name="uq_classroom_exports_tenant_idempotency",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "generation_job_id",
+            name="uq_classroom_exports_tenant_generation_job",
+        ),
+        UniqueConstraint(
+            "tenant_id",
             "object_key",
             name="uq_classroom_exports_tenant_object_key",
         ),
+    )
+
+
+class ClassroomExportPolicy(TenantBase):
+    """Tenant policy for costly or privileged classroom export formats."""
+
+    __tablename__ = "classroom_export_policies"
+
+    tenant_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    allow_mp4: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        server_default="false",
+    )
+    updated_by: Mapped[str] = mapped_column(String(128))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
     )
 
 
@@ -1215,6 +1354,7 @@ __all__ = [
     "ClassroomDraft",
     "ClassroomDraftMedia",
     "ClassroomExport",
+    "ClassroomExportPolicy",
     "ClassroomPublicationMaterialization",
     "ClassroomReviewPolicy",
     "ClassroomReviewRequest",
