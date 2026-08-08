@@ -1,4 +1,15 @@
 import type { DraftClassroomMedia } from "@/lib/classroom-api";
+import type { Slide } from "@openmaic/dsl";
+
+import type {
+  ClassroomDocument,
+  JsonObject,
+  MediaManifestItem,
+} from "./contracts";
+import {
+  pushHistory,
+  type EditorHistory,
+} from "./editor-history";
 
 export type ImportedMedia = DraftClassroomMedia;
 export type UploadImportedMedia = (
@@ -17,7 +28,7 @@ export interface OpenMaicImporterModule {
   importPptx(
     input: File | Blob | ArrayBuffer,
     options?: { upload?: ImporterUpload },
-  ): Promise<unknown[]>;
+  ): Promise<Slide[]>;
 }
 
 export const OPENMAIC_IMPORTER_VENDOR_URL =
@@ -30,9 +41,11 @@ type FetchVendor = (
 type ImportVendor = (url: string) => Promise<unknown>;
 
 export interface ImportedSlides {
-  slides: unknown[];
+  slides: Slide[];
   media: ImportedMedia[];
 }
+
+export type ImportIdFactory = (prefix: "scene" | "canvas") => string;
 
 export interface ImporterLoader {
   readonly loaded: boolean;
@@ -45,6 +58,7 @@ export interface ImporterLoader {
 
 const MEDIA_FIELDS = new Set([
   "mediaId",
+  "relativePath",
   "readUrl",
   "mimeType",
   "sizeBytes",
@@ -53,6 +67,8 @@ const MEDIA_FIELDS = new Set([
 const MEDIA_URL_FIELDS = new Set([
   "src",
   "poster",
+  "pattern",
+  "mediaRef",
   "mediaUrl",
   "imageUrl",
   "audioUrl",
@@ -60,6 +76,19 @@ const MEDIA_URL_FIELDS = new Set([
 ]);
 const MAX_IMPORTED_NODES = 100_000;
 const MAX_IMPORTED_DEPTH = 64;
+const MAX_ID_ATTEMPTS = 100;
+
+function portableMediaPath(value: string): boolean {
+  return (
+    value.length > 0 &&
+    value.trim() === value &&
+    !value.includes("\\") &&
+    !value.startsWith("/") &&
+    !/[?#%\u0000-\u001f\u007f]/.test(value) &&
+    !/^[A-Za-z][A-Za-z0-9+.-]*:/.test(value) &&
+    value.split("/").every(segment => segment !== "" && segment !== "." && segment !== "..")
+  );
+}
 
 function controlledMediaUrl(value: string, mediaId: string): boolean {
   const encodedMediaId = encodeURIComponent(mediaId);
@@ -86,6 +115,8 @@ function validateImportedMedia(value: ImportedMedia): ImportedMedia {
     value.mediaId.length === 0 ||
     value.mediaId.trim() !== value.mediaId ||
     /[\u0000-\u001f\u007f]/.test(value.mediaId) ||
+    typeof value.relativePath !== "string" ||
+    !portableMediaPath(value.relativePath) ||
     typeof value.readUrl !== "string" ||
     !controlledMediaUrl(value.readUrl, value.mediaId) ||
     value.readUrl.includes("openmaic")
@@ -106,6 +137,7 @@ function validateImportedMedia(value: ImportedMedia): ImportedMedia {
   }
   return {
     mediaId: value.mediaId,
+    relativePath: value.relativePath,
     readUrl: value.readUrl,
     mimeType: value.mimeType,
     sizeBytes: value.sizeBytes,
@@ -113,25 +145,50 @@ function validateImportedMedia(value: ImportedMedia): ImportedMedia {
   };
 }
 
-function validateSlideMediaUrls(
-  slides: unknown[],
+interface MediaIndexes {
+  byReadUrl: ReadonlyMap<string, ImportedMedia>;
+  byRelativePath: ReadonlyMap<string, ImportedMedia>;
+  ordered: readonly ImportedMedia[];
+}
+
+function indexImportedMedia(media: readonly ImportedMedia[]): MediaIndexes {
+  const byReadUrl = new Map<string, ImportedMedia>();
+  const byRelativePath = new Map<string, ImportedMedia>();
+  const byId = new Map<string, ImportedMedia>();
+  const ordered = media.map(validateImportedMedia);
+  for (const item of ordered) {
+    if (
+      byReadUrl.has(item.readUrl) ||
+      byRelativePath.has(item.relativePath) ||
+      byId.has(item.mediaId)
+    ) {
+      throw new Error("Imported media receipts must have unique identities and paths");
+    }
+    byReadUrl.set(item.readUrl, item);
+    byRelativePath.set(item.relativePath, item);
+    byId.set(item.mediaId, item);
+  }
+  return { byReadUrl, byRelativePath, ordered };
+}
+
+function transformSlideMediaReferences(
+  slides: readonly Slide[],
   media: readonly ImportedMedia[],
-): void {
-  const uploadedUrls = new Set(media.map(item => item.readUrl));
-  const visited = new WeakSet<object>();
+  replaceWithPortablePath: boolean,
+): { slides: Slide[]; referencedMediaIds: ReadonlySet<string> } {
+  const indexes = indexImportedMedia(media);
   const active = new WeakSet<object>();
+  const referencedMediaIds = new Set<string>();
   let nodeCount = 0;
 
-  const visit = (value: unknown, depth: number): void => {
+  const visit = (value: unknown, depth: number): unknown => {
     if (depth > MAX_IMPORTED_DEPTH) {
       throw new Error("Imported slides exceed the supported nesting depth");
     }
-    if (typeof value !== "object" || value === null) return;
+    if (typeof value !== "object" || value === null) return value;
     if (active.has(value)) {
       throw new Error("Imported slides must not contain cyclic data");
     }
-    if (visited.has(value)) return;
-    visited.add(value);
     active.add(value);
     nodeCount += 1;
     if (nodeCount > MAX_IMPORTED_NODES) {
@@ -139,24 +196,164 @@ function validateSlideMediaUrls(
     }
 
     if (Array.isArray(value)) {
-      for (const item of value) visit(item, depth + 1);
+      const result = value.map(item => visit(item, depth + 1));
       active.delete(value);
-      return;
+      return result;
     }
+    const result: Record<string, unknown> = {};
     for (const [key, item] of Object.entries(value)) {
       if (MEDIA_URL_FIELDS.has(key) && item !== null && item !== undefined) {
-        if (typeof item !== "string" || !uploadedUrls.has(item)) {
+        const receipt = typeof item === "string"
+          ? indexes.byReadUrl.get(item) ?? indexes.byRelativePath.get(item)
+          : undefined;
+        if (!receipt) {
           throw new Error(
-            "Imported media must be uploaded through a controlled yFeiSTAI media route",
+            "Imported media must be uploaded through a controlled yFeiSTAI media route and match an uploaded classroom media receipt",
           );
         }
+        referencedMediaIds.add(receipt.mediaId);
+        result[key] = replaceWithPortablePath ? receipt.relativePath : item;
+      } else {
+        result[key] = visit(item, depth + 1);
       }
-      visit(item, depth + 1);
     }
     active.delete(value);
+    return result;
   };
 
-  visit(slides, 0);
+  return {
+    slides: visit(slides, 0) as Slide[],
+    referencedMediaIds,
+  };
+}
+
+function validateSlideMediaUrls(
+  slides: readonly Slide[],
+  media: readonly ImportedMedia[],
+): void {
+  transformSlideMediaReferences(slides, media, false);
+}
+
+function cloneDocument(input: ClassroomDocument): ClassroomDocument {
+  return JSON.parse(JSON.stringify(input)) as ClassroomDocument;
+}
+
+function nextUniqueId(
+  prefix: "scene" | "canvas",
+  usedIds: Set<string>,
+  idFactory: ImportIdFactory,
+): string {
+  for (let attempt = 0; attempt < MAX_ID_ATTEMPTS; attempt += 1) {
+    const candidate = idFactory(prefix);
+    if (
+      typeof candidate === "string" &&
+      candidate.length > 0 &&
+      candidate.trim() === candidate &&
+      !/[\u0000-\u001f\u007f]/.test(candidate) &&
+      !usedIds.has(candidate)
+    ) {
+      usedIds.add(candidate);
+      return candidate;
+    }
+  }
+  throw new Error(`Unable to allocate a unique imported ${prefix} ID`);
+}
+
+function manifestItem(receipt: ImportedMedia): MediaManifestItem {
+  return {
+    mediaId: receipt.mediaId,
+    relativePath: receipt.relativePath,
+    mimeType: receipt.mimeType,
+    sha256: receipt.sha256,
+    sizeBytes: receipt.sizeBytes,
+  };
+}
+
+function sameManifestBinding(
+  current: MediaManifestItem,
+  receipt: ImportedMedia,
+): boolean {
+  return (
+    current.mediaId === receipt.mediaId &&
+    current.relativePath === receipt.relativePath &&
+    current.mimeType === receipt.mimeType &&
+    current.sha256 === receipt.sha256 &&
+    current.sizeBytes === receipt.sizeBytes
+  );
+}
+
+export function mergeImportedSlides(
+  document: ClassroomDocument,
+  slides: readonly Slide[],
+  receipts: readonly ImportedMedia[],
+  idFactory: ImportIdFactory,
+): ClassroomDocument {
+  if (slides.length === 0) {
+    throw new Error("Imported presentation must contain at least one slide");
+  }
+  const indexes = indexImportedMedia(receipts);
+  const transformed = transformSlideMediaReferences(slides, indexes.ordered, true);
+  const next = cloneDocument(document);
+  next.openmaic.scenes = next.openmaic.scenes.map((scene, order) => ({
+    ...scene,
+    order,
+  }));
+
+  const usedIds = new Set<string>();
+  for (const scene of next.openmaic.scenes) {
+    usedIds.add(scene.id);
+    if (scene.type === "slide" && typeof scene.content.canvas.id === "string") {
+      usedIds.add(scene.content.canvas.id);
+    }
+  }
+
+  transformed.slides.forEach((slide, index) => {
+    const sceneId = nextUniqueId("scene", usedIds, idFactory);
+    const canvasId = nextUniqueId("canvas", usedIds, idFactory);
+    const title = slide.sectionTag?.title?.trim() || `Imported slide ${index + 1}`;
+    next.openmaic.scenes.push({
+      id: sceneId,
+      stageId: next.openmaic.stage.id,
+      title,
+      order: next.openmaic.scenes.length,
+      type: "slide",
+      content: {
+        type: "slide",
+        canvas: {
+          ...(slide as unknown as JsonObject),
+          id: canvasId,
+        },
+      },
+      actions: [],
+    });
+  });
+
+  for (const receipt of indexes.ordered) {
+    if (!transformed.referencedMediaIds.has(receipt.mediaId)) continue;
+    const existing = next.mediaManifest.find(
+      item => item.mediaId === receipt.mediaId || item.relativePath === receipt.relativePath,
+    );
+    if (existing) {
+      if (!sameManifestBinding(existing, receipt)) {
+        throw new Error("Imported media conflicts with an existing classroom media binding");
+      }
+      continue;
+    }
+    next.mediaManifest.push(manifestItem(receipt));
+  }
+  return next;
+}
+
+export function mergeImportedSlidesIntoHistory(
+  history: EditorHistory<ClassroomDocument>,
+  slides: readonly Slide[],
+  receipts: readonly ImportedMedia[],
+  idFactory: ImportIdFactory,
+): EditorHistory<ClassroomDocument> {
+  return pushHistory(
+    history,
+    mergeImportedSlides(history.present, slides, receipts, idFactory),
+  );
 }
 
 function throwIfAborted(signal?: AbortSignal): void {

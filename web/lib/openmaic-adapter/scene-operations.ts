@@ -520,11 +520,25 @@ function readDraftEnvelope(input: unknown): {
   document: ClassroomDocument;
 } {
   const envelope = record(input);
-  const revision =
+  const rawRevision =
     envelope?.revision ?? envelope?.serverRevision ?? envelope?.server_revision;
   const document =
     envelope?.document ?? envelope?.serverDocument ?? envelope?.server_document;
-  if (typeof revision !== "string" || revision.trim().length === 0 || !document) {
+  let revision: string;
+  if (Number.isSafeInteger(rawRevision) && (rawRevision as number) >= 1) {
+    revision = `"revision-${rawRevision as number}"`;
+  } else if (
+    typeof rawRevision === "string" &&
+    /^"revision-[1-9]\d*"$/.test(rawRevision)
+  ) {
+    revision = rawRevision;
+  } else {
+    throw new SceneOperationError(
+      "INVALID_DRAFT_RESPONSE",
+      "draft response revision must be a positive integer or canonical strong ETag",
+    );
+  }
+  if (!document) {
     throw new SceneOperationError(
       "INVALID_DRAFT_RESPONSE",
       "draft response must include a revision and classroom document",
@@ -567,7 +581,33 @@ export async function saveClassroomDraft(
     },
   );
   if (response.status === 409 || response.status === 412) {
-    const server = readDraftEnvelope(await responseJson(response));
+    const conflictPayload = await responseJson(response);
+    let server: ReturnType<typeof readDraftEnvelope>;
+    try {
+      server = readDraftEnvelope(conflictPayload);
+    } catch (error) {
+      if (
+        !(error instanceof SceneOperationError) ||
+        error.code !== "INVALID_DRAFT_RESPONSE"
+      ) {
+        throw error;
+      }
+      const latest = await fetcher(
+        `/api/v1/classrooms/${encodeURIComponent(classroomId)}/draft`,
+        {
+          method: "GET",
+          credentials: "same-origin",
+          cache: "no-store",
+        },
+      );
+      if (!latest.ok) {
+        throw new SceneOperationError(
+          "INVALID_DRAFT_RESPONSE",
+          `draft conflict recovery failed with status ${latest.status}`,
+        );
+      }
+      server = readDraftEnvelope(await responseJson(latest));
+    }
     return {
       status: "conflict",
       responseStatus: response.status,

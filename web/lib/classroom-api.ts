@@ -14,6 +14,7 @@ export const MP4_EXPORT_DISABLED_REASON =
 
 export interface DraftClassroomMedia {
   mediaId: string;
+  relativePath: string;
   readUrl: string;
   mimeType: string;
   sizeBytes: number;
@@ -46,6 +47,23 @@ export interface ClassroomExportJob {
   retryOfJobId: string | null;
   format: ClassroomExportFormat;
   downloadReady: boolean;
+}
+
+export interface ClassroomExportFailureDetails {
+  errorCategory: string;
+  errorCode: string;
+}
+
+export function classroomExportFailureDetails(
+  job: ClassroomExportJob,
+): ClassroomExportFailureDetails | null {
+  if (job.status !== "failed" || !job.errorCategory || !job.errorCode) {
+    return null;
+  }
+  return {
+    errorCategory: job.errorCategory,
+    errorCode: job.errorCode,
+  };
 }
 
 export interface ClassroomExportOption {
@@ -223,41 +241,60 @@ async function requestJson(
 
 const MEDIA_RESPONSE_KEYS = new Set([
   "id",
-  "read_url",
-  "mime_type",
-  "size_bytes",
+  "relativePath",
+  "mimeType",
+  "sizeBytes",
   "sha256",
 ]);
+
+function portableMediaPath(value: string): boolean {
+  return (
+    value.length > 0 &&
+    value.trim() === value &&
+    !value.includes("\\") &&
+    !value.startsWith("/") &&
+    !/[?#%\u0000-\u001f\u007f]/.test(value) &&
+    !/^[A-Za-z][A-Za-z0-9+.-]*:/.test(value) &&
+    value.split("/").every(segment => segment !== "" && segment !== "." && segment !== "..")
+  );
+}
 
 function parseDraftMedia(
   input: unknown,
   encodedAssetId: string,
+  expectedSha256: string,
+  expectedSizeBytes: number,
 ): DraftClassroomMedia {
   const value = record(input, "media response");
   exactKeys(value, MEDIA_RESPONSE_KEYS, "media response");
   const mediaId = requiredString(value, "id", "media response");
   const encodedMediaId = safeRouteSegment(mediaId, "media ID");
-  const readUrl = requiredString(value, "read_url", "media response");
-  const expectedReadUrl = `/api/v1/classrooms/${encodedAssetId}/draft-media/${encodedMediaId}`;
-  if (readUrl !== expectedReadUrl) {
-    throw new ClassroomApiError(
-      "Media response must use the controlled yFeiSTAI media route",
-    );
+  const relativePath = requiredString(value, "relativePath", "media response");
+  if (!portableMediaPath(relativePath)) {
+    throw new ClassroomApiError("media response.relativePath must be a portable relative path");
   }
-  const mimeType = requiredString(value, "mime_type", "media response");
+  const readUrl = `/api/v1/classrooms/${encodedAssetId}/draft-media/${encodedMediaId}`;
+  const mimeType = requiredString(value, "mimeType", "media response");
   if (!MIME_PATTERN.test(mimeType)) {
-    throw new ClassroomApiError("media response.mime_type is invalid");
+    throw new ClassroomApiError("media response.mimeType is invalid");
   }
-  const sizeBytes = value.size_bytes;
+  const sizeBytes = value.sizeBytes;
   if (!Number.isSafeInteger(sizeBytes) || (sizeBytes as number) < 0) {
-    throw new ClassroomApiError("media response.size_bytes must be a non-negative integer");
+    throw new ClassroomApiError("media response.sizeBytes must be a non-negative integer");
+  }
+  if (sizeBytes !== expectedSizeBytes) {
+    throw new ClassroomApiError("Media response size does not match the uploaded file");
   }
   const sha256 = requiredString(value, "sha256", "media response");
   if (!SHA256_PATTERN.test(sha256)) {
     throw new ClassroomApiError("media response.sha256 must be a lowercase SHA-256 hash");
   }
+  if (sha256 !== expectedSha256) {
+    throw new ClassroomApiError("Media response SHA-256 does not match the uploaded file");
+  }
   return {
     mediaId,
+    relativePath,
     readUrl,
     mimeType,
     sizeBytes: sizeBytes as number,
@@ -274,14 +311,25 @@ export async function uploadDraftClassroomMedia(
   if (blob.size === 0) {
     throw new ClassroomApiError("media file must not be empty");
   }
+  signal?.throwIfAborted();
+  const subtle = globalThis.crypto?.subtle;
+  if (!subtle) {
+    throw new ClassroomApiError("Web Crypto is required to upload classroom media");
+  }
+  const digest = await subtle.digest("SHA-256", await blob.arrayBuffer());
+  signal?.throwIfAborted();
+  const sha256 = [...new Uint8Array(digest)]
+    .map(value => value.toString(16).padStart(2, "0"))
+    .join("");
   const encodedAssetId = safeRouteSegment(assetId, "asset ID");
   const form = new FormData();
   form.append("file", blob, safeFilename(filename));
+  form.append("sha256", sha256);
   const payload = await requestJson(
     `/api/v1/classrooms/${encodedAssetId}/draft-media`,
     { method: "POST", body: form, signal },
   );
-  return parseDraftMedia(payload, encodedAssetId);
+  return parseDraftMedia(payload, encodedAssetId, sha256, blob.size);
 }
 
 const EXPORT_RESPONSE_KEYS = new Set([

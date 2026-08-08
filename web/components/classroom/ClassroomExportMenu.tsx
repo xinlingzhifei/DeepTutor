@@ -6,6 +6,7 @@ import { useTranslation } from "react-i18next";
 
 import {
   classroomExportDownloadUrl,
+  classroomExportFailureDetails,
   createClassroomExportAttemptRegistry,
   createDraftClassroomExport,
   createVersionClassroomExport,
@@ -24,12 +25,14 @@ type ClassroomExportTarget =
 interface ClassroomExportMenuProps {
   target: ClassroomExportTarget;
   policy: ClassroomExportPolicy;
+  disabled?: boolean;
   onJobChange?: (job: ClassroomExportJob) => void;
 }
 
 export function ClassroomExportMenu({
   target,
   policy,
+  disabled = false,
   onJobChange,
 }: ClassroomExportMenuProps) {
   const { t } = useTranslation();
@@ -66,7 +69,7 @@ export function ClassroomExportMenu({
   };
 
   const startExport = async (format: ClassroomExportFormat) => {
-    if (pendingFormat || controllerRef.current) return;
+    if (disabled || pendingFormat || controllerRef.current) return;
     const controller = new AbortController();
     controllerRef.current = controller;
     setPendingFormat(format);
@@ -166,6 +169,7 @@ export function ClassroomExportMenu({
         return t("classroom.export.status.canceled");
     }
   };
+  const failureDetails = job ? classroomExportFailureDetails(job) : null;
 
   return (
     <section
@@ -185,7 +189,7 @@ export function ClassroomExportMenu({
             <div key={option.format}>
               <button
                 type="button"
-                disabled={!option.enabled || pendingFormat !== null}
+                disabled={disabled || !option.enabled || pendingFormat !== null}
                 onClick={() => startExport(option.format)}
                 className="flex w-full items-center justify-center gap-2 rounded-lg border border-[var(--border)] px-3 py-2 text-sm font-medium text-[var(--foreground)] hover:bg-[var(--muted)] disabled:cursor-not-allowed disabled:opacity-50"
               >
@@ -224,6 +228,23 @@ export function ClassroomExportMenu({
               style={{ width: `${job.progressPercent}%` }}
             />
           </div>
+          {failureDetails ? (
+            <dl
+              role="alert"
+              className="grid gap-1 rounded-lg border border-[var(--destructive)]/30 bg-[var(--destructive)]/5 p-3 text-xs text-[var(--destructive)]"
+            >
+              <div className="flex flex-wrap gap-1">
+                <dt className="font-semibold">
+                  {t("classroom.export.errorCategory")}:
+                </dt>
+                <dd className="font-mono">{failureDetails.errorCategory}</dd>
+              </div>
+              <div className="flex flex-wrap gap-1">
+                <dt className="font-semibold">{t("classroom.export.errorCode")}:</dt>
+                <dd className="font-mono">{failureDetails.errorCode}</dd>
+              </div>
+            </dl>
+          ) : null}
           {job.downloadReady ? (
             <a
               href={classroomExportDownloadUrl(job.jobId)}

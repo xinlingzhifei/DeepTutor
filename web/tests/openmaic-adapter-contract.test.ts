@@ -7,9 +7,11 @@ import test from "node:test";
 import {
   ClassroomCompatibilityError,
   classroomMediaUrl,
+  draftClassroomMediaUrl,
   mapClassroomTheme,
   parseYFeClassroomDocument,
   resolveClassroomMediaReferences,
+  resolveDraftClassroomMediaReferences,
 } from "../lib/openmaic-adapter/contracts";
 
 const SHA_A = "a".repeat(64);
@@ -370,6 +372,59 @@ test("media references resolve only through encoded yFeiSTAI routes", () => {
   assert.throws(
     () => resolveClassroomMediaReferences(interactiveResource),
     /self-contained/i,
+  );
+});
+
+test("draft rendering projects portable media without mutating the saved document", () => {
+  const parsed = parseYFeClassroomDocument(validClassroomDocument());
+  const resolved = resolveDraftClassroomMediaReferences(parsed, "asset / 1");
+  const originalSlide = parsed.openmaic.scenes[0];
+  const resolvedSlide = resolved.openmaic.scenes[0];
+  assert.equal(originalSlide.type, "slide");
+  assert.equal(resolvedSlide.type, "slide");
+  assert.equal(
+    ((originalSlide.content.canvas.elements as Array<{ src: string }>)[0]).src,
+    "media/scene-1/image.png",
+  );
+  assert.equal(
+    ((resolvedSlide.content.canvas.elements as Array<{ src: string }>)[0]).src,
+    "/api/v1/classrooms/asset%20%2F%201/draft-media/media-1",
+  );
+  assert.equal(
+    draftClassroomMediaUrl("asset / 1", "media?#1"),
+    "/api/v1/classrooms/asset%20%2F%201/draft-media/media%3F%231",
+  );
+  assert.deepEqual(resolved.mediaManifest, parsed.mediaManifest);
+});
+
+test("draft rendering rejects external and object-key mediaRef values", () => {
+  for (const mediaRef of [
+    "https://cdn.example/video.mp4",
+    "tenant-a/private/video.mp4",
+  ]) {
+    const parsed = parseYFeClassroomDocument(validClassroomDocument());
+    const slide = parsed.openmaic.scenes[0];
+    assert.equal(slide.type, "slide");
+    (slide.content.canvas.elements as Array<Record<string, unknown>>)[0].mediaRef = mediaRef;
+    assert.throws(
+      () => resolveDraftClassroomMediaReferences(parsed, "asset-1"),
+      /classroom media route/i,
+    );
+  }
+});
+
+test("draft media bindings do not require deprecated download metadata", () => {
+  const document = validClassroomDocument();
+  delete (document.mediaManifest[0] as Record<string, unknown>).temporaryDownloadPath;
+  delete (document.mediaManifest[0] as Record<string, unknown>).expiresAt;
+
+  assert.doesNotThrow(() => parseYFeClassroomDocument(document));
+
+  const missingExportPath = validClassroomDocument();
+  delete (missingExportPath.exportManifest[0] as Record<string, unknown>).temporaryDownloadPath;
+  assert.throws(
+    () => parseYFeClassroomDocument(missingExportPath),
+    /INVALID_CLASSROOM_DOCUMENT/,
   );
 });
 

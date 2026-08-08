@@ -1,7 +1,14 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { useMemo, useRef, useState } from "react";
+import {
+  forwardRef,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import type { TFunction } from "i18next";
 import { useTranslation } from "react-i18next";
 
@@ -10,6 +17,7 @@ import type {
   ClassroomScene,
   ClassroomThemeId,
 } from "@/lib/openmaic-adapter/contracts";
+import { resolveDraftClassroomMediaReferences } from "@/lib/openmaic-adapter/contracts";
 import {
   applyEditIntents,
   classroomSlideForEditing,
@@ -25,6 +33,10 @@ import {
   undo,
   type EditorHistory,
 } from "@/lib/openmaic-adapter/editor-history";
+import {
+  mergeImportedSlidesIntoHistory,
+  type ImportedSlides,
+} from "@/lib/openmaic-adapter/importer";
 import {
   applySceneOperations,
   saveClassroomDraft,
@@ -58,7 +70,10 @@ type EditorSaveState =
 export interface ClassroomEditorProps {
   initialDocument: ClassroomDocument;
   initialRevision: string;
+  draftMediaAssetId?: string;
   theme?: ClassroomThemeId;
+  disabled?: boolean;
+  onDirtyChange?(dirty: boolean): void;
   onSaved?(document: ClassroomDocument, revision: string): void;
   onConflict?(
     localDocument: ClassroomDocument,
@@ -66,6 +81,10 @@ export interface ClassroomEditorProps {
     serverDocument: ClassroomDocument,
     serverRevision: string,
   ): void;
+}
+
+export interface ClassroomEditorHandle {
+  importSlides(result: ImportedSlides): void;
 }
 
 function editorId(prefix: string): string {
@@ -198,13 +217,16 @@ function retainedSelection(
   return { ...selection, elementIds, primaryId, editingId };
 }
 
-export function ClassroomEditor({
+export const ClassroomEditor = forwardRef<ClassroomEditorHandle, ClassroomEditorProps>(function ClassroomEditor({
   initialDocument,
   initialRevision,
+  draftMediaAssetId,
   theme = "snow",
+  disabled: externallyDisabled = false,
+  onDirtyChange,
   onSaved,
   onConflict,
-}: ClassroomEditorProps) {
+}, ref) {
   const { t } = useTranslation();
   const [history, setHistory] = useState(() => createHistory(initialDocument));
   const historyRef = useRef<EditorHistory<ClassroomDocument>>(history);
@@ -225,13 +247,19 @@ export function ClassroomEditor({
   const scenes = currentDocument.openmaic.scenes;
   const currentScene = scenes.find(scene => scene.id === selectedSceneId) ?? scenes[0];
   const dirty = fingerprint(currentDocument) !== savedFingerprint;
-  const disabled = saveState.status === "saving";
+  const mutationDisabled = externallyDisabled || saveState.status === "saving";
+  useEffect(() => {
+    onDirtyChange?.(dirty);
+  }, [dirty, onDirtyChange]);
   const editableSlide = useMemo(
-    () =>
-      currentScene?.type === "slide"
-        ? classroomSlideForEditing(currentDocument, currentScene.id, theme)
-        : null,
-    [currentDocument, currentScene, theme],
+    () => {
+      if (currentScene?.type !== "slide") return null;
+      const renderDocument = draftMediaAssetId
+        ? resolveDraftClassroomMediaReferences(currentDocument, draftMediaAssetId)
+        : currentDocument;
+      return classroomSlideForEditing(renderDocument, currentScene.id, theme);
+    },
+    [currentDocument, currentScene, draftMediaAssetId, theme],
   );
   const knowledgePointIds = useMemo(
     () =>
@@ -256,14 +284,40 @@ export function ClassroomEditor({
   };
 
   const commitDocument = (next: ClassroomDocument) => {
+    if (mutationDisabled) return;
     setEditorHistory(pushHistory(historyRef.current, next));
     setSaveState({ status: "idle" });
   };
 
+  useImperativeHandle(ref, () => ({
+    importSlides(result) {
+      if (mutationDisabled || saveInFlight.current) {
+        throw new Error("Cannot import slides while the classroom is locked");
+      }
+      try {
+        const previousSceneCount = historyRef.current.present.openmaic.scenes.length;
+        const next = mergeImportedSlidesIntoHistory(
+          historyRef.current,
+          result.slides,
+          result.media,
+          editorId,
+        );
+        const firstImported = next.present.openmaic.scenes[previousSceneCount];
+        setEditorHistory(next);
+        setSelectedSceneId(firstImported?.id ?? selectedSceneId);
+        setSelection(EMPTY_CLASSROOM_SELECTION);
+        setSaveState({ status: "idle" });
+      } catch (error) {
+        setSaveState({ status: "error", message: message(error, t) });
+        throw error;
+      }
+    },
+  }));
+
   const commitSceneOperations = (
     operations: readonly SceneOperation[],
   ): ClassroomDocument | null => {
-    if (saveInFlight.current) return null;
+    if (mutationDisabled || saveInFlight.current) return null;
     try {
       const next = applySceneOperations(historyRef.current.present, operations);
       commitDocument(next);
@@ -275,7 +329,12 @@ export function ClassroomEditor({
   };
 
   const handleEditIntents = (intents: ClassroomEditIntent[]) => {
-    if (!currentScene || currentScene.type !== "slide" || saveInFlight.current) return;
+    if (
+      !currentScene ||
+      currentScene.type !== "slide" ||
+      mutationDisabled ||
+      saveInFlight.current
+    ) return;
     try {
       const next = applyEditIntents(
         historyRef.current.present,
@@ -290,7 +349,7 @@ export function ClassroomEditor({
   };
 
   const handleSave = async () => {
-    if (!dirty || saveInFlight.current) return;
+    if (!dirty || mutationDisabled || saveInFlight.current) return;
     saveInFlight.current = true;
     setSaveState({ status: "saving" });
     const localDocument = historyRef.current.present;
@@ -342,15 +401,16 @@ export function ClassroomEditor({
         canUndo={history.past.length > 0}
         canRedo={history.future.length > 0}
         dirty={dirty}
+        disabled={mutationDisabled}
         saveState={saveState}
         onUndo={() => {
-          if (saveInFlight.current) return;
+          if (mutationDisabled || saveInFlight.current) return;
           setEditorHistory(undo(historyRef.current));
           setSelection(EMPTY_CLASSROOM_SELECTION);
           setSaveState({ status: "idle" });
         }}
         onRedo={() => {
-          if (saveInFlight.current) return;
+          if (mutationDisabled || saveInFlight.current) return;
           setEditorHistory(redo(historyRef.current));
           setSelection(EMPTY_CLASSROOM_SELECTION);
           setSaveState({ status: "idle" });
@@ -379,7 +439,7 @@ export function ClassroomEditor({
         <SceneNavigator
           scenes={scenes}
           selectedSceneId={currentScene.id}
-          disabled={disabled}
+          disabled={mutationDisabled}
           onSelect={sceneId => {
             setSelectedSceneId(sceneId);
             setSelection(EMPTY_CLASSROOM_SELECTION);
@@ -430,7 +490,7 @@ export function ClassroomEditor({
                 grid={25}
                 ruler
                 className="mx-auto"
-                style={{ pointerEvents: disabled ? "none" : undefined }}
+                style={{ pointerEvents: mutationDisabled ? "none" : undefined }}
               />
             </div>
           ) : (
@@ -447,7 +507,7 @@ export function ClassroomEditor({
         <ScenePropertiesPanel
           scene={currentScene}
           knowledgePointIds={knowledgePointIds}
-          disabled={disabled}
+          disabled={mutationDisabled}
           selectedElementCount={selection.elementIds.length}
           onOperation={operation => commitSceneOperations([operation])}
         />
@@ -462,4 +522,4 @@ export function ClassroomEditor({
       </footer>
     </section>
   );
-}
+});

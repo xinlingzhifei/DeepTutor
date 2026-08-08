@@ -252,6 +252,81 @@ test("draft conflicts expose comparable server state and never retry or overwrit
   }
 });
 
+test("draft save normalizes the backend integer revision to a strong ETag", async () => {
+  const document = classroomWithAllScenes();
+  const result = await saveClassroomDraft({
+    classroomId: "classroom-1",
+    revision: '"revision-7"',
+    document,
+    fetch: async () =>
+      new Response(JSON.stringify({ revision: 8, document }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+  });
+
+  assert.equal(result.status, "saved");
+  assert.equal(result.revision, '"revision-8"');
+});
+
+test("draft save rejects invalid backend revisions instead of inventing ETags", async () => {
+  const document = classroomWithAllScenes();
+  for (const revision of [0, 1.5, "revision-8", '"revision-0"']) {
+    await assert.rejects(
+      saveClassroomDraft({
+        classroomId: "classroom-1",
+        revision: '"revision-7"',
+        document,
+        fetch: async () =>
+          new Response(JSON.stringify({ revision, document }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }),
+      }),
+      /revision/i,
+    );
+  }
+});
+
+test("detail-only revision conflicts recover comparable state with one controlled GET", async () => {
+  const clientDocument = classroomWithAllScenes();
+  const serverDocument = classroomWithAllScenes();
+  serverDocument.openmaic.stage.updatedAt = "2026-07-30T13:00:00+08:00";
+  const requests: Array<{ url: string; method: string }> = [];
+
+  const result = await saveClassroomDraft({
+    classroomId: "classroom-1",
+    revision: '"revision-7"',
+    document: clientDocument,
+    fetch: async (input, init) => {
+      requests.push({ url: String(input), method: init?.method ?? "GET" });
+      if (init?.method === "PUT") {
+        return new Response(JSON.stringify({ detail: "Draft revision is stale" }), {
+          status: 409,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({ revision: 8, document: serverDocument }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    },
+  });
+
+  assert.deepEqual(requests, [
+    { url: "/api/v1/classrooms/classroom-1/draft", method: "PUT" },
+    { url: "/api/v1/classrooms/classroom-1/draft", method: "GET" },
+  ]);
+  assert.equal(result.status, "conflict");
+  if (result.status === "conflict") {
+    assert.equal(result.serverRevision, '"revision-8"');
+    assert.equal(
+      result.serverDocument.openmaic.stage.updatedAt,
+      "2026-07-30T13:00:00+08:00",
+    );
+  }
+});
+
 test("draft save runs interactive publication safety before transport", async () => {
   const document = classroomWithAllScenes();
   const interactive = document.openmaic.scenes.find(scene => scene.type === "interactive");
@@ -300,6 +375,10 @@ test("the host dynamically loads editing and business components never import Op
   ]) {
     assert.match(host, new RegExp(`\\[${state},\\s*set`, "m"));
   }
+  assert.match(host, /forwardRef<ClassroomEditorHandle, ClassroomEditorProps>/);
+  assert.match(host, /useImperativeHandle\s*\(/);
+  assert.match(host, /mergeImportedSlidesIntoHistory\s*\(/);
+  assert.match(host, /onDirtyChange\?\.\(dirty\)/);
 });
 
 test("the adapter reducer covers the installed renderer EditIntent union exactly", () => {

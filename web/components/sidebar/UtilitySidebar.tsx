@@ -1,7 +1,9 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useRouter } from "next/navigation";
+import Link from "next/link";
+import { usePathname, useRouter } from "next/navigation";
+import { GraduationCap } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { SidebarShell } from "@/components/sidebar/SidebarShell";
 import { LogoutButton } from "@/components/auth/LogoutButton";
@@ -18,6 +20,7 @@ import {
 export default function UtilitySidebar() {
   const { t } = useTranslation();
   const router = useRouter();
+  const pathname = usePathname();
   const { activeSessionId, setActiveSessionId } = useAppShell();
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [loadingSessions, setLoadingSessions] = useState(false);
@@ -93,6 +96,21 @@ export default function UtilitySidebar() {
       onDeleteSession={handleDeleteSession}
       footerSlot={(collapsed) => (
         <>
+          <Link
+            href="/teaching/classrooms"
+            aria-label={t("Teaching workspace")}
+            title={t("Teaching workspace")}
+            className={`flex items-center rounded-lg transition-colors ${
+              collapsed ? "h-9 w-9 justify-center" : "gap-2.5 px-3 py-2 text-[13.5px]"
+            } ${
+              pathname.startsWith("/teaching")
+                ? "bg-[var(--accent)] font-medium text-[var(--foreground)]"
+                : "text-[var(--foreground)]/85 hover:bg-[var(--background)]/60 hover:text-[var(--foreground)]"
+            }`}
+          >
+            <GraduationCap size={collapsed ? 18 : 16} strokeWidth={1.7} />
+            {!collapsed ? <span>{t("Teaching workspace")}</span> : null}
+          </Link>
           <ProfileLink collapsed={collapsed} />
           <AdminLink collapsed={collapsed} />
           <LogoutButton collapsed={collapsed} />

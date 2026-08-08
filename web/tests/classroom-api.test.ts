@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 
 import {
   MP4_EXPORT_DISABLED_REASON,
   ClassroomApiError,
   classroomExportDownloadUrl,
+  classroomExportFailureDetails,
   createClassroomExportAttemptRegistry,
   createDraftClassroomExport,
   createVersionClassroomExport,
@@ -64,7 +66,8 @@ test("media URLs are always yFeiSTAI routes", () => {
   assert.equal(url.includes("openmaic"), false);
 });
 
-test("draft media upload sends only the file to the asset-scoped route", async () => {
+test("draft media upload hashes the file and uses the asset-scoped route", async () => {
+  const expectedSha256 = createHash("sha256").update("image").digest("hex");
   let seenInput: RequestInfo | URL | undefined;
   let seenInit: RequestInit | undefined;
   const media = await withFetch(
@@ -73,11 +76,10 @@ test("draft media upload sends only the file to the asset-scoped route", async (
       seenInit = init;
       return jsonResponse({
         id: "media-1",
-        read_url:
-          "/api/v1/classrooms/asset%20%2F%201/draft-media/media-1",
-        mime_type: "image/png",
-        size_bytes: 5,
-        sha256: SHA256,
+        relativePath: "media/media-1/slide.png",
+        mimeType: "image/png",
+        sizeBytes: 5,
+        sha256: expectedSha256,
       });
     },
     () =>
@@ -94,26 +96,29 @@ test("draft media upload sends only the file to the asset-scoped route", async (
   );
   assert.equal(seenInit?.method, "POST");
   assert.ok(seenInit?.body instanceof FormData);
-  assert.deepEqual([...seenInit.body.keys()], ["file"]);
+  assert.deepEqual([...seenInit.body.keys()], ["file", "sha256"]);
+  assert.equal(seenInit.body.get("sha256"), expectedSha256);
   assert.deepEqual(media, {
     mediaId: "media-1",
+    relativePath: "media/media-1/slide.png",
     readUrl: "/api/v1/classrooms/asset%20%2F%201/draft-media/media-1",
     mimeType: "image/png",
     sizeBytes: 5,
-    sha256: SHA256,
+    sha256: expectedSha256,
   });
 });
 
-test("draft media rejects storage details and external read URLs", async () => {
+test("draft media derives its read route and rejects storage details", async () => {
+  const expectedSha256 = createHash("sha256").update("image").digest("hex");
   await withFetch(
     async () =>
       jsonResponse({
         id: "media-1",
-        read_url: "https://files.openmaic.example/media-1",
-        mime_type: "image/png",
-        size_bytes: 5,
-        sha256: SHA256,
-        object_key: "tenant-a/media-1",
+        relativePath: "media/media-1/slide.png",
+        mimeType: "image/png",
+        sizeBytes: 5,
+        sha256: expectedSha256,
+        objectKey: "tenant-a/media-1",
       }),
     () =>
       assert.rejects(
@@ -122,9 +127,64 @@ test("draft media rejects storage details and external read URLs", async () => {
           new Blob(["image"]),
           "slide.png",
         ),
-        /unexpected media response field|controlled yFeiSTAI/i,
+        /unexpected media response field/i,
       ),
   );
+});
+
+test("draft media rejects a receipt hash that differs from the uploaded blob", async () => {
+  await withFetch(
+    async () =>
+      jsonResponse({
+        id: "media-1",
+        relativePath: "media/media-1/slide.png",
+        mimeType: "image/png",
+        sizeBytes: 5,
+        sha256: SHA256,
+      }),
+    () =>
+      assert.rejects(
+        uploadDraftClassroomMedia(
+          "asset-1",
+          new Blob(["image"], { type: "image/png" }),
+          "slide.png",
+        ),
+        /does not match/i,
+      ),
+  );
+});
+
+test("draft media accepts only portable relative paths", async () => {
+  const expectedSha256 = createHash("sha256").update("image").digest("hex");
+  for (const relativePath of [
+    "../media.png",
+    "media/../media.png",
+    "/media/media.png",
+    "media\\media.png",
+    "https://cdn.example/media.png",
+    "data:image/png;base64,ZmFrZQ==",
+    "media/./media.png",
+  ]) {
+    await withFetch(
+      async () =>
+        jsonResponse({
+          id: "media-1",
+          relativePath,
+          mimeType: "image/png",
+          sizeBytes: 5,
+          sha256: expectedSha256,
+        }),
+      () =>
+        assert.rejects(
+          uploadDraftClassroomMedia(
+            "asset-1",
+            new Blob(["image"], { type: "image/png" }),
+            "slide.png",
+          ),
+          /relativePath.*portable/i,
+        ),
+    );
+  }
 });
 
 test("draft and immutable-version exports use only yFeiSTAI job routes", async () => {
@@ -446,5 +506,30 @@ test("MP4 availability and download URLs are controlled by stable policy", () =>
   assert.equal(
     classroomExportDownloadUrl("export / 1"),
     "/api/v1/classroom-exports/export%20%2F%201/download",
+  );
+});
+
+test("failed exports expose only the stable backend category and code", async () => {
+  const failed = await withFetch(
+    async () =>
+      jsonResponse(
+        exportPayload({
+          status: "failed",
+          progress_percent: 70,
+          cancellable: false,
+          retryable: true,
+          error_category: "rendering",
+          error_code: "pptx_materialization_failed",
+        }),
+      ),
+    () => getClassroomExport("export-1", "pptx"),
+  );
+  assert.deepEqual(classroomExportFailureDetails(failed), {
+    errorCategory: "rendering",
+    errorCode: "pptx_materialization_failed",
+  });
+  assert.equal(
+    classroomExportFailureDetails({ ...failed, status: "queued" }),
+    null,
   );
 });

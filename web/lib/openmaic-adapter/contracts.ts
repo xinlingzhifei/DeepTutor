@@ -120,8 +120,8 @@ export interface MediaManifestItem {
   mimeType: string;
   sha256: string;
   sizeBytes: number;
-  temporaryDownloadPath: string;
-  expiresAt: string;
+  temporaryDownloadPath?: string;
+  expiresAt?: string;
 }
 
 export type ExportFormat = "classroom_zip" | "pptx" | "offline_html" | "mp4";
@@ -616,8 +616,6 @@ function validateManifestItem(
         "mimeType",
         "sha256",
         "sizeBytes",
-        "temporaryDownloadPath",
-        "expiresAt",
       ]
     : [
         "format",
@@ -628,7 +626,13 @@ function validateManifestItem(
         "temporaryDownloadPath",
         "expiresAt",
       ];
-  const item = objectAt(context, value, path, required);
+  const item = objectAt(
+    context,
+    value,
+    path,
+    required,
+    media ? ["temporaryDownloadPath", "expiresAt"] : [],
+  );
   if (!item) return { id: null, relativePath: null };
   const id = media ? stringAt(context, item.mediaId, `${path}/mediaId`) : null;
   if (!media && !EXPORT_FORMATS.has(item.format as string)) {
@@ -641,8 +645,12 @@ function validateManifestItem(
   }
   sha256At(context, item.sha256, `${path}/sha256`);
   integerAt(context, item.sizeBytes, `${path}/sizeBytes`, 0);
-  stringAt(context, item.temporaryDownloadPath, `${path}/temporaryDownloadPath`);
-  timestampAt(context, item.expiresAt, `${path}/expiresAt`);
+  if (!media || item.temporaryDownloadPath !== undefined) {
+    stringAt(context, item.temporaryDownloadPath, `${path}/temporaryDownloadPath`);
+  }
+  if (!media || item.expiresAt !== undefined) {
+    timestampAt(context, item.expiresAt, `${path}/expiresAt`);
+  }
   return { id, relativePath };
 }
 
@@ -910,6 +918,13 @@ export function classroomMediaUrl(
   return `/api/v1/classrooms/versions/${safeRouteSegment(classroomVersionId, "/classroomVersionId")}/media/${safeRouteSegment(mediaId, "/mediaId")}`;
 }
 
+export function draftClassroomMediaUrl(
+  assetId: string,
+  mediaId: string,
+): string {
+  return `/api/v1/classrooms/${safeRouteSegment(assetId, "/assetId")}/draft-media/${safeRouteSegment(mediaId, "/mediaId")}`;
+}
+
 function portableArtifactPath(value: string): boolean {
   return (
     value.length > 0 &&
@@ -930,6 +945,7 @@ const MEDIA_KEYS = new Set([
   "videoUrl",
   "imageUrl",
   "pattern",
+  "mediaRef",
 ]);
 
 function unsafeExternalReference(value: string): boolean {
@@ -1019,8 +1035,9 @@ export function assertPortableInteractiveHtml(
   }
 }
 
-export function resolveClassroomMediaReferences(
+function resolveMediaReferences(
   input: ClassroomDocument,
+  mediaUrl: (mediaId: string) => string,
 ): ClassroomDocument {
   const document = cloneDocument(input);
   const pathToUrl = new Map<string, string>();
@@ -1036,7 +1053,7 @@ export function resolveClassroomMediaReferences(
     }
     pathToUrl.set(
       item.relativePath,
-      classroomMediaUrl(document.classroomVersionId, item.mediaId),
+      mediaUrl(item.mediaId),
     );
   });
   const controlledUrls = new Set(pathToUrl.values());
@@ -1057,6 +1074,25 @@ export function resolveClassroomMediaReferences(
     return rewritten;
   });
   return document;
+}
+
+export function resolveClassroomMediaReferences(
+  input: ClassroomDocument,
+): ClassroomDocument {
+  return resolveMediaReferences(
+    input,
+    mediaId => classroomMediaUrl(input.classroomVersionId, mediaId),
+  );
+}
+
+export function resolveDraftClassroomMediaReferences(
+  input: ClassroomDocument,
+  assetId: string,
+): ClassroomDocument {
+  return resolveMediaReferences(
+    input,
+    mediaId => draftClassroomMediaUrl(assetId, mediaId),
+  );
 }
 
 export const CLASSROOM_THEME_IDS = ["snow", "cream", "dark", "glass"] as const;
