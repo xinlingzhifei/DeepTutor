@@ -72,8 +72,8 @@ export interface PortableMediaEntry {
   mimeType: string;
   sha256: string;
   sizeBytes: number;
-  temporaryDownloadPath: string;
-  expiresAt: string;
+  temporaryDownloadPath?: string;
+  expiresAt?: string;
 }
 
 export interface PortableClassroomDocument {
@@ -146,13 +146,13 @@ function asRecord(value: unknown, label: string): Record<string, unknown> {
 function exactKeys(
   value: Record<string, unknown>,
   label: string,
-  keys: readonly string[],
+  requiredKeys: readonly string[],
+  optionalKeys: readonly string[] = [],
 ): void {
-  const expected = new Set(keys);
+  const expected = new Set([...requiredKeys, ...optionalKeys]);
   if (
-    Object.keys(value).length !== keys.length ||
     Object.keys(value).some((key) => !expected.has(key)) ||
-    keys.some((key) => !(key in value))
+    requiredKeys.some((key) => !(key in value))
   ) {
     throw new Error(`${label} has an invalid field set`);
   }
@@ -251,29 +251,32 @@ export function validateMediaManifest(
   for (const [index, raw] of value.entries()) {
     const label = `media manifest entry ${index}`;
     const entry = asRecord(raw, label);
-    exactKeys(entry, label, [
-      "mediaId",
-      "relativePath",
-      "mimeType",
-      "sha256",
-      "sizeBytes",
-      "temporaryDownloadPath",
-      "expiresAt",
-    ]);
+    exactKeys(
+      entry,
+      label,
+      ["mediaId", "relativePath", "mimeType", "sha256", "sizeBytes"],
+      ["temporaryDownloadPath", "expiresAt"],
+    );
     nonEmptyString(entry.mediaId, `${label}.mediaId`);
     nonEmptyString(entry.relativePath, `${label}.relativePath`);
     if (
       typeof entry.mimeType !== "string" ||
       entry.mimeType.length === 0 ||
       !Number.isInteger(entry.sizeBytes) ||
-      (entry.sizeBytes as number) < 0 ||
-      typeof entry.temporaryDownloadPath !== "string" ||
-      entry.temporaryDownloadPath.length === 0
+      (entry.sizeBytes as number) < 0
     ) {
       throw new Error(`${label} metadata is invalid`);
     }
     sha256(entry.sha256, `${label}.sha256`);
-    awareTimestamp(entry.expiresAt, `${label}.expiresAt`);
+    if (entry.temporaryDownloadPath !== undefined) {
+      nonEmptyString(
+        entry.temporaryDownloadPath,
+        `${label}.temporaryDownloadPath`,
+      );
+    }
+    if (entry.expiresAt !== undefined) {
+      awareTimestamp(entry.expiresAt, `${label}.expiresAt`);
+    }
   }
 }
 

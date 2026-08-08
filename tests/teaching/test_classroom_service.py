@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from deeptutor.teaching.artifacts import StoredArtifact
+from deeptutor.teaching.artifacts import StoredArtifact, classroom_artifact_key
 from deeptutor.teaching.brief_builder import TeachingBriefBuilder
 from deeptutor.teaching.contracts import (
     ClassroomDocument,
@@ -24,6 +24,7 @@ from deeptutor.teaching.contracts import (
     canonical_outline_sha256,
 )
 from deeptutor.teaching.permissions import permissions_for_roles
+from deeptutor.teaching.repositories.classrooms import SqlAlchemyClassroomRepository
 from deeptutor.teaching.repositories.jobs import GenerationJobDetails
 from deeptutor.teaching.services.batches import (
     BatchItemRecord,
@@ -44,6 +45,7 @@ from deeptutor.teaching.services.classrooms import (
     DraftMediaRecord,
     GenerationStage,
     InvalidClassroomState,
+    InvalidDraftDocument,
     InvalidDraftMedia,
     NewClassroomWorkflow,
     NewDraftMedia,
@@ -124,6 +126,7 @@ def _request(**changes):
         "duration_minutes": 45,
         "classroom_mode": "full",
         "web_policy": "disabled",
+        "media_policy": "image_audio",
         "allowed_web_domains": [],
         "template_id": "template-a",
         "template_version": "1",
@@ -151,6 +154,8 @@ class _Repository:
         self.validation_reports: list[dict[str, object]] = []
         self.media: dict[tuple[str, str], DraftMediaRecord] = {}
         self.media_status: dict[tuple[str, str], str] = {}
+        self.version_media: dict[tuple[str, str], SimpleNamespace] = {}
+        self.version_media_calls: list[tuple[str, str]] = []
         self.cleanup_transitions: list[str] = []
 
     async def get_creation(self, idempotency_key: str):
@@ -379,6 +384,10 @@ class _Repository:
 
     async def get_media(self, asset_id, media_id):
         return self.media.get((asset_id, media_id))
+
+    async def get_bound_version_media(self, asset_id, media_id):
+        self.version_media_calls.append((asset_id, media_id))
+        return self.version_media.get((asset_id, media_id))
 
 
 class _Generation:
@@ -792,6 +801,24 @@ async def test_create_idempotency_key_rejects_a_different_request() -> None:
             context,
             _request(objective="Explain acceleration"),
             idempotency_key="classroom-request-1",
+        )
+
+    assert len(repository.new_workflows) == 1
+    assert len(generation.start_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_create_idempotency_hash_includes_media_policy() -> None:
+    context = _context()
+    service, repository, generation = _service(context)
+
+    await service.create(context, _request(), idempotency_key="classroom-media-policy")
+
+    with pytest.raises(ClassroomIdempotencyConflict):
+        await service.create(
+            context,
+            _request(media_policy="text_only"),
+            idempotency_key="classroom-media-policy",
         )
 
     assert len(repository.new_workflows) == 1
@@ -1496,6 +1523,115 @@ async def test_validation_report_cannot_commit_after_concurrent_draft_update() -
 
 
 @pytest.mark.asyncio
+async def test_draft_update_recomputes_a_stale_but_well_formed_file_hash() -> None:
+    context = _context()
+    service, repository, _ = _service(context)
+    created = await service.create(context, _request())
+    version_id = "classroom-version-edit"
+    current = replace(
+        repository.records[created.asset_id],
+        lifecycle_state="editing",
+        status="succeeded",
+        classroom_version_id=version_id,
+        document=_canonical_document(
+            classroom_id=created.asset_id,
+            classroom_version_id=version_id,
+            title="Before edit",
+        ),
+    )
+    repository.records[created.asset_id] = current
+    edited = _canonical_document(
+        classroom_id=created.asset_id,
+        classroom_version_id=version_id,
+        title="After edit",
+    )
+    edited["fileSha256"] = "f" * 64
+
+    updated = await service.update_draft(
+        context,
+        created.asset_id,
+        edited,
+        current.revision,
+    )
+
+    unhashed = dict(updated.document)
+    file_sha256 = unhashed.pop("fileSha256")
+    assert file_sha256 != "f" * 64
+    assert file_sha256 == hashlib.sha256(canonical_json_bytes(unhashed)).hexdigest()
+    assert repository.records[created.asset_id].document == updated.document
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_kind",
+    [
+        "snake_case_hash",
+        "duplicate_hash_alias",
+        "snake_case_field",
+        "explicit_none",
+        "extra_field",
+        "unsafe_reference",
+    ],
+)
+async def test_draft_update_rehash_only_relaxes_the_hash_value(
+    invalid_kind: str,
+) -> None:
+    context = _context()
+    service, repository, _ = _service(context)
+    created = await service.create(context, _request())
+    version_id = "classroom-version-edit"
+    original = _canonical_document(
+        classroom_id=created.asset_id,
+        classroom_version_id=version_id,
+        title="Before edit",
+    )
+    current = replace(
+        repository.records[created.asset_id],
+        lifecycle_state="editing",
+        status="succeeded",
+        classroom_version_id=version_id,
+        document=original,
+    )
+    repository.records[created.asset_id] = current
+    edited = _canonical_document(
+        classroom_id=created.asset_id,
+        classroom_version_id=version_id,
+        title="Rejected representation",
+    )
+    if invalid_kind == "snake_case_hash":
+        edited["file_sha256"] = edited.pop("fileSha256")
+    elif invalid_kind == "duplicate_hash_alias":
+        edited["file_sha256"] = edited["fileSha256"]
+    elif invalid_kind == "snake_case_field":
+        edited["schema_version"] = edited.pop("schemaVersion")
+    elif invalid_kind == "explicit_none":
+        audit_metadata = edited["auditMetadata"]
+        assert isinstance(audit_metadata, dict)
+        audit_metadata["parentClassroomVersionId"] = None
+    elif invalid_kind == "extra_field":
+        edited["unexpectedField"] = True
+    else:
+        openmaic = edited["openmaic"]
+        assert isinstance(openmaic, dict)
+        scenes = openmaic["scenes"]
+        assert isinstance(scenes, list) and isinstance(scenes[0], dict)
+        scenes[0]["content"] = {
+            "type": "slide",
+            "canvas": {"src": "https://attacker.invalid/image.png"},
+        }
+
+    with pytest.raises(InvalidDraftDocument):
+        await service.update_draft(
+            context,
+            created.asset_id,
+            edited,
+            current.revision,
+        )
+
+    assert repository.records[created.asset_id].document == original
+
+
+@pytest.mark.asyncio
 async def test_media_upload_validates_content_and_uses_opaque_asset_scoped_id() -> None:
     context = _context()
     service, repository, store = _service_with_store(context)
@@ -1513,9 +1649,195 @@ async def test_media_upload_validates_content_and_uses_opaque_asset_scoped_id() 
     )
     assert media.object_key not in repr(media)
     assert media.object_revision == "revision-1"
+    assert media.relative_path == f"media/{media.id}.png"
+    assert media.object_key.endswith(media.relative_path)
     assert upload.closed is True
     assert len(repository.media) == 1
     assert len(store.put_calls) == 1
+    streamed = await service.get_media(context, created.asset_id, media.id)
+    assert streamed is not None
+    assert b"".join([chunk async for chunk in streamed.body]) == body
+    assert repository.version_media_calls == []
+
+
+@pytest.mark.asyncio
+async def test_authorized_draft_media_read_falls_back_to_exact_bound_version_media() -> None:
+    context = _context()
+    service, repository, store = _service_with_store(context)
+    created = await service.create(context, _request())
+    media_id = "generated-media-1"
+    body = b"\x89PNG\r\n\x1a\ngenerated"
+    object_key = (
+        f"tenants/{context.tenant_id}/classrooms/{created.asset_id}/versions/1/"
+        f"media/{media_id}.png"
+    )
+    repository.version_media[(created.asset_id, media_id)] = SimpleNamespace(
+        id=media_id,
+        classroom_id=created.asset_id,
+        relative_path=f"media/{media_id}.png",
+        mime_type="image/png",
+        sha256=hashlib.sha256(body).hexdigest(),
+        size_bytes=len(body),
+        object_key=object_key,
+    )
+    store.content[object_key] = body
+
+    media = await service.get_media(context, created.asset_id, media_id)
+
+    assert media is not None
+    assert media.id == media_id
+    assert b"".join([chunk async for chunk in media.body]) == body
+    assert repository.version_media_calls == [(created.asset_id, media_id)]
+
+    denied = await service.get_media(
+        _context(user_id="teacher-b", scope_id="class-b"),
+        created.asset_id,
+        media_id,
+    )
+    assert denied is None
+    assert repository.version_media_calls == [(created.asset_id, media_id)]
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("classroomId", "asset-b"),
+        ("classroomVersionId", "version-b"),
+    ],
+)
+def test_bound_version_media_requires_document_asset_and_base_version_binding(
+    field_name: str,
+    value: str,
+) -> None:
+    document = _canonical_document(
+        classroom_id="asset-a",
+        classroom_version_id="version-a",
+    )
+    document[field_name] = value
+    unhashed = dict(document)
+    unhashed.pop("fileSha256")
+    document["fileSha256"] = hashlib.sha256(canonical_json_bytes(unhashed)).hexdigest()
+    encoded = canonical_json_bytes(document).decode("utf-8")
+    draft = SimpleNamespace(
+        classroom_id="asset-a",
+        base_version_id="version-a",
+        document=encoded,
+        document_sha256=hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+    )
+
+    assert SqlAlchemyClassroomRepository._verified_draft_document(draft) is None
+
+
+def test_available_and_read_media_share_exact_canonical_version_binding() -> None:
+    media_id = "media-generated"
+    payload = valid_classroom_document()
+    payload["classroom_id"] = "asset-a"
+    payload["classroom_version_id"] = "version-a"
+    payload["export_manifest"] = []
+    manifest = payload["media_manifest"]
+    assert isinstance(manifest, list) and isinstance(manifest[0], dict)
+    manifest[0].update(
+        media_id=media_id,
+        relative_path="media/generated.png",
+        mime_type="image/png",
+        sha256="a" * 64,
+        size_bytes=8,
+    )
+    document = ClassroomDocument.model_validate(payload).model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+    )
+    unhashed = dict(document)
+    unhashed.pop("fileSha256")
+    document["fileSha256"] = hashlib.sha256(canonical_json_bytes(unhashed)).hexdigest()
+    encoded = canonical_json_bytes(document).decode()
+    draft = SimpleNamespace(
+        tenant_id="tenant-a",
+        classroom_id="asset-a",
+        base_version_id="version-a",
+        document=encoded,
+        document_sha256=hashlib.sha256(encoded.encode()).hexdigest(),
+    )
+    version = SimpleNamespace(
+        tenant_id="tenant-a",
+        id="version-a",
+        classroom_id="asset-a",
+        version_number=1,
+    )
+    artifact = SimpleNamespace(
+        id="artifact-a",
+        tenant_id="tenant-a",
+        classroom_version_id="version-a",
+        artifact_kind="media",
+        relative_name="media/generated.png",
+        mime_type="image/png",
+        sha256="a" * 64,
+        size_bytes=8,
+        object_key=classroom_artifact_key(
+            "tenant-a",
+            "asset-a",
+            1,
+            "media/generated.png",
+        ),
+    )
+    repository = object.__new__(SqlAlchemyClassroomRepository)
+    repository._tenant_id = "tenant-a"
+
+    resolved = repository._verified_bound_version_media(
+        "asset-a",
+        draft,
+        version,
+        (artifact,),
+    )
+
+    assert resolved is not None and resolved[0].id == media_id
+    assert (
+        repository._verified_bound_version_media(
+            "asset-a",
+            draft,
+            version,
+            (
+                SimpleNamespace(
+                    **{
+                        **vars(artifact),
+                        "object_key": "tenants/tenant-a/other",
+                    }
+                ),
+            ),
+        )
+        is None
+    )
+    assert (
+        repository._verified_bound_version_media(
+            "asset-a",
+            draft,
+            version,
+            (artifact, artifact),
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("mime_type", "suffix"),
+    [
+        ("audio/x-wav", ".wav"),
+        (
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            ".pptx",
+        ),
+    ],
+)
+def test_draft_media_relative_path_uses_the_upload_mime_mapping(
+    mime_type: str,
+    suffix: str,
+) -> None:
+    from deeptutor.teaching.services.classrooms import draft_media_relative_path
+
+    media_id = "media-0123456789abcdef0123456789abcdef"
+
+    assert draft_media_relative_path(media_id, mime_type) == f"media/{media_id}{suffix}"
 
 
 @pytest.mark.asyncio

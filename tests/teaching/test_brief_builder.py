@@ -100,6 +100,30 @@ def _snapshot() -> SourceSnapshot:
     )
 
 
+@pytest.mark.parametrize(
+    ("media_policy", "allow_generation", "allowed_mime_types"),
+    [
+        ("text_only", False, []),
+        ("image_audio", True, ["image/png", "audio/mpeg"]),
+    ],
+)
+def test_media_policy_is_frozen_into_the_teaching_brief(
+    media_policy: str,
+    allow_generation: bool,
+    allowed_mime_types: list[str],
+) -> None:
+    brief = TeachingBriefBuilder(_context(), object()).open_creation(
+        _spec(
+            content_mode="open_creation",
+            open_creation_acknowledged=True,
+            media_policy=media_policy,
+        )
+    ).contract
+
+    assert brief.media_policy.allow_generation is allow_generation
+    assert brief.media_policy.allowed_mime_types == allowed_mime_types
+
+
 class _SnapshotBuilder:
     def __init__(self, snapshot: SourceSnapshot) -> None:
         self.snapshot = snapshot

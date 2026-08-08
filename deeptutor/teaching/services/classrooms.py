@@ -159,6 +159,10 @@ class DraftMediaRecord:
     status: str = "writing"
     last_error_code: str | None = None
 
+    @property
+    def relative_path(self) -> str:
+        return draft_media_relative_path(self.id, self.mime_type)
+
 
 @dataclass(frozen=True, slots=True)
 class DraftMediaContent:
@@ -176,6 +180,17 @@ class ClassroomMediaBinding:
     mime_type: str
     sha256: str
     size_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class BoundClassroomMedia:
+    id: str
+    classroom_id: str
+    relative_path: str
+    mime_type: str
+    sha256: str
+    size_bytes: int
+    object_key: str = field(repr=False)
 
 
 class ClassroomRepository(Protocol):
@@ -292,6 +307,12 @@ class ClassroomRepository(Protocol):
         media_id: str,
     ) -> DraftMediaRecord | None: ...
 
+    async def get_bound_version_media(
+        self,
+        asset_id: str,
+        media_id: str,
+    ) -> BoundClassroomMedia | None: ...
+
 
 class ClassroomGeneration(Protocol):
     async def start_outline(
@@ -376,6 +397,7 @@ _RAW_REFERENCE_FIELDS = frozenset(
         "href",
         "objectkey",
         "objectpath",
+        "pattern",
         "poster",
         "relativepath",
         "s3key",
@@ -405,6 +427,7 @@ def _creation_request_sha256(request: object) -> str:
             }
             for point in getattr(request, "knowledge_points")
         ],
+        "mediaPolicy": getattr(request, "media_policy", "image_audio"),
         "objective": getattr(request, "objective"),
         "openCreationAcknowledged": getattr(
             request,
@@ -579,6 +602,15 @@ _DRAFT_MEDIA_SUFFIXES = {
     "video/mp4": ".mp4",
     "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
 }
+
+
+def draft_media_relative_path(media_id: str, mime_type: str) -> str:
+    """Return the durable portable path for one server-issued draft upload."""
+
+    suffix = _DRAFT_MEDIA_SUFFIXES.get(mime_type)
+    if _MEDIA_ID_PATTERN.fullmatch(media_id) is None or suffix is None:
+        raise InvalidDraftMedia("draft media identity is invalid")
+    return f"media/{media_id}{suffix}"
 
 
 def _walk(value: object, path: str = "$"):
@@ -828,6 +860,27 @@ def _canonical_classroom_document(document: Mapping[str, Any]) -> ClassroomDocum
     return parsed
 
 
+def _materialize_edited_classroom_document(
+    document: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(document, Mapping):
+        raise InvalidDraftDocument("draft document is invalid")
+    try:
+        parsed = ClassroomDocument.model_validate(document)
+    except Exception:
+        raise InvalidDraftDocument("draft document is not a portable classroom") from None
+    canonical = parsed.model_dump(mode="json", by_alias=True, exclude_none=True)
+    canonical.pop("fileSha256")
+    original_without_hash = dict(document)
+    if "fileSha256" not in original_without_hash:
+        raise InvalidDraftDocument("draft document is not canonical")
+    original_without_hash.pop("fileSha256")
+    if canonical_json_bytes(original_without_hash) != canonical_json_bytes(canonical):
+        raise InvalidDraftDocument("draft document is not canonical")
+    canonical["fileSha256"] = hashlib.sha256(canonical_json_bytes(canonical)).hexdigest()
+    return canonical
+
+
 def _validate_portable_path(value: str) -> None:
     decoded = _decoded_reference(value)
     parsed = urlsplit(decoded)
@@ -875,7 +928,10 @@ def _validate_controlled_artifact_path(value: str, relative_path: str) -> None:
         )
 
 
-def _embedded_media_ids(value: object) -> frozenset[str]:
+def _embedded_media_ids(
+    value: object,
+    media_ids_by_path: Mapping[str, str],
+) -> frozenset[str]:
     media_ids: set[str] = set()
     for _path, key, nested in _walk(value):
         normalized_key = _normalized_field_name(key) if isinstance(key, str) else None
@@ -894,7 +950,9 @@ def _embedded_media_ids(value: object) -> frozenset[str]:
                 raise InvalidDraftDocument("draft document has an unsafe reference")
             media_ids.update(nested)
         elif normalized_key is not None and _is_reference_semantic_field(key, nested):
-            raise InvalidDraftDocument("draft document has an unsafe reference")
+            if not isinstance(nested, str) or nested not in media_ids_by_path:
+                raise InvalidDraftDocument("draft document has an unsafe reference")
+            media_ids.add(media_ids_by_path[nested])
     return frozenset(media_ids)
 
 
@@ -911,6 +969,7 @@ def validate_draft_document_references(
         raise InvalidDraftDocument("available classroom media bindings conflict")
     declared_ids: set[str] = set()
     declared_paths: set[str] = set()
+    media_ids_by_path: dict[str, str] = {}
     for item in parsed.media_manifest:
         if (
             _CANONICAL_MEDIA_ID_PATTERN.fullmatch(item.media_id) is None
@@ -927,10 +986,13 @@ def validate_draft_document_references(
             ).validate()
         except ArtifactManifestError:
             raise InvalidDraftDocument("classroom media manifest is invalid") from None
-        _validate_controlled_artifact_path(
-            item.temporary_download_path,
-            item.relative_path,
-        )
+        legacy_item = item.model_dump(mode="json", by_alias=True, exclude_none=True)
+        temporary_download_path = legacy_item.get("temporaryDownloadPath")
+        if isinstance(temporary_download_path, str):
+            _validate_controlled_artifact_path(
+                temporary_download_path,
+                item.relative_path,
+            )
         binding = bindings.get(item.media_id)
         if binding is None or (
             binding.relative_name,
@@ -946,6 +1008,7 @@ def validate_draft_document_references(
             raise InvalidDraftDocument("draft document references unavailable media")
         declared_ids.add(item.media_id)
         declared_paths.add(item.relative_path)
+        media_ids_by_path[item.relative_path] = item.media_id
     for item in parsed.export_manifest:
         try:
             ArtifactManifestEntry(
@@ -969,7 +1032,8 @@ def validate_draft_document_references(
                         mode="json", by_alias=True, exclude_none=True
                     ),
                     "actions": scene.actions,
-                }
+                },
+                media_ids_by_path,
             )
         )
     if referenced_ids != declared_ids:
@@ -1759,6 +1823,7 @@ class ClassroomService:
                     "open_creation_acknowledged",
                 ),
                 allowed_web_domains=tuple(getattr(request, "allowed_web_domains")),
+                media_policy=getattr(request, "media_policy", "image_audio"),
             )
             content_mode = getattr(request, "content_mode")
             source_type = getattr(request, "source_type")
@@ -2084,7 +2149,8 @@ class ClassroomService:
         record = await self._editable_record(context, asset_id)
         if record.lifecycle_state != "editing":
             raise InvalidClassroomState("classroom draft is not editable")
-        parsed = _canonical_classroom_document(document)
+        canonical_document = _materialize_edited_classroom_document(document)
+        parsed = _canonical_classroom_document(canonical_document)
         if (
             record.classroom_version_id is None
             or parsed.classroom_id != asset_id
@@ -2093,13 +2159,8 @@ class ClassroomService:
             raise InvalidDraftDocument("draft document classroom binding is invalid")
         available = await self._repository.available_media_bindings(asset_id)
         validate_draft_document_references(
-            document,
+            canonical_document,
             available_media_bindings=available,
-        )
-        canonical_document = parsed.model_dump(
-            mode="json",
-            by_alias=True,
-            exclude_none=True,
         )
         document_sha256 = _sha256_payload(canonical_document)
         updated = await self._repository.update_document(
@@ -2183,10 +2244,11 @@ class ClassroomService:
             if actual_sha256 != declared_sha256:
                 raise InvalidDraftMedia("draft media SHA-256 does not match")
             media_id = f"media-{secrets.token_hex(16)}"
+            relative_path = draft_media_relative_path(media_id, mime_type)
             object_key = temporary_artifact_key(
                 context.tenant_id,
                 f"draft-{asset_id}",
-                f"media/{media_id}{_DRAFT_MEDIA_SUFFIXES[mime_type]}",
+                relative_path,
             )
             ownership_token = secrets.token_hex(16)
             await self._repository.reserve_media(
@@ -2325,10 +2387,19 @@ class ClassroomService:
         record = await self._repository.get_workflow(asset_id)
         if record is None or not self._can_edit(context, record):
             return None
-        if _MEDIA_ID_PATTERN.fullmatch(media_id) is None:
+        if (
+            _CANONICAL_MEDIA_ID_PATTERN.fullmatch(media_id) is None
+            or self._store_provider is None
+        ):
             return None
-        media = await self._repository.get_media(asset_id, media_id)
-        if media is None or media.object_revision is None or self._store_provider is None:
+        media: DraftMediaRecord | BoundClassroomMedia | None = None
+        if _MEDIA_ID_PATTERN.fullmatch(media_id) is not None:
+            upload = await self._repository.get_media(asset_id, media_id)
+            if upload is not None and upload.object_revision is not None:
+                media = upload
+        if media is None:
+            media = await self._repository.get_bound_version_media(asset_id, media_id)
+        if media is None:
             return None
         store = await self._store_provider.store_for_tenant(context.tenant_id)
         return DraftMediaContent(
@@ -2341,6 +2412,7 @@ class ClassroomService:
 
 
 __all__ = [
+    "BoundClassroomMedia",
     "ClassroomAccessDenied",
     "ClassroomConfirmationConflict",
     "ClassroomIdempotencyConflict",
@@ -2360,6 +2432,7 @@ __all__ = [
     "NewDraftMedia",
     "SqlAlchemyClassroomGeneration",
     "build_validation_report",
+    "draft_media_relative_path",
     "matches_reviewed_outline_binding",
     "validate_draft_document_references",
 ]

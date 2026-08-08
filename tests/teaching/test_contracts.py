@@ -1515,8 +1515,6 @@ def test_portable_scene_content_matches_task4_without_arbitrary_config() -> None
         ("media_manifest", "sha256", "sha256"),
         ("media_manifest", "size_bytes", "sizeBytes"),
         ("media_manifest", "mime_type", "mimeType"),
-        ("media_manifest", "temporary_download_path", "temporaryDownloadPath"),
-        ("media_manifest", "expires_at", "expiresAt"),
         ("export_manifest", "sha256", "sha256"),
         ("export_manifest", "size_bytes", "sizeBytes"),
         ("export_manifest", "mime_type", "mimeType"),
@@ -1524,7 +1522,7 @@ def test_portable_scene_content_matches_task4_without_arbitrary_config() -> None
         ("export_manifest", "expires_at", "expiresAt"),
     ],
 )
-def test_every_manifest_file_requires_integrity_and_temporary_download_metadata(
+def test_manifest_files_require_integrity_and_export_download_metadata(
     manifest_name: str,
     field_name: str,
     camel_name: str,
@@ -1547,6 +1545,84 @@ def test_every_manifest_file_requires_integrity_and_temporary_download_metadata(
     del dumped_manifest[0][camel_name]
     with pytest.raises(JsonSchemaValidationError):
         Draft202012Validator(committed_schema("classroom-document.schema.json")).validate(dumped)
+
+
+def test_media_manifest_deprecated_download_metadata_is_optional() -> None:
+    from deeptutor.teaching.contracts import ClassroomDocument
+
+    payload = valid_classroom_document()
+    manifest = payload["media_manifest"]
+    assert isinstance(manifest, list) and isinstance(manifest[0], dict)
+    del manifest[0]["temporary_download_path"]
+    del manifest[0]["expires_at"]
+
+    dumped = ClassroomDocument.model_validate(payload).model_dump(
+        mode="json",
+        by_alias=True,
+        exclude_none=True,
+    )
+
+    assert "temporaryDownloadPath" not in dumped["mediaManifest"][0]
+    assert "expiresAt" not in dumped["mediaManifest"][0]
+    schema = committed_schema("classroom-document.schema.json")
+    media_schema = schema["$defs"]["MediaManifestItem"]
+    assert "temporaryDownloadPath" not in media_schema["required"]
+    assert "expiresAt" not in media_schema["required"]
+    assert media_schema["properties"]["temporaryDownloadPath"]["deprecated"] is True
+    assert media_schema["properties"]["expiresAt"]["deprecated"] is True
+    Draft202012Validator(schema).validate(dumped)
+
+
+def test_omitted_media_download_metadata_stays_omitted_in_normal_model_dumps() -> None:
+    from deeptutor.teaching.contracts import ClassroomDocument, MediaManifestItem
+
+    payload = valid_classroom_document()
+    manifest = payload["media_manifest"]
+    assert isinstance(manifest, list) and isinstance(manifest[0], dict)
+    del manifest[0]["temporary_download_path"]
+    del manifest[0]["expires_at"]
+
+    entry = MediaManifestItem.model_validate(manifest[0])
+    direct = entry.model_dump(mode="json", by_alias=True)
+    nested = ClassroomDocument.model_validate(payload).model_dump(
+        mode="json",
+        by_alias=True,
+    )["mediaManifest"][0]
+
+    assert "temporaryDownloadPath" not in direct
+    assert "expiresAt" not in direct
+    assert "temporaryDownloadPath" not in nested
+    assert "expiresAt" not in nested
+
+
+@pytest.mark.parametrize(
+    ("field_name", "camel_name"),
+    [
+        ("temporary_download_path", "temporaryDownloadPath"),
+        ("expires_at", "expiresAt"),
+    ],
+)
+def test_optional_media_download_metadata_rejects_explicit_null(
+    field_name: str,
+    camel_name: str,
+) -> None:
+    from deeptutor.teaching.contracts import ClassroomDocument
+
+    payload = valid_classroom_document()
+    manifest = payload["media_manifest"]
+    assert isinstance(manifest, list) and isinstance(manifest[0], dict)
+    manifest[0][field_name] = None
+    with pytest.raises(ValidationError):
+        ClassroomDocument.model_validate(payload)
+
+    dumped = ClassroomDocument.model_validate(valid_classroom_document()).model_dump(
+        mode="json"
+    )
+    dumped["mediaManifest"][0][camel_name] = None
+    with pytest.raises(JsonSchemaValidationError):
+        Draft202012Validator(committed_schema("classroom-document.schema.json")).validate(
+            dumped
+        )
 
 
 @pytest.mark.parametrize("content_type", ["quiz", "interactive", "pbl"])

@@ -74,6 +74,7 @@ class TeachingBriefSpec:
     content_mode: ContentMode | None = None
     open_creation_acknowledged: bool = False
     allowed_web_domains: tuple[str, ...] = ()
+    media_policy: Literal["text_only", "image_audio"] = "image_audio"
 
     def __post_init__(self) -> None:
         strings = (
@@ -99,6 +100,8 @@ class TeachingBriefSpec:
             raise ValueError("web policy is invalid")
         if self.content_mode not in {None, "source_grounded", "open_creation"}:
             raise ValueError("content mode is invalid")
+        if self.media_policy not in {"text_only", "image_audio"}:
+            raise ValueError("media policy is invalid")
         if not isinstance(self.open_creation_acknowledged, bool):
             raise ValueError("open creation acknowledgement is invalid")
         if not isinstance(self.knowledge_points, tuple) or not self.knowledge_points:
@@ -371,8 +374,12 @@ class TeachingBriefBuilder:
                 allowed_domains=list(spec.allowed_web_domains),
             ),
             media_policy=MediaPolicy(
-                allow_generation=True,
-                allowed_mime_types=["image/png", "audio/mpeg"],
+                allow_generation=spec.media_policy == "image_audio",
+                allowed_mime_types=(
+                    ["image/png", "audio/mpeg"]
+                    if spec.media_policy == "image_audio"
+                    else []
+                ),
             ),
             template_policy=TemplatePolicy(
                 template_id=spec.template_id,

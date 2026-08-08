@@ -15,6 +15,7 @@ from pydantic import (
     Field,
     FiniteFloat,
     StringConstraints,
+    model_serializer,
     model_validator,
 )
 from typing_extensions import TypeAliasType
@@ -830,14 +831,72 @@ class KnowledgePointMapping(_ContractModel):
     source_refs: list[SourceReference]
 
 
+def _media_manifest_schema_extra(schema: dict[str, object]) -> None:
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return
+    for name in ("temporaryDownloadPath", "expiresAt"):
+        field_schema = properties.get(name)
+        if not isinstance(field_schema, dict):
+            continue
+        branches = field_schema.pop("anyOf", None)
+        if isinstance(branches, list):
+            non_null = next(
+                (
+                    branch
+                    for branch in branches
+                    if isinstance(branch, dict) and branch.get("type") != "null"
+                ),
+                None,
+            )
+            if isinstance(non_null, dict):
+                field_schema.update(non_null)
+        field_schema.pop("default", None)
+
+
 class MediaManifestItem(_ContractModel):
+    model_config = ConfigDict(json_schema_extra=_media_manifest_schema_extra)
+
     media_id: NonEmptyString
     relative_path: NonEmptyString
     mime_type: NonEmptyString
     sha256: Sha256
     size_bytes: int = Field(ge=0)
-    temporary_download_path: NonEmptyString
-    expires_at: AwareDatetime
+    temporary_download_path: NonEmptyString | None = Field(
+        default_factory=lambda: None,
+        deprecated=True,
+    )
+    expires_at: AwareDatetime | None = Field(
+        default_factory=lambda: None,
+        deprecated=True,
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_explicit_null_download_metadata(cls, value: object) -> object:
+        if isinstance(value, dict) and any(
+            key in value and value[key] is None
+            for key in (
+                "temporary_download_path",
+                "temporaryDownloadPath",
+                "expires_at",
+                "expiresAt",
+            )
+        ):
+            raise ValueError("media download metadata cannot be null")
+        return value
+
+    @model_serializer(mode="wrap")
+    def omit_missing_download_metadata(self, handler):
+        payload = handler(self)
+        if isinstance(payload, dict):
+            if self.__dict__.get("temporary_download_path") is None:
+                payload.pop("temporary_download_path", None)
+                payload.pop("temporaryDownloadPath", None)
+            if self.__dict__.get("expires_at") is None:
+                payload.pop("expires_at", None)
+                payload.pop("expiresAt", None)
+        return payload
 
 
 class ExportManifestItem(_ContractModel):

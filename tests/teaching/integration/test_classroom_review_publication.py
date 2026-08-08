@@ -44,6 +44,9 @@ from deeptutor.teaching.models.classrooms import (
     Publication,
     TeachingBrief,
 )
+from deeptutor.teaching.models.classrooms import (
+    SourceSnapshot as SourceSnapshotModel,
+)
 from deeptutor.teaching.models.jobs import (
     ArtifactPromotionState,
     ClassroomArtifact,
@@ -76,10 +79,19 @@ from deeptutor.teaching.services.review_repository import SqlAlchemyReviewReposi
 from deeptutor.teaching.services.reviews import (
     ReviewAccessDenied,
     ReviewConflict,
+    ReviewPersistenceError,
     ReviewPolicy,
     ReviewService,
     ReviewValidationStale,
     SubmitReviewCommand,
+)
+from deeptutor.teaching.source_snapshots import (
+    AuthorizedFragment,
+    AuthorizedSourceReference,
+    PermissionEvidence,
+)
+from deeptutor.teaching.source_snapshots import (
+    SourceSnapshot as AuthorizedSourceSnapshot,
 )
 from deeptutor.teaching.tenant_context import TenantContext
 from tests.teaching_contract_fixtures import valid_classroom_document
@@ -170,6 +182,14 @@ class _StoreProvider:
 
     async def store_for_tenant(self, _tenant_id: str):
         return self._store
+
+
+class _ExactSnapshotBuilder:
+    def __init__(self, snapshot: AuthorizedSourceSnapshot) -> None:
+        self._snapshot = snapshot
+
+    async def from_kb(self, _kb_ref, _request):
+        return self._snapshot
 
 
 class _LoseFirstMaterializationResponse:
@@ -879,6 +899,265 @@ async def test_review_decision_is_atomic_append_only_and_rejects_self_review(
                 await session.execute(
                     update(Approval).where(Approval.id == event.id).values(reason="changed")
                 )
+
+
+@pytest.mark.asyncio
+async def test_review_detail_reads_exact_source_evidence_and_real_publication_baseline(
+    review_database: ReviewDatabase,
+) -> None:
+    sessions = _tenant_sessions(review_database)
+    async with sessions() as session:
+        async with session.begin():
+            session.add(
+                Publication(
+                    id="detail-baseline-publication",
+                    tenant_id=review_database.tenant_id,
+                    classroom_id=review_database.asset_id,
+                    classroom_version_id=review_database.source_version_id,
+                    actor_id="publisher-0",
+                    scope="tenant",
+                    class_id=None,
+                    review_request_id=None,
+                    idempotency_key=None,
+                    request_sha256=None,
+                )
+            )
+
+    edited_document = _canonical_document(
+        review_database.asset_id,
+        review_database.source_version_id,
+        title="Reviewed evidence",
+        text_content="Updated lesson grounded by source evidence",
+    )
+    author = _context(
+        review_database,
+        "author-1",
+        "classroom.edit",
+        "classroom.submit",
+    )
+    classrooms = ClassroomService(
+        SqlAlchemyClassroomRepository(review_database.engine, review_database.tenant_id),
+        object(),
+        object(),
+        None,
+    )
+    await classrooms.update_draft(
+        author,
+        review_database.asset_id,
+        edited_document,
+        expected_revision=1,
+    )
+    await classrooms.validate(author, review_database.asset_id)
+
+    fragment = AuthorizedFragment.create(
+        stable_source_id="user:kb:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        provider_fragment_id="chunk-1",
+        text="Newton described motion.",
+        document_id="document-1",
+        page=1,
+        section="Motion",
+    )
+    reference = AuthorizedSourceReference(
+        citation_id="citation-1",
+        source_id=fragment.source_id,
+        fragment_id=fragment.fragment_id,
+        document_id="document-1",
+        page=1,
+        section="Motion",
+    )
+    snapshot = AuthorizedSourceSnapshot.create(
+        source_kind="knowledge_base",
+        stable_source_id=fragment.source_id,
+        source_revision="binding-v1",
+        fragments=(fragment,),
+        source_refs=(reference,),
+        permission_summary=PermissionEvidence(
+            permissions=("source.use",),
+            scope_type="class",
+            scope_id="class-a",
+        ),
+        query_sha256="1" * 64,
+        retrieval_provider="llamaindex",
+        retrieval_view_signature="2" * 64,
+        created_at=datetime(2026, 8, 9, tzinfo=timezone.utc),
+        created_by="author-1",
+    )
+    grounded_brief = (
+        await TeachingBriefBuilder(
+            _context(review_database, "author-1", "source.use"),
+            _ExactSnapshotBuilder(snapshot),
+        ).from_kb(
+            "kb",
+            TeachingBriefSpec(
+                course_id="course-a",
+                class_id="class-a",
+                objective="Explain motion",
+                grade_band="grade-8",
+                audience="intermediate",
+                duration_minutes=45,
+                classroom_mode="full",
+                web_policy="disabled",
+                template_id="template-1",
+                template_version="1",
+                knowledge_points=(
+                    KnowledgePointSpec(
+                        knowledge_point_id="kp-motion",
+                        title="Motion",
+                        description="Describe motion.",
+                    ),
+                ),
+                content_mode="source_grounded",
+            ),
+        )
+    ).contract
+    manifest = snapshot.to_generation_payload()
+    manifest.pop("created_at")
+    async with sessions() as session:
+        async with session.begin():
+            session.add(
+                SourceSnapshotModel(
+                    id=snapshot.snapshot_id,
+                    tenant_id=review_database.tenant_id,
+                    source_type="knowledge_base",
+                    source_id=snapshot.stable_source_id,
+                    resource_owner_id="author-1",
+                    source_upload_id=None,
+                    display_name=None,
+                    source_revision=snapshot.source_revision,
+                    content_sha256=snapshot.snapshot_sha256,
+                    permission_sha256="3" * 64,
+                    citation_manifest=canonical_json_bytes(manifest).decode(),
+                    created_by="author-1",
+                )
+            )
+            await session.flush()
+            brief = await session.scalar(select(TeachingBrief).limit(1))
+            assert brief is not None
+            brief.source_snapshot_id = snapshot.snapshot_id
+            brief.document = json.dumps(
+                grounded_brief.model_dump(
+                    mode="json",
+                    by_alias=True,
+                    exclude_none=False,
+                ),
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            brief.document_sha256 = grounded_brief.content_sha256
+
+    repository = SqlAlchemyReviewRepository(
+        review_database.engine,
+        review_database.tenant_id,
+    )
+    review = await ReviewService(repository).submit(
+        author,
+        review_database.asset_id,
+        scope="tenant",
+        class_id=None,
+        idempotency_key="detail-evidence-review",
+    )
+    detail = await ReviewService(
+        repository,
+        _StoreProvider(review_database.store),
+    ).detail(
+        _context(review_database, "reviewer-1", "classroom.approve"),
+        review.id,
+    )
+
+    assert detail.source_fragments[0].text == "Newton described motion."
+    assert detail.baseline is not None
+    assert detail.baseline.version_id == review_database.source_version_id
+    assert "/openmaic/scenes/0/title" in detail.changed_paths
+    assert "/openmaic/scenes/0/content/canvas/text" in detail.changed_paths
+
+    async with sessions() as session:
+        async with session.begin():
+            await session.execute(
+                update(ClassroomReviewRequest)
+                .where(ClassroomReviewRequest.id == review.id)
+                .values(document_sha256="f" * 64)
+            )
+    with pytest.raises(ReviewValidationStale):
+        await repository.get_detail(review.id)
+
+
+@pytest.mark.asyncio
+async def test_tenant_publication_library_uses_publications_and_filters_candidates(
+    review_database: ReviewDatabase,
+) -> None:
+    reviews = ReviewService(
+        SqlAlchemyReviewRepository(review_database.engine, review_database.tenant_id)
+    )
+    review = await reviews.submit(
+        _context(review_database, "author-1", "classroom.submit"),
+        review_database.asset_id,
+        scope="tenant",
+        class_id=None,
+        idempotency_key="library-review",
+    )
+    await reviews.approve(
+        _context(review_database, "reviewer-1", "classroom.approve"),
+        review.id,
+        "approved for tenant library",
+    )
+    sessions = _tenant_sessions(review_database)
+    async with sessions() as session:
+        async with session.begin():
+            session.add_all(
+                [
+                    Publication(
+                        id="library-class-publication",
+                        tenant_id=review_database.tenant_id,
+                        classroom_id=review_database.asset_id,
+                        classroom_version_id=review_database.source_version_id,
+                        actor_id="publisher-0",
+                        scope="class",
+                        class_id="class-a",
+                        review_request_id=None,
+                        idempotency_key=None,
+                        request_sha256=None,
+                    ),
+                    Publication(
+                        id="library-platform-publication",
+                        tenant_id=review_database.tenant_id,
+                        classroom_id=review_database.asset_id,
+                        classroom_version_id=review_database.source_version_id,
+                        actor_id="publisher-0",
+                        scope="platform",
+                        class_id=None,
+                        review_request_id=None,
+                        idempotency_key=None,
+                        request_sha256=None,
+                    ),
+                ]
+            )
+    repository = SqlAlchemyPublicationRepository(
+        review_database.engine,
+        review_database.tenant_id,
+    )
+    service = PublicationService(
+        repository,
+        ClassroomPublicationMaterializer(_StoreProvider(review_database.store)),
+    )
+    publisher = _context(review_database, "publisher-1", "classroom.publish")
+
+    before = await service.library(publisher)
+    assert before.items == ()
+    assert [item.review_id for item in before.candidates] == [review.id]
+    assert (await service.library(_context(review_database, "viewer-1"))).candidates == ()
+
+    published = await service.publish(
+        publisher,
+        review_database.asset_id,
+        scope="tenant",
+        class_id=None,
+        idempotency_key="library-publish",
+    )
+    after = await service.library(publisher)
+
+    assert [item.version_id for item in after.items] == [published.version_id]
+    assert after.candidates == ()
 
 
 @pytest.mark.asyncio

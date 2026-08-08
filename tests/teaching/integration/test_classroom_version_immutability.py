@@ -940,6 +940,31 @@ async def test_generation_atomically_replaces_draft_with_canonical_media_snapsho
     assert [(item.media_id, item.relative_name, item.sha256) for item in bindings] == [
         (media_entry.media_id, media_entry.relative_path, media_entry.sha256)
     ]
+    resolved = await repository_context.repository.get_bound_version_media(
+        repository_context.asset_id,
+        media_entry.media_id,
+    )
+    assert resolved is not None
+    assert (
+        resolved.relative_path,
+        resolved.mime_type,
+        resolved.sha256,
+        resolved.size_bytes,
+        resolved.object_key,
+    ) == (
+        media_entry.relative_path,
+        media_entry.mime_type,
+        media_entry.sha256,
+        media_entry.size_bytes,
+        media_key,
+    )
+    assert (
+        await repository_context.repository.get_bound_version_media(
+            "other-asset",
+            media_entry.media_id,
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio

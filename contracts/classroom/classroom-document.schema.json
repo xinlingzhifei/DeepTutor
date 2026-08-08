@@ -335,6 +335,7 @@
       "additionalProperties": false,
       "properties": {
         "expiresAt": {
+          "deprecated": true,
           "format": "date-time",
           "title": "Expiresat",
           "type": "string"
@@ -365,6 +366,7 @@
           "type": "integer"
         },
         "temporaryDownloadPath": {
+          "deprecated": true,
           "minLength": 1,
           "title": "Temporarydownloadpath",
           "type": "string"
@@ -375,9 +377,7 @@
         "relativePath",
         "mimeType",
         "sha256",
-        "sizeBytes",
-        "temporaryDownloadPath",
-        "expiresAt"
+        "sizeBytes"
       ],
       "title": "MediaManifestItem",
       "type": "object"

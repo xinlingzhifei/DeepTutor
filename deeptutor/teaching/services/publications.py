@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 import hashlib
 from typing import Literal, Protocol
 
@@ -66,6 +67,42 @@ class PublishedVersionRecord:
     publication_scope: PublicationScope
     class_id: str | None
     idempotency_key: str
+
+
+@dataclass(frozen=True, slots=True)
+class TenantPublicationItem:
+    tenant_id: str
+    publication_id: str
+    version_id: str
+    asset_id: str
+    version_number: int
+    title: str
+    course_id: str
+    document_sha256: str
+    published_by: str
+    created_at: datetime
+    scope: PublicationScope
+
+
+@dataclass(frozen=True, slots=True)
+class TenantPublicationCandidate:
+    tenant_id: str
+    review_id: str
+    asset_id: str
+    title: str
+    course_id: str
+    target_class_id: str
+    draft_revision: int
+    document_sha256: str
+    submitted_by: str
+    review_scope: PublicationScope
+    review_status: Literal["pending", "approved", "rejected"]
+
+
+@dataclass(frozen=True, slots=True)
+class TenantPublicationLibrary:
+    items: tuple[TenantPublicationItem, ...]
+    candidates: tuple[TenantPublicationCandidate, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -261,6 +298,13 @@ class PublicationRepository(Protocol):
         asset_id: str,
     ) -> PublicationTarget | None: ...
 
+    async def list_tenant_library(
+        self,
+    ) -> tuple[
+        tuple[TenantPublicationItem, ...],
+        tuple[TenantPublicationCandidate, ...],
+    ]: ...
+
     async def publish(
         self,
         command: PublishCommand,
@@ -309,6 +353,33 @@ class PublicationService:
     ) -> None:
         self._repository = repository
         self._materializer = materializer
+
+    async def library(self, context: TenantContext) -> TenantPublicationLibrary:
+        items, candidates = await self._repository.list_tenant_library()
+        visible_items = tuple(
+            item
+            for item in items
+            if item.tenant_id == context.tenant_id and item.scope == "tenant"
+        )
+        visible_candidates = tuple(
+            candidate
+            for candidate in candidates
+            if (
+                candidate.tenant_id == context.tenant_id
+                and candidate.review_scope == "tenant"
+                and candidate.review_status == "approved"
+                and _allows(
+                    context,
+                    "classroom.publish",
+                    course_id=candidate.course_id,
+                    class_id=candidate.target_class_id,
+                )
+            )
+        )
+        return TenantPublicationLibrary(
+            items=visible_items,
+            candidates=visible_candidates,
+        )
 
     async def publish(
         self,
@@ -512,6 +583,9 @@ __all__ = [
     "PublicationValidationStale",
     "PublishCommand",
     "PublishedVersionRecord",
+    "TenantPublicationCandidate",
+    "TenantPublicationItem",
+    "TenantPublicationLibrary",
     "VersionTarget",
     "publication_media_manifest_sha256",
 ]

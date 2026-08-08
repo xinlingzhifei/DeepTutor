@@ -12,6 +12,7 @@ from sqlalchemy import and_, delete, func, select, update
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
+from deeptutor.teaching.artifacts import classroom_artifact_key
 from deeptutor.teaching.contracts import (
     ClassroomDocument,
     OutlineBundle,
@@ -40,27 +41,21 @@ from deeptutor.teaching.repositories.classroom_version_allocation import (
 )
 from deeptutor.teaching.schema_names import tenant_schema_name
 from deeptutor.teaching.services.classrooms import (
+    BoundClassroomMedia,
     ClassroomConfirmationConflict,
     ClassroomIdempotencyConflict,
     ClassroomMediaBinding,
     ClassroomRecord,
     DraftMediaRecord,
+    InvalidDraftMedia,
     NewClassroomWorkflow,
     NewDraftMedia,
+    draft_media_relative_path,
     matches_reviewed_outline_binding,
 )
 
 _LOWER_HEX_DIGITS = frozenset("0123456789abcdef")
 _IMMUTABLE_TRIGGER_MESSAGE = "immutable classroom record"
-_DRAFT_MEDIA_SUFFIXES = {
-    "image/png": ".png",
-    "image/jpeg": ".jpg",
-    "image/gif": ".gif",
-    "image/webp": ".webp",
-    "audio/mpeg": ".mp3",
-    "audio/wav": ".wav",
-    "video/mp4": ".mp4",
-}
 
 
 def _required(value: str, name: str, max_length: int) -> str:
@@ -169,6 +164,102 @@ class SqlAlchemyClassroomRepository:
         if not isinstance(decoded, dict):
             raise ClassroomPersistenceError(f"stored classroom {field} is invalid")
         return decoded
+
+    @staticmethod
+    def _verified_draft_document(draft: ClassroomDraft) -> ClassroomDocument | None:
+        try:
+            payload = json.loads(draft.document)
+            document = ClassroomDocument.model_validate(payload)
+            canonical_payload = canonical_json_bytes(document)
+            raw = document.model_dump(mode="json", by_alias=True, exclude_none=True)
+            file_sha256 = raw.pop("fileSha256")
+            if (
+                draft.base_version_id is None
+                or document.classroom_id != draft.classroom_id
+                or document.classroom_version_id != draft.base_version_id
+                or canonical_json_bytes(payload) != canonical_payload
+                or not hmac.compare_digest(
+                    hashlib.sha256(canonical_json_bytes(raw)).hexdigest(),
+                    file_sha256,
+                )
+                or not hmac.compare_digest(
+                    hashlib.sha256(canonical_payload).hexdigest(),
+                    draft.document_sha256,
+                )
+            ):
+                return None
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        return document
+
+    def _verified_bound_version_media(
+        self,
+        asset_id: str,
+        draft: ClassroomDraft,
+        version: ClassroomVersion,
+        artifacts: tuple[ClassroomArtifact, ...],
+    ) -> tuple[BoundClassroomMedia, ...] | None:
+        document = self._verified_draft_document(draft)
+        if (
+            document is None
+            or draft.tenant_id != self._tenant_id
+            or draft.classroom_id != asset_id
+            or version.tenant_id != self._tenant_id
+            or version.id != draft.base_version_id
+            or version.classroom_id != asset_id
+        ):
+            return None
+        manifest_ids = [item.media_id for item in document.media_manifest]
+        manifest_paths = [item.relative_path for item in document.media_manifest]
+        if (
+            len(set(manifest_ids)) != len(manifest_ids)
+            or len(set(manifest_paths)) != len(manifest_paths)
+        ):
+            return None
+        artifacts_by_path: dict[str, list[ClassroomArtifact]] = {}
+        for artifact in artifacts:
+            if (
+                artifact.tenant_id != self._tenant_id
+                or artifact.classroom_version_id != version.id
+                or artifact.artifact_kind != "media"
+            ):
+                return None
+            artifacts_by_path.setdefault(artifact.relative_name, []).append(artifact)
+        resolved: list[BoundClassroomMedia] = []
+        for item in document.media_manifest:
+            matches = artifacts_by_path.get(item.relative_path, [])
+            if len(matches) != 1:
+                return None
+            artifact = matches[0]
+            if (
+                artifact.mime_type,
+                artifact.sha256,
+                artifact.size_bytes,
+            ) != (item.mime_type, item.sha256, item.size_bytes):
+                return None
+            try:
+                expected_object_key = classroom_artifact_key(
+                    self._tenant_id,
+                    asset_id,
+                    version.version_number,
+                    item.relative_path,
+                )
+            except ValueError:
+                return None
+            if not hmac.compare_digest(artifact.object_key, expected_object_key):
+                return None
+            resolved.append(
+                BoundClassroomMedia(
+                    id=item.media_id,
+                    classroom_id=asset_id,
+                    relative_path=item.relative_path,
+                    mime_type=item.mime_type,
+                    sha256=item.sha256,
+                    size_bytes=item.size_bytes,
+                    object_key=artifact.object_key,
+                )
+            )
+        return tuple(resolved)
 
     def _workflow_statement(self):
         return (
@@ -776,38 +867,33 @@ class SqlAlchemyClassroomRepository:
                     .order_by(ClassroomDraftMedia.id)
                 )
             )
-            bindings = [
-                ClassroomMediaBinding(
-                    media_id=item.id,
-                    relative_name=f"media/{item.id}{_DRAFT_MEDIA_SUFFIXES[item.mime_type]}",
-                    mime_type=item.mime_type,
-                    sha256=item.sha256,
-                    size_bytes=item.size_bytes,
+            bindings: list[ClassroomMediaBinding] = []
+            for item in uploads:
+                if item.object_revision is None:
+                    continue
+                try:
+                    relative_name = draft_media_relative_path(item.id, item.mime_type)
+                except InvalidDraftMedia:
+                    continue
+                bindings.append(
+                    ClassroomMediaBinding(
+                        media_id=item.id,
+                        relative_name=relative_name,
+                        mime_type=item.mime_type,
+                        sha256=item.sha256,
+                        size_bytes=item.size_bytes,
+                    )
                 )
-                for item in uploads
-                if item.mime_type in _DRAFT_MEDIA_SUFFIXES and item.object_revision is not None
-            ]
             if draft.base_version_id is None:
                 return tuple(bindings)
-            try:
-                payload = json.loads(draft.document)
-                document = ClassroomDocument.model_validate(payload)
-                canonical_payload = canonical_json_bytes(document)
-                raw = document.model_dump(mode="json", by_alias=True, exclude_none=True)
-                file_sha256 = raw.pop("fileSha256")
-                if (
-                    canonical_json_bytes(payload) != canonical_payload
-                    or not hmac.compare_digest(
-                        hashlib.sha256(canonical_json_bytes(raw)).hexdigest(),
-                        file_sha256,
-                    )
-                    or not hmac.compare_digest(
-                        hashlib.sha256(canonical_payload).hexdigest(),
-                        draft.document_sha256,
-                    )
-                ):
-                    return tuple(bindings)
-            except (TypeError, ValueError, json.JSONDecodeError):
+            version = await session.scalar(
+                select(ClassroomVersion).where(
+                    ClassroomVersion.id == draft.base_version_id,
+                    ClassroomVersion.classroom_id == asset_id,
+                    ClassroomVersion.tenant_id == self._tenant_id,
+                )
+            )
+            if version is None:
                 return tuple(bindings)
             artifacts = tuple(
                 await session.scalars(
@@ -820,23 +906,24 @@ class SqlAlchemyClassroomRepository:
                     .order_by(ClassroomArtifact.relative_name)
                 )
             )
-            artifacts_by_name = {item.relative_name: item for item in artifacts}
-            for item in document.media_manifest:
-                artifact = artifacts_by_name.get(item.relative_path)
-                if artifact is not None and (
-                    artifact.mime_type,
-                    artifact.sha256,
-                    artifact.size_bytes,
-                ) == (item.mime_type, item.sha256, item.size_bytes):
-                    bindings.append(
-                        ClassroomMediaBinding(
-                            media_id=item.media_id,
-                            relative_name=item.relative_path,
-                            mime_type=item.mime_type,
-                            sha256=item.sha256,
-                            size_bytes=item.size_bytes,
-                        )
-                    )
+            resolved = self._verified_bound_version_media(
+                asset_id,
+                draft,
+                version,
+                artifacts,
+            )
+            if resolved is None:
+                return tuple(bindings)
+            bindings.extend(
+                ClassroomMediaBinding(
+                    media_id=item.id,
+                    relative_name=item.relative_path,
+                    mime_type=item.mime_type,
+                    sha256=item.sha256,
+                    size_bytes=item.size_bytes,
+                )
+                for item in resolved
+            )
             return tuple(bindings)
 
     async def save_validation_report(
@@ -1087,6 +1174,54 @@ class SqlAlchemyClassroomRepository:
                 )
             )
             return self._media_record(model) if model is not None else None
+
+    async def get_bound_version_media(
+        self,
+        asset_id: str,
+        media_id: str,
+    ) -> BoundClassroomMedia | None:
+        _required(asset_id, "asset_id", 128)
+        _required(media_id, "media_id", 128)
+        async with self._session_factory() as session:
+            draft = await session.scalar(
+                select(ClassroomDraft)
+                .where(
+                    ClassroomDraft.classroom_id == asset_id,
+                    ClassroomDraft.tenant_id == self._tenant_id,
+                )
+                .with_for_update()
+            )
+            if draft is None or draft.base_version_id is None:
+                return None
+            version = await session.scalar(
+                select(ClassroomVersion).where(
+                    ClassroomVersion.id == draft.base_version_id,
+                    ClassroomVersion.classroom_id == asset_id,
+                    ClassroomVersion.tenant_id == self._tenant_id,
+                )
+            )
+            if version is None:
+                return None
+            artifacts = tuple(
+                await session.scalars(
+                    select(ClassroomArtifact)
+                    .where(
+                        ClassroomArtifact.tenant_id == self._tenant_id,
+                        ClassroomArtifact.classroom_version_id == draft.base_version_id,
+                        ClassroomArtifact.artifact_kind == "media",
+                    )
+                    .order_by(ClassroomArtifact.relative_name, ClassroomArtifact.id)
+                )
+            )
+            resolved = self._verified_bound_version_media(
+                asset_id,
+                draft,
+                version,
+                artifacts,
+            )
+            if resolved is None:
+                return None
+            return next((item for item in resolved if item.id == media_id), None)
 
     async def insert_published_version(
         self,

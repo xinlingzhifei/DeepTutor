@@ -63,6 +63,8 @@ from deeptutor.teaching.services.publications import (
     PublicationValidationStale,
     PublishCommand,
     PublishedVersionRecord,
+    TenantPublicationCandidate,
+    TenantPublicationItem,
     VersionTarget,
     publication_media_manifest_sha256,
     validated_publication_document,
@@ -198,6 +200,212 @@ class SqlAlchemyPublicationRepository:
                 await session.execute(self._publication_target_statement(asset_id))
             ).one_or_none()
             return self._publication_target(row) if row is not None else None
+
+    async def list_tenant_library(
+        self,
+    ) -> tuple[
+        tuple[TenantPublicationItem, ...],
+        tuple[TenantPublicationCandidate, ...],
+    ]:
+        async with self._session_factory() as session:
+            item_rows = (
+                await session.execute(
+                    select(
+                        Publication,
+                        ClassroomVersion,
+                        ClassroomAsset,
+                        ClassroomReviewRequest,
+                        ClassroomDraft,
+                        TeachingBrief,
+                    )
+                    .join(
+                        ClassroomVersion,
+                        and_(
+                            ClassroomVersion.id == Publication.classroom_version_id,
+                            ClassroomVersion.classroom_id == Publication.classroom_id,
+                            ClassroomVersion.tenant_id == Publication.tenant_id,
+                        ),
+                    )
+                    .join(
+                        ClassroomAsset,
+                        and_(
+                            ClassroomAsset.id == Publication.classroom_id,
+                            ClassroomAsset.tenant_id == Publication.tenant_id,
+                        ),
+                    )
+                    .join(
+                        ClassroomReviewRequest,
+                        and_(
+                            ClassroomReviewRequest.id == Publication.review_request_id,
+                            ClassroomReviewRequest.classroom_id == ClassroomAsset.id,
+                            ClassroomReviewRequest.tenant_id == Publication.tenant_id,
+                        ),
+                    )
+                    .join(
+                        ClassroomDraft,
+                        and_(
+                            ClassroomDraft.id
+                            == ClassroomReviewRequest.classroom_draft_id,
+                            ClassroomDraft.classroom_id == ClassroomAsset.id,
+                            ClassroomDraft.tenant_id == ClassroomAsset.tenant_id,
+                        ),
+                    )
+                    .join(
+                        TeachingBrief,
+                        and_(
+                            TeachingBrief.id == ClassroomDraft.teaching_brief_id,
+                            TeachingBrief.tenant_id == ClassroomDraft.tenant_id,
+                        ),
+                    )
+                    .where(
+                        Publication.tenant_id == self._tenant_id,
+                        Publication.scope == "tenant",
+                        ClassroomReviewRequest.scope == "tenant",
+                        ClassroomReviewRequest.status == "approved",
+                    )
+                    .order_by(Publication.created_at.desc(), Publication.id.desc())
+                )
+            ).all()
+            items: list[TenantPublicationItem] = []
+            for publication, version, asset, review, draft, brief in item_rows:
+                if (
+                    any(
+                        model.tenant_id != self._tenant_id
+                        for model in (publication, version, asset, review, draft, brief)
+                    )
+                    or publication.scope != "tenant"
+                    or publication.classroom_id != asset.id
+                    or version.classroom_id != asset.id
+                    or publication.review_request_id != review.id
+                    or review.scope != "tenant"
+                    or review.status != "approved"
+                    or review.classroom_draft_id != draft.id
+                    or draft.classroom_id != asset.id
+                    or draft.teaching_brief_id != brief.id
+                    or asset.title is None
+                    or brief.course_id is None
+                ):
+                    raise PublicationPersistenceError(
+                        "stored tenant publication is invalid"
+                    )
+                items.append(
+                    TenantPublicationItem(
+                        tenant_id=self._tenant_id,
+                        publication_id=publication.id,
+                        version_id=version.id,
+                        asset_id=asset.id,
+                        version_number=version.version_number,
+                        title=asset.title,
+                        course_id=brief.course_id,
+                        document_sha256=version.document_sha256,
+                        published_by=publication.actor_id,
+                        created_at=publication.created_at,
+                        scope="tenant",
+                    )
+                )
+            published_review = (
+                select(Publication.id)
+                .where(
+                    Publication.tenant_id == self._tenant_id,
+                    Publication.scope == "tenant",
+                    Publication.review_request_id == ClassroomReviewRequest.id,
+                )
+                .correlate(ClassroomReviewRequest)
+                .exists()
+            )
+            candidate_rows = (
+                await session.execute(
+                    select(
+                        ClassroomReviewRequest,
+                        ClassroomAsset,
+                        ClassroomDraft,
+                        TeachingBrief,
+                    )
+                    .join(
+                        ClassroomAsset,
+                        and_(
+                            ClassroomAsset.id == ClassroomReviewRequest.classroom_id,
+                            ClassroomAsset.tenant_id == ClassroomReviewRequest.tenant_id,
+                        ),
+                    )
+                    .join(
+                        ClassroomDraft,
+                        and_(
+                            ClassroomDraft.id
+                            == ClassroomReviewRequest.classroom_draft_id,
+                            ClassroomDraft.classroom_id
+                            == ClassroomReviewRequest.classroom_id,
+                            ClassroomDraft.tenant_id
+                            == ClassroomReviewRequest.tenant_id,
+                        ),
+                    )
+                    .join(
+                        TeachingBrief,
+                        and_(
+                            TeachingBrief.id == ClassroomDraft.teaching_brief_id,
+                            TeachingBrief.tenant_id == ClassroomDraft.tenant_id,
+                        ),
+                    )
+                    .where(
+                        ClassroomReviewRequest.tenant_id == self._tenant_id,
+                        ClassroomReviewRequest.status == "approved",
+                        ClassroomReviewRequest.scope == "tenant",
+                        ClassroomAsset.lifecycle_state == "approved",
+                        ~published_review,
+                    )
+                    .order_by(
+                        ClassroomReviewRequest.created_at,
+                        ClassroomReviewRequest.id,
+                    )
+                )
+            ).all()
+            candidates: list[TenantPublicationCandidate] = []
+            for review, asset, draft, brief in candidate_rows:
+                if (
+                    any(
+                        model.tenant_id != self._tenant_id
+                        for model in (review, asset, draft, brief)
+                    )
+                    or review.scope != "tenant"
+                    or review.status != "approved"
+                    or asset.lifecycle_state != "approved"
+                    or review.classroom_id != asset.id
+                    or review.classroom_draft_id != draft.id
+                    or draft.classroom_id != asset.id
+                    or draft.revision != review.draft_revision
+                    or not hmac.compare_digest(
+                        draft.document_sha256,
+                        review.document_sha256,
+                    )
+                    or asset.title is None
+                    or brief.course_id is None
+                    or brief.class_id is None
+                ):
+                    raise PublicationPersistenceError(
+                        "stored tenant publication candidate is invalid"
+                    )
+                try:
+                    self._validate_review_binding(asset, draft, review)
+                except PublicationValidationStale:
+                    raise PublicationPersistenceError(
+                        "stored tenant publication candidate is invalid"
+                    ) from None
+                candidates.append(
+                    TenantPublicationCandidate(
+                        tenant_id=self._tenant_id,
+                        review_id=review.id,
+                        asset_id=asset.id,
+                        title=asset.title,
+                        course_id=brief.course_id,
+                        target_class_id=brief.class_id,
+                        draft_revision=review.draft_revision,
+                        document_sha256=review.document_sha256,
+                        submitted_by=review.submitted_by,
+                        review_scope="tenant",
+                        review_status="approved",
+                    )
+                )
+            return tuple(items), tuple(candidates)
 
     @staticmethod
     def _validate_review_binding(

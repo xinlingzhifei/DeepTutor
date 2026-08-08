@@ -46,6 +46,7 @@ from deeptutor.teaching.services.classrooms import (
     InvalidDraftDocument,
     InvalidDraftMedia,
     SqlAlchemyClassroomGeneration,
+    draft_media_relative_path,
 )
 from deeptutor.teaching.source_snapshots import SourceSnapshotBuilder
 from deeptutor.teaching.tenant_context import TenantContext, require_tenant
@@ -82,6 +83,7 @@ class CreateClassroomRequest(_ApiModel):
     duration_minutes: int = Field(ge=1, le=600)
     classroom_mode: Literal["full"]
     web_policy: Literal["disabled", "enabled"]
+    media_policy: Literal["text_only", "image_audio"] = "image_audio"
     allowed_web_domains: list[str] = Field(default_factory=list, max_length=32)
     template_id: str = Field(min_length=1, max_length=128)
     template_version: str = Field(min_length=1, max_length=64)
@@ -148,6 +150,7 @@ class ClassroomListResponse(_ApiModel):
 
 class DraftMediaResponse(_ApiModel):
     id: str
+    relative_path: str
     mime_type: str
     sha256: str
     size_bytes: int
@@ -398,14 +401,18 @@ async def upload_classroom_draft_media(
 ) -> DraftMediaResponse:
     record = await _call(service.upload_media(context, asset_id, file, sha256))
     if isinstance(record, Mapping):
+        media_id = str(record["id"])
+        mime_type = str(record["mime_type"])
         return DraftMediaResponse(
-            id=str(record["id"]),
-            mime_type=str(record["mime_type"]),
+            id=media_id,
+            relative_path=draft_media_relative_path(media_id, mime_type),
+            mime_type=mime_type,
             sha256=str(record["sha256"]),
             size_bytes=int(record["size_bytes"]),
         )
     return DraftMediaResponse(
         id=record.id,
+        relative_path=record.relative_path,
         mime_type=record.mime_type,
         sha256=record.sha256,
         size_bytes=record.size_bytes,

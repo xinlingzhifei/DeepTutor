@@ -26,6 +26,7 @@ def _canonical_document(
     html: str | None = None,
     media_id: str | None = None,
     media_download_path: str | None = None,
+    include_media_download_metadata: bool = True,
 ) -> dict[str, object]:
     payload = valid_classroom_document()
     payload["export_manifest"] = []
@@ -57,6 +58,9 @@ def _canonical_document(
                 or f"/api/yfeistai/v1/artifacts/job-a/media/{media_id}.png"
             ),
         )
+        if not include_media_download_metadata:
+            manifest[0].pop("temporary_download_path")
+            manifest[0].pop("expires_at")
     provisional = ClassroomDocument.model_validate(payload)
     unhashed = provisional.model_dump(mode="json", by_alias=True, exclude_none=True)
     unhashed.pop("fileSha256")
@@ -223,6 +227,18 @@ def test_teacher_full_classroom_stops_for_outline_confirmation() -> None:
     assert body["classroomVersionId"] is None
 
 
+def test_create_media_policy_defaults_to_image_audio_and_accepts_text_only() -> None:
+    defaulted = classrooms.CreateClassroomRequest.model_validate(
+        _full_classroom_request()
+    )
+    text_only_payload = _full_classroom_request()
+    text_only_payload["mediaPolicy"] = "text_only"
+    text_only = classrooms.CreateClassroomRequest.model_validate(text_only_payload)
+
+    assert defaulted.media_policy == "image_audio"
+    assert text_only.media_policy == "text_only"
+
+
 def test_create_forwards_and_echoes_a_strong_idempotency_key() -> None:
     service = _WorkflowService()
 
@@ -300,6 +316,13 @@ def test_draft_media_is_bound_to_asset_and_tenant() -> None:
         files={"file": ("diagram.png", BytesIO(body), "image/png")},
     )
     assert media.status_code == 201
+    assert media.json() == {
+        "id": "media-0123456789abcdef0123456789abcdef",
+        "relativePath": "media/media-0123456789abcdef0123456789abcdef.png",
+        "mimeType": "image/png",
+        "sha256": "8" * 64,
+        "sizeBytes": len(body),
+    }
 
     response = client.get(f"/api/v1/classrooms/asset-b/draft-media/{media.json()['id']}")
 
@@ -487,6 +510,61 @@ def test_semantic_media_id_suffix_is_validated_and_collected() -> None:
         document,
         available_media_bindings=(_media_binding(document),),
     ) == frozenset({media_id})
+
+
+@pytest.mark.parametrize("field_name", ["src", "poster", "pattern", "mediaRef"])
+def test_exact_declared_portable_media_paths_are_validated_and_collected(
+    field_name: str,
+) -> None:
+    media_id = "media-0123456789abcdef0123456789abcdef"
+    relative_path = f"media/{media_id}.png"
+    document = _canonical_document(
+        canvas={field_name: relative_path},
+        media_id=media_id,
+    )
+
+    assert validate_draft_document_references(
+        document,
+        available_media_bindings=(_media_binding(document),),
+    ) == frozenset({media_id})
+
+
+def test_portable_media_path_does_not_require_deprecated_download_metadata() -> None:
+    media_id = "media-0123456789abcdef0123456789abcdef"
+    document = _canonical_document(
+        canvas={"src": f"media/{media_id}.png"},
+        media_id=media_id,
+        include_media_download_metadata=False,
+    )
+
+    assert validate_draft_document_references(
+        document,
+        available_media_bindings=(_media_binding(document),),
+    ) == frozenset({media_id})
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "media/unknown.png",
+        "data:image/png;base64,iVBORw0KGgo=",
+        "blob:https://example.invalid/opaque",
+    ],
+)
+def test_portable_media_reference_must_match_a_trusted_manifest_path(
+    reference: str,
+) -> None:
+    media_id = "media-0123456789abcdef0123456789abcdef"
+    document = _canonical_document(
+        canvas={"src": reference},
+        media_id=media_id,
+    )
+
+    with pytest.raises(InvalidDraftDocument, match="unsafe reference"):
+        validate_draft_document_references(
+            document,
+            available_media_bindings=(_media_binding(document),),
+        )
 
 
 def test_unused_media_manifest_item_is_rejected() -> None:

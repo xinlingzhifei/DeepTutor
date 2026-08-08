@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime, timezone
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -20,6 +21,8 @@ from deeptutor.teaching.services.publications import (
     PublicationService,
     PublicationTarget,
     PublishedVersionRecord,
+    TenantPublicationCandidate,
+    TenantPublicationItem,
     VersionTarget,
 )
 from deeptutor.teaching.services.reviews import ReviewPolicy
@@ -69,6 +72,88 @@ class _PublicationRepository:
         self.active_learning = False
         self.guard_known = True
         self.migrations: dict[str, MigrationRecord] = {}
+        self.library_items = (
+            TenantPublicationItem(
+                tenant_id="tenant-a",
+                publication_id="publication-1",
+                version_id="version-1",
+                asset_id="asset-1",
+                version_number=1,
+                title="Tenant lesson",
+                course_id="course-a",
+                document_sha256="a" * 64,
+                published_by="publisher-1",
+                created_at=datetime(2026, 8, 9, tzinfo=timezone.utc),
+                scope="tenant",
+            ),
+            TenantPublicationItem(
+                tenant_id="tenant-a",
+                publication_id="publication-class",
+                version_id="version-class",
+                asset_id="asset-1",
+                version_number=2,
+                title="Class lesson",
+                course_id="course-a",
+                document_sha256="b" * 64,
+                published_by="publisher-1",
+                created_at=datetime(2026, 8, 9, tzinfo=timezone.utc),
+                scope="class",
+            ),
+            TenantPublicationItem(
+                tenant_id="tenant-b",
+                publication_id="publication-other",
+                version_id="version-other",
+                asset_id="asset-other",
+                version_number=1,
+                title="Other tenant",
+                course_id="course-b",
+                document_sha256="c" * 64,
+                published_by="publisher-b",
+                created_at=datetime(2026, 8, 9, tzinfo=timezone.utc),
+                scope="tenant",
+            ),
+        )
+        self.library_candidates = (
+            TenantPublicationCandidate(
+                tenant_id="tenant-a",
+                review_id="review-approved",
+                asset_id="asset-1",
+                title="Ready lesson",
+                course_id="course-a",
+                target_class_id="class-a",
+                draft_revision=4,
+                document_sha256="d" * 64,
+                submitted_by="teacher-1",
+                review_scope="tenant",
+                review_status="approved",
+            ),
+            TenantPublicationCandidate(
+                tenant_id="tenant-a",
+                review_id="review-other-class",
+                asset_id="asset-2",
+                title="Denied lesson",
+                course_id="course-b",
+                target_class_id="class-b",
+                draft_revision=4,
+                document_sha256="e" * 64,
+                submitted_by="teacher-2",
+                review_scope="tenant",
+                review_status="approved",
+            ),
+            TenantPublicationCandidate(
+                tenant_id="tenant-a",
+                review_id="review-pending",
+                asset_id="asset-3",
+                title="Pending lesson",
+                course_id="course-a",
+                target_class_id="class-a",
+                draft_revision=4,
+                document_sha256="f" * 64,
+                submitted_by="teacher-3",
+                review_scope="tenant",
+                review_status="pending",
+            ),
+        )
 
     async def get_policy(self) -> ReviewPolicy:
         return self.policy
@@ -102,6 +187,9 @@ class _PublicationRepository:
             publication_class_id=command.class_id,
         )
         return version
+
+    async def list_tenant_library(self):
+        return self.library_items, self.library_candidates
 
     async def get_version_target(self, version_id: str) -> VersionTarget | None:
         return self.version_targets.get(version_id)
@@ -286,6 +374,21 @@ async def test_org_and_platform_publication_require_approved_review() -> None:
             class_id=None,
             idempotency_key="publish-key-2",
         )
+
+
+@pytest.mark.asyncio
+async def test_tenant_library_shows_real_tenant_items_and_authorized_candidates() -> None:
+    repository = _PublicationRepository()
+    service = _service(repository)
+    context = _context(
+        "publisher-1",
+        ("classroom.publish", "class", "class-a"),
+    )
+
+    library = await service.library(context)
+
+    assert [item.publication_id for item in library.items] == ["publication-1"]
+    assert [item.review_id for item in library.candidates] == ["review-approved"]
 
 
 @pytest.mark.asyncio
@@ -507,3 +610,43 @@ def test_active_learning_migration_refusal_is_fixed_safe_api_error() -> None:
     )
     assert response.status_code == 409
     assert response.json() == {"detail": "Class has active learning sessions"}
+
+
+def test_tenant_publication_library_api_returns_exact_items_and_candidates() -> None:
+    repository = _PublicationRepository()
+    context = _context(
+        "publisher-1",
+        ("classroom.publish", "class", "class-a"),
+    )
+
+    response = _client(_service(repository), context).get(
+        "/api/v1/classroom-publications"
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "items": [
+            {
+                "publicationId": "publication-1",
+                "versionId": "version-1",
+                "assetId": "asset-1",
+                "versionNumber": 1,
+                "title": "Tenant lesson",
+                "courseId": "course-a",
+                "documentSha256": "a" * 64,
+                "publishedBy": "publisher-1",
+                "createdAt": "2026-08-09T00:00:00Z",
+            }
+        ],
+        "candidates": [
+            {
+                "reviewId": "review-approved",
+                "assetId": "asset-1",
+                "title": "Ready lesson",
+                "courseId": "course-a",
+                "draftRevision": 4,
+                "documentSha256": "d" * 64,
+                "submittedBy": "teacher-1",
+            }
+        ],
+    }

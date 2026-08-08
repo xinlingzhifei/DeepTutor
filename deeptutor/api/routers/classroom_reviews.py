@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Annotated, Literal, Protocol
 
 from fastapi import APIRouter, Depends, Header, HTTPException
@@ -103,6 +104,31 @@ class ReviewListResponse(_ApiModel):
     items: list[ReviewResponse]
 
 
+class ReviewSourceFragmentResponse(_ApiModel):
+    fragment_id: str
+    source_id: str
+    text: str
+    content_sha256: str
+
+
+class ReviewBaselineResponse(_ApiModel):
+    version_id: str
+    version_number: int
+    document_sha256: str
+
+
+class ReviewDetailResponse(_ApiModel):
+    review: ReviewResponse
+    title: str
+    course_id: str
+    target_class_id: str
+    document: dict[str, object]
+    validation_report: dict[str, object]
+    source_fragments: list[ReviewSourceFragmentResponse]
+    baseline: ReviewBaselineResponse | None
+    changed_paths: list[str]
+
+
 class PublishedVersionResponse(_ApiModel):
     version_id: str
     asset_id: str
@@ -111,6 +137,33 @@ class PublishedVersionResponse(_ApiModel):
     publication_scope: str
     class_id: str | None
     idempotency_key: str
+
+
+class TenantPublicationItemResponse(_ApiModel):
+    publication_id: str
+    version_id: str
+    asset_id: str
+    version_number: int
+    title: str
+    course_id: str
+    document_sha256: str
+    published_by: str
+    created_at: datetime
+
+
+class TenantPublicationCandidateResponse(_ApiModel):
+    review_id: str
+    asset_id: str
+    title: str
+    course_id: str
+    draft_revision: int
+    document_sha256: str
+    submitted_by: str
+
+
+class TenantPublicationLibraryResponse(_ApiModel):
+    items: list[TenantPublicationItemResponse]
+    candidates: list[TenantPublicationCandidateResponse]
 
 
 class AssignmentResponse(_ApiModel):
@@ -139,11 +192,13 @@ class MigrationResponse(_ApiModel):
 class ReviewServiceLike(Protocol):
     async def submit(self, context, asset_id, *, scope, class_id, idempotency_key): ...
     async def list(self, context): ...
+    async def detail(self, context, review_id): ...
     async def approve(self, context, review_id, comment): ...
     async def reject(self, context, review_id, comment): ...
 
 
 class PublicationServiceLike(Protocol):
+    async def library(self, context): ...
     async def publish(self, context, asset_id, *, scope, class_id, idempotency_key): ...
     async def assign(self, context, version_id, *, class_id, idempotency_key): ...
     async def migrate(
@@ -169,6 +224,21 @@ def get_review_service(
 
     return ReviewService(
         SqlAlchemyReviewRepository(get_platform_engine(), context.tenant_id)
+    )
+
+
+def get_review_detail_service(
+    context: TenantContext = Depends(require_tenant),
+    store_provider=Depends(get_source_store_provider),
+) -> ReviewService:
+    from deeptutor.teaching.database import get_platform_engine
+    from deeptutor.teaching.services.review_repository import (
+        SqlAlchemyReviewRepository,
+    )
+
+    return ReviewService(
+        SqlAlchemyReviewRepository(get_platform_engine(), context.tenant_id),
+        store_provider,
     )
 
 
@@ -264,6 +334,33 @@ async def list_classroom_reviews(
     )
 
 
+@router.get("/classroom-reviews/{review_id}", response_model=ReviewDetailResponse)
+async def get_classroom_review_detail(
+    review_id: str,
+    context: TenantContext = Depends(require_tenant),
+    service: ReviewServiceLike = Depends(get_review_detail_service),
+) -> ReviewDetailResponse:
+    detail = await _call(service.detail(context, review_id))
+    return ReviewDetailResponse(
+        review=ReviewResponse.model_validate(detail.review, from_attributes=True),
+        title=detail.title,
+        course_id=detail.course_id,
+        target_class_id=detail.target_class_id,
+        document=detail.document,
+        validation_report=detail.validation_report,
+        source_fragments=[
+            ReviewSourceFragmentResponse.model_validate(item, from_attributes=True)
+            for item in detail.source_fragments
+        ],
+        baseline=(
+            ReviewBaselineResponse.model_validate(detail.baseline, from_attributes=True)
+            if detail.baseline is not None
+            else None
+        ),
+        changed_paths=list(detail.changed_paths),
+    )
+
+
 async def _decision(
     review_id: str,
     request: ReviewDecisionRequest,
@@ -317,6 +414,30 @@ async def publish_classroom(
     )
 
 
+@router.get(
+    "/classroom-publications",
+    response_model=TenantPublicationLibraryResponse,
+)
+async def list_tenant_classroom_publications(
+    context: TenantContext = Depends(require_tenant),
+    service: PublicationServiceLike = Depends(get_publication_service),
+) -> TenantPublicationLibraryResponse:
+    library = await _call(service.library(context))
+    return TenantPublicationLibraryResponse(
+        items=[
+            TenantPublicationItemResponse.model_validate(item, from_attributes=True)
+            for item in library.items
+        ],
+        candidates=[
+            TenantPublicationCandidateResponse.model_validate(
+                item,
+                from_attributes=True,
+            )
+            for item in library.candidates
+        ],
+    )
+
+
 @router.post("/classroom-versions/{version_id}/assign", response_model=AssignmentResponse, status_code=201)
 async def assign_classroom_version(
     version_id: str,
@@ -364,6 +485,7 @@ async def migrate_classroom_assignment(
 
 __all__ = [
     "get_publication_service",
+    "get_review_detail_service",
     "get_review_service",
     "router",
 ]

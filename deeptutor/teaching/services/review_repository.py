@@ -7,17 +7,27 @@ import hashlib
 import hmac
 import json
 
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
-from deeptutor.teaching.contracts import canonical_json_bytes
+from deeptutor.teaching.contracts import (
+    ClassroomDocument,
+    canonical_json_bytes,
+    canonical_teaching_brief_sha256,
+)
+from deeptutor.teaching.contracts import (
+    TeachingBrief as TeachingBriefContract,
+)
 from deeptutor.teaching.models.classrooms import (
     Approval,
     ClassroomAsset,
     ClassroomDraft,
     ClassroomReviewPolicy,
     ClassroomReviewRequest,
+    ClassroomVersion,
+    Publication,
+    SourceSnapshot,
     TeachingBrief,
     transition,
 )
@@ -26,15 +36,20 @@ from deeptutor.teaching.schema_names import tenant_schema_name
 from deeptutor.teaching.services.reviews import (
     DecideReviewCommand,
     ReviewAccessDenied,
+    ReviewBaseline,
     ReviewBlocked,
     ReviewConflict,
+    ReviewDetailEvidence,
     ReviewPersistenceError,
     ReviewPolicy,
     ReviewRecord,
+    ReviewSourceFragment,
     ReviewTarget,
     ReviewValidationStale,
     SubmitReviewCommand,
 )
+
+_LOWER_HEX = frozenset("0123456789abcdef")
 
 
 def _digest(payload: object) -> str:
@@ -96,6 +111,232 @@ class SqlAlchemyReviewRepository:
             reviewer_id=model.decided_by,
             comment=model.decision_comment,
         )
+
+    @staticmethod
+    def _reviewed_document(
+        asset: ClassroomAsset,
+        draft: ClassroomDraft,
+        review: ClassroomReviewRequest,
+    ) -> dict[str, object]:
+        payload = _decode_object(draft.document, field="document")
+        try:
+            document = ClassroomDocument.model_validate(payload)
+        except Exception:
+            raise ReviewPersistenceError("stored classroom document is invalid") from None
+        canonical = canonical_json_bytes(document)
+        raw = document.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+        )
+        file_sha256 = raw.pop("fileSha256")
+        if (
+            canonical_json_bytes(payload) != canonical
+            or draft.revision != review.draft_revision
+            or draft.id != review.classroom_draft_id
+            or draft.classroom_id != asset.id
+            or review.classroom_id != asset.id
+            or document.classroom_id != asset.id
+            or draft.base_version_id is None
+            or document.classroom_version_id != draft.base_version_id
+            or not hmac.compare_digest(
+                hashlib.sha256(canonical).hexdigest(),
+                draft.document_sha256,
+            )
+            or not hmac.compare_digest(draft.document_sha256, review.document_sha256)
+            or not hmac.compare_digest(
+                hashlib.sha256(canonical_json_bytes(raw)).hexdigest(),
+                file_sha256,
+            )
+        ):
+            raise ReviewValidationStale("classroom review binding is stale")
+        return document.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+        )
+
+    @staticmethod
+    def _brief_contract(
+        brief: TeachingBrief,
+        asset: ClassroomAsset,
+    ) -> TeachingBriefContract:
+        payload = _decode_object(brief.document, field="teaching brief")
+        try:
+            contract = TeachingBriefContract.model_validate(payload)
+        except Exception:
+            raise ReviewPersistenceError("stored classroom teaching brief is invalid") from None
+        if (
+            brief.tenant_id != asset.tenant_id
+            or contract.tenant_id != asset.tenant_id
+            or contract.brief_id != brief.id
+            or contract.course_id != brief.course_id
+            or contract.target_class_id != brief.class_id
+            or not hmac.compare_digest(
+                canonical_teaching_brief_sha256(contract),
+                contract.content_sha256,
+            )
+            or not hmac.compare_digest(contract.content_sha256, brief.document_sha256)
+        ):
+            raise ReviewPersistenceError("stored classroom teaching brief is invalid")
+        return contract
+
+    @staticmethod
+    def _source_fragments(
+        snapshot: SourceSnapshot | None,
+        brief: TeachingBrief,
+        contract: TeachingBriefContract,
+    ) -> tuple[ReviewSourceFragment, ...]:
+        if brief.source_snapshot_id is None:
+            if snapshot is not None or contract.source_snapshot is not None or contract.source_fragments:
+                raise ReviewPersistenceError("stored review source evidence is invalid")
+            return ()
+        if (
+            snapshot is None
+            or snapshot.tenant_id != brief.tenant_id
+            or snapshot.id != brief.source_snapshot_id
+            or contract.source_snapshot is None
+            or contract.source_snapshot.snapshot_id != snapshot.id
+            or not hmac.compare_digest(
+                contract.source_snapshot.content_sha256,
+                snapshot.content_sha256,
+            )
+        ):
+            raise ReviewPersistenceError("stored review source evidence is invalid")
+        try:
+            manifest = json.loads(snapshot.citation_manifest)
+        except (TypeError, ValueError):
+            raise ReviewPersistenceError("stored review source evidence is invalid") from None
+        expected_keys = {
+            "schema_version",
+            "snapshot_id",
+            "source_kind",
+            "source_id",
+            "source_snapshot_sha256",
+            "fragments",
+            "source_refs",
+            "permission_summary",
+            "query_sha256",
+            "retrieval",
+            "created_by",
+        }
+        if (
+            not isinstance(manifest, dict)
+            or set(manifest) != expected_keys
+            or manifest.get("schema_version") != 1
+            or manifest.get("snapshot_id") != snapshot.id
+            or manifest.get("source_id") != snapshot.source_id
+            or manifest.get("source_snapshot_sha256") != snapshot.content_sha256
+            or not isinstance(manifest.get("fragments"), list)
+        ):
+            raise ReviewPersistenceError("stored review source evidence is invalid")
+        fragments: list[ReviewSourceFragment] = []
+        seen: set[str] = set()
+        for raw in manifest["fragments"]:
+            if not isinstance(raw, dict):
+                raise ReviewPersistenceError("stored review source evidence is invalid")
+            fragment_id = raw.get("fragment_id")
+            source_id = raw.get("source_id")
+            text = raw.get("text")
+            content_sha256 = raw.get("content_sha256")
+            if (
+                set(raw)
+                != {
+                    "fragment_id",
+                    "source_id",
+                    "text",
+                    "content_sha256",
+                    "permission",
+                    "document_id",
+                    "page",
+                    "section",
+                }
+                or not isinstance(fragment_id, str)
+                or not fragment_id
+                or fragment_id in seen
+                or source_id != snapshot.source_id
+                or not isinstance(text, str)
+                or not text
+                or text != text.strip()
+                or not isinstance(content_sha256, str)
+                or len(content_sha256) != 64
+                or any(character not in _LOWER_HEX for character in content_sha256)
+                or not hmac.compare_digest(
+                    hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                    content_sha256,
+                )
+                or raw.get("permission") != "source.use"
+            ):
+                raise ReviewPersistenceError("stored review source evidence is invalid")
+            seen.add(fragment_id)
+            fragments.append(
+                ReviewSourceFragment(
+                    fragment_id=fragment_id,
+                    source_id=source_id,
+                    text=text,
+                    content_sha256=content_sha256,
+                )
+            )
+        contract_fragments = tuple(
+            (item.fragment_id, item.source_id, item.text, item.content_sha256)
+            for item in contract.source_fragments
+        )
+        persisted_fragments = tuple(
+            (item.fragment_id, item.source_id, item.text, item.content_sha256)
+            for item in fragments
+        )
+        if persisted_fragments != contract_fragments:
+            raise ReviewPersistenceError("stored review source evidence is invalid")
+        raw_refs = manifest.get("source_refs")
+        if not isinstance(raw_refs, list):
+            raise ReviewPersistenceError("stored review source evidence is invalid")
+        persisted_refs: list[tuple[str, str, str]] = []
+        for raw in raw_refs:
+            if (
+                not isinstance(raw, dict)
+                or set(raw)
+                != {
+                    "citation_id",
+                    "source_id",
+                    "fragment_id",
+                    "document_id",
+                    "page",
+                    "section",
+                }
+                or not isinstance(raw.get("citation_id"), str)
+                or raw.get("source_id") != snapshot.source_id
+                or raw.get("fragment_id") not in seen
+            ):
+                raise ReviewPersistenceError("stored review source evidence is invalid")
+            persisted_refs.append(
+                (
+                    raw["citation_id"],
+                    raw["source_id"],
+                    raw["fragment_id"],
+                )
+            )
+        contract_refs = [
+            (item.citation_id, item.source_id, item.fragment_id)
+            for item in contract.source_refs
+        ]
+        permission = manifest.get("permission_summary")
+        expected_scope_ids = {
+            "tenant": brief.tenant_id,
+            "course": brief.course_id,
+            "class": brief.class_id,
+        }
+        if (
+            persisted_refs != contract_refs
+            or not isinstance(permission, dict)
+            or set(permission) != {"permissions", "scope_type", "scope_id"}
+            or permission.get("permissions") != ["source.use"]
+            or permission.get("scope_id")
+            != expected_scope_ids.get(permission.get("scope_type"))
+            or set(contract.permission_summary.allowed_fragment_ids) != seen
+            or set(contract.permission_summary.allowed_source_ids) != {snapshot.source_id}
+        ):
+            raise ReviewPersistenceError("stored review source evidence is invalid")
+        return tuple(fragments)
 
     def _target_statement(self, asset_id: str):
         return (
@@ -195,6 +436,150 @@ class SqlAlchemyReviewRepository:
                 )
             )
             return self._record(model) if model is not None else None
+
+    async def get_detail(self, review_id: str) -> ReviewDetailEvidence | None:
+        async with self._session_factory() as session:
+            row = (
+                await session.execute(
+                    select(
+                        ClassroomReviewRequest,
+                        ClassroomAsset,
+                        ClassroomDraft,
+                        TeachingBrief,
+                        SourceSnapshot,
+                    )
+                    .join(
+                        ClassroomAsset,
+                        and_(
+                            ClassroomAsset.id == ClassroomReviewRequest.classroom_id,
+                            ClassroomAsset.tenant_id == ClassroomReviewRequest.tenant_id,
+                        ),
+                    )
+                    .join(
+                        ClassroomDraft,
+                        and_(
+                            ClassroomDraft.id
+                            == ClassroomReviewRequest.classroom_draft_id,
+                            ClassroomDraft.classroom_id
+                            == ClassroomReviewRequest.classroom_id,
+                            ClassroomDraft.tenant_id
+                            == ClassroomReviewRequest.tenant_id,
+                        ),
+                    )
+                    .join(
+                        TeachingBrief,
+                        and_(
+                            TeachingBrief.id == ClassroomDraft.teaching_brief_id,
+                            TeachingBrief.tenant_id == ClassroomDraft.tenant_id,
+                        ),
+                    )
+                    .outerjoin(
+                        SourceSnapshot,
+                        and_(
+                            SourceSnapshot.id == TeachingBrief.source_snapshot_id,
+                            SourceSnapshot.tenant_id == TeachingBrief.tenant_id,
+                        ),
+                    )
+                    .where(
+                        ClassroomReviewRequest.id == review_id,
+                        ClassroomReviewRequest.tenant_id == self._tenant_id,
+                    )
+                )
+            ).one_or_none()
+            if row is None:
+                return None
+            review, asset, draft, brief, snapshot = row
+            if (
+                any(
+                    item.tenant_id != self._tenant_id
+                    for item in (review, asset, draft, brief)
+                )
+                or asset.title is None
+                or not asset.title.strip()
+                or brief.course_id is None
+                or brief.class_id is None
+            ):
+                raise ReviewPersistenceError("stored classroom review binding is invalid")
+            document = self._reviewed_document(asset, draft, review)
+            validation_sha256, _ = self._validated_report(draft)
+            if not hmac.compare_digest(
+                validation_sha256,
+                review.validation_report_sha256,
+            ):
+                raise ReviewValidationStale("classroom validation is stale")
+            validation_report = _decode_object(
+                draft.validation_report or "",
+                field="validation report",
+            )
+            brief_contract = self._brief_contract(brief, asset)
+            source_fragments = self._source_fragments(snapshot, brief, brief_contract)
+            baseline_row = (
+                await session.execute(
+                    select(Publication, ClassroomVersion)
+                    .join(
+                        ClassroomVersion,
+                        and_(
+                            ClassroomVersion.id == Publication.classroom_version_id,
+                            ClassroomVersion.classroom_id == Publication.classroom_id,
+                            ClassroomVersion.tenant_id == Publication.tenant_id,
+                        ),
+                    )
+                    .where(
+                        Publication.tenant_id == self._tenant_id,
+                        Publication.classroom_id == asset.id,
+                        Publication.scope == review.scope,
+                        or_(
+                            Publication.review_request_id.is_(None),
+                            Publication.review_request_id != review.id,
+                        ),
+                        *(
+                            (Publication.class_id == review.class_id,)
+                            if review.scope == "class"
+                            else (Publication.class_id.is_(None),)
+                        ),
+                    )
+                    .order_by(
+                        Publication.created_at.desc(),
+                        ClassroomVersion.version_number.desc(),
+                        Publication.id.desc(),
+                    )
+                    .limit(1)
+                )
+            ).one_or_none()
+            baseline = None
+            if baseline_row is not None:
+                publication, version = baseline_row
+                if (
+                    publication.tenant_id != self._tenant_id
+                    or version.tenant_id != self._tenant_id
+                    or version.classroom_id != asset.id
+                    or publication.classroom_id != asset.id
+                ):
+                    raise ReviewPersistenceError("stored review baseline is invalid")
+                baseline = ReviewBaseline(
+                    version_id=version.id,
+                    version_number=version.version_number,
+                    document_sha256=version.document_sha256,
+                    document_object_key=version.document_object_key,
+                )
+            target = ReviewTarget(
+                tenant_id=asset.tenant_id,
+                asset_id=asset.id,
+                owner_id=asset.owner_id,
+                course_id=brief.course_id,
+                class_id=brief.class_id,
+            )
+            return ReviewDetailEvidence(
+                review=self._record(review),
+                target=target,
+                title=asset.title,
+                course_id=brief.course_id,
+                target_class_id=brief.class_id,
+                document=document,
+                validation_report=validation_report,
+                source_fragments=source_fragments,
+                baseline=baseline,
+            )
 
     async def list_pending(self) -> tuple[ReviewRecord, ...]:
         async with self._session_factory() as session:

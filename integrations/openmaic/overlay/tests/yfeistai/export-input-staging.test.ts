@@ -13,7 +13,10 @@ import {
   type ExportInputDeclaration,
 } from "../../lib/yfeistai/export-input-staging";
 import { canonicalJson } from "../../lib/yfeistai/outline-generation";
-import type { PortableClassroomDocument } from "../../lib/yfeistai/portable-classroom";
+import {
+  asPortableDocument,
+  type PortableClassroomDocument,
+} from "../../lib/yfeistai/portable-classroom";
 
 function sha256(value: string | Uint8Array): string {
   return createHash("sha256").update(value).digest("hex");
@@ -131,6 +134,55 @@ async function* chunks(value: Uint8Array) {
 }
 
 describe("export input staging", () => {
+  test("accepts durable media entries without deprecated download metadata", () => {
+    const document = classroomDocument();
+    document.mediaManifest = [
+      {
+        mediaId: "media-a",
+        relativePath: "media/media-a.png",
+        mimeType: "image/png",
+        sha256: "a".repeat(64),
+        sizeBytes: 8,
+      },
+    ];
+
+    expect(asPortableDocument(document).mediaManifest).toEqual(
+      document.mediaManifest,
+    );
+  });
+
+  test("rejects explicit null for optional media download metadata", () => {
+    const document = classroomDocument();
+    document.mediaManifest = [
+      {
+        mediaId: "media-a",
+        relativePath: "media/media-a.png",
+        mimeType: "image/png",
+        sha256: "a".repeat(64),
+        sizeBytes: 8,
+        temporaryDownloadPath: null,
+      },
+    ];
+
+    expect(() => asPortableDocument(document)).toThrow(/non-empty string/i);
+  });
+
+  test("keeps export manifest download metadata strict", () => {
+    const document = classroomDocument();
+    document.exportManifest = [
+      {
+        format: "pptx",
+        relativePath: "exports/classroom.pptx",
+        sha256: "a".repeat(64),
+        sizeBytes: 8,
+        mimeType:
+          "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+      },
+    ];
+
+    expect(() => asPortableDocument(document)).toThrow(/invalid field set/i);
+  });
+
   test("commits an immutable input before making it visible to export", async () => {
     const { outputs, staging } = stores();
     const { body, declaration } = fixture();
