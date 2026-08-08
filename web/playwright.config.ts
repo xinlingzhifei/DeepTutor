@@ -40,6 +40,18 @@ export default defineConfig({
     : undefined,
   projects: [
     {
+      name: "teaching-flow",
+      testMatch: [
+        "**/e2e/teacher-classroom-flow.spec.ts",
+        "**/e2e/content-operations-flow.spec.ts",
+      ],
+      workers: 1,
+      use: {
+        ...devices["Desktop Chrome"],
+        channel: "chromium",
+      },
+    },
+    {
       name: "ui-audit",
       testMatch: "**/*.audit.ts",
       use: { ...devices["Desktop Chrome"] },
