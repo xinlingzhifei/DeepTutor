@@ -363,6 +363,12 @@ class SqlAlchemyStudentClassroomGeneration:
                     compensation_errors=compensation_errors,
                 ) from primary_error
             raise
+        if not self._matches_recoverable_job(details, job_request):
+            await self._reject_incompatible_job(
+                tenant_id=context.tenant_id,
+                job_id=job_id,
+                primary_error=IdempotencyConflict(),
+            )
         return self._full_generation._stage(details)
 
     async def get_stage(

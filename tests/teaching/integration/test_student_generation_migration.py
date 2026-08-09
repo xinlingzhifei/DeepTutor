@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 import subprocess
@@ -552,6 +553,116 @@ async def test_real_student_route_uses_exact_current_durable_safety_evidence(
                 {"asset_id": accepted.json()["assetId"]},
             )
         assert (job_count, bound_job_id) == (1, recovered_job_id)
+
+        selected_context["value"] = context
+        weak_idempotent_restart = client.post(
+            "/api/v1/student-classrooms",
+            json=payload,
+        )
+        assert weak_idempotent_restart.status_code == 202
+        weak_idempotent_approval = await approval_service.approve(
+            reviewer,
+            weak_idempotent_restart.json()["approvalId"],
+        )
+        assert weak_idempotent_approval.status == "approved"
+        weak_idempotent_record = await classroom_repository.start_student_generation(
+            weak_idempotent_restart.json()["assetId"],
+            "micro",
+        )
+        weak_idempotent_stage = await recovery_generation.start(
+            context=context,
+            record=replace(weak_idempotent_record, owner_id="wrong-owner"),
+            estimate=SimpleNamespace(scene_range=(1, 2), quota_units=2),
+            mode="micro",
+            actor_id=reviewer.user_id,
+        )
+
+        class FirstReadUnavailableJobRepository:
+            def __init__(self, delegate) -> None:
+                self._delegate = delegate
+                self._detail_reads = 0
+                self.create_returned = False
+
+            def __getattr__(self, name: str):
+                return getattr(self._delegate, name)
+
+            async def create_job_and_reserve(self, request):
+                await self._delegate.create_job_and_reserve(request)
+                self.create_returned = True
+
+            async def get_job_details(self, selected_tenant_id: str, job_id: str):
+                self._detail_reads += 1
+                if self._detail_reads == 1:
+                    raise RuntimeError("pre-read unavailable")
+                return await self._delegate.get_job_details(
+                    selected_tenant_id,
+                    job_id,
+                )
+
+        weak_idempotent_repository = FirstReadUnavailableJobRepository(job_repository)
+        application.dependency_overrides[
+            student_classrooms.get_job_repository
+        ] = lambda: weak_idempotent_repository
+        selected_context["value"] = reviewer
+        weak_idempotent_replay = client.post(
+            "/api/v1/student-generation-approvals/"
+            f'{weak_idempotent_restart.json()["approvalId"]}/approve',
+            json={},
+        )
+        application.dependency_overrides[
+            student_classrooms.get_job_repository
+        ] = lambda: job_repository
+        async with engine.connect() as connection:
+            weak_idempotent_state = (
+                await connection.execute(
+                    text(
+                        f'SELECT approval.status, request.quota_state, '
+                        f'asset.lifecycle_state, draft.generation_job_id FROM '
+                        f'"{schema_name}".student_generation_approvals AS approval '
+                        f'JOIN "{schema_name}".student_generation_requests AS request '
+                        "ON request.id = approval.request_id "
+                        f'JOIN "{schema_name}".student_classroom_assets AS marker '
+                        "ON marker.request_id = request.id "
+                        f'JOIN "{schema_name}".classroom_assets AS asset '
+                        "ON asset.id = marker.asset_id "
+                        f'JOIN "{schema_name}".classroom_drafts AS draft '
+                        "ON draft.classroom_id = asset.id "
+                        "WHERE approval.id = :approval_id"
+                    ),
+                    {"approval_id": weak_idempotent_restart.json()["approvalId"]},
+                )
+            ).one()
+            weak_idempotent_job_state = (
+                await connection.execute(
+                    text(
+                        f'SELECT status, cancel_requested FROM "{schema_name}".'
+                        "generation_jobs WHERE id = :job_id"
+                    ),
+                    {"job_id": weak_idempotent_stage.job_id},
+                )
+            ).one()
+            weak_idempotent_active_jobs = await connection.scalar(
+                text(
+                    f'SELECT count(*) FROM "{schema_name}".generation_jobs '
+                    "WHERE classroom_draft_id = :draft_id "
+                    "AND status NOT IN ('succeeded', 'failed', 'canceled')"
+                ),
+                {"draft_id": weak_idempotent_record.draft_id},
+            )
+        assert weak_idempotent_replay.status_code == 503, weak_idempotent_replay.text
+        assert weak_idempotent_repository.create_returned is True
+        assert weak_idempotent_repository._detail_reads == 2
+        assert tuple(weak_idempotent_state) == (
+            "expired",
+            "released",
+            "canceled",
+            None,
+        )
+        assert (
+            weak_idempotent_job_state[0] == "canceled"
+            or weak_idempotent_job_state[1] is True
+        )
+        assert weak_idempotent_active_jobs == 0
 
         selected_context["value"] = context
         cross_reviewer_restart = client.post("/api/v1/student-classrooms", json=payload)

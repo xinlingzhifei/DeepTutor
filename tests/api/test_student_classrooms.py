@@ -856,6 +856,169 @@ async def test_generation_cancels_the_deterministic_job_when_details_are_lost(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mismatched_pin",
+    [
+        None,
+        "owner_id",
+        "classroom_draft_id",
+        "resource_course_id",
+        "resource_class_id",
+        "quota_units",
+    ],
+    ids=["matching", "owner", "draft", "course", "class", "quota"],
+)
+async def test_generation_rechecks_stable_pins_after_weak_idempotent_create(
+    mismatched_pin: str | None,
+) -> None:
+    service_module = importlib.import_module(
+        "deeptutor.teaching.services.student_classrooms"
+    )
+    spec = service_module.TeachingBriefSpec(
+        course_id="course-a",
+        class_id="class-a",
+        objective="Student topic",
+        grade_band="student",
+        audience="student",
+        duration_minutes=15,
+        classroom_mode="micro",
+        web_policy="disabled",
+        template_id="student-default",
+        template_version="1",
+        knowledge_points=(
+            service_module.KnowledgePointSpec(
+                knowledge_point_id="student-topic",
+                title="Student topic",
+                description="Student topic",
+            ),
+        ),
+        content_mode="open_creation",
+        open_creation_acknowledged=True,
+    )
+    brief = TeachingBriefBuilder(
+        _context("alice"),
+        object(),
+    ).open_creation(spec).contract
+    record = ClassroomRecord(
+        tenant_id="tenant-a",
+        asset_id="student-asset-1",
+        draft_id="student-draft-1",
+        job_id=None,
+        lifecycle_state="generating_content",
+        status="generating_content",
+        title="Student classroom",
+        course_id="course-a",
+        class_id="class-a",
+        owner_id="alice",
+        teaching_brief=brief,
+        revision=1,
+        outline=None,
+        document={},
+        classroom_version_id=None,
+        confirmed_outline_sha256=None,
+        validation_report=None,
+        student_generation_request_id="request-1",
+    )
+
+    class Repository:
+        request = None
+        detail_reads = 0
+        canceled: list[str] = []
+
+        async def create_job_and_reserve(self, request):
+            self.request = request
+
+        async def get_job_details(self, _tenant_id: str, _job_id: str):
+            self.detail_reads += 1
+            if self.detail_reads == 1:
+                raise RuntimeError("pre-read unavailable")
+            request = self.request
+            assert request is not None
+            values = {
+                "tenant_id": request.tenant_id,
+                "job_id": request.job_id,
+                "job_kind": request.job_kind,
+                "phase": request.phase,
+                "export_format": request.export_format,
+                "status": "quota_reserved",
+                "priority": request.priority_rank,
+                "quota_units": request.quota_units,
+                "actor_id": request.actor_id,
+                "owner_id": request.owner_id,
+                "visibility": request.visibility,
+                "request_id": request.request_id,
+                "idempotency_key": request.idempotency_key,
+                "classroom_draft_id": request.classroom_draft_id,
+                "batch_id": request.batch_id,
+                "resource_course_id": request.resource_course_id,
+                "resource_class_id": request.resource_class_id,
+                "public_request_sha256": request.public_request_sha256,
+                "request_sha256": request.request_sha256,
+                "data_plane_route_id": request.data_plane_route_id,
+                "provider_profile_id": request.provider_profile_id,
+                "worker_pool_ref": request.worker_pool_ref,
+                "queue_ref": request.queue_ref,
+                "request_payload": request.request_payload,
+                "progress_percent": 0,
+                "waiting_reason": None,
+                "cancel_requested": False,
+                "error_category": None,
+                "error_code": None,
+                "result_payload": None,
+                "result_ref": None,
+                "retry_of_job_id": request.retry_of_job_id,
+            }
+            if mismatched_pin is not None:
+                values[mismatched_pin] = (
+                    request.quota_units + 1
+                    if mismatched_pin == "quota_units"
+                    else f"wrong-{mismatched_pin}"
+                )
+            return SimpleNamespace(**values)
+
+        async def request_cancel(self, _tenant_id: str, job_id: str):
+            self.canceled.append(job_id)
+            return SimpleNamespace(running=False)
+
+    class Selector:
+        async def resolve(self, _tenant_id: str):
+            return SimpleNamespace(
+                route_ref="route-a",
+                provider_profile_ref="provider-a",
+                worker_pool_ref="workers-a",
+                queue_ref="queue-a",
+            )
+
+    repository = Repository()
+    generation = service_module.SqlAlchemyStudentClassroomGeneration(
+        repository,
+        Selector(),
+    )
+    expected_job_id = generation._micro_job_id("tenant-a", record.asset_id)
+
+    if mismatched_pin is None:
+        stage = await generation.start(
+            context=_context("alice"),
+            record=record,
+            estimate=SimpleNamespace(scene_range=(1, 5), quota_units=5),
+            mode="micro",
+            actor_id="alice",
+        )
+        assert stage.job_id == expected_job_id
+        assert repository.canceled == []
+    else:
+        with pytest.raises(service_module.StudentClassroomUnavailable):
+            await generation.start(
+                context=_context("alice"),
+                record=record,
+                estimate=SimpleNamespace(scene_range=(1, 5), quota_units=5),
+                mode="micro",
+                actor_id="alice",
+            )
+        assert repository.canceled == [expected_job_id]
+
+
+@pytest.mark.asyncio
 async def test_job_attach_failure_cancels_orphan_job_policy_and_asset() -> None:
     service_module = importlib.import_module(
         "deeptutor.teaching.services.student_classrooms"
