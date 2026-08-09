@@ -184,6 +184,29 @@ class SqlAlchemyCatalogRepository:
             models = await session.scalars(statement.order_by(Enrollment.learner_id))
             return tuple(_enrollment_record(model) for model in models)
 
+    async def list_active_enrollment_class_ids(
+        self,
+        course_id: str,
+        learner_id: str,
+    ) -> tuple[str, ...]:
+        """Return active classes for one learner inside one active course."""
+
+        statement = (
+            select(TeachingClass.id)
+            .join(Course, Course.id == TeachingClass.course_id)
+            .join(Enrollment, Enrollment.class_id == TeachingClass.id)
+            .where(
+                Course.id == course_id,
+                Course.status == "active",
+                TeachingClass.status == "active",
+                Enrollment.learner_id == learner_id,
+                Enrollment.status == "active",
+            )
+            .order_by(TeachingClass.id)
+        )
+        async with self._session_factory() as session:
+            return tuple(await session.scalars(statement))
+
     async def add_enrollment(self, class_id: str, learner_id: str) -> EnrollmentRecord:
         async with self._session_factory() as session:
             async with session.begin():

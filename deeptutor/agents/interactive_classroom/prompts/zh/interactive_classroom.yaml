@@ -1,0 +1,8 @@
+status:
+  policy_checking: "正在检查互动课堂生成策略。"
+  building_grounded_brief: "正在根据可信来源构建教学简报。"
+  outline_queued: "课堂大纲已进入生成队列。"
+  micro_queued: "微课堂已进入生成队列。"
+  awaiting_approval: "该请求正在等待教师审批。"
+  awaiting_outline_confirmation: "课堂大纲正在等待你的确认。"
+  generation_denied: "当前请求不允许生成课堂。"

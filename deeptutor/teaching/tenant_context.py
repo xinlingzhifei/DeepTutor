@@ -10,7 +10,11 @@ from deeptutor.api.routers.auth import (
     require_auth,
     require_platform_identity_from_payload,
 )
-from deeptutor.multi_user.context import get_current_user, set_current_tenant
+from deeptutor.multi_user.context import (
+    get_current_user,
+    get_current_user_or_none,
+    set_current_tenant,
+)
 from deeptutor.services.auth import TokenPayload
 from deeptutor.services.config import load_platform_settings
 from deeptutor.teaching.permissions import (
@@ -106,16 +110,52 @@ async def require_tenant(
 ) -> TenantContext:
     """Resolve and install one trusted request tenant."""
 
-    if not load_platform_settings().enabled:
-        current_user = get_current_user()
-        context = _local_tenant_context(current_user.id)
-        set_current_tenant(context)
-        return context
+    platform_enabled = load_platform_settings().enabled
+    requested_tenant_id = None
+    if platform_enabled:
+        require_platform_identity_from_payload(payload)
+        requested_tenant_id = _requested_tenant(x_tenant_id, dt_tenant)
 
-    identity = require_platform_identity_from_payload(payload)
-    current_user = get_current_user()
-    is_platform_admin = identity.role == "admin"
-    requested_tenant_id = _requested_tenant(x_tenant_id, dt_tenant)
+    context = await resolve_tenant_context(
+        requested_tenant_id=requested_tenant_id,
+        repository=repository,
+    )
+    set_current_tenant(context)
+    return context
+
+
+async def resolve_tenant_context(
+    *,
+    requested_tenant_id: str | None,
+    repository: TenantRepository,
+    require_explicit_selection: bool = False,
+) -> TenantContext:
+    """Resolve one trusted tenant for HTTP or a long-lived connection."""
+
+    if not load_platform_settings().enabled:
+        return _local_tenant_context(get_current_user().id)
+
+    current_user = get_current_user_or_none()
+    if current_user is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Tenant platform requires authentication",
+        )
+
+    if requested_tenant_id is not None:
+        requested_tenant_id = requested_tenant_id.strip()
+        if not requested_tenant_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Tenant selection cannot be empty",
+            )
+
+    is_platform_admin = current_user.role == "admin"
+    if require_explicit_selection and requested_tenant_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Select an active tenant first",
+        )
     if is_platform_admin and requested_tenant_id is None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -159,11 +199,9 @@ async def require_tenant(
             scope_type="tenant",
             scope_id=access.summary.tenant_id,
         )
-    context = TenantContext(
+    return TenantContext(
         tenant_id=access.summary.tenant_id,
         schema_name=access.schema_name,
         user_id=current_user.id,
         permissions=permissions,
     )
-    set_current_tenant(context)
-    return context

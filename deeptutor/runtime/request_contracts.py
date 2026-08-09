@@ -6,6 +6,10 @@ from typing import Any, Callable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from deeptutor.agents.interactive_classroom.request_config import (
+    InteractiveClassroomRequestConfig,
+    validate_interactive_classroom_request_config,
+)
 from deeptutor.agents.math_animator.request_config import (
     MathAnimatorRequestConfig,
     validate_math_animator_request_config,
@@ -130,6 +134,7 @@ CAPABILITY_CONFIG_VALIDATORS: dict[str, Callable[[dict[str, Any] | None], Any]] 
     "deep_solve": validate_deep_solve_request_config,
     "deep_question": validate_deep_question_request_config,
     "deep_research": validate_research_request_config,
+    "interactive_classroom": validate_interactive_classroom_request_config,
     "math_animator": validate_math_animator_request_config,
     "visualize": validate_visualize_request_config,
 }
@@ -139,6 +144,7 @@ CAPABILITY_REQUEST_SCHEMAS: dict[str, dict[str, Any]] = {
     "deep_solve": build_request_schema(DeepSolveRequestConfig),
     "deep_question": build_request_schema(DeepQuestionRequestConfig),
     "deep_research": build_request_schema(DeepResearchRequestConfig),
+    "interactive_classroom": build_request_schema(InteractiveClassroomRequestConfig),
     "math_animator": build_request_schema(MathAnimatorRequestConfig),
     "visualize": build_request_schema(VisualizeRequestConfig),
 }
@@ -166,6 +172,7 @@ __all__ = [
     "ChatRequestConfig",
     "DeepQuestionRequestConfig",
     "DeepSolveRequestConfig",
+    "InteractiveClassroomRequestConfig",
     "VisualizeRequestConfig",
     "build_request_schema",
     "get_capability_request_schema",
@@ -173,5 +180,6 @@ __all__ = [
     "validate_chat_request_config",
     "validate_deep_question_request_config",
     "validate_deep_solve_request_config",
+    "validate_interactive_classroom_request_config",
     "validate_visualize_request_config",
 ]

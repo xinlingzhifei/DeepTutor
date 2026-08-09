@@ -1,0 +1,8 @@
+status:
+  policy_checking: "Checking classroom generation policy."
+  building_grounded_brief: "Building a source-grounded teaching brief."
+  outline_queued: "The classroom outline has been queued."
+  micro_queued: "The micro-classroom has been queued."
+  awaiting_approval: "The request is awaiting teacher approval."
+  awaiting_outline_confirmation: "The classroom outline is awaiting your confirmation."
+  generation_denied: "Generation is not allowed for this request."

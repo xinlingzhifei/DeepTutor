@@ -1459,3 +1459,40 @@ def test_real_application_registers_student_routes_when_platform_is_enabled(
     finally:
         monkeypatch.setattr(runtime_config, "load_platform_settings", original)
         importlib.reload(main)
+
+
+def test_api_factory_delegates_to_shared_student_classroom_builder(monkeypatch) -> None:
+    from deeptutor.api.routers import student_classrooms
+
+    captured: dict[str, object] = {}
+    expected = object()
+
+    def fake_builder(context: TenantContext, **dependencies: object):
+        captured["context"] = context
+        captured["dependencies"] = dependencies
+        return expected
+
+    monkeypatch.setattr(
+        student_classrooms,
+        "build_student_classroom_service",
+        fake_builder,
+        raising=False,
+    )
+    context = _context("student-current")
+    dependencies = {
+        "request_repository": object(),
+        "classroom_repository": object(),
+        "source_repository": object(),
+        "store_provider": object(),
+        "job_repository": object(),
+        "data_plane_selector": object(),
+        "cancellation_gateway": object(),
+    }
+
+    result = student_classrooms.get_student_classroom_service(
+        context=context,
+        **dependencies,
+    )
+
+    assert result is expected
+    assert captured == {"context": context, "dependencies": dependencies}

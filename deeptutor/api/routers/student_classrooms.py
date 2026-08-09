@@ -17,7 +17,6 @@ from deeptutor.api.routers.teaching_catalog import (
     get_source_repository,
     get_source_store_provider,
 )
-from deeptutor.teaching.brief_builder import TeachingBriefBuilder
 from deeptutor.teaching.database import get_platform_engine
 from deeptutor.teaching.job_route_binding import DataPlaneBindingUnavailable
 from deeptutor.teaching.quota import InsufficientQuota
@@ -38,13 +37,13 @@ from deeptutor.teaching.services.classrooms import (
     ClassroomIdempotencyConflict,
     ClassroomNotFound,
     ClassroomRevisionConflict,
-    ClassroomService,
     ClassroomServiceError,
     InvalidClassroomState,
 )
+from deeptutor.teaching.services.student_classroom_runtime import (
+    build_student_classroom_service,
+)
 from deeptutor.teaching.services.student_classrooms import (
-    SqlAlchemyStudentClassroomGeneration,
-    SqlAlchemyStudentClassroomWorkflow,
     StudentClassroomConflict,
     StudentClassroomDenied,
     StudentClassroomNotFound,
@@ -54,12 +53,9 @@ from deeptutor.teaching.services.student_classrooms import (
 from deeptutor.teaching.services.student_generation import (
     StudentGenerationApprovalConflict,
     StudentGenerationApprovalNotFound,
-    StudentGenerationApprovalService,
-    StudentGenerationService,
 )
 from deeptutor.teaching.source_snapshots import (
     SourceAccessDenied,
-    SourceSnapshotBuilder,
     SourceSnapshotUnavailable,
 )
 from deeptutor.teaching.tenant_context import TenantContext, require_tenant
@@ -247,42 +243,15 @@ def get_student_classroom_service(
     data_plane_selector=Depends(get_data_plane_selector),
     cancellation_gateway=Depends(get_cancellation_gateway),
 ) -> StudentClassroomService:
-    snapshots = SourceSnapshotBuilder(
+    return build_student_classroom_service(
         context,
-        source_repository,
-        store_provider=store_provider,
-    )
-    brief_builder = TeachingBriefBuilder(context, snapshots)
-    generation = SqlAlchemyStudentClassroomGeneration(
-        job_repository,
-        data_plane_selector,
-        cancellation_gateway,
-    )
-    classroom_service = ClassroomService(
-        classroom_repository,
-        brief_builder,
-        generation,
-        store_provider,
-        student_owner_only=True,
-    )
-    workflow = SqlAlchemyStudentClassroomWorkflow(
-        repository=classroom_repository,
-        classroom_service=classroom_service,
-        brief_builder=brief_builder,
-        generation=generation,
         request_repository=request_repository,
-    )
-    return StudentClassroomService(
-        policy_service=StudentGenerationService(
-            tenant_id=context.tenant_id,
-            learner_id=context.user_id,
-            repository=request_repository,
-        ),
-        workflow=workflow,
-        approval_service=StudentGenerationApprovalService(
-            tenant_id=context.tenant_id,
-            repository=request_repository,
-        ),
+        classroom_repository=classroom_repository,
+        source_repository=source_repository,
+        store_provider=store_provider,
+        job_repository=job_repository,
+        data_plane_selector=data_plane_selector,
+        cancellation_gateway=cancellation_gateway,
     )
 
 

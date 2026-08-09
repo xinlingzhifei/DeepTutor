@@ -320,7 +320,11 @@ async def ws_require_auth(ws: WebSocket) -> _CtxToken | _WsAuthFailed:
         finally:
             reset_current_user(user_token)
     """
+    platform_enabled = load_platform_settings().enabled
     if not AUTH_ENABLED:
+        if platform_enabled:
+            await ws.close(code=4001)
+            return ws_auth_failed
         return _install_current_user(None)
 
     token = ws.query_params.get("token") or ws.cookies.get(_COOKIE_NAME)
@@ -328,6 +332,12 @@ async def ws_require_auth(ws: WebSocket) -> _CtxToken | _WsAuthFailed:
     if not payload:
         await ws.close(code=4001)
         return ws_auth_failed
+
+    if platform_enabled:
+        payload = authoritative_platform_identity(payload)
+        if payload is None:
+            await ws.close(code=4001)
+            return ws_auth_failed
 
     return _install_current_user(payload)
 

@@ -4,6 +4,10 @@ Unified WebSocket Endpoint
 
 Single ``/api/v1/ws`` endpoint for turn-based execution and replayable streaming.
 
+The active tenant is authenticated once from ``dt_tenant`` during the
+WebSocket handshake and remains pinned for the life of that connection. A
+tenant switch therefore requires reconnecting with the new cookie.
+
 Supported client message ``type`` values:
 
 - ``message`` / ``start_turn`` — start a new turn from a payload.
@@ -35,7 +39,7 @@ import json
 import logging
 from typing import Any
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -44,13 +48,36 @@ logger = logging.getLogger(__name__)
 @router.websocket("/ws")
 async def unified_websocket(ws: WebSocket) -> None:
     from deeptutor.api.routers.auth import ws_auth_failed, ws_require_auth
-    from deeptutor.multi_user.context import reset_current_user
+    from deeptutor.multi_user.context import (
+        reset_current_tenant,
+        reset_current_user,
+        set_current_tenant,
+    )
+    from deeptutor.teaching.repositories.tenants import get_tenant_repository
+    from deeptutor.teaching.tenant_context import resolve_tenant_context
 
     user_token = await ws_require_auth(ws)
     if user_token is ws_auth_failed:
         return
 
-    await ws.accept()
+    tenant_token = None
+    try:
+        tenant_context = await resolve_tenant_context(
+            requested_tenant_id=ws.cookies.get("dt_tenant"),
+            repository=get_tenant_repository(),
+            require_explicit_selection=True,
+        )
+        tenant_token = set_current_tenant(tenant_context)
+    except HTTPException:
+        reset_current_user(user_token)
+        await ws.close(code=4003)
+        return
+    except Exception:
+        reset_current_user(user_token)
+        logger.error("Unified WS tenant resolution failed", exc_info=True)
+        await ws.close(code=1011)
+        return
+
     closed = False
     subscription_tasks: dict[str, asyncio.Task[None]] = {}
 
@@ -100,6 +127,7 @@ async def unified_websocket(ws: WebSocket) -> None:
         subscription_tasks[key] = asyncio.create_task(_forward())
 
     try:
+        await ws.accept()
         while not closed:
             raw = await ws.receive_text()
             try:
@@ -320,5 +348,7 @@ async def unified_websocket(ws: WebSocket) -> None:
         closed = True
         for key in list(subscription_tasks.keys()):
             await stop_subscription(key)
+        if tenant_token is not None:
+            reset_current_tenant(tenant_token)
         if user_token is not None:
             reset_current_user(user_token)
