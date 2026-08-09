@@ -17,7 +17,7 @@
 - Create: `deeptutor/teaching/models/student_generation.py`
 - Create: `deeptutor/teaching/policies/student_generation.py`
 - Create: `deeptutor/teaching/services/student_generation.py`
-- Create: `deeptutor/teaching/migrations/versions/20260728_0004_student_generation.py`
+- Create: `deeptutor/teaching/migrations/versions/20260809_0013_student_generation.py`
 - Create: `tests/teaching/test_student_generation_policy.py`
 - Create: `tests/teaching/test_student_generation_service.py`
 
@@ -112,7 +112,7 @@ Expected: PASS。
 - [ ] Step 7: 提交
 
 ```powershell
-git add deeptutor/teaching/models/student_generation.py deeptutor/teaching/policies/student_generation.py deeptutor/teaching/services/student_generation.py deeptutor/teaching/migrations/versions/20260728_0004_student_generation.py tests/teaching/test_student_generation_policy.py tests/teaching/test_student_generation_service.py
+git add deeptutor/teaching/models/student_generation.py deeptutor/teaching/policies/student_generation.py deeptutor/teaching/services/student_generation.py deeptutor/teaching/migrations/versions/20260809_0013_student_generation.py tests/teaching/test_student_generation_policy.py tests/teaching/test_student_generation_service.py
 git commit -m "feat(teaching): enforce student classroom policy"
 ```
 

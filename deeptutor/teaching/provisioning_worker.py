@@ -25,7 +25,7 @@ from deeptutor.teaching.migrations.runner import (
 )
 from deeptutor.teaching.schema_names import tenant_schema_name
 
-TENANT_SCHEMA_REVISION = "20260804_0012"
+TENANT_SCHEMA_REVISION = "20260809_0013"
 OBJECT_STORAGE_POLICY_VERSION = "20260730"
 DEFAULT_POLICY_VERSION = "20260730"
 DEFAULT_POLICY_PAYLOAD = (

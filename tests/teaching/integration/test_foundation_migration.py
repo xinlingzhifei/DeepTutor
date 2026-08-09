@@ -24,7 +24,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 FOUNDATION_REVISION = "20260728_0001"
 SCOPED_GRANTS_REVISION = "20260730_0002"
 PROVISIONING_REVISION = "20260730_0003"
-HEAD_REVISION = "20260804_0012"
+HEAD_REVISION = "20260809_0013"
 
 
 @dataclass(frozen=True)
@@ -520,6 +520,7 @@ def test_wheel_packages_migrations_and_full_app_entrypoint(
         "deeptutor/teaching/migrations/versions/20260803_0010_classroom_authoring.py",
         "deeptutor/teaching/migrations/versions/20260803_0011_review_publication.py",
         "deeptutor/teaching/migrations/versions/20260804_0012_classroom_exports.py",
+        "deeptutor/teaching/migrations/versions/20260809_0013_student_generation.py",
     }.issubset(names)
     assert "deeptutor-migrate = deeptutor.teaching.migrations.cli:main" in entry_points
     assert "deeptutor-provisioner = deeptutor.teaching.provisioning_cli:main" in entry_points

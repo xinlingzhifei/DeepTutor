@@ -293,7 +293,7 @@ def test_classroom_export_policy_defaults_mp4_to_denied() -> None:
     assert {"updated_by", "updated_at"}.issubset(policy.c.keys())
 
 
-def test_classroom_export_migration_is_the_tenant_head() -> None:
+def test_classroom_export_migration_follows_review_publication() -> None:
     migration = importlib.import_module(
         "deeptutor.teaching.migrations.versions.20260804_0012_classroom_exports"
     )

@@ -52,6 +52,11 @@ from .platform import (
     TenantStorageCredential,
     TenantStorageState,
 )
+from .student_generation import (
+    CourseGenerationPolicyRecord,
+    StudentGenerationApprovalRecord,
+    StudentGenerationRequestRecord,
+)
 from .tenant import Course, Enrollment, TeachingClass, TenantBase
 
 __all__ = [
@@ -64,6 +69,7 @@ __all__ = [
     "BatchItem",
     "BatchJob",
     "Course",
+    "CourseGenerationPolicyRecord",
     "ClassroomArtifact",
     "ClassroomAsset",
     "ClassroomDraft",
@@ -90,6 +96,8 @@ __all__ = [
     "RoleGrant",
     "SourceSnapshot",
     "SourceUpload",
+    "StudentGenerationApprovalRecord",
+    "StudentGenerationRequestRecord",
     "TeachingBrief",
     "TeachingClass",
     "Tenant",
