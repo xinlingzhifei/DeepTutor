@@ -165,6 +165,14 @@ def validate_pb_token(token: str, *, fresh: bool = False) -> dict[str, Any] | No
         return payload
 
     except Exception as exc:
+        if fresh:
+            try:
+                from pocketbase.errors import ClientResponseError
+            except ImportError:
+                pass
+            else:
+                if isinstance(exc, ClientResponseError) and exc.status in {401, 403}:
+                    _TOKEN_CACHE.pop(cache_key, None)
         logger.debug(f"PocketBase token validation failed: {exc}")
         return None
 

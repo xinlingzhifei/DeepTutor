@@ -17,6 +17,15 @@ from .context import UnifiedContext
 from .stream_bus import StreamBus
 
 
+class CapabilityPublicError(RuntimeError):
+    """A capability failure safe to expose through shared transports."""
+
+    def __init__(self, message: str, *, code: str, status: str = "failed") -> None:
+        super().__init__(message)
+        self.code = code
+        self.status = status
+
+
 @dataclass
 class CapabilityManifest:
     """Static metadata for a capability."""

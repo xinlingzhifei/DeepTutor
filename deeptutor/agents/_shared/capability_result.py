@@ -15,10 +15,12 @@ emits the same envelope shape.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from deeptutor.core.agentic.usage import UsageTracker
 from deeptutor.core.stream_bus import StreamBus
+
+if TYPE_CHECKING:
+    from deeptutor.core.agentic.usage import UsageTracker
 
 
 async def emit_capability_result(

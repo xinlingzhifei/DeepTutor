@@ -11,6 +11,16 @@ from deeptutor.runtime.registry.capability_registry import get_capability_regist
 from deeptutor.services.notebook import get_notebook_manager
 from deeptutor.services.session import get_session_store, get_turn_runtime_manager
 
+_INTERACTIVE_CLASSROOM_SERVER_MODULES = (
+    "asyncpg",
+    "boto3",
+    "fastapi",
+    "sqlalchemy",
+)
+_INTERACTIVE_CLASSROOM_INSTALL_HINT = (
+    "Install server dependencies, enable the tenant platform, and select an active tenant."
+)
+
 
 @dataclass(slots=True)
 class TurnRequest:
@@ -97,6 +107,26 @@ class DeepTutorApp:
 
     def get_capability_availability(self, capability: str) -> CapabilityAvailability:
         resolved = self.resolve_capability(capability)
+        if resolved == "interactive_classroom":
+            dependencies_available = all(
+                importlib.util.find_spec(module) is not None
+                for module in _INTERACTIVE_CLASSROOM_SERVER_MODULES
+            )
+            available = False
+            if dependencies_available:
+                from deeptutor.multi_user.context import get_current_tenant_or_none
+                from deeptutor.services.config import load_platform_settings
+
+                try:
+                    platform_enabled = load_platform_settings().enabled
+                except (OSError, ValueError):
+                    platform_enabled = False
+                available = platform_enabled and get_current_tenant_or_none() is not None
+            return CapabilityAvailability(
+                name=resolved,
+                available=available,
+                install_hint="" if available else _INTERACTIVE_CLASSROOM_INSTALL_HINT,
+            )
         if resolved == "math_animator":
             available = importlib.util.find_spec("manim") is not None
             return CapabilityAvailability(
@@ -117,6 +147,13 @@ class DeepTutorApp:
         if isinstance(request, dict):
             request = TurnRequest(**request)
         resolved_capability = self.resolve_capability(request.capability)
+        if resolved_capability == "interactive_classroom":
+            availability = self.get_capability_availability(resolved_capability)
+            if not availability.available:
+                raise RuntimeError(
+                    f"Capability `{resolved_capability}` is unavailable. "
+                    f"{availability.install_hint}"
+                )
         session, turn = await self.runtime.start_turn(
             {
                 **request.to_payload(),

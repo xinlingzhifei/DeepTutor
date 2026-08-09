@@ -13,6 +13,7 @@ import logging
 from typing import Any, AsyncIterator
 import uuid
 
+from deeptutor.core.capability_protocol import CapabilityPublicError
 from deeptutor.core.context import UnifiedContext
 from deeptutor.core.stream import StreamEvent, StreamEventType
 from deeptutor.core.stream_bus import StreamBus, register_bus, unregister_bus
@@ -73,13 +74,36 @@ class ChatOrchestrator:
             register_bus(_turn_id, bus)
 
         async def _run() -> None:
+            terminal_status = "completed"
             try:
                 await capability.run(context, bus)
             except Exception as exc:
                 logger.error("Capability %s failed: %s", cap_name, exc, exc_info=True)
-                await bus.error(str(exc), source=cap_name)
+                if isinstance(exc, CapabilityPublicError):
+                    message = str(exc)
+                    code = exc.code
+                    terminal_status = exc.status
+                else:
+                    message = "The capability could not complete this request."
+                    code = "capability_execution_failed"
+                    terminal_status = "failed"
+                await bus.error(
+                    message,
+                    source=cap_name,
+                    metadata={
+                        "code": code,
+                        "status": terminal_status,
+                        "turn_terminal": True,
+                    },
+                )
             finally:
-                await bus.emit(StreamEvent(type=StreamEventType.DONE, source=cap_name))
+                await bus.emit(
+                    StreamEvent(
+                        type=StreamEventType.DONE,
+                        source=cap_name,
+                        metadata={"status": terminal_status},
+                    )
+                )
                 await bus.close()
                 if _turn_id:
                     unregister_bus(_turn_id)

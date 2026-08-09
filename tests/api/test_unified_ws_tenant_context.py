@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import sys
 from types import SimpleNamespace
 from typing import Any
 
 from fastapi import WebSocketDisconnect
+from pocketbase.errors import ClientResponseError
 import pytest
 
 from deeptutor.api.routers import auth as auth_router
@@ -148,7 +151,10 @@ def _enable_pocketbase_refresh(
     class FakeUsers:
         def auth_refresh(self) -> object:
             state["calls"] += 1
-            if state.get("error"):
+            error = state.get("error")
+            if isinstance(error, BaseException):
+                raise error
+            if error:
                 raise RuntimeError("PocketBase unavailable")
             return SimpleNamespace(
                 record=SimpleNamespace(
@@ -259,7 +265,7 @@ async def test_pocketbase_ws_fresh_validation_network_failure_is_closed(
     state: dict[str, Any] = {"role": "admin", "calls": 0, "error": False}
     _enable_pocketbase_refresh(monkeypatch, state)
     assert auth_service.decode_token("signed-token") is not None
-    state["error"] = True
+    state["error"] = TimeoutError("PocketBase timed out")
     ws = _FakeWebSocket(tenant_cookie="tenant-a")
 
     result = await auth_router.ws_require_auth(ws)  # type: ignore[arg-type]
@@ -268,9 +274,32 @@ async def test_pocketbase_ws_fresh_validation_network_failure_is_closed(
         assert state["calls"] == 2
         assert ws.close_codes == [4001]
         assert get_current_user_or_none() is None
+        cached_admin = auth_service.decode_token("signed-token")
+        assert cached_admin is not None and cached_admin.role == "admin"
+        assert state["calls"] == 2
     finally:
         if result is not auth_router.ws_auth_failed:
             reset_current_user(result)
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_pocketbase_fresh_authoritative_rejection_evicts_stale_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+) -> None:
+    state: dict[str, Any] = {"role": "admin", "calls": 0, "error": False}
+    _enable_pocketbase_refresh(monkeypatch, state)
+    cached_admin = auth_service.decode_token("signed-token")
+    assert cached_admin is not None and cached_admin.role == "admin"
+    state["error"] = ClientResponseError(
+        "token rejected",
+        url="https://pocketbase.test/api/collections/users/auth-refresh",
+        status=status,
+    )
+
+    assert auth_service.decode_token("signed-token", fresh=True) is None
+    assert auth_service.decode_token("signed-token") is None
+    assert state["calls"] == 3
 
 
 @pytest.mark.asyncio
@@ -353,5 +382,70 @@ async def test_unified_websocket_preserves_local_mode_without_repository_access(
     ]
     assert repository.access_calls == []
     assert ws.sent == [{"type": "pong"}]
+    assert get_current_tenant_or_none() is None
+    assert get_current_user_or_none() is None
+
+
+@pytest.mark.asyncio
+async def test_websocket_cleanup_continues_after_completed_subscription_failed(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from deeptutor.services import session as session_service
+
+    failed_started = asyncio.Event()
+    live_started = asyncio.Event()
+    live_stopped = asyncio.Event()
+
+    class Runtime:
+        async def subscribe_turn(self, turn_id: str, *, after_seq: int):
+            assert after_seq == 0
+            if turn_id == "failed":
+                failed_started.set()
+                raise RuntimeError("subscription forwarding failed")
+            live_started.set()
+            try:
+                await asyncio.Future()
+                yield {}
+            finally:
+                live_stopped.set()
+
+    class CleanupWebSocket(_FakeWebSocket):
+        def __init__(self) -> None:
+            super().__init__(tenant_cookie=None)
+            self._step = 0
+
+        async def receive_text(self) -> str:
+            self._step += 1
+            if self._step == 1:
+                return '{"type":"subscribe_turn","turn_id":"failed"}'
+            if self._step == 2:
+                await failed_started.wait()
+                await asyncio.sleep(0)
+                return '{"type":"subscribe_turn","turn_id":"live"}'
+            await live_started.wait()
+            raise WebSocketDisconnect()
+
+    settings = SimpleNamespace(enabled=False)
+    repository = _TenantRepository()
+    monkeypatch.setattr(auth_router, "AUTH_ENABLED", False)
+    monkeypatch.setattr(auth_router, "load_platform_settings", lambda: settings)
+    monkeypatch.setattr(tenant_context_module, "load_platform_settings", lambda: settings)
+    monkeypatch.setattr(
+        tenant_repositories,
+        "get_tenant_repository",
+        lambda: repository,
+    )
+    monkeypatch.setattr(
+        session_service,
+        "get_turn_runtime_manager",
+        lambda: Runtime(),
+    )
+
+    with caplog.at_level(logging.ERROR, logger=unified_ws_router.__name__):
+        await unified_ws_router.unified_websocket(CleanupWebSocket())  # type: ignore[arg-type]
+
+    assert live_stopped.is_set()
+    assert "Subscription failed while stopping failed" in caplog.text
     assert get_current_tenant_or_none() is None
     assert get_current_user_or_none() is None

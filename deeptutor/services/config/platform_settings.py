@@ -15,8 +15,6 @@ from pydantic import (
     ValidationError,
     model_validator,
 )
-from sqlalchemy.engine import URL, make_url
-from sqlalchemy.exc import ArgumentError
 
 from .loader import get_runtime_settings_dir
 
@@ -86,6 +84,9 @@ class PlatformSettings(BaseModel):
 
 
 def _database_url_from_password_file(settings: PlatformSettings) -> SecretStr:
+    from sqlalchemy.engine import URL, make_url
+    from sqlalchemy.exc import ArgumentError
+
     password_file = settings.database_password_file
     if password_file is None:
         raise ValueError("platform database password secret file is required")
@@ -189,6 +190,9 @@ def _validate_platform_settings_payload(
 
 
 def _is_valid_database_url(database_url: SecretStr) -> bool:
+    from sqlalchemy.engine import make_url
+    from sqlalchemy.exc import ArgumentError
+
     try:
         parsed = make_url(database_url.get_secret_value())
         port = parsed.port

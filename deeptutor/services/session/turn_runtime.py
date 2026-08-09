@@ -1671,12 +1671,15 @@ class TurnRuntimeManager:
 
             orch = ChatOrchestrator()
             pending_done_event: StreamEvent | None = None
+            terminal_error_event: StreamEvent | None = None
             async for event in orch.handle(context):
                 if event.type == StreamEventType.SESSION:
                     continue
                 if event.type == StreamEventType.DONE:
                     pending_done_event = event
                     continue
+                if event.type == StreamEventType.ERROR and event.metadata.get("turn_terminal"):
+                    terminal_error_event = event
                 payload_event = await self._publish_live_event(execution, event)
                 if payload_event.get("type") not in {"done", "session"}:
                     assistant_events.append(payload_event)
@@ -1730,12 +1733,24 @@ class TurnRuntimeManager:
                     attachments=generated_attachments or None,
                 )
             await self._flush_buffered_events(execution)
-            await self.store.update_turn_status(turn_id, "completed")
+            if terminal_error_event is None:
+                await self.store.update_turn_status(turn_id, "completed")
+            else:
+                await self.store.update_turn_status(
+                    turn_id,
+                    "failed",
+                    terminal_error_event.content,
+                )
             if pending_done_event is None:
+                done_status = (
+                    str(terminal_error_event.metadata.get("status") or "failed")
+                    if terminal_error_event is not None
+                    else "completed"
+                )
                 pending_done_event = StreamEvent(
                     type=StreamEventType.DONE,
                     source=capability_name,
-                    metadata={"status": "completed"},
+                    metadata={"status": done_status},
                 )
             # Attach the persisted row ids so the frontend can reconcile its
             # optimistic (negative) message ids with a targeted in-place swap
@@ -1752,7 +1767,7 @@ class TurnRuntimeManager:
                 pending_done_event.metadata = {**pending_done_event.metadata, **persisted_ids}
             await self._publish_live_event(execution, pending_done_event)
             stream_done_sent = True
-            if not is_regenerate:
+            if not is_regenerate and terminal_error_event is None:
                 # Title generation is post-turn metadata. Keep it after DONE
                 # so the composer and duration clock stop as soon as the
                 # assistant answer is saved; the frontend keeps this socket

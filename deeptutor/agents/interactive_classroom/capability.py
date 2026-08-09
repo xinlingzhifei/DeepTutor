@@ -4,49 +4,72 @@ from __future__ import annotations
 
 from collections.abc import Awaitable
 from dataclasses import asdict, dataclass
-from typing import Callable, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Literal, Protocol
 
 from deeptutor.agents._shared.capability_result import emit_capability_result
 from deeptutor.agents.interactive_classroom.request_config import (
     InteractiveClassroomRequestConfig,
     validate_interactive_classroom_request_config,
 )
-from deeptutor.core.capability_protocol import BaseCapability, CapabilityManifest
+from deeptutor.core.capability_protocol import (
+    BaseCapability,
+    CapabilityManifest,
+    CapabilityPublicError,
+)
 from deeptutor.core.context import UnifiedContext
 from deeptutor.core.stream_bus import StreamBus
 from deeptutor.i18n import StatusI18n
 from deeptutor.runtime.request_contracts import get_capability_request_schema
-from deeptutor.teaching.policies.student_generation import StudentGenerationEstimate
-from deeptutor.teaching.services.student_classroom_runtime import (
-    build_student_classroom_service,
-    resolve_student_class_id,
-)
-from deeptutor.teaching.services.student_classrooms import (
-    StudentClassroomDenied,
-    StudentClassroomView,
-)
-from deeptutor.teaching.tenant_context import (
-    TenantContext,
-    resolve_runtime_tenant_context,
-)
+
+if TYPE_CHECKING:
+    from deeptutor.teaching.policies.student_generation import StudentGenerationEstimate
+    from deeptutor.teaching.services.student_classrooms import StudentClassroomView
+
+
+def resolve_runtime_tenant_context() -> Any:
+    from deeptutor.teaching.tenant_context import resolve_runtime_tenant_context as resolve
+
+    return resolve()
+
+
+def build_student_classroom_service(context: Any) -> StudentClassroomServiceLike:
+    from deeptutor.teaching.services.student_classroom_runtime import (
+        build_student_classroom_service as build,
+    )
+
+    return build(context)
+
+
+async def resolve_student_class_id(context: Any, course_id: str) -> str:
+    from deeptutor.teaching.services.student_classroom_runtime import (
+        resolve_student_class_id as resolve,
+    )
+
+    return await resolve(context, course_id)
+
+
+def _is_student_classroom_denied(error: Exception) -> bool:
+    from deeptutor.teaching.services.student_classrooms import StudentClassroomDenied
+
+    return isinstance(error, StudentClassroomDenied)
 
 
 class StudentClassroomServiceLike(Protocol):
     async def estimate(
         self,
-        context: TenantContext,
+        context: Any,
         request: object,
     ) -> StudentGenerationEstimate: ...
 
     async def create(
         self,
-        context: TenantContext,
+        context: Any,
         request: object,
     ) -> StudentClassroomView: ...
 
 
-ServiceFactory = Callable[[TenantContext], StudentClassroomServiceLike]
-ClassResolver = Callable[[TenantContext, str], Awaitable[str]]
+ServiceFactory = Callable[[Any], StudentClassroomServiceLike]
+ClassResolver = Callable[[Any, str], Awaitable[str]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +92,32 @@ _ZERO_COST_SUMMARY = {
     "prompt_tokens": 0,
     "completion_tokens": 0,
 }
+
+
+class InteractiveClassroomDeniedError(CapabilityPublicError):
+    def __init__(self) -> None:
+        super().__init__(
+            "Classroom generation is not allowed for this request.",
+            code="interactive_classroom_denied",
+            status="denied",
+        )
+
+
+class InteractiveClassroomInvalidRequestError(CapabilityPublicError):
+    def __init__(self) -> None:
+        super().__init__(
+            "Interactive classroom request is invalid.",
+            code="interactive_classroom_invalid_request",
+            status="rejected",
+        )
+
+
+class InteractiveClassroomUnavailableError(CapabilityPublicError):
+    def __init__(self) -> None:
+        super().__init__(
+            "Interactive classroom generation is temporarily unavailable.",
+            code="interactive_classroom_unavailable",
+        )
 
 
 class InteractiveClassroomCapability(BaseCapability):
@@ -94,7 +143,7 @@ class InteractiveClassroomCapability(BaseCapability):
         self._service_factory = service_factory or build_student_classroom_service
         self._class_resolver = class_resolver or resolve_student_class_id
 
-    def _resolve_service(self, context: TenantContext) -> StudentClassroomServiceLike:
+    def _resolve_service(self, context: Any) -> StudentClassroomServiceLike:
         return self._service or self._service_factory(context)
 
     @staticmethod
@@ -107,16 +156,7 @@ class InteractiveClassroomCapability(BaseCapability):
         if not class_id or len(class_id) > 64:
             raise ValueError("trusted classroom class_id is unavailable")
 
-        question = config.question.strip() or context.user_message.strip()
-        if len(question) > 4000:
-            raise ValueError("question cannot exceed 4000 characters")
-        source_ref = (
-            context.knowledge_bases[0]
-            if config.content_mode == "source_grounded" and context.knowledge_bases
-            else None
-        )
-        if config.content_mode == "source_grounded" and not source_ref:
-            raise ValueError("source-grounded classroom requires a knowledge base")
+        question, source_ref = InteractiveClassroomCapability._request_inputs(context, config)
 
         return _StudentClassroomCommand(
             course_id=config.course_id,
@@ -130,9 +170,49 @@ class InteractiveClassroomCapability(BaseCapability):
             objective=question or "Student classroom",
         )
 
+    @staticmethod
+    def _request_inputs(
+        context: UnifiedContext,
+        config: InteractiveClassroomRequestConfig,
+    ) -> tuple[str, str | None]:
+        question = config.question.strip() or context.user_message.strip()
+        if len(question) > 4000:
+            raise ValueError("question cannot exceed 4000 characters")
+        source_ref = (
+            context.knowledge_bases[0]
+            if config.content_mode == "source_grounded" and context.knowledge_bases
+            else None
+        )
+        if config.content_mode == "source_grounded" and not source_ref:
+            raise ValueError("source-grounded classroom requires a knowledge base")
+        return question, source_ref
+
     async def run(self, context: UnifiedContext, stream: StreamBus) -> None:
-        tenant_context = resolve_runtime_tenant_context()
-        config = validate_interactive_classroom_request_config(context.config_overrides)
+        try:
+            tenant_context = resolve_runtime_tenant_context()
+        except Exception as exc:
+            raise InteractiveClassroomUnavailableError() from exc
+        try:
+            config = validate_interactive_classroom_request_config(context.config_overrides)
+            self._request_inputs(context, config)
+        except ValueError as exc:
+            raise InteractiveClassroomInvalidRequestError() from exc
+        try:
+            await self._run(context, stream, tenant_context, config)
+        except CapabilityPublicError:
+            raise
+        except Exception as exc:
+            if _is_student_classroom_denied(exc):
+                raise InteractiveClassroomDeniedError() from exc
+            raise InteractiveClassroomUnavailableError() from exc
+
+    async def _run(
+        self,
+        context: UnifiedContext,
+        stream: StreamBus,
+        tenant_context: Any,
+        config: InteractiveClassroomRequestConfig,
+    ) -> None:
         class_id = await self._class_resolver(tenant_context, config.course_id)
         service = self._resolve_service(tenant_context)
         request = self._command(context, config, class_id)
@@ -157,7 +237,9 @@ class InteractiveClassroomCapability(BaseCapability):
                     stage="briefing",
                 )
                 classroom = await service.create(tenant_context, request)
-        except StudentClassroomDenied:
+        except Exception as exc:
+            if not _is_student_classroom_denied(exc):
+                raise
             await stream.progress(
                 message=i18n.t(
                     "generation_denied",
@@ -226,4 +308,10 @@ class InteractiveClassroomCapability(BaseCapability):
         return "outline_queued", "The classroom outline has been queued."
 
 
-__all__ = ["InteractiveClassroomCapability", "StudentClassroomServiceLike"]
+__all__ = [
+    "InteractiveClassroomCapability",
+    "InteractiveClassroomDeniedError",
+    "InteractiveClassroomInvalidRequestError",
+    "InteractiveClassroomUnavailableError",
+    "StudentClassroomServiceLike",
+]

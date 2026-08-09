@@ -102,6 +102,12 @@ async def unified_websocket(ws: WebSocket) -> None:
             await task
         except asyncio.CancelledError:
             pass
+        except Exception:
+            logger.error(
+                "Subscription failed while stopping %s",
+                key,
+                exc_info=True,
+            )
 
     async def subscribe_turn(turn_id: str, after_seq: int = 0) -> None:
         from deeptutor.services.session import get_turn_runtime_manager
@@ -346,9 +352,13 @@ async def unified_websocket(ws: WebSocket) -> None:
         await safe_send({"type": "error", "content": str(exc)})
     finally:
         closed = True
-        for key in list(subscription_tasks.keys()):
-            await stop_subscription(key)
-        if tenant_token is not None:
-            reset_current_tenant(tenant_token)
-        if user_token is not None:
-            reset_current_user(user_token)
+        try:
+            for key in list(subscription_tasks.keys()):
+                await stop_subscription(key)
+        finally:
+            try:
+                if tenant_token is not None:
+                    reset_current_tenant(tenant_token)
+            finally:
+                if user_token is not None:
+                    reset_current_user(user_token)

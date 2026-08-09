@@ -64,13 +64,11 @@ def _local_tenant_context(user_id: str) -> TenantContext:
 
 
 def resolve_runtime_tenant_context() -> TenantContext:
-    """Return an installed tenant or a trusted local-mode tenant."""
+    """Return the tenant installed by a trusted server entry point."""
 
     context = get_current_tenant_or_none()
     if context is not None:
         return context
-    if not load_platform_settings().enabled:
-        return _local_tenant_context(get_current_user().id)
     raise RuntimeError("tenant context is not installed")
 
 

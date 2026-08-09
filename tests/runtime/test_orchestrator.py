@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -140,7 +141,10 @@ class TestOrchestratorRouting:
 
 class TestOrchestratorErrorHandling:
     @pytest.mark.asyncio
-    async def test_capability_exception_yields_error_event(self) -> None:
+    async def test_capability_exception_yields_sanitized_error_event(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
         fail_cap = _FailingCapability()
         orch = _make_orchestrator({"fail": fail_cap})
 
@@ -149,15 +153,24 @@ class TestOrchestratorErrorHandling:
             active_capability="fail",
         )
         events: list[StreamEvent] = []
-        async for event in orch.handle(ctx):
-            events.append(event)
+        with caplog.at_level(logging.ERROR, logger="deeptutor.runtime.orchestrator"):
+            async for event in orch.handle(ctx):
+                events.append(event)
 
         error_events = [e for e in events if e.type == StreamEventType.ERROR]
         assert len(error_events) == 1
-        assert "intentional failure" in error_events[0].content
+        assert error_events[0].content == "The capability could not complete this request."
+        assert error_events[0].metadata == {
+            "code": "capability_execution_failed",
+            "status": "failed",
+            "turn_terminal": True,
+        }
+        assert "intentional failure" not in str(error_events[0].to_dict())
+        assert "intentional failure" in caplog.text
 
         done_events = [e for e in events if e.type == StreamEventType.DONE]
         assert len(done_events) == 1
+        assert done_events[0].metadata["status"] == "failed"
 
 
 # ---------------------------------------------------------------------------

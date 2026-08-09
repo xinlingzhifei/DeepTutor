@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -14,7 +16,6 @@ from deeptutor.core.stream import StreamEventType
 from deeptutor.core.stream_bus import StreamBus
 from deeptutor.multi_user.context import (
     get_current_tenant_or_none,
-    get_current_user,
     reset_current_tenant,
     reset_current_user,
     set_current_tenant,
@@ -215,7 +216,10 @@ async def test_fallback_question_rejects_more_than_4000_effective_characters() -
     service = _FakeStudentClassroomService(_record())
     token = set_current_tenant(_tenant())
     try:
-        with pytest.raises(ValueError, match="question.*4000"):
+        with pytest.raises(
+            RuntimeError,
+            match="Interactive classroom request is invalid.",
+        ) as captured:
             await InteractiveClassroomCapability(
                 service=service,
                 class_resolver=_trusted_class_id,
@@ -226,6 +230,8 @@ async def test_fallback_question_rejects_more_than_4000_effective_characters() -
     finally:
         reset_current_tenant(token)
 
+    assert getattr(captured.value, "code", None) == "interactive_classroom_invalid_request"
+    assert isinstance(captured.value.__cause__, ValueError)
     assert service.calls == []
 
 
@@ -337,7 +343,10 @@ async def test_generation_denial_is_streamed_and_propagated() -> None:
     stream = StreamBus()
     token = set_current_tenant(_tenant())
     try:
-        with pytest.raises(StudentClassroomDenied, match="policy denied"):
+        with pytest.raises(
+            RuntimeError,
+            match="Classroom generation is not allowed for this request.",
+        ) as captured:
             await InteractiveClassroomCapability(
                 service=service,
                 class_resolver=_trusted_class_id,
@@ -345,6 +354,9 @@ async def test_generation_denial_is_streamed_and_propagated() -> None:
     finally:
         reset_current_tenant(token)
 
+    assert getattr(captured.value, "code", None) == "interactive_classroom_denied"
+    assert getattr(captured.value, "status", None) == "denied"
+    assert isinstance(captured.value.__cause__, StudentClassroomDenied)
     messages = [
         event.content
         for event in stream._history
@@ -354,17 +366,34 @@ async def test_generation_denial_is_streamed_and_propagated() -> None:
     assert not any(event.type == StreamEventType.RESULT for event in stream._history)
 
 
+_SECRET_RESOLVER_ERROR = (
+    "SELECT learner_id FROM tenant_secret WHERE provider_key='sk-live-secret'; "
+    "store=<TenantStore password='db-secret'>"
+)
+_SECRET_DENIED_ERROR = "policy denied from tenant_rule_<secret-policy-row>"
+
+
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure_mode", ["success", "resolver", "denied"])
 async def test_turn_runtime_executes_zero_arg_builtin_with_trusted_composition(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    failure_mode: str,
 ) -> None:
     from deeptutor.agents.interactive_classroom import capability as capability_module
     from deeptutor.runtime.registry import capability_registry as registry_module
 
     store = SQLiteSessionStore(tmp_path / "chat_history.db")
     runtime = TurnRuntimeManager(store)
-    service = _FakeStudentClassroomService(_record())
+    service = _FakeStudentClassroomService(
+        _record(),
+        error=(
+            StudentClassroomDenied(_SECRET_DENIED_ERROR)
+            if failure_mode == "denied"
+            else None
+        ),
+    )
     captured: dict[str, object] = {}
 
     class FakeContextBuilder:
@@ -383,6 +412,8 @@ async def test_turn_runtime_executes_zero_arg_builtin_with_trusted_composition(
     async def resolve_class(context: TenantContext, course_id: str) -> str:
         captured["binding_context"] = context
         captured["course_id"] = course_id
+        if failure_mode == "resolver":
+            raise RuntimeError(_SECRET_RESOLVER_ERROR)
         return "class-trusted"
 
     def build_service(context: TenantContext) -> _FakeStudentClassroomService:
@@ -476,36 +507,78 @@ async def test_turn_runtime_executes_zero_arg_builtin_with_trusted_composition(
     )
     tenant_token = set_current_tenant(trusted)
     try:
-        _, turn = await runtime.start_turn(
-            {
-                "type": "start_turn",
-                "content": "Explain Fourier transform",
-                "session_id": None,
-                "capability": "interactive_classroom",
-                "tools": [],
-                "knowledge_bases": ["kb-authorized"],
-                "attachments": [],
-                "language": "en",
-                "llm_selection": {
-                    "profile_id": "p-test",
-                    "model_id": "m-test",
-                },
-                "config": {
-                    "mode": "micro",
-                    "course_id": "course-a",
-                    "question": "A focused Fourier lesson",
-                    "content_mode": "source_grounded",
-                },
-            }
-        )
-        events = [
-            event
-            async for event in runtime.subscribe_turn(turn["id"], after_seq=0)
-        ]
+        with caplog.at_level(logging.ERROR, logger="deeptutor.runtime.orchestrator"):
+            session, turn = await runtime.start_turn(
+                {
+                    "type": "start_turn",
+                    "content": "Explain Fourier transform",
+                    "session_id": None,
+                    "capability": "interactive_classroom",
+                    "tools": [],
+                    "knowledge_bases": ["kb-authorized"],
+                    "attachments": [],
+                    "language": "en",
+                    "llm_selection": {
+                        "profile_id": "p-test",
+                        "model_id": "m-test",
+                    },
+                    "config": {
+                        "mode": "micro",
+                        "course_id": "course-a",
+                        "question": "A focused Fourier lesson",
+                        "content_mode": "source_grounded",
+                    },
+                }
+            )
+            events = [
+                event
+                async for event in runtime.subscribe_turn(turn["id"], after_seq=0)
+            ]
     finally:
         reset_current_tenant(tenant_token)
         reset_current_user(user_token)
         registry_module._default_registry = None
+
+    if failure_mode != "success":
+        error = next(event for event in events if event["type"] == "error")
+        expected_error = (
+            {
+                "content": "Classroom generation is not allowed for this request.",
+                "code": "interactive_classroom_denied",
+                "status": "denied",
+            }
+            if failure_mode == "denied"
+            else {
+                "content": "Interactive classroom generation is temporarily unavailable.",
+                "code": "interactive_classroom_unavailable",
+                "status": "failed",
+            }
+        )
+        assert error["content"] == expected_error["content"]
+        assert error["metadata"] == {
+            "code": expected_error["code"],
+            "status": expected_error["status"],
+            "turn_terminal": True,
+        }
+        persisted = {
+            "events": await store.get_turn_events(turn["id"]),
+            "session": await store.get_session_with_messages(session["id"]),
+            "turn": await store.get_turn(turn["id"]),
+        }
+        serialized = json.dumps(persisted, ensure_ascii=False, default=str)
+        assert "sk-live-secret" not in serialized
+        assert "db-secret" not in serialized
+        assert "tenant_secret" not in serialized
+        assert "secret-policy-row" not in serialized
+        assert (
+            _SECRET_DENIED_ERROR if failure_mode == "denied" else _SECRET_RESOLVER_ERROR
+        ) in caplog.text
+        assert persisted["turn"]["status"] == "failed"
+        assert persisted["turn"]["error"] == expected_error["content"]
+        done = next(event for event in events if event["type"] == "done")
+        assert done["metadata"]["status"] == expected_error["status"]
+        assert not any(event["type"] == "result" for event in events)
+        return
 
     assert captured == {
         "binding_context": trusted,
@@ -519,63 +592,34 @@ async def test_turn_runtime_executes_zero_arg_builtin_with_trusted_composition(
 
 
 @pytest.mark.asyncio
-async def test_local_app_alias_runs_zero_arg_builtin_without_installed_tenant(
+async def test_capability_requires_installed_tenant_even_in_local_mode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from deeptutor.agents.interactive_classroom import capability as capability_module
-    from deeptutor.app.facade import DeepTutorApp
-    from deeptutor.runtime.orchestrator import ChatOrchestrator
-    from deeptutor.runtime.registry import capability_registry as registry_module
+    from deeptutor.agents.interactive_classroom.capability import (
+        InteractiveClassroomCapability,
+    )
     from deeptutor.teaching import tenant_context as tenant_context_module
 
     service = _FakeStudentClassroomService(_record())
-    captured: dict[str, object] = {}
-
-    async def resolve_class(context: TenantContext, course_id: str) -> str:
-        captured["binding_context"] = context
-        captured["course_id"] = course_id
-        return "class-trusted"
-
-    def build_service(context: TenantContext) -> _FakeStudentClassroomService:
-        captured["service_context"] = context
-        return service
-
     monkeypatch.setattr(
         tenant_context_module,
         "load_platform_settings",
         lambda: SimpleNamespace(enabled=False),
     )
-    monkeypatch.setattr(
-        capability_module,
-        "resolve_student_class_id",
-        resolve_class,
-    )
-    monkeypatch.setattr(
-        capability_module,
-        "build_student_classroom_service",
-        build_service,
-    )
-    monkeypatch.setattr(registry_module, "_default_registry", None)
     assert get_current_tenant_or_none() is None
-    current_user = get_current_user()
-    try:
-        app = DeepTutorApp()
-        capability_name = app.resolve_capability("classroom")
-        context = _context()
-        context.active_capability = capability_name
-        events = [event async for event in ChatOrchestrator().handle(context)]
-    finally:
-        registry_module._default_registry = None
 
-    assert capability_name == "interactive_classroom"
-    assert captured["course_id"] == "course-a"
-    tenant = captured["binding_context"]
-    assert tenant is captured["service_context"]
-    assert tenant.tenant_id == "local"
-    assert tenant.user_id == current_user.id
-    assert any(event.type == StreamEventType.RESULT for event in events)
-    assert not any(event.type == StreamEventType.ERROR for event in events)
-    assert get_current_tenant_or_none() is None
+    with pytest.raises(
+        RuntimeError,
+        match="Interactive classroom generation is temporarily unavailable.",
+    ) as captured:
+        await InteractiveClassroomCapability(
+            service=service,
+            class_resolver=_trusted_class_id,
+        ).run(_context(), StreamBus())
+
+    assert getattr(captured.value, "code", None) == "interactive_classroom_unavailable"
+    assert isinstance(captured.value.__cause__, RuntimeError)
+    assert service.calls == []
 
 
 @pytest.mark.asyncio
@@ -599,11 +643,16 @@ async def test_capability_does_not_accept_tenant_identity_from_unified_context(
         lambda: SimpleNamespace(enabled=True),
     )
 
-    with pytest.raises(RuntimeError, match="tenant context is not installed"):
+    with pytest.raises(
+        RuntimeError,
+        match="Interactive classroom generation is temporarily unavailable.",
+    ) as captured:
         await InteractiveClassroomCapability(
             service=service,
             class_resolver=_trusted_class_id,
         ).run(context, StreamBus())
+    assert getattr(captured.value, "code", None) == "interactive_classroom_unavailable"
+    assert isinstance(captured.value.__cause__, RuntimeError)
     assert service.calls == []
 
 
