@@ -23,11 +23,11 @@ from deeptutor.teaching.services.student_generation import (
 from deeptutor.teaching.tenant_context import TenantContext, require_tenant
 
 
-def _teacher_context() -> TenantContext:
+def _teacher_context(user_id: str = "teacher-a") -> TenantContext:
     return TenantContext(
         tenant_id="tenant-a",
         schema_name="tenant_tenant-a",
-        user_id="teacher-a",
+        user_id=user_id,
         permissions=permissions_for_roles(
             {"content_reviewer", "teacher"},
             scope_type="class",
@@ -475,7 +475,7 @@ async def test_approved_start_failure_expires_authorization_and_cancels_asset(
             reviewer_id: str,
             approval_id: str,
         ):
-            assert (reviewer_id, approval_id) == ("teacher-a", "approval-1")
+            assert (reviewer_id, approval_id) == ("teacher-b", "approval-1")
             events.append("approval-expired")
 
     class Generation:
@@ -499,23 +499,29 @@ async def test_approved_start_failure_expires_authorization_and_cancels_asset(
     )
 
     if failure_phase == "job_cancel":
-        with pytest.raises(
-            service_module.StudentClassroomConflict,
-            match="compensation failed",
-        ):
-            await workflow.start_approved_generation(_teacher_context(), approval)
+        with pytest.raises(service_module.StudentClassroomUnavailable) as captured:
+            await workflow.start_approved_generation(
+                _teacher_context("teacher-b"), approval
+            )
+        assert str(captured.value.primary_error) == "attach unavailable"
+        assert [str(error) for error in captured.value.compensation_errors] == [
+            "cancel unavailable"
+        ]
     else:
         with pytest.raises(RuntimeError, match="unavailable"):
-            await workflow.start_approved_generation(_teacher_context(), approval)
+            await workflow.start_approved_generation(
+                _teacher_context("teacher-b"), approval
+            )
 
     expected = ["asset-started"]
     if failure_phase == "job":
         expected.append("job-start-failed")
     elif failure_phase == "job_cancel":
         expected.extend(["job-started", "attach-failed"])
-    expected.extend(["asset-canceled", "approval-expired"])
+    expected.append("asset-canceled")
     if failure_phase == "job_cancel":
         expected.append("job-cancel-failed")
+    expected.append("approval-expired")
     assert events == expected
 
 

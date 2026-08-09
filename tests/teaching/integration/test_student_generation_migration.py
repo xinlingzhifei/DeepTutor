@@ -462,7 +462,41 @@ async def test_real_student_route_uses_exact_current_durable_safety_evidence(
                 )
             )
         assert tuple(initially_reserved) == (1, 5, 3, 25, 5, "reserved")
-        selected_context["value"] = reviewer
+        refreshed_approval = await approval_service.approve(
+            reviewer,
+            accepted.json()["approvalId"],
+        )
+        assert refreshed_approval.status == "approved"
+        classroom_repository = SqlAlchemyClassroomRepository(engine, tenant_id)
+        unbound_record = await classroom_repository.start_student_generation(
+            accepted.json()["assetId"],
+            "micro",
+        )
+        recovery_generation = SqlAlchemyStudentClassroomGeneration(
+            job_repository,
+            Selector(),
+        )
+        unbound_stage = await recovery_generation.start(
+            context=context,
+            record=unbound_record,
+            estimate=SimpleNamespace(scene_range=(1, 2), quota_units=2),
+            mode="micro",
+            actor_id=reviewer.user_id,
+        )
+        assert (await classroom_repository.get_workflow(unbound_record.asset_id)).job_id is None
+
+        second_reviewer = TenantContext(
+            tenant_id=tenant_id,
+            schema_name=schema_name,
+            user_id="teacher-2",
+            permissions=permissions_for_roles(
+                {"content_reviewer"},
+                scope_type="class",
+                scope_id="class-1",
+                tenant_id=tenant_id,
+            ),
+        )
+        selected_context["value"] = second_reviewer
 
         recoverable = client.get("/api/v1/student-generation-approvals")
 
@@ -478,7 +512,7 @@ async def test_real_student_route_uses_exact_current_durable_safety_evidence(
         assert recovered.status_code == 202, recovered.text
         recovered_job_id = recovered.json()["generationJobId"]
         assert recovered.json()["status"] == "approved"
-        assert recovered_job_id is not None
+        assert recovered_job_id == unbound_stage.job_id
         async with engine.connect() as connection:
             refreshed_reservation = (
                 await connection.execute(
@@ -527,36 +561,34 @@ async def test_real_student_route_uses_exact_current_durable_safety_evidence(
             cross_reviewer_restart.json()["approvalId"],
         )
         assert approved_by_first_reviewer.status == "approved"
-
-        second_reviewer = TenantContext(
-            tenant_id=tenant_id,
-            schema_name=schema_name,
-            user_id="teacher-2",
-            permissions=permissions_for_roles(
-                {"content_reviewer"},
-                scope_type="class",
-                scope_id="class-1",
-                tenant_id=tenant_id,
-            ),
+        stale_record = await classroom_repository.start_student_generation(
+            cross_reviewer_restart.json()["assetId"],
+            "micro",
         )
-
-        class UnavailableSelector:
-            async def resolve(self, _tenant_id: str):
-                return None
+        stale_stage = await recovery_generation.start(
+            context=context,
+            record=stale_record,
+            estimate=SimpleNamespace(scene_range=(1, 2), quota_units=2),
+            mode="micro",
+            actor_id=reviewer.user_id,
+        )
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    f'UPDATE "{schema_name}".course_generation_policies SET '
+                    "micro_scene_limit = 1, daily_student_units = 1, "
+                    "monthly_student_units = 1, updated_by = 'teacher-3' "
+                    "WHERE course_id = 'course-1'"
+                )
+            )
 
         selected_context["value"] = second_reviewer
-        application.dependency_overrides[
-            student_classrooms.get_data_plane_selector
-        ] = UnavailableSelector
         failed_restart = client.post(
             "/api/v1/student-generation-approvals/"
             f'{cross_reviewer_restart.json()["approvalId"]}/approve',
             json={},
         )
-        application.dependency_overrides[
-            student_classrooms.get_data_plane_selector
-        ] = Selector
-        async with engine.connect() as connection:
+        async with engine.begin() as connection:
             failed_restart_state = (
                 await connection.execute(
                     text(
@@ -576,13 +608,39 @@ async def test_real_student_route_uses_exact_current_durable_safety_evidence(
                     {"approval_id": cross_reviewer_restart.json()["approvalId"]},
                 )
             ).one()
+            stale_job_state = (
+                await connection.execute(
+                    text(
+                        f'SELECT status, cancel_requested FROM "{schema_name}".'
+                        "generation_jobs WHERE id = :job_id"
+                    ),
+                    {"job_id": stale_stage.job_id},
+                )
+            ).one()
+            active_job_count = await connection.scalar(
+                text(
+                    f'SELECT count(*) FROM "{schema_name}".generation_jobs '
+                    "WHERE classroom_draft_id = :draft_id "
+                    "AND status NOT IN ('succeeded', 'failed', 'canceled')"
+                ),
+                {"draft_id": stale_record.draft_id},
+            )
+            await connection.execute(
+                text(
+                    f'UPDATE "{schema_name}".course_generation_policies SET '
+                    "micro_scene_limit = 2, daily_student_units = 2, "
+                    "monthly_student_units = 2, updated_by = 'teacher-2' "
+                    "WHERE course_id = 'course-1'"
+                )
+            )
         assert tuple(failed_restart_state) == ("expired", "released", "canceled", None)
-        assert failed_restart.status_code == 409, failed_restart.text
+        assert stale_job_state[0] == "canceled" or stale_job_state[1] is True
+        assert active_job_count == 0
+        assert failed_restart.status_code == 503, failed_restart.text
 
         selected_context["value"] = context
         raced = client.post("/api/v1/student-classrooms", json=payload)
         assert raced.status_code == 202, raced.text
-        classroom_repository = SqlAlchemyClassroomRepository(engine, tenant_id)
         raced_record = await classroom_repository.start_student_generation(
             raced.json()["assetId"],
             "micro",

@@ -49,6 +49,7 @@ from deeptutor.teaching.services.student_classrooms import (
     StudentClassroomDenied,
     StudentClassroomNotFound,
     StudentClassroomService,
+    StudentClassroomUnavailable,
 )
 from deeptutor.teaching.services.student_generation import (
     StudentGenerationApprovalConflict,
@@ -324,6 +325,11 @@ async def _call(operation):
         raise HTTPException(status_code=404, detail="Student classroom not found") from None
     except StudentClassroomDenied:
         raise HTTPException(status_code=403, detail="Student generation is denied") from None
+    except StudentClassroomUnavailable:
+        raise HTTPException(
+            status_code=503,
+            detail="Student classroom service is unavailable",
+        ) from None
     except (
         StudentClassroomConflict,
         StudentGenerationApprovalConflict,

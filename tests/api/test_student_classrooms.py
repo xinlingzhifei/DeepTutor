@@ -276,6 +276,32 @@ def test_student_not_found_errors_hide_asset_identifiers() -> None:
     assert asset_id not in response.text
 
 
+def test_compensation_failure_is_reported_as_hidden_service_unavailability() -> None:
+    service_module = importlib.import_module(
+        "deeptutor.teaching.services.student_classrooms"
+    )
+
+    class UnavailableService(_StudentClassroomService):
+        async def create(self, _context: TenantContext, _request):
+            primary = RuntimeError("private primary failure")
+            raise service_module.StudentClassroomUnavailable(
+                "private compensation failure",
+                primary_error=primary,
+                compensation_errors=(RuntimeError("private cancel failure"),),
+            ) from primary
+
+    response = _client(UnavailableService(), {"id": "alice"}).post(
+        "/api/v1/student-classrooms",
+        json=_request(),
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": "Student classroom service is unavailable"
+    }
+    assert "private" not in response.text
+
+
 def test_unauthorized_source_is_hidden_as_not_found() -> None:
     class HiddenSourceService(_StudentClassroomService):
         async def create(self, _context: TenantContext, request):
@@ -911,9 +937,168 @@ async def test_job_attach_failure_cancels_orphan_job_policy_and_asset() -> None:
     assert events == [
         "job-created",
         "attach-failed",
+        "asset-canceled",
         "job-canceled",
         "policy-canceled",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "cancel_failure",
+    ["request_cancel unavailable", "gateway unavailable"],
+)
+async def test_attach_failure_compensation_fences_asset_and_releases_policy_when_job_cancel_fails(
+    cancel_failure: str,
+) -> None:
+    service_module = importlib.import_module(
+        "deeptutor.teaching.services.student_classrooms"
+    )
+    events: list[str] = []
+    record = ClassroomRecord(
+        tenant_id="tenant-a",
+        asset_id="student-asset-1",
+        draft_id="student-draft-1",
+        job_id=None,
+        lifecycle_state="generating_content",
+        status="generating_content",
+        title="Student classroom",
+        course_id="course-a",
+        class_id="class-a",
+        owner_id="alice",
+        teaching_brief=SimpleNamespace(),
+        revision=1,
+        outline=None,
+        document={},
+        classroom_version_id=None,
+        confirmed_outline_sha256=None,
+        validation_report=None,
+        student_generation_request_id="request-1",
+    )
+
+    class Repository:
+        async def get_workflow(self, _asset_id: str):
+            return record
+
+        async def attach_generation_job(self, *_args):
+            events.append("attach-failed")
+            raise RuntimeError("attach unavailable")
+
+        async def mark_canceled(self, _asset_id: str):
+            events.append("asset-canceled")
+            return replace(record, lifecycle_state="canceled", status="canceled")
+
+    class Generation:
+        durable_cancel_requested = False
+
+        async def start(self, **_kwargs):
+            events.append("job-created")
+            return SimpleNamespace(job_id="student-job-1", status="queued")
+
+        async def request_cancel(self, _tenant_id: str, _job_id: str):
+            self.durable_cancel_requested = True
+            events.append("job-cancel-failed")
+            raise RuntimeError(cancel_failure)
+
+    class RequestRepository:
+        async def cancel_request(self, *_args):
+            events.append("policy-canceled")
+
+    generation = Generation()
+    workflow = service_module.SqlAlchemyStudentClassroomWorkflow(
+        repository=Repository(),
+        classroom_service=SimpleNamespace(),
+        brief_builder=SimpleNamespace(),
+        generation=generation,
+        request_repository=RequestRepository(),
+    )
+    view = service_module.StudentClassroomView(
+        asset_id=record.asset_id,
+        request_id="request-1",
+        approval_id=None,
+        generation_job_id=None,
+        status="preparing",
+        course_id="course-a",
+        class_id="class-a",
+        mode="micro",
+        owner_id="alice",
+        revision=1,
+        outline=None,
+    )
+
+    with pytest.raises(service_module.StudentClassroomUnavailable) as captured:
+        await workflow.start_generation(
+            _context("alice"),
+            view,
+            SimpleNamespace(),
+        )
+
+    assert str(captured.value.primary_error) == "attach unavailable"
+    assert [str(error) for error in captured.value.compensation_errors] == [
+        cancel_failure
+    ]
+    assert generation.durable_cancel_requested is True
+    assert events == [
+        "job-created",
+        "attach-failed",
         "asset-canceled",
+        "job-cancel-failed",
+        "policy-canceled",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_create_preserves_primary_error_when_outer_policy_cancel_fails() -> None:
+    service_module = importlib.import_module(
+        "deeptutor.teaching.services.student_classrooms"
+    )
+
+    class PolicyService:
+        async def evaluate(self, _request):
+            return StudentGenerationResult(
+                estimate=StudentGenerationEstimate(
+                    scene_range=(1, 5),
+                    duration_minutes_range=(3, 25),
+                    quota_units=5,
+                    requires_outline_confirmation=False,
+                    requires_approval=False,
+                ),
+                decision=PolicyDecision(
+                    outcome="accepted",
+                    reason="accepted",
+                    estimated_units=5,
+                    evaluated_checks=("quota",),
+                ),
+                request_id="request-1",
+                approval_id=None,
+            )
+
+        async def cancel(self, _request_id: str):
+            raise RuntimeError("policy cancel unavailable")
+
+    class Workflow:
+        async def create(self, *_args):
+            raise RuntimeError("asset unavailable")
+
+    service = service_module.StudentClassroomService(
+        policy_service=PolicyService(),
+        workflow=Workflow(),
+        approval_service=SimpleNamespace(),
+    )
+    request = SimpleNamespace(
+        course_id="course-a",
+        class_id="class-a",
+        mode="micro",
+        content_mode="open_creation",
+        web_search_requested=False,
+    )
+
+    with pytest.raises(service_module.StudentClassroomUnavailable) as captured:
+        await service.create(_context("alice"), request)
+
+    assert str(captured.value.primary_error) == "asset unavailable"
+    assert [str(error) for error in captured.value.compensation_errors] == [
+        "policy cancel unavailable"
     ]
 
 

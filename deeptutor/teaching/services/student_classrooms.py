@@ -17,6 +17,7 @@ from deeptutor.teaching.policies.student_generation import (
 )
 from deeptutor.teaching.repositories.jobs import (
     GenerationJobRequest,
+    IdempotencyConflict,
     SqlAlchemyGenerationJobRepository,
 )
 from deeptutor.teaching.services.classrooms import (
@@ -50,6 +51,38 @@ class StudentClassroomNotFound(StudentClassroomError, LookupError):
 
 class StudentClassroomConflict(StudentClassroomError):
     pass
+
+
+class StudentClassroomUnavailable(StudentClassroomError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        primary_error: Exception,
+        compensation_errors: tuple[Exception, ...] = (),
+    ) -> None:
+        super().__init__(message)
+        self.primary_error = primary_error
+        self.compensation_errors = compensation_errors
+
+
+def _compensation_failure(
+    message: str,
+    *,
+    primary_error: Exception,
+    compensation_errors: list[Exception],
+) -> StudentClassroomUnavailable:
+    if isinstance(primary_error, StudentClassroomUnavailable):
+        root_error = primary_error.primary_error
+        inherited_errors = primary_error.compensation_errors
+    else:
+        root_error = primary_error
+        inherited_errors = ()
+    return StudentClassroomUnavailable(
+        message,
+        primary_error=root_error,
+        compensation_errors=(*inherited_errors, *compensation_errors),
+    )
 
 
 class StudentClassroomWorkflow(Protocol):
@@ -153,6 +186,55 @@ class SqlAlchemyStudentClassroomGeneration:
         digest = hashlib.sha256(f"{tenant_id}\0{asset_id}\0micro".encode()).hexdigest()
         return f"job-{digest[:48]}"
 
+    @staticmethod
+    def _matches_recoverable_job(details, request: GenerationJobRequest) -> bool:
+        return (
+            details.tenant_id == request.tenant_id
+            and details.job_id == request.job_id
+            and details.job_kind == request.job_kind
+            and details.phase == request.phase
+            and details.export_format == request.export_format
+            and details.priority == request.priority_rank
+            and details.quota_units == request.quota_units
+            and details.owner_id == request.owner_id
+            and details.visibility == "private"
+            and details.visibility == request.visibility
+            and details.request_id == request.request_id
+            and details.idempotency_key == request.idempotency_key
+            and details.classroom_draft_id == request.classroom_draft_id
+            and details.batch_id == request.batch_id
+            and details.resource_course_id == request.resource_course_id
+            and details.resource_class_id == request.resource_class_id
+            and details.public_request_sha256 == request.public_request_sha256
+            and details.request_sha256 == request.request_sha256
+            and details.data_plane_route_id == request.data_plane_route_id
+            and details.provider_profile_id == request.provider_profile_id
+            and details.worker_pool_ref == request.worker_pool_ref
+            and details.queue_ref == request.queue_ref
+            and details.request_payload == request.request_payload
+            and details.retry_of_job_id == request.retry_of_job_id
+            and details.status not in {"failed", "canceled"}
+            and not details.cancel_requested
+        )
+
+    async def _reject_incompatible_job(
+        self,
+        *,
+        tenant_id: str,
+        job_id: str,
+        primary_error: Exception,
+    ) -> None:
+        compensation_errors: list[Exception] = []
+        try:
+            await self.request_cancel(tenant_id, job_id)
+        except Exception as error:
+            compensation_errors.append(error)
+        raise _compensation_failure(
+            "student generation job binding changed",
+            primary_error=primary_error,
+            compensation_errors=compensation_errors,
+        ) from primary_error
+
     async def start(
         self,
         *,
@@ -201,45 +283,85 @@ class SqlAlchemyStudentClassroomGeneration:
             priority=priority,
         )
         payload = canonical_json_bytes(generation).decode("utf-8")
-        await self._repository.create_job_and_reserve(
-            GenerationJobRequest(
+        request_sha256 = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        job_request = GenerationJobRequest(
+            tenant_id=context.tenant_id,
+            job_id=job_id,
+            job_kind="generation",
+            phase="content" if phase == "micro" else "outline",
+            export_format=None,
+            priority=priority,
+            quota_units=estimate.quota_units,
+            actor_id=actor_id,
+            owner_id=record.owner_id,
+            visibility="private",
+            request_id=generation.request_id,
+            idempotency_key=generation.idempotency_key,
+            request_sha256=request_sha256,
+            data_plane_route_id=selection.route_ref,
+            provider_profile_id=selection.provider_profile_ref,
+            worker_pool_ref=selection.worker_pool_ref,
+            queue_ref=selection.queue_ref,
+            request_payload=payload,
+            classroom_draft_id=record.draft_id,
+            resource_course_id=record.course_id,
+            resource_class_id=record.class_id,
+            public_request_sha256=request_sha256,
+        )
+        try:
+            details = await self._repository.get_job_details(context.tenant_id, job_id)
+        except Exception:
+            details = None
+        if details is not None:
+            if self._matches_recoverable_job(details, job_request):
+                return self._full_generation._stage(details)
+            await self._reject_incompatible_job(
                 tenant_id=context.tenant_id,
                 job_id=job_id,
-                job_kind="generation",
-                phase="content" if phase == "micro" else "outline",
-                export_format=None,
-                priority=priority,
-                quota_units=estimate.quota_units,
-                actor_id=actor_id,
-                owner_id=record.owner_id,
-                visibility="private",
-                request_id=generation.request_id,
-                idempotency_key=generation.idempotency_key,
-                request_sha256=hashlib.sha256(payload.encode("utf-8")).hexdigest(),
-                data_plane_route_id=selection.route_ref,
-                provider_profile_id=selection.provider_profile_ref,
-                worker_pool_ref=selection.worker_pool_ref,
-                queue_ref=selection.queue_ref,
-                request_payload=payload,
-                classroom_draft_id=record.draft_id,
-                resource_course_id=record.course_id,
-                resource_class_id=record.class_id,
-                public_request_sha256=hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+                primary_error=IdempotencyConflict(),
             )
-        )
+        try:
+            await self._repository.create_job_and_reserve(job_request)
+        except IdempotencyConflict as error:
+            try:
+                details = await self._repository.get_job_details(
+                    context.tenant_id,
+                    job_id,
+                )
+            except Exception as details_error:
+                await self._reject_incompatible_job(
+                    tenant_id=context.tenant_id,
+                    job_id=job_id,
+                    primary_error=details_error,
+                )
+            if details is not None and self._matches_recoverable_job(
+                details,
+                job_request,
+            ):
+                return self._full_generation._stage(details)
+            await self._reject_incompatible_job(
+                tenant_id=context.tenant_id,
+                job_id=job_id,
+                primary_error=error,
+            )
         try:
             details = await self._repository.get_job_details(context.tenant_id, job_id)
             if details is None:
                 raise StudentClassroomConflict(
                     "student generation job is unavailable"
                 )
-        except Exception:
+        except Exception as primary_error:
+            compensation_errors: list[Exception] = []
             try:
                 await self.request_cancel(context.tenant_id, job_id)
-            except Exception as cancellation_error:
-                raise StudentClassroomConflict(
-                    "student generation job compensation failed"
-                ) from cancellation_error
+            except Exception as error:
+                compensation_errors.append(error)
+            if compensation_errors:
+                raise _compensation_failure(
+                    "student generation job compensation failed",
+                    primary_error=primary_error,
+                    compensation_errors=compensation_errors,
+                ) from primary_error
             raise
         return self._full_generation._stage(details)
 
@@ -437,18 +559,34 @@ class SqlAlchemyStudentClassroomWorkflow:
                 stage.job_id,
                 "content" if record.mode == "micro" else "outline",
             )
-        except Exception:
+        except Exception as primary_error:
+            compensation_errors: list[Exception] = []
+            try:
+                await self._repository.mark_canceled(record.asset_id)
+            except Exception as error:
+                compensation_errors.append(error)
             if stage is not None:
-                await self._generation.request_cancel(
+                try:
+                    await self._generation.request_cancel(
+                        context.tenant_id,
+                        stage.job_id,
+                    )
+                except Exception as error:
+                    compensation_errors.append(error)
+            try:
+                await self._request_repository.cancel_request(
                     context.tenant_id,
-                    stage.job_id,
+                    context.user_id,
+                    record.request_id,
                 )
-            await self._request_repository.cancel_request(
-                context.tenant_id,
-                context.user_id,
-                record.request_id,
-            )
-            await self._repository.mark_canceled(record.asset_id)
+            except Exception as error:
+                compensation_errors.append(error)
+            if compensation_errors:
+                raise _compensation_failure(
+                    "student generation start compensation failed",
+                    primary_error=primary_error,
+                    compensation_errors=compensation_errors,
+                ) from primary_error
             raise
         return self._view(
             workflow,
@@ -699,20 +837,12 @@ class SqlAlchemyStudentClassroomWorkflow:
                 stage.job_id,
                 "content" if details.mode == "micro" else "outline",
             )
-        except Exception:
-            compensation_error: Exception | None = None
+        except Exception as primary_error:
+            compensation_errors: list[Exception] = []
             try:
                 await self._repository.mark_canceled(asset_id)
             except Exception as error:
-                compensation_error = error
-            try:
-                await self._request_repository.abort_approved_request(
-                    context.tenant_id,
-                    context.user_id,
-                    approval.approval_id,
-                )
-            except Exception as error:
-                compensation_error = compensation_error or error
+                compensation_errors.append(error)
             if stage is not None:
                 try:
                     await self._generation.request_cancel(
@@ -720,11 +850,21 @@ class SqlAlchemyStudentClassroomWorkflow:
                         stage.job_id,
                     )
                 except Exception as error:
-                    compensation_error = compensation_error or error
-            if compensation_error is not None:
-                raise StudentClassroomConflict(
-                    "student approval start compensation failed"
-                ) from compensation_error
+                    compensation_errors.append(error)
+            try:
+                await self._request_repository.abort_approved_request(
+                    context.tenant_id,
+                    context.user_id,
+                    approval.approval_id,
+                )
+            except Exception as error:
+                compensation_errors.append(error)
+            if compensation_errors:
+                raise _compensation_failure(
+                    "student approval start compensation failed",
+                    primary_error=primary_error,
+                    compensation_errors=compensation_errors,
+                ) from primary_error
             raise
         return StudentGenerationApprovalView(
             approval_id=approval.approval_id,
@@ -807,8 +947,18 @@ class StudentClassroomService:
                 record,
                 result.estimate,
             )
-        except Exception:
-            await self._policy_service.cancel(result.request_id)
+        except Exception as primary_error:
+            compensation_errors: list[Exception] = []
+            try:
+                await self._policy_service.cancel(result.request_id)
+            except Exception as error:
+                compensation_errors.append(error)
+            if compensation_errors:
+                raise _compensation_failure(
+                    "student classroom creation compensation failed",
+                    primary_error=primary_error,
+                    compensation_errors=compensation_errors,
+                ) from primary_error
             raise
 
     async def list(self, context: TenantContext):
