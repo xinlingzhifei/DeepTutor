@@ -700,17 +700,31 @@ class SqlAlchemyStudentClassroomWorkflow:
                 "content" if details.mode == "micro" else "outline",
             )
         except Exception:
-            if stage is not None:
-                await self._generation.request_cancel(
+            compensation_error: Exception | None = None
+            try:
+                await self._repository.mark_canceled(asset_id)
+            except Exception as error:
+                compensation_error = error
+            try:
+                await self._request_repository.abort_approved_request(
                     context.tenant_id,
-                    stage.job_id,
+                    context.user_id,
+                    approval.approval_id,
                 )
-            await self._request_repository.abort_approved_request(
-                context.tenant_id,
-                context.user_id,
-                approval.approval_id,
-            )
-            await self._repository.mark_canceled(asset_id)
+            except Exception as error:
+                compensation_error = compensation_error or error
+            if stage is not None:
+                try:
+                    await self._generation.request_cancel(
+                        context.tenant_id,
+                        stage.job_id,
+                    )
+                except Exception as error:
+                    compensation_error = compensation_error or error
+            if compensation_error is not None:
+                raise StudentClassroomConflict(
+                    "student approval start compensation failed"
+                ) from compensation_error
             raise
         return StudentGenerationApprovalView(
             approval_id=approval.approval_id,

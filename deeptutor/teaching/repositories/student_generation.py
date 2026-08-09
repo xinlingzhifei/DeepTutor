@@ -243,11 +243,30 @@ class SqlAlchemyStudentGenerationRepository:
                 learner_id,
                 request,
             )
+        return self._validated_safety(safety)
+
+    @staticmethod
+    def _validated_safety(safety: object) -> StudentSafetyAssessment:
         if type(safety) is not StudentSafetyAssessment:
             raise StudentGenerationConfigurationError(
                 "student safety assessment is invalid"
             )
         return safety
+
+    async def _assess_external_safety(
+        self,
+        learner_id: str,
+        request: StudentGenerationRequest,
+    ) -> StudentSafetyAssessment | None:
+        if isinstance(self._safety_evaluator, SqlAlchemyStudentSafetyEvaluator):
+            return None
+        return self._validated_safety(
+            await self._safety_evaluator.assess(
+                self._tenant_id,
+                learner_id,
+                request,
+            )
+        )
 
     @staticmethod
     def _source_binding_statement(
@@ -500,6 +519,7 @@ class SqlAlchemyStudentGenerationRepository:
             raise ValueError("tenant_id does not match repository binding")
         if not learner_id or len(learner_id) > 128:
             raise ValueError("learner_id is invalid")
+        safety = await self._assess_external_safety(learner_id, request)
         async with self._session_factory() as session:
             async with session.begin():
                 await session.execute(
@@ -511,11 +531,12 @@ class SqlAlchemyStudentGenerationRepository:
                         )
                     },
                 )
-                safety = await self._assess_safety_locked(
-                    session,
-                    learner_id,
-                    request,
-                )
+                if safety is None:
+                    safety = await self._assess_safety_locked(
+                        session,
+                        learner_id,
+                        request,
+                    )
                 inputs, _ = await self._load_inputs_locked(
                     session,
                     learner_id,
@@ -781,28 +802,76 @@ class SqlAlchemyStudentGenerationRepository:
             raise ValueError("approval_id is invalid")
         async with self._session_factory() as session:
             async with session.begin():
-                approval = await session.scalar(
-                    select(StudentGenerationApprovalRecord)
-                    .where(
-                        StudentGenerationApprovalRecord.id == approval_id,
-                        StudentGenerationApprovalRecord.tenant_id == self._tenant_id,
+                row = (
+                    await session.execute(
+                        self._approval_statement()
+                        .where(StudentGenerationApprovalRecord.id == approval_id)
+                        .with_for_update(
+                            of=(
+                                StudentGenerationApprovalRecord,
+                                StudentGenerationRequestRecord,
+                            )
+                        )
                     )
-                    .with_for_update()
-                )
-                if approval is None or approval.decided_by != reviewer_id:
+                ).one_or_none()
+                if row is None:
                     raise StudentGenerationApprovalNotFound(approval_id)
-                if approval.status != "approved":
+                approval, request = row
+                if (
+                    approval.id != approval_id
+                    or approval.tenant_id != self._tenant_id
+                    or approval.request_id != request.id
+                    or request.tenant_id != self._tenant_id
+                    or reviewer_id == request.learner_id
+                ):
+                    raise StudentGenerationApprovalNotFound(approval_id)
+                already_aborted = (
+                    approval.status == "expired" and request.quota_state == "released"
+                )
+                if not already_aborted and (
+                    approval.status != "approved"
+                    or approval.decided_by is None
+                    or approval.decided_at is None
+                    or request.decision_outcome != "accepted"
+                    or request.quota_state not in {"reserved", "settled", "released"}
+                ):
                     raise StudentGenerationApprovalConflict(approval_id)
-                request = await session.scalar(
-                    select(StudentGenerationRequestRecord)
-                    .where(
-                        StudentGenerationRequestRecord.id == approval.request_id,
-                        StudentGenerationRequestRecord.tenant_id == self._tenant_id,
+                binding_row = (
+                    await session.execute(
+                        self._approval_source_snapshot_statement(
+                            tenant_id=self._tenant_id,
+                            request_id=request.id,
+                        ).with_for_update(
+                            read=True,
+                            of=(
+                                StudentClassroomAssetRecord,
+                                ClassroomAsset,
+                                ClassroomDraft,
+                                TeachingBriefRecord,
+                            ),
+                        )
                     )
-                    .with_for_update()
-                )
-                if request is None:
+                ).one_or_none()
+                if binding_row is None:
                     raise StudentGenerationApprovalNotFound(approval_id)
+                marker, asset, draft, brief = binding_row
+                if (
+                    marker.tenant_id != self._tenant_id
+                    or marker.request_id != request.id
+                    or marker.asset_id != asset.id
+                    or asset.tenant_id != self._tenant_id
+                    or asset.owner_id != request.learner_id
+                    or draft.tenant_id != self._tenant_id
+                    or draft.classroom_id != asset.id
+                    or draft.teaching_brief_id != brief.id
+                    or draft.generation_job_id is not None
+                    or brief.tenant_id != self._tenant_id
+                    or brief.course_id != request.course_id
+                    or brief.class_id != request.class_id
+                ):
+                    raise StudentGenerationApprovalNotFound(approval_id)
+                if already_aborted:
+                    return
                 approval.status = "expired"
                 if request.quota_state == "reserved":
                     request.quota_state = "released"
@@ -841,6 +910,7 @@ class SqlAlchemyStudentGenerationRepository:
         if prelocked_request is None:
             raise StudentGenerationApprovalNotFound(approval_id)
         request = self._request(prelocked_request)
+        safety = await self._assess_external_safety(current.learner_id, request)
 
         async with self._session_factory() as session:
             async with session.begin():
@@ -991,11 +1061,12 @@ class SqlAlchemyStudentGenerationRepository:
                     raise StudentGenerationConfigurationError(
                         "student approval source binding is unavailable"
                     )
-                safety = await self._assess_safety_locked(
-                    session,
-                    stored_request.learner_id,
-                    locked_request,
-                )
+                if safety is None:
+                    safety = await self._assess_safety_locked(
+                        session,
+                        stored_request.learner_id,
+                        locked_request,
+                    )
                 inputs, decision_time = await self._load_inputs_locked(
                     session,
                     stored_request.learner_id,
@@ -1026,6 +1097,24 @@ class SqlAlchemyStudentGenerationRepository:
                         approval.status = "expired"
                         if stored_request.quota_state == "reserved":
                             stored_request.quota_state = "released"
+                    else:
+                        stored_request.scene_min = estimate.scene_range[0]
+                        stored_request.scene_max = estimate.scene_range[1]
+                        stored_request.duration_minutes_min = (
+                            estimate.duration_minutes_range[0]
+                        )
+                        stored_request.duration_minutes_max = (
+                            estimate.duration_minutes_range[1]
+                        )
+                        stored_request.estimated_units = estimate.quota_units
+                        stored_request.requires_outline_confirmation = (
+                            estimate.requires_outline_confirmation
+                        )
+                        stored_request.decision_outcome = decision.outcome
+                        stored_request.decision_reason = decision.reason
+                        stored_request.evaluated_checks = ",".join(
+                            decision.evaluated_checks
+                        )
                 else:
                     approval.status = "approved" if approved else "expired"
                     approval.decided_by = reviewer_id
@@ -1133,6 +1222,7 @@ class SqlAlchemyStudentGenerationRepository:
             raise ValueError("tenant_id does not match repository binding")
         if not learner_id or len(learner_id) > 128:
             raise ValueError("learner_id is invalid")
+        safety = await self._assess_external_safety(learner_id, request)
         request_id = f"student-request-{uuid.uuid4().hex}"
         async with self._session_factory() as session:
             async with session.begin():
@@ -1144,11 +1234,12 @@ class SqlAlchemyStudentGenerationRepository:
                         )
                     },
                 )
-                safety = await self._assess_safety_locked(
-                    session,
-                    learner_id,
-                    request,
-                )
+                if safety is None:
+                    safety = await self._assess_safety_locked(
+                        session,
+                        learner_id,
+                        request,
+                    )
                 inputs, decision_time = await self._load_inputs_locked(
                     session,
                     learner_id,

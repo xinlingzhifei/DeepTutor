@@ -15,6 +15,7 @@ from deeptutor.teaching.policies.student_generation import (
     PolicyDecision,
     StudentGenerationEstimate,
 )
+from deeptutor.teaching.schema_names import tenant_schema_name
 from deeptutor.teaching.services.classrooms import ClassroomRecord, ClassroomService
 from deeptutor.teaching.services.student_classrooms import StudentClassroomNotFound
 from deeptutor.teaching.services.student_generation import (
@@ -216,8 +217,13 @@ def test_real_app_wires_a_tenant_bound_durable_student_safety_evaluator(
     monkeypatch,
 ) -> None:
     student_classrooms = _student_router_module()
+
     class Engine:
-        def execution_options(self, **_options):
+        def __init__(self) -> None:
+            self.execution_option_calls: list[dict[str, object]] = []
+
+        def execution_options(self, **options):
+            self.execution_option_calls.append(options)
             return self
 
     engine = Engine()
@@ -226,7 +232,9 @@ def test_real_app_wires_a_tenant_bound_durable_student_safety_evaluator(
     evaluator = student_classrooms.get_student_safety_evaluator(_context("alice"))
 
     assert evaluator.__class__.__name__ == "SqlAlchemyStudentSafetyEvaluator"
-    assert evaluator._engine is engine
+    assert engine.execution_option_calls == [
+        {"schema_translate_map": {"tenant": tenant_schema_name("tenant-a")}}
+    ]
     assert evaluator._tenant_id == "tenant-a"
 
 

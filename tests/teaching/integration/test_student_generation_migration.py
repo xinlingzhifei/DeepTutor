@@ -434,6 +434,27 @@ async def test_real_student_route_uses_exact_current_durable_safety_evidence(
             accepted.json()["approvalId"],
         )
         assert approved.status == "approved"
+        async with engine.begin() as connection:
+            initially_reserved = (
+                await connection.execute(
+                    text(
+                        f'SELECT scene_min, scene_max, duration_minutes_min, '
+                        f'duration_minutes_max, estimated_units, quota_state FROM '
+                        f'"{schema_name}".student_generation_requests '
+                        "WHERE id = :request_id"
+                    ),
+                    {"request_id": accepted.json()["requestId"]},
+                )
+            ).one()
+            await connection.execute(
+                text(
+                    f'UPDATE "{schema_name}".course_generation_policies SET '
+                    "micro_scene_limit = 2, daily_student_units = 2, "
+                    "monthly_student_units = 2, updated_by = 'teacher-2' "
+                    "WHERE course_id = 'course-1'"
+                )
+            )
+        assert tuple(initially_reserved) == (1, 5, 3, 25, 5, "reserved")
         selected_context["value"] = reviewer
 
         recoverable = client.get("/api/v1/student-generation-approvals")
@@ -451,6 +472,27 @@ async def test_real_student_route_uses_exact_current_durable_safety_evidence(
         recovered_job_id = recovered.json()["generationJobId"]
         assert recovered.json()["status"] == "approved"
         assert recovered_job_id is not None
+        async with engine.connect() as connection:
+            refreshed_reservation = (
+                await connection.execute(
+                    text(
+                        f'SELECT scene_min, scene_max, duration_minutes_min, '
+                        f'duration_minutes_max, estimated_units, quota_state FROM '
+                        f'"{schema_name}".student_generation_requests '
+                        "WHERE id = :request_id"
+                    ),
+                    {"request_id": accepted.json()["requestId"]},
+                )
+            ).one()
+            refreshed_job_units = await connection.scalar(
+                text(
+                    f'SELECT quota_units FROM "{schema_name}".generation_jobs '
+                    "WHERE id = :job_id"
+                ),
+                {"job_id": recovered_job_id},
+            )
+        assert tuple(refreshed_reservation) == (1, 2, 3, 10, 2, "reserved")
+        assert refreshed_job_units == 2
         hidden_after_binding = client.get("/api/v1/student-generation-approvals")
         assert hidden_after_binding.status_code == 200
         assert hidden_after_binding.json()["items"] == []
@@ -469,6 +511,66 @@ async def test_real_student_route_uses_exact_current_durable_safety_evidence(
                 {"asset_id": accepted.json()["assetId"]},
             )
         assert (job_count, bound_job_id) == (1, recovered_job_id)
+
+        selected_context["value"] = context
+        cross_reviewer_restart = client.post("/api/v1/student-classrooms", json=payload)
+        assert cross_reviewer_restart.status_code == 202, cross_reviewer_restart.text
+        approved_by_first_reviewer = await approval_service.approve(
+            reviewer,
+            cross_reviewer_restart.json()["approvalId"],
+        )
+        assert approved_by_first_reviewer.status == "approved"
+
+        second_reviewer = TenantContext(
+            tenant_id=tenant_id,
+            schema_name=schema_name,
+            user_id="teacher-2",
+            permissions=permissions_for_roles(
+                {"content_reviewer"},
+                scope_type="class",
+                scope_id="class-1",
+                tenant_id=tenant_id,
+            ),
+        )
+
+        class UnavailableSelector:
+            async def resolve(self, _tenant_id: str):
+                return None
+
+        selected_context["value"] = second_reviewer
+        application.dependency_overrides[
+            student_classrooms.get_data_plane_selector
+        ] = UnavailableSelector
+        failed_restart = client.post(
+            "/api/v1/student-generation-approvals/"
+            f'{cross_reviewer_restart.json()["approvalId"]}/approve',
+            json={},
+        )
+        application.dependency_overrides[
+            student_classrooms.get_data_plane_selector
+        ] = Selector
+        async with engine.connect() as connection:
+            failed_restart_state = (
+                await connection.execute(
+                    text(
+                        f'SELECT approval.status, request.quota_state, '
+                        f'asset.lifecycle_state, draft.generation_job_id FROM '
+                        f'"{schema_name}".student_generation_approvals AS approval '
+                        f'JOIN "{schema_name}".student_generation_requests AS request '
+                        "ON request.id = approval.request_id "
+                        f'JOIN "{schema_name}".student_classroom_assets AS marker '
+                        "ON marker.request_id = request.id "
+                        f'JOIN "{schema_name}".classroom_assets AS asset '
+                        "ON asset.id = marker.asset_id "
+                        f'JOIN "{schema_name}".classroom_drafts AS draft '
+                        "ON draft.classroom_id = asset.id "
+                        "WHERE approval.id = :approval_id"
+                    ),
+                    {"approval_id": cross_reviewer_restart.json()["approvalId"]},
+                )
+            ).one()
+        assert tuple(failed_restart_state) == ("expired", "released", "canceled", None)
+        assert failed_restart.status_code == 409, failed_restart.text
 
         selected_context["value"] = context
         raced = client.post("/api/v1/student-classrooms", json=payload)
@@ -511,6 +613,11 @@ async def test_real_student_route_uses_exact_current_durable_safety_evidence(
 
         source_revoked = client.post("/api/v1/student-classrooms", json=payload)
         assert source_revoked.status_code == 202, source_revoked.text
+        source_reserved = await approval_service.approve(
+            reviewer,
+            source_revoked.json()["approvalId"],
+        )
+        assert source_reserved.status == "approved"
         async with engine.begin() as connection:
             source_brief_id = await connection.scalar(
                 text(
@@ -606,7 +713,7 @@ async def test_real_student_route_uses_exact_current_durable_safety_evidence(
                     {"request_id": source_revoked.json()["requestId"]},
                 )
             ).one()
-        assert source_request_state == ("denied", "none")
+        assert source_request_state == ("accepted", "released")
 
         locked = client.post("/api/v1/student-classrooms", json=payload)
         assert locked.status_code == 202, locked.text
@@ -708,11 +815,29 @@ async def test_real_student_route_uses_exact_current_durable_safety_evidence(
         assert locked_approved.status == "approved"
         with pytest.raises(StudentGenerationApprovalNotFound):
             await approval_service.approve(reviewer, locked.json()["approvalId"])
-        await SqlAlchemyStudentGenerationRepository(
+        cleanup_repository = SqlAlchemyStudentGenerationRepository(
             engine,
             tenant_id,
             safety_evaluator=evaluator,
-        ).abort_approved_request(
+        )
+        with pytest.raises(StudentGenerationApprovalNotFound):
+            await cleanup_repository.abort_approved_request(
+                tenant_id,
+                reviewer.user_id,
+                locked.json()["approvalId"],
+            )
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    f'UPDATE "{schema_name}".classroom_assets SET owner_id = '
+                    ":learner_id WHERE id = :asset_id"
+                ),
+                {
+                    "learner_id": learner_id,
+                    "asset_id": locked.json()["assetId"],
+                },
+            )
+        await cleanup_repository.abort_approved_request(
             tenant_id,
             reviewer.user_id,
             locked.json()["approvalId"],

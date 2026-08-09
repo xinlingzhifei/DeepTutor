@@ -383,7 +383,7 @@ async def test_replayed_approval_returns_the_already_bound_job_without_restartin
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure_phase", ["asset", "job"])
+@pytest.mark.parametrize("failure_phase", ["asset", "job", "job_cancel"])
 async def test_approved_start_failure_expires_authorization_and_cancels_asset(
     failure_phase: str,
 ) -> None:
@@ -456,6 +456,15 @@ async def test_approved_start_failure_expires_authorization_and_cancels_asset(
             events.append("asset-canceled")
             return replace(record, lifecycle_state="canceled", status="canceled")
 
+        async def attach_generation_job(
+            self,
+            _asset_id: str,
+            _job_id: str,
+            _phase: str,
+        ):
+            events.append("attach-failed")
+            raise RuntimeError("attach unavailable")
+
     class RequestRepository:
         async def get_request_details(self, _tenant_id: str, _request_id: str):
             return details
@@ -471,8 +480,15 @@ async def test_approved_start_failure_expires_authorization_and_cancels_asset(
 
     class Generation:
         async def start(self, **_kwargs):
-            events.append("job-start-failed")
-            raise RuntimeError("queue unavailable")
+            if failure_phase == "job":
+                events.append("job-start-failed")
+                raise RuntimeError("queue unavailable")
+            events.append("job-started")
+            return SimpleNamespace(job_id="student-job-1", status="queued")
+
+        async def request_cancel(self, _tenant_id: str, _job_id: str):
+            events.append("job-cancel-failed")
+            raise RuntimeError("cancel unavailable")
 
     workflow = service_module.SqlAlchemyStudentClassroomWorkflow(
         repository=ClassroomRepository(),
@@ -482,13 +498,24 @@ async def test_approved_start_failure_expires_authorization_and_cancels_asset(
         request_repository=RequestRepository(),
     )
 
-    with pytest.raises(RuntimeError, match="unavailable"):
-        await workflow.start_approved_generation(_teacher_context(), approval)
+    if failure_phase == "job_cancel":
+        with pytest.raises(
+            service_module.StudentClassroomConflict,
+            match="compensation failed",
+        ):
+            await workflow.start_approved_generation(_teacher_context(), approval)
+    else:
+        with pytest.raises(RuntimeError, match="unavailable"):
+            await workflow.start_approved_generation(_teacher_context(), approval)
 
     expected = ["asset-started"]
     if failure_phase == "job":
         expected.append("job-start-failed")
-    expected.extend(["approval-expired", "asset-canceled"])
+    elif failure_phase == "job_cancel":
+        expected.extend(["job-started", "attach-failed"])
+    expected.extend(["asset-canceled", "approval-expired"])
+    if failure_phase == "job_cancel":
+        expected.append("job-cancel-failed")
     assert events == expected
 
 
