@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import json
+from types import SimpleNamespace
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -14,7 +15,9 @@ from deeptutor.teaching.object_store import (
     ObjectStoreError,
     ObjectStoreIntegrityError,
 )
+from deeptutor.teaching.permissions import permissions_for_roles
 from deeptutor.teaching.services.exports import (
+    ClassroomExportService,
     ExportPolicyDenied,
     ExportRecord,
 )
@@ -204,6 +207,66 @@ def test_draft_export_requires_revision_and_returns_safe_job_envelope(api_harnes
         "download_ready": False,
     }
     assert "object" not in json.dumps(response.json()).lower()
+
+
+def test_teacher_cannot_export_a_student_classroom_through_the_draft_route() -> None:
+    from tests.teaching.test_classroom_export_service import (
+        _Jobs,
+        _Materializer,
+        _Repository,
+    )
+
+    context = TenantContext(
+        tenant_id="tenant-a",
+        schema_name="tenant_tenant-a",
+        user_id="teacher-a",
+        permissions=permissions_for_roles(
+            {"teacher"},
+            scope_type="class",
+            scope_id="class-a",
+            tenant_id="tenant-a",
+        ),
+    )
+    repository = _Repository()
+    repository.draft = SimpleNamespace(
+        **{
+            field: getattr(repository.draft, field)
+            for field in repository.draft.__slots__
+            if field not in {"owner_id", "student_generation_request_id"}
+        },
+        owner_id="student-a",
+        student_generation_request_id="student-request-a",
+    )
+    materializer = _Materializer()
+    jobs = _Jobs(repository)
+    service = ClassroomExportService(
+        repository,
+        materializer,
+        jobs,
+        mp4_enabled=lambda _tenant_id: False,
+    )
+    app = FastAPI()
+    app.include_router(exports_router.router, prefix="/api/v1")
+    app.dependency_overrides[auth_router.require_platform_enabled] = lambda: None
+    app.dependency_overrides[require_tenant] = lambda: context
+    app.dependency_overrides[exports_router.get_classroom_export_service] = (
+        lambda: service
+    )
+
+    response = TestClient(app).post(
+        "/api/v1/classrooms/asset-a/draft/exports",
+        headers={
+            "If-Match": '"revision-3"',
+            "Idempotency-Key": "student-export-bypass",
+        },
+        json={"format": "pptx"},
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Classroom not found"}
+    assert repository.reserve_calls == []
+    assert materializer.plans == []
+    assert jobs.commands == []
 
 
 def test_draft_export_rejects_invalid_if_match_before_service_call(api_harness) -> None:

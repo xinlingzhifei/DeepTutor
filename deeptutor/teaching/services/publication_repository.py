@@ -35,6 +35,7 @@ from deeptutor.teaching.repositories.classroom_version_allocation import (
     allocate_classroom_version_number,
     raise_for_classroom_version_allocation_conflict,
 )
+from deeptutor.teaching.repositories.student_visibility import teacher_asset_visible
 from deeptutor.teaching.schema_names import tenant_schema_name
 from deeptutor.teaching.services.classrooms import (
     ClassroomMediaBinding,
@@ -164,6 +165,7 @@ class SqlAlchemyPublicationRepository:
             .where(
                 ClassroomAsset.id == asset_id,
                 ClassroomAsset.tenant_id == self._tenant_id,
+                teacher_asset_visible(ClassroomAsset.id, ClassroomAsset.tenant_id),
             )
             .order_by(
                 ClassroomReviewRequest.created_at.desc(),
@@ -262,6 +264,10 @@ class SqlAlchemyPublicationRepository:
                         Publication.scope == "tenant",
                         ClassroomReviewRequest.scope == "tenant",
                         ClassroomReviewRequest.status == "approved",
+                        teacher_asset_visible(
+                            ClassroomAsset.id,
+                            ClassroomAsset.tenant_id,
+                        ),
                     )
                     .order_by(Publication.created_at.desc(), Publication.id.desc())
                 )
@@ -351,6 +357,10 @@ class SqlAlchemyPublicationRepository:
                         ClassroomReviewRequest.status == "approved",
                         ClassroomReviewRequest.scope == "tenant",
                         ClassroomAsset.lifecycle_state == "approved",
+                        teacher_asset_visible(
+                            ClassroomAsset.id,
+                            ClassroomAsset.tenant_id,
+                        ),
                         ~published_review,
                     )
                     .order_by(
@@ -1270,6 +1280,10 @@ class SqlAlchemyPublicationRepository:
             .where(
                 ClassroomVersion.id == version_id,
                 ClassroomVersion.tenant_id == self._tenant_id,
+                teacher_asset_visible(
+                    ClassroomVersion.classroom_id,
+                    ClassroomVersion.tenant_id,
+                ),
             )
             .order_by(ClassroomDraft.updated_at.desc(), ClassroomDraft.id)
             .limit(1)
@@ -1456,6 +1470,10 @@ class SqlAlchemyPublicationRepository:
                     .where(
                         Assignment.id == assignment_id,
                         Assignment.tenant_id == self._tenant_id,
+                        teacher_asset_visible(
+                            ClassroomVersion.classroom_id,
+                            ClassroomVersion.tenant_id,
+                        ),
                     )
                 )
             ).one_or_none()

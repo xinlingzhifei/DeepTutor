@@ -56,6 +56,7 @@ class PublicationTarget:
     submitted_by: str
     draft_revision: int
     document_sha256: str
+    student_generation_request_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +83,7 @@ class TenantPublicationItem:
     published_by: str
     created_at: datetime
     scope: PublicationScope
+    student_generation_request_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +99,7 @@ class TenantPublicationCandidate:
     submitted_by: str
     review_scope: PublicationScope
     review_status: Literal["pending", "approved", "rejected"]
+    student_generation_request_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,6 +213,7 @@ class VersionTarget:
     course_id: str
     publication_scope: PublicationScope
     publication_class_id: str | None
+    student_generation_request_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,6 +237,7 @@ class AssignmentTarget:
     course_id: str
     class_id: str
     revoked_at: object | None
+    student_generation_request_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -359,7 +364,11 @@ class PublicationService:
         visible_items = tuple(
             item
             for item in items
-            if item.tenant_id == context.tenant_id and item.scope == "tenant"
+            if (
+                item.tenant_id == context.tenant_id
+                and item.scope == "tenant"
+                and item.student_generation_request_id is None
+            )
         )
         visible_candidates = tuple(
             candidate
@@ -368,6 +377,7 @@ class PublicationService:
                 candidate.tenant_id == context.tenant_id
                 and candidate.review_scope == "tenant"
                 and candidate.review_status == "approved"
+                and candidate.student_generation_request_id is None
                 and _allows(
                     context,
                     "classroom.publish",
@@ -391,7 +401,11 @@ class PublicationService:
         idempotency_key: str,
     ) -> PublishedVersionRecord:
         target = await self._repository.get_publication_target(asset_id)
-        if target is None or target.tenant_id != context.tenant_id:
+        if (
+            target is None
+            or target.tenant_id != context.tenant_id
+            or target.student_generation_request_id is not None
+        ):
             raise PublicationNotFound("classroom publication target was not found")
         if not _allows(
             context,
@@ -460,7 +474,11 @@ class PublicationService:
         idempotency_key: str,
     ) -> AssignmentRecord:
         target = await self._repository.get_version_target(version_id)
-        if target is None or target.tenant_id != context.tenant_id:
+        if (
+            target is None
+            or target.tenant_id != context.tenant_id
+            or target.student_generation_request_id is not None
+        ):
             raise PublicationNotFound("classroom version was not found")
         if target.publication_scope == "private":
             raise PublicationAccessDenied("private classroom cannot be assigned")
@@ -513,7 +531,11 @@ class PublicationService:
                 raise ActiveLearningConflict("class learning-state guard is unavailable")
             return existing
         old = await self._repository.get_assignment_target(assignment_id)
-        if old is None or old.tenant_id != context.tenant_id:
+        if (
+            old is None
+            or old.tenant_id != context.tenant_id
+            or old.student_generation_request_id is not None
+        ):
             raise PublicationNotFound("classroom assignment was not found")
         if (
             old.version_id != old_version_id
@@ -526,6 +548,7 @@ class PublicationService:
             target is None
             or target.tenant_id != context.tenant_id
             or target.asset_id != old.asset_id
+            or target.student_generation_request_id is not None
         ):
             raise PublicationAccessDenied("migration target is not accessible")
         if target.publication_scope == "private" or (

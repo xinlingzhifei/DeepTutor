@@ -92,6 +92,7 @@ class ExportSource:
     document_sha256: str
     media_manifest_sha256: str
     media: tuple[ExportSourceMedia, ...]
+    student_generation_request_id: str | None = None
 
     def __post_init__(self) -> None:
         draft = self.classroom_draft_id is not None
@@ -541,7 +542,11 @@ class ClassroomExportService:
         idempotency_key: str,
     ) -> ExportRecord:
         source = await self._repository.get_draft_source(asset_id)
-        if source is None or source.tenant_id != context.tenant_id:
+        if (
+            source is None
+            or source.tenant_id != context.tenant_id
+            or source.student_generation_request_id is not None
+        ):
             raise ExportNotFound("classroom draft not found")
         if not _can_access(context, source):
             raise ExportAccessDenied("classroom export is denied")
@@ -558,7 +563,11 @@ class ClassroomExportService:
         idempotency_key: str,
     ) -> ExportRecord:
         source = await self._repository.get_version_source(version_id)
-        if source is None or source.tenant_id != context.tenant_id:
+        if (
+            source is None
+            or source.tenant_id != context.tenant_id
+            or source.student_generation_request_id is not None
+        ):
             raise ExportNotFound("classroom version not found")
         if not _can_access(context, source):
             raise ExportAccessDenied("classroom export is denied")

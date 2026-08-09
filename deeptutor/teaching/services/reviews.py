@@ -62,6 +62,7 @@ class ReviewTarget:
     owner_id: str
     course_id: str
     class_id: str
+    student_generation_request_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,7 +274,11 @@ class ReviewService:
         idempotency_key: str,
     ) -> ReviewRecord:
         target = await self._repository.get_target(asset_id)
-        if target is None or target.tenant_id != context.tenant_id:
+        if (
+            target is None
+            or target.tenant_id != context.tenant_id
+            or target.student_generation_request_id is not None
+        ):
             raise ReviewNotFound("classroom review target was not found")
         if not _allows(context, "classroom.submit", target):
             raise ReviewAccessDenied("classroom submission is denied")
@@ -301,7 +306,11 @@ class ReviewService:
             if review.tenant_id != context.tenant_id:
                 continue
             target = await self._repository.get_target(review.asset_id)
-            if target is None or target.tenant_id != context.tenant_id:
+            if (
+                target is None
+                or target.tenant_id != context.tenant_id
+                or target.student_generation_request_id is not None
+            ):
                 continue
             if await self._can_review(context, review, target):
                 visible.append(review)
@@ -318,6 +327,7 @@ class ReviewService:
             or evidence.review.tenant_id != context.tenant_id
             or evidence.target.tenant_id != context.tenant_id
             or evidence.review.asset_id != evidence.target.asset_id
+            or evidence.target.student_generation_request_id is not None
         ):
             raise ReviewNotFound("classroom review was not found")
         if not await self._can_review(context, evidence.review, evidence.target):
@@ -456,7 +466,11 @@ class ReviewService:
         if review.status != "pending":
             raise ReviewConflict("classroom review was already decided")
         target = await self._repository.get_target(review.asset_id)
-        if target is None or target.tenant_id != context.tenant_id:
+        if (
+            target is None
+            or target.tenant_id != context.tenant_id
+            or target.student_generation_request_id is not None
+        ):
             raise ReviewNotFound("classroom review was not found")
         policy = await self._repository.get_policy()
         if policy.prohibit_self_review and review.submitted_by == context.user_id:

@@ -32,6 +32,7 @@ from deeptutor.teaching.models.classrooms import (
     transition,
 )
 from deeptutor.teaching.models.platform import AuditLog
+from deeptutor.teaching.repositories.student_visibility import teacher_asset_visible
 from deeptutor.teaching.schema_names import tenant_schema_name
 from deeptutor.teaching.services.reviews import (
     DecideReviewCommand,
@@ -358,6 +359,7 @@ class SqlAlchemyReviewRepository:
             .where(
                 ClassroomAsset.id == asset_id,
                 ClassroomAsset.tenant_id == self._tenant_id,
+                teacher_asset_visible(ClassroomAsset.id, ClassroomAsset.tenant_id),
             )
             .order_by(ClassroomDraft.updated_at.desc(), ClassroomDraft.id)
             .limit(1)
@@ -483,6 +485,10 @@ class SqlAlchemyReviewRepository:
                     .where(
                         ClassroomReviewRequest.id == review_id,
                         ClassroomReviewRequest.tenant_id == self._tenant_id,
+                        teacher_asset_visible(
+                            ClassroomAsset.id,
+                            ClassroomAsset.tenant_id,
+                        ),
                     )
                 )
             ).one_or_none()

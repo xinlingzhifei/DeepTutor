@@ -738,6 +738,27 @@ def test_student_cannot_read_another_users_private_job(api_harness) -> None:
     assert response.status_code == 404
 
 
+def test_teacher_cannot_read_or_mutate_a_students_private_generation_job(
+    api_harness,
+) -> None:
+    app, repository, cancellation, _stores, _store = api_harness
+    repository.jobs["job-student-private"] = _detail(
+        job_id="job-student-private",
+        owner_id="student-1",
+        visibility="private",
+    )
+    app.dependency_overrides[require_tenant] = lambda: _context("teacher-1", "teacher")
+    client = TestClient(app)
+
+    read = client.get("/api/v1/classroom-jobs/job-student-private")
+    cancel = client.post("/api/v1/classroom-jobs/job-student-private/cancel")
+
+    assert read.status_code == 404
+    assert cancel.status_code == 404
+    assert cancellation.calls == []
+    assert repository.jobs["job-student-private"].status == "awaiting_confirmation"
+
+
 def test_non_private_job_still_requires_matching_resource_scope(api_harness) -> None:
     app, repository, _cancellation, _stores, _store = api_harness
     repository.jobs["job-class"] = _detail(

@@ -14,7 +14,10 @@ from deeptutor.teaching.models.classrooms import (
     ClassroomExport,
     ClassroomPublicationMaterialization,
 )
-from deeptutor.teaching.repositories.exports import _source_media
+from deeptutor.teaching.repositories.exports import (
+    SqlAlchemyClassroomExportRepository,
+    _source_media,
+)
 from deeptutor.teaching.repositories.jobs import (
     GenerationJobRequest,
     SqlAlchemyGenerationJobRepository,
@@ -62,6 +65,34 @@ def test_published_version_media_comes_from_exact_finalized_receipts() -> None:
     assert len(media) == 1
     assert media[0].media_id == document.media_manifest[0].media_id
     assert media[0].object_key.endswith("/media/voice.mp3")
+
+
+class _EmptyResult:
+    def one_or_none(self):
+        return None
+
+
+class _StatementCaptureSession:
+    def __init__(self) -> None:
+        self.statements = []
+
+    async def execute(self, statement):
+        self.statements.append(statement)
+        return _EmptyResult()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("loader", ["_draft_parts", "_version_parts"])
+async def test_export_source_queries_exclude_student_classroom_assets(loader: str) -> None:
+    repository = object.__new__(SqlAlchemyClassroomExportRepository)
+    repository._tenant_id = "tenant-a"
+    session = _StatementCaptureSession()
+
+    assert await getattr(repository, loader)(session, "source-a") is None
+
+    sql = str(session.statements[0].compile(compile_kwargs={"literal_binds": True}))
+    assert "student_classroom_assets" in sql
+    assert "NOT (EXISTS" in sql
 
 
 def _job_request(
@@ -148,4 +179,3 @@ async def test_atomic_job_binding_compares_the_frozen_request_to_export_pins() -
     )
     assert exported.generation_job_id == exported.id
     assert exported.status == "quota_reserved"
-

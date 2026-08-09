@@ -611,9 +611,19 @@ class SqlAlchemyClassroomRepository:
         _required(job_id, "job_id", 64)
         if phase not in {"outline", "content"}:
             raise ValueError("generation job phase is invalid")
+        required_lifecycle = (
+            "generating_outline" if phase == "outline" else "generating_content"
+        )
         async with self._session_factory() as session:
             async with session.begin():
-                _, draft = await self._lock_draft(session, asset_id)
+                asset, draft = await self._lock_draft(session, asset_id)
+                if (
+                    draft.generation_job_id is None
+                    and asset.lifecycle_state != required_lifecycle
+                ):
+                    raise ClassroomPersistenceError(
+                        "classroom generation lifecycle is no longer attachable"
+                    )
                 job = await session.scalar(
                     select(GenerationJob).where(
                         GenerationJob.id == job_id,

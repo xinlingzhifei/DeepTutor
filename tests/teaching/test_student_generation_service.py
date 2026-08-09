@@ -138,8 +138,14 @@ def test_approval_source_recheck_is_bound_to_the_original_snapshot() -> None:
 
     assert "tenant_source_bindings.source_snapshot_id = 'source-snapshot-original'" in source_sql
     assert "student_classroom_assets.request_id = 'request-1'" in approval_sql
+    assert "classroom_assets.owner_id" in approval_sql
+    assert "student_classroom_assets.tenant_id = 'tenant-1'" in approval_sql
     assert "classroom_drafts" in approval_sql
+    assert "classroom_drafts.teaching_brief_id" in approval_sql
     assert "teaching_briefs" in approval_sql
+    assert "teaching_briefs.course_id" in approval_sql
+    assert "teaching_briefs.class_id" in approval_sql
+    assert "teaching_briefs.source_snapshot_id" in approval_sql
 
 
 @dataclass

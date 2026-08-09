@@ -227,9 +227,20 @@ class SqlAlchemyStudentClassroomGeneration:
                 public_request_sha256=hashlib.sha256(payload.encode("utf-8")).hexdigest(),
             )
         )
-        details = await self._repository.get_job_details(context.tenant_id, job_id)
-        if details is None:
-            raise StudentClassroomConflict("student generation job is unavailable")
+        try:
+            details = await self._repository.get_job_details(context.tenant_id, job_id)
+            if details is None:
+                raise StudentClassroomConflict(
+                    "student generation job is unavailable"
+                )
+        except Exception:
+            try:
+                await self.request_cancel(context.tenant_id, job_id)
+            except Exception as cancellation_error:
+                raise StudentClassroomConflict(
+                    "student generation job compensation failed"
+                ) from cancellation_error
+            raise
         return self._full_generation._stage(details)
 
     async def get_stage(
@@ -246,6 +257,13 @@ class SqlAlchemyStudentClassroomGeneration:
     async def request_cancel(self, tenant_id: str, job_id: str):
         cancellation = await self._repository.request_cancel(tenant_id, job_id)
         if cancellation is None:
+            details = await self._repository.get_job_details(tenant_id, job_id)
+            if details is not None and details.status in {
+                "succeeded",
+                "failed",
+                "canceled",
+            }:
+                return True
             return None
         if cancellation.running:
             if self._cancellation_gateway is None:
@@ -550,7 +568,11 @@ class SqlAlchemyStudentClassroomWorkflow:
         if record is None:
             return None
         details = await self._details(context, record)
-        if record.lifecycle_state == "canceled":
+        if (
+            record.lifecycle_state == "canceled"
+            and details.quota_state in {"none", "released", "settled"}
+            and details.approval_status != "pending"
+        ):
             return self._view(
                 record,
                 request_id=details.request_id,
@@ -558,6 +580,7 @@ class SqlAlchemyStudentClassroomWorkflow:
                 mode=details.mode,
                 status="canceled",
             )
+        record = await self._repository.mark_canceled(asset_id)
         if record.job_id is not None:
             cancellation = await self._generation.request_cancel(
                 context.tenant_id,
@@ -570,7 +593,6 @@ class SqlAlchemyStudentClassroomWorkflow:
             context.user_id,
             details.request_id,
         )
-        record = await self._repository.mark_canceled(asset_id)
         return self._view(
             record,
             request_id=details.request_id,
@@ -611,9 +633,41 @@ class SqlAlchemyStudentClassroomWorkflow:
             context.tenant_id,
             approval.request_id,
         )
-        if details is None or details.approval_status != "approved":
+        if (
+            details is None
+            or details.request_id != approval.request_id
+            or details.learner_id != approval.learner_id
+            or details.course_id != approval.course_id
+            or details.class_id != approval.class_id
+            or details.approval_id != approval.approval_id
+            or details.approval_status != "approved"
+            or details.decision_outcome != "accepted"
+            or details.quota_state not in {"reserved", "settled"}
+        ):
             raise StudentClassroomConflict("student approval reservation is unavailable")
         asset_id = record.asset_id
+        target_state = (
+            "generating_content" if details.mode == "micro" else "generating_outline"
+        )
+        if record.job_id is not None:
+            if record.lifecycle_state in {"canceled", "failed", "draft"}:
+                raise StudentClassroomConflict(
+                    "student approval job binding is unavailable"
+                )
+            return StudentGenerationApprovalView(
+                approval_id=approval.approval_id,
+                request_id=approval.request_id,
+                asset_id=record.asset_id,
+                learner_id=approval.learner_id,
+                course_id=approval.course_id,
+                class_id=approval.class_id,
+                reason=approval.reason,
+                status=approval.status,
+                decided_by=approval.decided_by,
+                generation_job_id=record.job_id,
+            )
+        if record.lifecycle_state not in {"draft", target_state}:
+            raise StudentClassroomConflict("student approval asset is not recoverable")
         stage = None
         try:
             record = await self._repository.start_student_generation(

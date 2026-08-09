@@ -75,6 +75,78 @@ class CourseGenerationPolicyRecord(TenantBase):
     )
 
 
+class StudentSafetyAssessmentRecord(TenantBase):
+    """Versioned reviewer evidence for one exact student request shape."""
+
+    __tablename__ = "student_safety_assessments"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64))
+    course_id: Mapped[str] = mapped_column(String(64))
+    class_id: Mapped[str] = mapped_column(String(64))
+    mode: Mapped[str] = mapped_column(String(16))
+    content_mode: Mapped[str] = mapped_column(String(32))
+    web_search_requested: Mapped[bool] = mapped_column(Boolean)
+    generally_safe: Mapped[bool] = mapped_column(Boolean)
+    minor_safe: Mapped[bool] = mapped_column(Boolean)
+    restricted_topic: Mapped[bool] = mapped_column(Boolean)
+    reviewed_by: Mapped[str] = mapped_column(String(128))
+    reviewed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    assessment_version: Mapped[int] = mapped_column(Integer)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["class_id", "course_id"],
+            ["tenant.classes.id", "tenant.classes.course_id"],
+            name="fk_student_safety_assessments_class_course",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["course_id", "tenant_id"],
+            [
+                "tenant.course_generation_policies.course_id",
+                "tenant.course_generation_policies.tenant_id",
+            ],
+            name="fk_student_safety_assessments_policy_tenant",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint(
+            "id",
+            "tenant_id",
+            name="uq_student_safety_assessments_id_tenant",
+        ),
+        UniqueConstraint(
+            "tenant_id",
+            "course_id",
+            "class_id",
+            "mode",
+            "content_mode",
+            "web_search_requested",
+            "assessment_version",
+            name="uq_student_safety_assessments_binding_version",
+        ),
+        CheckConstraint("mode IN ('micro', 'full')", name="mode"),
+        CheckConstraint(
+            "content_mode IN ('source_grounded', 'open_creation')",
+            name="content_mode",
+        ),
+        CheckConstraint("assessment_version > 0", name="assessment_version"),
+        CheckConstraint("length(reviewed_by) > 0", name="reviewed_by"),
+        CheckConstraint("reviewed_at < expires_at", name="validity_window"),
+        Index(
+            "ix_student_safety_assessments_lookup",
+            "tenant_id",
+            "course_id",
+            "class_id",
+            "mode",
+            "content_mode",
+            "web_search_requested",
+            "expires_at",
+        ),
+    )
+
+
 class StudentGenerationRequestRecord(TenantBase):
     __tablename__ = "student_generation_requests"
 

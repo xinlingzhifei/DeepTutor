@@ -9,6 +9,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 import pytest
 
+from deeptutor.teaching.brief_builder import TeachingBriefBuilder
 from deeptutor.teaching.permissions import permissions_for_roles
 from deeptutor.teaching.policies.student_generation import (
     PolicyDecision,
@@ -209,6 +210,24 @@ def test_student_create_rejects_client_selected_trusted_fields() -> None:
 
     assert response.status_code == 422
     assert service.create_calls == 0
+
+
+def test_real_app_wires_a_tenant_bound_durable_student_safety_evaluator(
+    monkeypatch,
+) -> None:
+    student_classrooms = _student_router_module()
+    class Engine:
+        def execution_options(self, **_options):
+            return self
+
+    engine = Engine()
+    monkeypatch.setattr(student_classrooms, "get_platform_engine", lambda: engine)
+
+    evaluator = student_classrooms.get_student_safety_evaluator(_context("alice"))
+
+    assert evaluator.__class__.__name__ == "SqlAlchemyStudentSafetyEvaluator"
+    assert evaluator._engine is engine
+    assert evaluator._tenant_id == "tenant-a"
 
 
 def test_student_source_selection_uses_logical_source_ids_only() -> None:
@@ -614,7 +633,7 @@ async def test_sql_workflow_persists_student_marker_before_any_job() -> None:
 
 
 @pytest.mark.asyncio
-async def test_cancel_pending_approval_expires_policy_before_closing_asset() -> None:
+async def test_cancel_pending_approval_closes_asset_fence_before_expiring_policy() -> None:
     service_module = importlib.import_module(
         "deeptutor.teaching.services.student_classrooms"
     )
@@ -689,11 +708,117 @@ async def test_cancel_pending_approval_expires_policy_before_closing_asset() -> 
     canceled = await workflow.cancel(_context("alice"), record.asset_id)
 
     assert canceled.status == "canceled"
-    assert events == ["approval-expired", "asset-canceled"]
+    assert events == ["asset-canceled", "approval-expired"]
     assert workflow._status(
         replace(record, lifecycle_state="canceled", status="canceled"),
         replace(details, approval_status="expired"),
     ) == "canceled"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("details_failure", [None, RuntimeError("details unavailable")])
+async def test_generation_cancels_the_deterministic_job_when_details_are_lost(
+    details_failure,
+) -> None:
+    service_module = importlib.import_module(
+        "deeptutor.teaching.services.student_classrooms"
+    )
+    spec = service_module.TeachingBriefSpec(
+        course_id="course-a",
+        class_id="class-a",
+        objective="Student topic",
+        grade_band="student",
+        audience="student",
+        duration_minutes=15,
+        classroom_mode="micro",
+        web_policy="disabled",
+        template_id="student-default",
+        template_version="1",
+        knowledge_points=(
+            service_module.KnowledgePointSpec(
+                knowledge_point_id="student-topic",
+                title="Student topic",
+                description="Student topic",
+            ),
+        ),
+        content_mode="open_creation",
+        open_creation_acknowledged=True,
+    )
+    brief = TeachingBriefBuilder(
+        _context("alice"),
+        object(),
+    ).open_creation(spec).contract
+    record = ClassroomRecord(
+        tenant_id="tenant-a",
+        asset_id="student-asset-1",
+        draft_id="student-draft-1",
+        job_id=None,
+        lifecycle_state="generating_content",
+        status="generating_content",
+        title="Student classroom",
+        course_id="course-a",
+        class_id="class-a",
+        owner_id="alice",
+        teaching_brief=brief,
+        revision=1,
+        outline=None,
+        document={},
+        classroom_version_id=None,
+        confirmed_outline_sha256=None,
+        validation_report=None,
+        student_generation_request_id="request-1",
+    )
+    created: list[str] = []
+    canceled: list[str] = []
+
+    class Repository:
+        async def create_job_and_reserve(self, request):
+            created.append(request.job_id)
+
+        async def get_job_details(self, _tenant_id: str, _job_id: str):
+            if isinstance(details_failure, Exception):
+                raise details_failure
+            return None
+
+        async def request_cancel(self, tenant_id: str, job_id: str):
+            assert tenant_id == "tenant-a"
+            canceled.append(job_id)
+            return SimpleNamespace(running=False)
+
+    class Selector:
+        async def resolve(self, tenant_id: str):
+            assert tenant_id == "tenant-a"
+            return SimpleNamespace(
+                route_ref="route-a",
+                provider_profile_ref="provider-a",
+                worker_pool_ref="workers-a",
+                queue_ref="queue-a",
+            )
+
+    generation = service_module.SqlAlchemyStudentClassroomGeneration(
+        Repository(),
+        Selector(),
+    )
+    expected_job_id = generation._micro_job_id("tenant-a", record.asset_id)
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "details unavailable"
+            if isinstance(details_failure, Exception)
+            else "student generation job is unavailable"
+        ),
+    ):
+        await generation.start(
+            context=_context("alice"),
+            record=record,
+            estimate=SimpleNamespace(scene_range=(1, 5), quota_units=5),
+            mode="micro",
+            actor_id="alice",
+        )
+
+    assert created == [expected_job_id]
+    assert canceled == [expected_job_id]
 
 
 @pytest.mark.asyncio
@@ -781,6 +906,97 @@ async def test_job_attach_failure_cancels_orphan_job_policy_and_asset() -> None:
         "job-canceled",
         "policy-canceled",
         "asset-canceled",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cancel_retry_converges_after_the_job_is_already_terminal() -> None:
+    service_module = importlib.import_module(
+        "deeptutor.teaching.services.student_classrooms"
+    )
+    events: list[str] = []
+    record = ClassroomRecord(
+        tenant_id="tenant-a",
+        asset_id="student-asset-1",
+        draft_id="student-draft-1",
+        job_id="student-job-1",
+        lifecycle_state="generating_content",
+        status="generating_content",
+        title="Student classroom",
+        course_id="course-a",
+        class_id="class-a",
+        owner_id="alice",
+        teaching_brief=None,
+        revision=1,
+        outline=None,
+        document={},
+        classroom_version_id=None,
+        confirmed_outline_sha256=None,
+        validation_report=None,
+        student_generation_request_id="request-1",
+    )
+    details = StudentGenerationRequestDetails(
+        request_id="request-1",
+        learner_id="alice",
+        course_id="course-a",
+        class_id="class-a",
+        mode="micro",
+        decision_outcome="accepted",
+        decision_reason="accepted",
+        quota_state="reserved",
+        scene_range=(1, 5),
+        duration_minutes_range=(3, 25),
+        estimated_units=5,
+        requires_outline_confirmation=False,
+        approval_id=None,
+        approval_status=None,
+    )
+
+    class Jobs:
+        async def request_cancel(self, tenant_id: str, job_id: str):
+            assert (tenant_id, job_id) == ("tenant-a", "student-job-1")
+            events.append("job-already-terminal")
+            return None
+
+        async def get_job_details(self, tenant_id: str, job_id: str):
+            assert (tenant_id, job_id) == ("tenant-a", "student-job-1")
+            return SimpleNamespace(status="canceled")
+
+    class ClassroomLookup:
+        async def get(self, _context, _asset_id: str):
+            return record
+
+    class ClassroomRepository:
+        async def mark_canceled(self, _asset_id: str):
+            events.append("asset-canceled")
+            return replace(record, lifecycle_state="canceled", status="canceled")
+
+    class RequestRepository:
+        async def get_request_details(self, *_args):
+            return details
+
+        async def cancel_request(self, *_args):
+            events.append("policy-canceled")
+
+    generation = service_module.SqlAlchemyStudentClassroomGeneration(
+        Jobs(),
+        SimpleNamespace(),
+    )
+    workflow = service_module.SqlAlchemyStudentClassroomWorkflow(
+        repository=ClassroomRepository(),
+        classroom_service=ClassroomLookup(),
+        brief_builder=SimpleNamespace(),
+        generation=generation,
+        request_repository=RequestRepository(),
+    )
+
+    result = await workflow.cancel(_context("alice"), record.asset_id)
+
+    assert result.status == "canceled"
+    assert events == [
+        "asset-canceled",
+        "job-already-terminal",
+        "policy-canceled",
     ]
 
 

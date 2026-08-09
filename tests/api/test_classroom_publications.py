@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -11,6 +12,9 @@ import pytest
 
 from deeptutor.api.routers import classroom_reviews
 from deeptutor.teaching.permissions import ScopedPermission
+from deeptutor.teaching.services.publication_repository import (
+    SqlAlchemyPublicationRepository,
+)
 from deeptutor.teaching.services.publications import (
     ActiveLearningConflict,
     AssignmentRecord,
@@ -610,6 +614,120 @@ def test_active_learning_migration_refusal_is_fixed_safe_api_error() -> None:
     )
     assert response.status_code == 409
     assert response.json() == {"detail": "Class has active learning sessions"}
+
+
+def test_teacher_cannot_publish_a_student_classroom() -> None:
+    repository = _PublicationRepository(self_publish=True)
+    repository.target = SimpleNamespace(
+        **{
+            field: getattr(repository.target, field)
+            for field in repository.target.__slots__
+            if field not in {"review_status", "student_generation_request_id"}
+        },
+        student_generation_request_id="student-request-1",
+        review_status="approved",
+    )
+    teacher = _teacher()
+
+    response = _client(_service(repository), teacher).post(
+        "/api/v1/classrooms/asset-1/publish",
+        headers={"Idempotency-Key": "student-publish-bypass"},
+        json={"scope": "class", "classId": "class-a"},
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Classroom publication not found"}
+
+
+def test_teacher_cannot_assign_a_version_from_a_student_classroom() -> None:
+    repository = _PublicationRepository()
+    repository.version_targets["version-student"] = SimpleNamespace(
+        tenant_id="tenant-a",
+        version_id="version-student",
+        asset_id="asset-student",
+        course_id="course-a",
+        publication_scope="tenant",
+        publication_class_id=None,
+        student_generation_request_id="student-request-1",
+    )
+    teacher = _context(
+        "teacher-1",
+        ("classroom.assign", "class", "class-a"),
+    )
+
+    response = _client(_service(repository), teacher).post(
+        "/api/v1/classroom-versions/version-student/assign",
+        headers={"Idempotency-Key": "student-assignment-bypass"},
+        json={"classId": "class-a"},
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Classroom publication not found"}
+
+
+@pytest.mark.parametrize(
+    ("statement_name", "identifier"),
+    [
+        ("_publication_target_statement", "asset-1"),
+        ("_version_target_statement", "version-1"),
+    ],
+)
+def test_publication_queries_exclude_student_classroom_assets(
+    statement_name: str,
+    identifier: str,
+) -> None:
+    repository = object.__new__(SqlAlchemyPublicationRepository)
+    repository._tenant_id = "tenant-a"
+
+    sql = str(
+        getattr(repository, statement_name)(identifier).compile(
+            compile_kwargs={"literal_binds": True}
+        )
+    )
+
+    assert "student_classroom_assets" in sql
+    assert "NOT (EXISTS" in sql
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["library", "assignment"])
+async def test_publication_read_queries_exclude_student_classroom_assets(
+    operation: str,
+) -> None:
+    statements = []
+
+    class Result:
+        def all(self):
+            return []
+
+        def one_or_none(self):
+            return None
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def execute(self, statement):
+            statements.append(statement)
+            return Result()
+
+    repository = object.__new__(SqlAlchemyPublicationRepository)
+    repository._tenant_id = "tenant-a"
+    repository._session_factory = Session
+
+    if operation == "library":
+        assert await repository.list_tenant_library() == ((), ())
+    else:
+        assert await repository.get_assignment_target("assignment-1") is None
+
+    assert statements
+    for statement in statements:
+        sql = str(statement.compile(compile_kwargs={"literal_binds": True}))
+        assert "student_classroom_assets" in sql
+        assert "NOT (EXISTS" in sql
 
 
 def test_tenant_publication_library_api_returns_exact_items_and_candidates() -> None:

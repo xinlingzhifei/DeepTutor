@@ -5,8 +5,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 import uuid
 
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
@@ -20,15 +23,32 @@ from deeptutor.teaching.models.student_generation import (
     StudentClassroomCopyRecord,
     StudentGenerationApprovalRecord,
     StudentGenerationRequestRecord,
+    StudentSafetyAssessmentRecord,
 )
+from deeptutor.teaching.openmaic.data_planes import DataPlaneSelection
+from deeptutor.teaching.permissions import permissions_for_roles
 from deeptutor.teaching.policies.student_generation import StudentGenerationRequest
 from deeptutor.teaching.repositories import student_generation as student_generation_repository
+from deeptutor.teaching.repositories.classrooms import (
+    ClassroomPersistenceError,
+    SqlAlchemyClassroomRepository,
+)
+from deeptutor.teaching.repositories.jobs import SqlAlchemyGenerationJobRepository
 from deeptutor.teaching.repositories.student_generation import (
     SqlAlchemyStudentGenerationRepository,
+    SqlAlchemyStudentSafetyEvaluator,
     StudentSafetyAssessment,
 )
 from deeptutor.teaching.schema_names import tenant_schema_name
-from deeptutor.teaching.services.student_generation import StudentGenerationService
+from deeptutor.teaching.services.student_classrooms import (
+    SqlAlchemyStudentClassroomGeneration,
+)
+from deeptutor.teaching.services.student_generation import (
+    StudentGenerationApprovalNotFound,
+    StudentGenerationApprovalService,
+    StudentGenerationService,
+)
+from deeptutor.teaching.tenant_context import TenantContext, require_tenant
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
@@ -88,6 +108,674 @@ def run_tenant_migration(generation_database, schema_name: str, target: str):
         check=False,
         timeout=120,
     )
+
+
+@pytest.mark.asyncio
+async def test_real_student_route_uses_exact_current_durable_safety_evidence(
+    generation_database,
+    monkeypatch,
+) -> None:
+    from deeptutor.api.routers import student_classrooms
+
+    tenant_id = f"student-safety-{uuid.uuid4().hex[:12]}"
+    learner_id = f"student-{uuid.uuid4().hex[:12]}"
+    route_suffix = uuid.uuid4().hex[:12]
+    provider_id = f"provider-{route_suffix}"
+    route_id = f"route-{route_suffix}"
+    worker_pool = f"workers-{route_suffix}"
+    queue_ref = f"queue-{route_suffix}"
+    schema_name = tenant_schema_name(tenant_id)
+    generation_database.migrate_tenant(tenant_id)
+    engine = create_async_engine(generation_database.url, poolclass=NullPool)
+    request = StudentGenerationRequest(
+        course_id="course-1",
+        class_id="class-1",
+        mode="micro",
+        content_mode="open_creation",
+        web_search_requested=False,
+    )
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO platform.tenants "
+                    "(id, name, status, data_plane_mode) "
+                    "VALUES (:tenant_id, 'Student safety', 'active', 'shared')"
+                ),
+                {"tenant_id": tenant_id},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO platform.tenant_memberships (tenant_id, user_id) "
+                    "VALUES (:tenant_id, :learner_id)"
+                ),
+                {"tenant_id": tenant_id, "learner_id": learner_id},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO platform.role_grants "
+                    "(tenant_id, user_id, role, scope_type, scope_id) "
+                    "VALUES (:tenant_id, :learner_id, 'student', 'class', 'class-1')"
+                ),
+                {"tenant_id": tenant_id, "learner_id": learner_id},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO platform.provider_profiles "
+                    "(id, scope, tenant_id, owner_key, provider_type, model_name, "
+                    "api_base_url, secret_ref, status) VALUES "
+                    "(:provider_id, 'shared', NULL, 'shared', 'openai-compatible', "
+                    "'student-test-model', NULL, :secret_ref, 'active')"
+                ),
+                {
+                    "provider_id": provider_id,
+                    "secret_ref": f"tests/student/{route_suffix}",
+                },
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO platform.data_plane_routes "
+                    "(id, tenant_id, owner_key, mode, base_url, worker_pool, "
+                    "queue_name, provider_profile_id, status, health_status) VALUES "
+                    "(:route_id, NULL, 'shared', 'shared', 'http://openmaic.invalid', "
+                    ":worker_pool, :queue_ref, :provider_id, 'active', 'healthy')"
+                ),
+                {
+                    "route_id": route_id,
+                    "worker_pool": worker_pool,
+                    "queue_ref": queue_ref,
+                    "provider_id": provider_id,
+                },
+            )
+            await connection.execute(
+                text(
+                    f'INSERT INTO "{schema_name}".courses (id, title) VALUES '
+                    "('course-1', 'Physics'), ('course-2', 'Chemistry')"
+                )
+            )
+            await connection.execute(
+                text(
+                    f'INSERT INTO "{schema_name}".classes (id, course_id, name) VALUES '
+                    "('class-1', 'course-1', 'Class 1'), "
+                    "('class-2', 'course-2', 'Class 2')"
+                )
+            )
+            await connection.execute(
+                text(
+                    f'INSERT INTO "{schema_name}".enrollments '
+                    "(class_id, learner_id, status) "
+                    "VALUES ('class-1', :learner_id, 'active')"
+                ),
+                {"learner_id": learner_id},
+            )
+            await connection.execute(
+                text(
+                    f'INSERT INTO "{schema_name}".course_generation_policies '
+                    "(course_id, tenant_id, allow_student_micro, allow_student_full, "
+                    "allowed_content_modes, allow_web_search, daily_student_units, "
+                    "monthly_student_units, updated_by) VALUES "
+                    "('course-1', :tenant_id, true, true, "
+                    "'source_grounded,open_creation', true, 0, 100, 'teacher-1'), "
+                    "('course-2', :tenant_id, true, true, "
+                    "'source_grounded,open_creation', true, 0, 100, 'teacher-1')"
+                ),
+                {"tenant_id": tenant_id},
+            )
+            await connection.execute(
+                text(
+                    f'INSERT INTO "{schema_name}".student_safety_assessments '
+                    "(id, tenant_id, course_id, class_id, mode, content_mode, "
+                    "web_search_requested, generally_safe, minor_safe, restricted_topic, "
+                    "reviewed_by, reviewed_at, assessment_version, expires_at) "
+                    "VALUES ('assessment-current', :tenant_id, 'course-1', 'class-1', "
+                    "'micro', 'open_creation', false, true, true, false, 'teacher-1', "
+                    "clock_timestamp() - interval '1 minute', 1, "
+                    "clock_timestamp() + interval '1 hour'), "
+                    "('assessment-expired', :tenant_id, 'course-1', 'class-1', "
+                    "'micro', 'open_creation', true, true, true, false, 'teacher-1', "
+                    "clock_timestamp() - interval '2 hours', 1, "
+                    "clock_timestamp() - interval '1 hour')"
+                ),
+                {"tenant_id": tenant_id},
+            )
+
+        job_repository = SqlAlchemyGenerationJobRepository(engine)
+        await job_repository.grant_quota(
+            tenant_id,
+            grant_id=f"grant-{route_suffix}",
+            units=100,
+        )
+
+        class Selector:
+            async def resolve(self, selected_tenant_id: str):
+                assert selected_tenant_id == tenant_id
+                return DataPlaneSelection(
+                    tenant_id=tenant_id,
+                    route_ref=route_id,
+                    provider_profile_ref=provider_id,
+                    mode="shared",
+                    worker_pool_ref=worker_pool,
+                    queue_ref=queue_ref,
+                )
+
+        evaluator = SqlAlchemyStudentSafetyEvaluator(engine, tenant_id)
+        current = await evaluator.assess(tenant_id, learner_id, request)
+        assert current == StudentSafetyAssessment(True, True, False)
+        assert await evaluator.assess("tenant-other", learner_id, request) == (
+            StudentSafetyAssessment(False, False, True)
+        )
+        for drifted in (
+            StudentGenerationRequest("course-2", "class-2", "micro", "open_creation", False),
+            StudentGenerationRequest("course-1", "class-1", "full", "open_creation", False),
+            StudentGenerationRequest(
+                "course-1", "class-1", "micro", "source_grounded", False
+            ),
+            StudentGenerationRequest("course-1", "class-1", "micro", "open_creation", True),
+        ):
+            assert await evaluator.assess(tenant_id, learner_id, drifted) == (
+                StudentSafetyAssessment(False, False, True)
+            )
+
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    f'INSERT INTO "{schema_name}".student_safety_assessments '
+                    "(id, tenant_id, course_id, class_id, mode, content_mode, "
+                    "web_search_requested, generally_safe, minor_safe, restricted_topic, "
+                    "reviewed_by, reviewed_at, assessment_version, expires_at) "
+                    "VALUES ('assessment-ambiguous', :tenant_id, 'course-1', 'class-1', "
+                    "'micro', 'open_creation', false, true, true, false, 'teacher-1', "
+                    "clock_timestamp() - interval '1 minute', 2, "
+                    "clock_timestamp() + interval '1 hour')"
+                ),
+                {"tenant_id": tenant_id},
+            )
+        assert await evaluator.assess(tenant_id, learner_id, request) == (
+            StudentSafetyAssessment(False, False, True)
+        )
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    f'DELETE FROM "{schema_name}".student_safety_assessments '
+                    "WHERE id = 'assessment-ambiguous'"
+                )
+            )
+
+        context = TenantContext(
+            tenant_id=tenant_id,
+            schema_name=schema_name,
+            user_id=learner_id,
+            permissions=permissions_for_roles(
+                {"student"},
+                scope_type="class",
+                scope_id="class-1",
+                tenant_id=tenant_id,
+            ),
+        )
+        monkeypatch.setattr(student_classrooms, "get_platform_engine", lambda: engine)
+        application = FastAPI()
+        application.include_router(student_classrooms.router, prefix="/api/v1")
+        selected_context = {"value": context}
+        application.dependency_overrides[require_tenant] = lambda: selected_context["value"]
+        application.dependency_overrides[
+            student_classrooms.get_source_repository
+        ] = lambda: object()
+        application.dependency_overrides[
+            student_classrooms.get_source_store_provider
+        ] = lambda: object()
+        application.dependency_overrides[
+            student_classrooms.get_job_repository
+        ] = lambda: job_repository
+        application.dependency_overrides[
+            student_classrooms.get_data_plane_selector
+        ] = Selector
+        application.dependency_overrides[
+            student_classrooms.get_cancellation_gateway
+        ] = lambda: object()
+        client = TestClient(application)
+        payload = {
+            "courseId": "course-1",
+            "classId": "class-1",
+            "mode": "micro",
+            "contentMode": "open_creation",
+            "webSearchRequested": False,
+        }
+
+        accepted = client.post("/api/v1/student-classrooms", json=payload)
+
+        assert accepted.status_code == 202, accepted.text
+        assert accepted.json()["status"] == "awaiting_approval"
+        assert accepted.json()["generationJobId"] is None
+        async with engine.connect() as connection:
+            assert await connection.scalar(
+                text(f'SELECT count(*) FROM "{schema_name}".generation_jobs')
+            ) == 0
+        reviewer = TenantContext(
+            tenant_id=tenant_id,
+            schema_name=schema_name,
+            user_id="teacher-1",
+            permissions=permissions_for_roles(
+                {"content_reviewer"},
+                scope_type="class",
+                scope_id="class-1",
+                tenant_id=tenant_id,
+            ),
+        )
+        approval_service = StudentGenerationApprovalService(
+            tenant_id=tenant_id,
+            repository=SqlAlchemyStudentGenerationRepository(
+                engine,
+                tenant_id,
+                safety_evaluator=evaluator,
+            ),
+        )
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    f'UPDATE "{schema_name}".classroom_assets SET owner_id = '
+                    "'tampered-owner' WHERE id = :asset_id"
+                ),
+                {"asset_id": accepted.json()["assetId"]},
+            )
+        with pytest.raises(StudentGenerationApprovalNotFound):
+            await approval_service.approve(reviewer, accepted.json()["approvalId"])
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    f'UPDATE "{schema_name}".classroom_assets SET owner_id = '
+                    ":learner_id WHERE id = :asset_id"
+                ),
+                {
+                    "asset_id": accepted.json()["assetId"],
+                    "learner_id": learner_id,
+                },
+            )
+            original_brief_id = await connection.scalar(
+                text(
+                    f'SELECT teaching_brief_id FROM "{schema_name}".classroom_drafts '
+                    "WHERE classroom_id = :asset_id"
+                ),
+                {"asset_id": accepted.json()["assetId"]},
+            )
+            await connection.execute(
+                text(
+                    f'INSERT INTO "{schema_name}".teaching_briefs '
+                    "(id, tenant_id, source_snapshot_id, course_id, class_id, "
+                    "brief_version, document, document_sha256, created_by) "
+                    "SELECT 'brief-wrong-binding', tenant_id, source_snapshot_id, "
+                    "'course-2', 'class-2', brief_version, document, "
+                    "document_sha256, created_by FROM "
+                    f'"{schema_name}".teaching_briefs WHERE id = :brief_id'
+                ),
+                {"brief_id": original_brief_id},
+            )
+            await connection.execute(
+                text(
+                    f'UPDATE "{schema_name}".classroom_drafts SET teaching_brief_id = '
+                    "'brief-wrong-binding' WHERE classroom_id = :asset_id"
+                ),
+                {"asset_id": accepted.json()["assetId"]},
+            )
+        with pytest.raises(StudentGenerationApprovalNotFound):
+            await approval_service.approve(reviewer, accepted.json()["approvalId"])
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    f'UPDATE "{schema_name}".classroom_drafts SET teaching_brief_id = '
+                    ":brief_id WHERE classroom_id = :asset_id"
+                ),
+                {
+                    "brief_id": original_brief_id,
+                    "asset_id": accepted.json()["assetId"],
+                },
+            )
+        approved = await approval_service.approve(
+            reviewer,
+            accepted.json()["approvalId"],
+        )
+        assert approved.status == "approved"
+        selected_context["value"] = reviewer
+
+        recoverable = client.get("/api/v1/student-generation-approvals")
+
+        assert recoverable.status_code == 200, recoverable.text
+        assert [item["approvalId"] for item in recoverable.json()["items"]] == [
+            approved.approval_id
+        ]
+        recovered = client.post(
+            f'/api/v1/student-generation-approvals/{accepted.json()["approvalId"]}/approve',
+            json={},
+        )
+
+        assert recovered.status_code == 202, recovered.text
+        recovered_job_id = recovered.json()["generationJobId"]
+        assert recovered.json()["status"] == "approved"
+        assert recovered_job_id is not None
+        hidden_after_binding = client.get("/api/v1/student-generation-approvals")
+        assert hidden_after_binding.status_code == 200
+        assert hidden_after_binding.json()["items"] == []
+        async with engine.connect() as connection:
+            job_count = await connection.scalar(
+                text(
+                    f'SELECT count(*) FROM "{schema_name}".generation_jobs '
+                    "WHERE classroom_draft_id IS NOT NULL"
+                )
+            )
+            bound_job_id = await connection.scalar(
+                text(
+                    f'SELECT generation_job_id FROM "{schema_name}".classroom_drafts '
+                    "WHERE classroom_id = :asset_id"
+                ),
+                {"asset_id": accepted.json()["assetId"]},
+            )
+        assert (job_count, bound_job_id) == (1, recovered_job_id)
+
+        selected_context["value"] = context
+        raced = client.post("/api/v1/student-classrooms", json=payload)
+        assert raced.status_code == 202, raced.text
+        classroom_repository = SqlAlchemyClassroomRepository(engine, tenant_id)
+        raced_record = await classroom_repository.start_student_generation(
+            raced.json()["assetId"],
+            "micro",
+        )
+        raced_generation = SqlAlchemyStudentClassroomGeneration(
+            job_repository,
+            Selector(),
+        )
+        raced_stage = await raced_generation.start(
+            context=context,
+            record=raced_record,
+            estimate=SimpleNamespace(scene_range=(1, 5), quota_units=5),
+            mode="micro",
+            actor_id=learner_id,
+        )
+        await classroom_repository.mark_canceled(raced_record.asset_id)
+        try:
+            with pytest.raises(ClassroomPersistenceError):
+                await classroom_repository.attach_generation_job(
+                    raced_record.asset_id,
+                    raced_stage.job_id,
+                    "content",
+                )
+        finally:
+            await raced_generation.request_cancel(tenant_id, raced_stage.job_id)
+            await SqlAlchemyStudentGenerationRepository(
+                engine,
+                tenant_id,
+                safety_evaluator=evaluator,
+            ).cancel_request(
+                tenant_id,
+                learner_id,
+                raced.json()["requestId"],
+            )
+
+        source_revoked = client.post("/api/v1/student-classrooms", json=payload)
+        assert source_revoked.status_code == 202, source_revoked.text
+        async with engine.begin() as connection:
+            source_brief_id = await connection.scalar(
+                text(
+                    f'SELECT teaching_brief_id FROM "{schema_name}".classroom_drafts '
+                    "WHERE classroom_id = :asset_id"
+                ),
+                {"asset_id": source_revoked.json()["assetId"]},
+            )
+            await connection.execute(
+                text(
+                    f'INSERT INTO "{schema_name}".source_snapshots '
+                    "(id, tenant_id, source_type, source_id, resource_owner_id, "
+                    "source_upload_id, display_name, source_revision, content_sha256, "
+                    "permission_sha256, citation_manifest, created_by) VALUES "
+                    "('snapshot-approval-original', :tenant_id, 'manual', "
+                    "'source-approval-original', 'tenant-workspace', NULL, NULL, "
+                    "'revision-1', :content_sha256, :permission_sha256, '[]', 'teacher-1')"
+                ),
+                {
+                    "tenant_id": tenant_id,
+                    "content_sha256": "a" * 64,
+                    "permission_sha256": "b" * 64,
+                },
+            )
+            await connection.execute(
+                text(
+                    f'INSERT INTO "{schema_name}".tenant_source_bindings '
+                    "(id, tenant_id, source_snapshot_id, course_id, class_id, bound_by) "
+                    "VALUES ('binding-approval-original', :tenant_id, "
+                    "'snapshot-approval-original', 'course-1', 'class-1', 'teacher-1')"
+                ),
+                {"tenant_id": tenant_id},
+            )
+            await connection.execute(
+                text(
+                    f'INSERT INTO "{schema_name}".teaching_briefs '
+                    "(id, tenant_id, source_snapshot_id, course_id, class_id, "
+                    "brief_version, document, document_sha256, created_by) "
+                    "SELECT 'brief-source-approval', tenant_id, "
+                    "'snapshot-approval-original', course_id, class_id, brief_version, "
+                    "document, document_sha256, created_by FROM "
+                    f'"{schema_name}".teaching_briefs WHERE id = :brief_id'
+                ),
+                {"brief_id": source_brief_id},
+            )
+            await connection.execute(
+                text(
+                    f'UPDATE "{schema_name}".classroom_drafts SET teaching_brief_id = '
+                    "'brief-source-approval' WHERE classroom_id = :asset_id"
+                ),
+                {"asset_id": source_revoked.json()["assetId"]},
+            )
+            await connection.execute(
+                text(
+                    f'UPDATE "{schema_name}".student_generation_requests SET '
+                    "content_mode = 'source_grounded' WHERE id = :request_id"
+                ),
+                {"request_id": source_revoked.json()["requestId"]},
+            )
+            await connection.execute(
+                text(
+                    f'INSERT INTO "{schema_name}".student_safety_assessments '
+                    "(id, tenant_id, course_id, class_id, mode, content_mode, "
+                    "web_search_requested, generally_safe, minor_safe, restricted_topic, "
+                    "reviewed_by, reviewed_at, assessment_version, expires_at) VALUES "
+                    "('assessment-source-grounded', :tenant_id, 'course-1', 'class-1', "
+                    "'micro', 'source_grounded', false, true, true, false, 'teacher-1', "
+                    "clock_timestamp() - interval '1 minute', 1, "
+                    "clock_timestamp() + interval '1 hour')"
+                ),
+                {"tenant_id": tenant_id},
+            )
+            await connection.execute(
+                text(
+                    f'DELETE FROM "{schema_name}".tenant_source_bindings '
+                    "WHERE id = 'binding-approval-original'"
+                )
+            )
+
+        expired_source = await approval_service.approve(
+            reviewer,
+            source_revoked.json()["approvalId"],
+        )
+
+        assert expired_source.status == "expired"
+        async with engine.connect() as connection:
+            source_request_state = (
+                await connection.execute(
+                    text(
+                        f'SELECT decision_outcome, quota_state FROM "{schema_name}".'
+                        "student_generation_requests WHERE id = :request_id"
+                    ),
+                    {"request_id": source_revoked.json()["requestId"]},
+                )
+            ).one()
+        assert source_request_state == ("denied", "none")
+
+        locked = client.post("/api/v1/student-classrooms", json=payload)
+        assert locked.status_code == 202, locked.text
+        approval_gate_key = int(uuid.uuid4().hex[:12], 16)
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    f'CREATE FUNCTION "{schema_name}".hold_student_approval_update() '
+                    "RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN "
+                    f"PERFORM pg_advisory_xact_lock({approval_gate_key}); "
+                    "RETURN NEW; END $$"
+                )
+            )
+            await connection.execute(
+                text(
+                    f'CREATE TRIGGER hold_student_approval_update BEFORE UPDATE ON '
+                    f'"{schema_name}".student_generation_requests FOR EACH ROW '
+                    f'WHEN (OLD.id = \'{locked.json()["requestId"]}\') '
+                    f'EXECUTE FUNCTION "{schema_name}".hold_student_approval_update()'
+                )
+            )
+        gate_connection = await engine.connect()
+        approval_task = None
+        owner_update_task = None
+        try:
+            gate_pid = await gate_connection.scalar(text("SELECT pg_backend_pid()"))
+            await gate_connection.execute(
+                text("SELECT pg_advisory_lock(:gate_key)"),
+                {"gate_key": approval_gate_key},
+            )
+            approval_task = asyncio.create_task(
+                approval_service.approve(reviewer, locked.json()["approvalId"])
+            )
+            for _attempt in range(100):
+                async with engine.connect() as connection:
+                    approval_is_waiting = await connection.scalar(
+                        text(
+                            "SELECT EXISTS (SELECT 1 FROM pg_locks waiting "
+                            "JOIN pg_locks holding ON "
+                            "holding.locktype = waiting.locktype "
+                            "AND holding.database IS NOT DISTINCT FROM waiting.database "
+                            "AND holding.classid = waiting.classid "
+                            "AND holding.objid = waiting.objid "
+                            "AND holding.objsubid = waiting.objsubid "
+                            "WHERE waiting.locktype = 'advisory' "
+                            "AND waiting.granted = false AND holding.granted = true "
+                            "AND holding.pid = :gate_pid)"
+                        ),
+                        {"gate_pid": gate_pid},
+                    )
+                if approval_is_waiting:
+                    break
+                await asyncio.sleep(0.05)
+            else:
+                pytest.fail("approval did not reach the locked update gate")
+
+            async def tamper_locked_owner() -> None:
+                async with engine.begin() as connection:
+                    await connection.execute(
+                        text(
+                            f'UPDATE "{schema_name}".classroom_assets SET owner_id = '
+                            "'tampered-after-lock' WHERE id = :asset_id"
+                        ),
+                        {"asset_id": locked.json()["assetId"]},
+                    )
+
+            owner_update_task = asyncio.create_task(tamper_locked_owner())
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    asyncio.shield(owner_update_task),
+                    timeout=0.25,
+                )
+            await gate_connection.execute(
+                text("SELECT pg_advisory_unlock(:gate_key)"),
+                {"gate_key": approval_gate_key},
+            )
+            locked_approved = await approval_task
+            await owner_update_task
+        finally:
+            await gate_connection.execute(text("SELECT pg_advisory_unlock_all()"))
+            await gate_connection.close()
+            if approval_task is not None and not approval_task.done():
+                approval_task.cancel()
+            if owner_update_task is not None and not owner_update_task.done():
+                owner_update_task.cancel()
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        f'DROP TRIGGER IF EXISTS hold_student_approval_update ON '
+                        f'"{schema_name}".student_generation_requests'
+                    )
+                )
+                await connection.execute(
+                    text(
+                        f'DROP FUNCTION IF EXISTS '
+                        f'"{schema_name}".hold_student_approval_update()'
+                    )
+                )
+        assert locked_approved.status == "approved"
+        with pytest.raises(StudentGenerationApprovalNotFound):
+            await approval_service.approve(reviewer, locked.json()["approvalId"])
+        await SqlAlchemyStudentGenerationRepository(
+            engine,
+            tenant_id,
+            safety_evaluator=evaluator,
+        ).abort_approved_request(
+            tenant_id,
+            reviewer.user_id,
+            locked.json()["approvalId"],
+        )
+        await classroom_repository.mark_canceled(locked.json()["assetId"])
+
+        selected_context["value"] = reviewer
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(f'DELETE FROM "{schema_name}".student_safety_assessments')
+            )
+
+        replayed_bound = client.post(
+            f'/api/v1/student-generation-approvals/{accepted.json()["approvalId"]}/approve',
+            json={},
+        )
+
+        assert replayed_bound.status_code == 202, replayed_bound.text
+        assert replayed_bound.json()["generationJobId"] == recovered_job_id
+        async with engine.connect() as connection:
+            assert await connection.scalar(
+                text(
+                    f'SELECT count(*) FROM "{schema_name}".generation_jobs '
+                    "WHERE id = :job_id"
+                ),
+                {"job_id": recovered_job_id},
+            ) == 1
+
+        missing = client.post("/api/v1/student-classrooms", json=payload)
+
+        assert missing.status_code == 403
+    finally:
+        async with engine.begin() as connection:
+            await connection.execute(
+                text("DELETE FROM platform.audit_log WHERE tenant_id = :tenant_id"),
+                {"tenant_id": tenant_id},
+            )
+            await connection.execute(DropSchema(schema_name, cascade=True))
+            await connection.execute(
+                text("DELETE FROM platform.role_grants WHERE tenant_id = :tenant_id"),
+                {"tenant_id": tenant_id},
+            )
+            await connection.execute(
+                text("DELETE FROM platform.tenant_memberships WHERE tenant_id = :tenant_id"),
+                {"tenant_id": tenant_id},
+            )
+            await connection.execute(
+                text("DELETE FROM platform.tenant_schema_states WHERE tenant_id = :tenant_id"),
+                {"tenant_id": tenant_id},
+            )
+            await connection.execute(
+                text("DELETE FROM platform.data_plane_routes WHERE id = :route_id"),
+                {"route_id": route_id},
+            )
+            await connection.execute(
+                text("DELETE FROM platform.provider_profiles WHERE id = :provider_id"),
+                {"provider_id": provider_id},
+            )
+            await connection.execute(
+                text("DELETE FROM platform.tenants WHERE id = :tenant_id"),
+                {"tenant_id": tenant_id},
+            )
+        await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -167,7 +855,8 @@ async def test_postgres_student_generation_migration_constraints_state_and_downg
                         "WHERE table_schema = :schema_name "
                         "AND table_name IN ('course_generation_policies', "
                         "'student_generation_requests', 'student_generation_approvals', "
-                        "'student_classroom_assets', 'student_classroom_copies')"
+                        "'student_classroom_assets', 'student_classroom_copies', "
+                        "'student_safety_assessments')"
                     ),
                     {"schema_name": schema_name},
                 )
@@ -197,7 +886,8 @@ async def test_postgres_student_generation_migration_constraints_state_and_downg
                         "WHERE table_schema = :schema_name "
                         "AND table_name IN ('course_generation_policies', "
                         "'student_generation_requests', 'student_generation_approvals', "
-                        "'student_classroom_assets', 'student_classroom_copies')"
+                        "'student_classroom_assets', 'student_classroom_copies', "
+                        "'student_safety_assessments')"
                     ),
                     {"schema_name": schema_name},
                 )
@@ -208,6 +898,7 @@ async def test_postgres_student_generation_migration_constraints_state_and_downg
             "student_generation_approvals",
             "student_classroom_assets",
             "student_classroom_copies",
+            "student_safety_assessments",
         }
         assert tables - tables_before == new_tables
         assert {
@@ -228,6 +919,9 @@ async def test_postgres_student_generation_migration_constraints_state_and_downg
             "fk_student_classroom_copies_teacher_tenant",
             "uq_student_classroom_assets_request_tenant",
             "uq_student_classroom_copies_teacher_tenant",
+            "fk_student_safety_assessments_class_course",
+            "fk_student_safety_assessments_policy_tenant",
+            "uq_student_safety_assessments_binding_version",
         }.issubset(constraint_names)
         assert pending_index is not None
         assert "UNIQUE INDEX" in pending_index
@@ -241,6 +935,7 @@ async def test_postgres_student_generation_migration_constraints_state_and_downg
                 StudentGenerationApprovalRecord,
                 StudentClassroomAssetRecord,
                 StudentClassroomCopyRecord,
+                StudentSafetyAssessmentRecord,
             )
         }
         actual_column_names: dict[str, set[str]] = {table_name: set() for table_name in new_tables}
@@ -256,7 +951,7 @@ async def test_postgres_student_generation_migration_constraints_state_and_downg
             for table_name, table in expected_tables.items()
             for column in table.c
         }
-        assert (revision, state_revision) == ("20260809_0014", "20260809_0014")
+        assert (revision, state_revision) == ("20260809_0015", "20260809_0015")
 
         with pytest.raises(IntegrityError):
             async with engine.begin() as connection:
@@ -331,7 +1026,7 @@ async def test_postgres_student_generation_migration_constraints_state_and_downg
                 ),
                 {"schema_name": schema_name},
             )
-        assert (revision, state_revision) == ("20260809_0014", "20260809_0014")
+        assert (revision, state_revision) == ("20260809_0015", "20260809_0015")
     finally:
         async with engine.begin() as connection:
             await connection.execute(

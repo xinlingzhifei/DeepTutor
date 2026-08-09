@@ -534,6 +534,75 @@ def test_review_api_maps_stale_validation_and_returns_warnings() -> None:
     assert response.json()["items"][0]["warnings"][0]["code"] == "needs_caption"
 
 
+def test_teacher_cannot_submit_a_student_classroom_for_review() -> None:
+    repository = _ReviewRepository()
+    repository.target = SimpleNamespace(
+        **{
+            field: getattr(repository.target, field)
+            for field in repository.target.__slots__
+            if field != "student_generation_request_id"
+        },
+        student_generation_request_id="student-request-1",
+    )
+    teacher = _context(
+        "teacher-1",
+        ("classroom.submit", "class", "class-a"),
+    )
+
+    response = _client(ReviewService(repository), teacher).post(
+        "/api/v1/classrooms/asset-1/submit",
+        headers={"Idempotency-Key": "student-review-bypass"},
+        json={"scope": "class", "classId": "class-a"},
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Classroom review not found"}
+
+
+def test_review_target_query_excludes_student_classroom_assets() -> None:
+    repository = object.__new__(SqlAlchemyReviewRepository)
+    repository._tenant_id = "tenant-a"
+
+    sql = str(
+        repository._target_statement("asset-1").compile(
+            compile_kwargs={"literal_binds": True}
+        )
+    )
+
+    assert "student_classroom_assets" in sql
+    assert "NOT (EXISTS" in sql
+
+
+@pytest.mark.asyncio
+async def test_review_detail_query_excludes_student_classroom_assets() -> None:
+    statements = []
+
+    class Result:
+        def one_or_none(self):
+            return None
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def execute(self, statement):
+            statements.append(statement)
+            return Result()
+
+    repository = object.__new__(SqlAlchemyReviewRepository)
+    repository._tenant_id = "tenant-a"
+    repository._session_factory = Session
+
+    assert await repository.get_detail("review-1") is None
+
+    sql = str(statements[0].compile(compile_kwargs={"literal_binds": True}))
+    assert "student_classroom_assets" in sql
+    assert "NOT (EXISTS" in sql
+
+
 def test_review_detail_api_returns_exact_camel_case_evidence() -> None:
     service, _ = _detail_service()
     reviewer = _context(

@@ -26,6 +26,7 @@ from deeptutor.teaching.object_store import (
     ClassroomArtifactStore,
     ObjectStoreNotFound,
 )
+from deeptutor.teaching.repositories.student_visibility import teacher_asset_visible
 from deeptutor.teaching.schema_names import tenant_schema_name
 from deeptutor.teaching.services.exports import (
     ExportCommand,
@@ -244,6 +245,10 @@ class SqlAlchemyClassroomExportRepository:
             .where(
                 ClassroomDraft.classroom_id == asset_id,
                 ClassroomDraft.tenant_id == self._tenant_id,
+                teacher_asset_visible(
+                    ClassroomDraft.classroom_id,
+                    ClassroomDraft.tenant_id,
+                ),
             )
         )
         if lock:
@@ -376,6 +381,10 @@ class SqlAlchemyClassroomExportRepository:
             .where(
                 ClassroomVersion.id == version_id,
                 ClassroomVersion.tenant_id == self._tenant_id,
+                teacher_asset_visible(
+                    ClassroomVersion.classroom_id,
+                    ClassroomVersion.tenant_id,
+                ),
             )
         )
         if lock:
@@ -704,6 +713,10 @@ class SqlAlchemyClassroomExportRepository:
                     ClassroomExport.id == export_id,
                     ClassroomExport.tenant_id == self._tenant_id,
                     ClassroomExport.classroom_id.is_not(None),
+                    teacher_asset_visible(
+                        ClassroomExport.classroom_id,
+                        ClassroomExport.tenant_id,
+                    ),
                 )
             )
             return await self._record(session, model) if model is not None else None

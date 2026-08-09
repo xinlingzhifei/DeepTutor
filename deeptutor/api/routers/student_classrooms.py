@@ -28,8 +28,8 @@ from deeptutor.teaching.repositories.classrooms import (
 )
 from deeptutor.teaching.repositories.jobs import IdempotencyConflict
 from deeptutor.teaching.repositories.student_generation import (
-    FailClosedStudentSafetyEvaluator,
     SqlAlchemyStudentGenerationRepository,
+    SqlAlchemyStudentSafetyEvaluator,
     StudentGenerationConfigurationError,
 )
 from deeptutor.teaching.services.classrooms import (
@@ -210,8 +210,13 @@ class StudentClassroomServiceLike(Protocol):
     ): ...
 
 
-def get_student_safety_evaluator():
-    return FailClosedStudentSafetyEvaluator()
+def get_student_safety_evaluator(
+    context: TenantContext = Depends(require_tenant),
+) -> SqlAlchemyStudentSafetyEvaluator:
+    return SqlAlchemyStudentSafetyEvaluator(
+        get_platform_engine(),
+        context.tenant_id,
+    )
 
 
 def get_student_generation_repository(

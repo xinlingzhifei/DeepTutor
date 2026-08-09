@@ -58,6 +58,7 @@ from .student_generation import (
     StudentClassroomCopyRecord,
     StudentGenerationApprovalRecord,
     StudentGenerationRequestRecord,
+    StudentSafetyAssessmentRecord,
 )
 from .tenant import Course, Enrollment, TeachingClass, TenantBase
 
@@ -100,6 +101,7 @@ __all__ = [
     "SourceUpload",
     "StudentGenerationApprovalRecord",
     "StudentGenerationRequestRecord",
+    "StudentSafetyAssessmentRecord",
     "StudentClassroomAssetRecord",
     "StudentClassroomCopyRecord",
     "TeachingBrief",

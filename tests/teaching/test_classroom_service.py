@@ -1698,6 +1698,34 @@ async def test_authorized_draft_media_read_falls_back_to_exact_bound_version_med
     assert repository.version_media_calls == [(created.asset_id, media_id)]
 
 
+@pytest.mark.asyncio
+async def test_teacher_media_read_hides_a_student_classroom_marker() -> None:
+    context = _context()
+    service, repository, store = _service_with_store(context)
+    created = await service.create(context, _request())
+    media_id = "generated-media-student"
+    repository.records[created.asset_id] = replace(
+        repository.records[created.asset_id],
+        owner_id="student-a",
+        student_generation_request_id="student-request-a",
+    )
+    repository.version_media[(created.asset_id, media_id)] = SimpleNamespace(
+        id=media_id,
+        classroom_id=created.asset_id,
+        relative_path=f"media/{media_id}.png",
+        mime_type="image/png",
+        sha256="a" * 64,
+        size_bytes=1,
+        object_key="must-not-open",
+    )
+
+    hidden = await service.get_media(context, created.asset_id, media_id)
+
+    assert hidden is None
+    assert repository.version_media_calls == []
+    assert "must-not-open" not in store.content
+
+
 @pytest.mark.parametrize(
     ("field_name", "value"),
     [

@@ -238,6 +238,42 @@ def test_student_asset_and_teacher_copy_have_durable_audit_links() -> None:
     )
 
 
+def test_student_safety_assessment_model_binds_exact_trusted_request_shape() -> None:
+    models = importlib.import_module("deeptutor.teaching.models.student_generation")
+    assessment_type = getattr(models, "StudentSafetyAssessmentRecord", None)
+
+    assert assessment_type is not None, "durable student safety evidence is missing"
+    table = assessment_type.__table__
+    assert {
+        "id",
+        "tenant_id",
+        "course_id",
+        "class_id",
+        "mode",
+        "content_mode",
+        "web_search_requested",
+        "generally_safe",
+        "minor_safe",
+        "restricted_topic",
+        "reviewed_by",
+        "reviewed_at",
+        "assessment_version",
+        "expires_at",
+    }.issubset(table.columns.keys())
+
+
+def test_student_safety_assessment_migration_follows_student_classroom_api() -> None:
+    module_name = (
+        "deeptutor.teaching.migrations.versions."
+        "20260809_0015_student_safety_assessments"
+    )
+
+    assert importlib.util.find_spec(module_name) is not None
+    migration = importlib.import_module(module_name)
+    assert migration.revision == "20260809_0015"
+    assert migration.down_revision == "20260809_0014"
+
+
 def test_student_classroom_api_migration_is_the_tenant_head() -> None:
     module_name = (
         "deeptutor.teaching.migrations.versions."
@@ -260,6 +296,90 @@ def test_classroom_repository_exposes_atomic_student_workflow_operations() -> No
     assert "start_student_generation" in methods
     assert "mark_canceled" in methods
     assert "copy_student_to_teacher_draft" in methods
+
+
+@pytest.mark.asyncio
+async def test_replayed_approval_returns_the_already_bound_job_without_restarting() -> None:
+    service_module = importlib.import_module(
+        "deeptutor.teaching.services.student_classrooms"
+    )
+    record = ClassroomRecord(
+        tenant_id="tenant-a",
+        asset_id="student-asset-1",
+        draft_id="student-draft-1",
+        job_id="student-job-1",
+        lifecycle_state="generating_content",
+        status="generating_content",
+        title="Student classroom",
+        course_id="course-a",
+        class_id="class-a",
+        owner_id="alice",
+        teaching_brief=SimpleNamespace(),
+        revision=1,
+        outline=None,
+        document={},
+        classroom_version_id=None,
+        confirmed_outline_sha256=None,
+        validation_report=None,
+        student_generation_request_id="request-1",
+    )
+    approval = StudentGenerationApprovalDetails(
+        approval_id="approval-1",
+        request_id="request-1",
+        learner_id="alice",
+        course_id="course-a",
+        class_id="class-a",
+        reason="quota_exceeded",
+        status="approved",
+        decided_by="teacher-a",
+    )
+    details = StudentGenerationRequestDetails(
+        request_id="request-1",
+        learner_id="alice",
+        course_id="course-a",
+        class_id="class-a",
+        mode="micro",
+        decision_outcome="accepted",
+        decision_reason="accepted",
+        quota_state="reserved",
+        scene_range=(1, 5),
+        duration_minutes_range=(3, 25),
+        estimated_units=5,
+        requires_outline_confirmation=False,
+        approval_id="approval-1",
+        approval_status="approved",
+    )
+
+    class ClassroomRepository:
+        async def get_student_workflow(self, _request_id: str):
+            return record
+
+        async def start_student_generation(self, *_args):
+            raise AssertionError("a bound approval replay must not restart its job")
+
+    class RequestRepository:
+        async def get_request_details(self, _tenant_id: str, _request_id: str):
+            return details
+
+    class Generation:
+        async def start(self, **_kwargs):
+            raise AssertionError("a bound approval replay must not create a job")
+
+    workflow = service_module.SqlAlchemyStudentClassroomWorkflow(
+        repository=ClassroomRepository(),
+        classroom_service=SimpleNamespace(),
+        brief_builder=SimpleNamespace(),
+        generation=Generation(),
+        request_repository=RequestRepository(),
+    )
+
+    replayed = await workflow.start_approved_generation(
+        _teacher_context(),
+        approval,
+    )
+
+    assert replayed.generation_job_id == "student-job-1"
+    assert replayed.status == "approved"
 
 
 @pytest.mark.asyncio

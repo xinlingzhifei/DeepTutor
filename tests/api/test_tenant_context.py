@@ -1527,7 +1527,7 @@ def test_write_statements_bind_scope_state_and_conflict_keys() -> None:
         build_activation_lock_statement("tenant-a", "job-a", 2),
         "tenant_schema_states.tenant_id = 'tenant-a'",
         "tenant_schema_states.status = 'active'",
-        "tenant_schema_states.revision = '20260809_0014'",
+        "tenant_schema_states.revision = '20260809_0015'",
         f"tenant_schema_states.schema_name = '{tenant_schema_name('tenant-a')}'",
         "tenant_storage_states.tenant_id = 'tenant-a'",
         "tenant_storage_states.status = 'active'",
