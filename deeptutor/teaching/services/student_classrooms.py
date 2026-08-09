@@ -148,6 +148,8 @@ class StudentClassroomView:
     revision: int
     outline: dict[str, object] | None
     classroom_version_id: str | None = None
+    estimate: StudentGenerationEstimate | None = None
+    decision_outcome: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -479,6 +481,8 @@ class SqlAlchemyStudentClassroomWorkflow:
         approval_id: str | None,
         mode: str,
         status: str,
+        estimate: StudentGenerationEstimate | None = None,
+        decision_outcome: str | None = None,
     ) -> StudentClassroomView:
         return StudentClassroomView(
             asset_id=record.asset_id,
@@ -493,6 +497,8 @@ class SqlAlchemyStudentClassroomWorkflow:
             revision=record.revision,
             outline=record.outline,
             classroom_version_id=record.classroom_version_id,
+            estimate=estimate,
+            decision_outcome=decision_outcome,
         )
 
     async def create(
@@ -536,6 +542,8 @@ class SqlAlchemyStudentClassroomWorkflow:
             approval_id=result.approval_id,
             mode=str(getattr(request, "mode")),
             status="awaiting_approval" if awaiting_approval else "preparing",
+            estimate=result.estimate,
+            decision_outcome=result.decision.outcome,
         )
 
     async def start_generation(
@@ -602,6 +610,8 @@ class SqlAlchemyStudentClassroomWorkflow:
             approval_id=record.approval_id,
             mode=record.mode,
             status=stage.status,
+            estimate=record.estimate,
+            decision_outcome=record.decision_outcome,
         )
 
     async def _details(

@@ -89,7 +89,7 @@ export function toCapabilityConfig(
 export function canConfirmStudentClassroomConfig(
   input: StudentClassroomConfigInput,
   availability: {
-    hasAuthorizedSource: boolean;
+    authorizedSourceCount: number;
     option: StudentClassroomOption | null;
   },
 ): boolean {
@@ -102,8 +102,20 @@ export function canConfirmStudentClassroomConfig(
   const contentMode = input.contentMode ?? "source_grounded";
   if (!option.allowedContentModes.includes(contentMode)) return false;
   return contentMode === "source_grounded"
-    ? availability.hasAuthorizedSource
+    ? availability.authorizedSourceCount === 1
     : true;
+}
+
+export function studentClassroomTurnKnowledgeBases(
+  contentMode: StudentClassroomContentMode,
+  selectedKnowledgeBases: readonly string[],
+  subagentNames: ReadonlySet<string>,
+): string[] | null {
+  if (contentMode === "open_creation") return [];
+  const groundedSources = selectedKnowledgeBases.filter(
+    name => !subagentNames.has(name),
+  );
+  return groundedSources.length === 1 ? groundedSources : null;
 }
 
 export function studentClassroomRequiresOutline(status: string): boolean {
@@ -119,6 +131,13 @@ export interface StudentClassroomEstimate {
   quotaUnits: number;
   requiresOutlineConfirmation: boolean;
   requiresApproval: boolean;
+}
+
+export interface StudentClassroomEstimateInput {
+  courseId: string;
+  mode: StudentClassroomMode;
+  contentMode: StudentClassroomContentMode;
+  sourceRef?: string;
 }
 
 export interface StudentClassroomTask {
@@ -156,6 +175,157 @@ export interface StudentClassroomJob {
   outline: Record<string, unknown> | null;
   errorCategory: string | null;
   errorCode: string | null;
+}
+
+const STUDENT_CLASSROOM_STATUSES = new Set([
+  "preparing",
+  "awaiting_approval",
+  "draft",
+  "created",
+  "quota_reserved",
+  "queued",
+  "generating_outline",
+  "awaiting_confirmation",
+  "awaiting_outline_confirmation",
+  "generating_content",
+  "validating",
+  "materializing",
+  "succeeded",
+  "failed",
+  "canceled",
+  "rejected",
+  "expired",
+]);
+
+const GENERATION_JOB_STATUSES = new Set([
+  "created",
+  "quota_reserved",
+  "queued",
+  "generating_outline",
+  "awaiting_confirmation",
+  "generating_content",
+  "validating",
+  "materializing",
+  "succeeded",
+  "failed",
+  "canceled",
+]);
+
+const GENERATION_JOB_PHASES = new Set(["outline", "content", "micro"]);
+
+export interface StudentClassroomCardState {
+  jobId: string | null;
+  status: string;
+  outline: Record<string, unknown> | null;
+  approvalId: string | null;
+  classroomVersionId: string | null;
+}
+
+export function resolveStudentClassroomCardState(
+  task: StudentClassroomTask,
+  classroom: StudentClassroomState | null,
+): StudentClassroomCardState {
+  if (classroom) {
+    return {
+      jobId: classroom.generationJobId,
+      status: classroom.status,
+      outline: classroom.outline,
+      approvalId: classroom.approvalId,
+      classroomVersionId: classroom.classroomVersionId,
+    };
+  }
+  return {
+    jobId: task.jobId,
+    status: task.status,
+    outline: task.outline,
+    approvalId: task.approvalId,
+    classroomVersionId: null,
+  };
+}
+
+const TERMINAL_STUDENT_CLASSROOM_STATUSES = new Set([
+  "succeeded",
+  "failed",
+  "canceled",
+  "rejected",
+  "expired",
+]);
+
+const OWNER_ACTION_STUDENT_CLASSROOM_STATUSES = new Set([
+  "awaiting_approval",
+  "awaiting_confirmation",
+  "awaiting_outline_confirmation",
+]);
+
+export function shouldPollStudentClassroom(
+  classroom: Pick<StudentClassroomState, "status" | "classroomVersionId">,
+): boolean {
+  return (
+    !TERMINAL_STUDENT_CLASSROOM_STATUSES.has(classroom.status) &&
+    !OWNER_ACTION_STUDENT_CLASSROOM_STATUSES.has(classroom.status)
+  );
+}
+
+export type StudentClassroomStatusKind =
+  | "success"
+  | "failure"
+  | "waiting"
+  | "running";
+
+export function studentClassroomStatusKind(
+  status: string,
+): StudentClassroomStatusKind {
+  if (status === "succeeded") return "success";
+  if (TERMINAL_STUDENT_CLASSROOM_STATUSES.has(status)) return "failure";
+  if (OWNER_ACTION_STUDENT_CLASSROOM_STATUSES.has(status)) return "waiting";
+  return "running";
+}
+
+export class StudentClassroomRequestError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+    this.name = "StudentClassroomRequestError";
+  }
+}
+
+export function studentClassroomPollRetryDelay(
+  error: unknown,
+  failureCount: number,
+): number | null {
+  if (
+    (error instanceof StudentClassroomRequestError &&
+      (error.status === 403 || error.status === 404)) ||
+    (error instanceof Error && error.name === "AbortError") ||
+    !Number.isInteger(failureCount) ||
+    failureCount < 1 ||
+    failureCount > 3
+  ) {
+    return null;
+  }
+  return 2500 * 2 ** (failureCount - 1);
+}
+
+export type StudentClassroomApprovalState =
+  | "waiting"
+  | "required"
+  | "approved"
+  | "notApproved"
+  | "notRequired";
+
+export function studentClassroomApprovalState(
+  state: Pick<StudentClassroomCardState, "status" | "approvalId" | "jobId">,
+): StudentClassroomApprovalState {
+  if (state.status === "awaiting_approval") return "waiting";
+  if (state.status === "rejected" || state.status === "expired") {
+    return "notApproved";
+  }
+  if (state.approvalId === null) return "notRequired";
+  return state.jobId !== null || !["created", "draft"].includes(state.status)
+    ? "approved"
+    : "required";
 }
 
 interface ResultEventLike {
@@ -241,6 +411,52 @@ function parseStudentClassroomOptions(input: unknown): StudentClassroomOption[] 
   });
 }
 
+function parseStudentClassroomEstimate(input: unknown): StudentClassroomEstimate {
+  const value = record(input, "student classroom estimate response");
+  exactKeys(
+    value,
+    [
+      "sceneRange",
+      "durationMinutesRange",
+      "quotaUnits",
+      "requiresOutlineConfirmation",
+      "requiresApproval",
+    ],
+    "student classroom estimate response",
+  );
+  const quotaUnits = requiredInteger(
+    value,
+    "quotaUnits",
+    "student classroom estimate response",
+  );
+  if (quotaUnits < 1) {
+    throw new Error("student classroom estimate response.quotaUnits is invalid");
+  }
+  return {
+    sceneRange: numberRange(
+      value,
+      "sceneRange",
+      "student classroom estimate response",
+    ),
+    durationMinutesRange: numberRange(
+      value,
+      "durationMinutesRange",
+      "student classroom estimate response",
+    ),
+    quotaUnits,
+    requiresOutlineConfirmation: requiredBoolean(
+      value,
+      "requiresOutlineConfirmation",
+      "student classroom estimate response",
+    ),
+    requiresApproval: requiredBoolean(
+      value,
+      "requiresApproval",
+      "student classroom estimate response",
+    ),
+  };
+}
+
 function requiredString(
   value: Record<string, unknown>,
   key: string,
@@ -249,6 +465,19 @@ function requiredString(
   const result = value[key];
   if (typeof result !== "string" || !result.trim()) {
     throw new Error(`${label}.${key} must be a non-empty string`);
+  }
+  return result;
+}
+
+function enumString(
+  value: Record<string, unknown>,
+  key: string,
+  allowed: ReadonlySet<string>,
+  label: string,
+): string {
+  const result = requiredString(value, key, label);
+  if (!allowed.has(result)) {
+    throw new Error(`${label}.${key} is invalid`);
   }
   return result;
 }
@@ -292,9 +521,10 @@ function numberRange(
   if (
     !Array.isArray(range) ||
     range.length !== 2 ||
-    !range.every(item => Number.isInteger(item) && item >= 0)
+    !range.every(item => Number.isInteger(item) && item > 0) ||
+    range[0] > range[1]
   ) {
-    throw new Error(`${label}.${key} must be a two-integer range`);
+    throw new Error(`${label}.${key} must be a positive ascending range`);
   }
   return [range[0] as number, range[1] as number];
 }
@@ -312,8 +542,50 @@ function requiredBoolean(
 
 function parseStudentClassroomTask(metadata: unknown): StudentClassroomTask {
   const result = record(metadata, "interactive classroom result");
+  exactKeys(
+    result,
+    [
+      "response",
+      "estimate",
+      "approval_id",
+      "job_id",
+      "outline",
+      "classroom",
+      "metadata",
+    ],
+    "interactive classroom result",
+  );
   const classroom = record(result.classroom, "interactive classroom result.classroom");
+  exactKeys(
+    classroom,
+    [
+      "asset_id",
+      "request_id",
+      "approval_id",
+      "generation_job_id",
+      "status",
+      "course_id",
+      "class_id",
+      "mode",
+      "owner_id",
+      "revision",
+      "outline",
+      "classroom_version_id",
+    ],
+    "interactive classroom result.classroom",
+  );
   const estimate = record(result.estimate, "interactive classroom result.estimate");
+  exactKeys(
+    estimate,
+    [
+      "scene_range",
+      "duration_minutes_range",
+      "quota_units",
+      "requires_outline_confirmation",
+      "requires_approval",
+    ],
+    "interactive classroom result.estimate",
+  );
   const mode = requiredString(classroom, "mode", "interactive classroom result.classroom");
   if (mode !== "micro" && mode !== "full") {
     throw new Error("interactive classroom result.classroom.mode is invalid");
@@ -331,6 +603,76 @@ function parseStudentClassroomTask(metadata: unknown): StudentClassroomTask {
   if (topLevelJobId !== classroomJobId) {
     throw new Error("interactive classroom result job identity is inconsistent");
   }
+  const topLevelApprovalId = nullableString(
+    result,
+    "approval_id",
+    "interactive classroom result",
+  );
+  const classroomApprovalId = nullableString(
+    classroom,
+    "approval_id",
+    "interactive classroom result.classroom",
+  );
+  if (topLevelApprovalId !== classroomApprovalId) {
+    throw new Error("interactive classroom result approval identity is inconsistent");
+  }
+  const topLevelOutline = nullableRecord(
+    result,
+    "outline",
+    "interactive classroom result",
+  );
+  const classroomOutline = nullableRecord(
+    classroom,
+    "outline",
+    "interactive classroom result.classroom",
+  );
+  if (JSON.stringify(topLevelOutline) !== JSON.stringify(classroomOutline)) {
+    throw new Error("interactive classroom result outline is inconsistent");
+  }
+  const status = enumString(
+    classroom,
+    "status",
+    STUDENT_CLASSROOM_STATUSES,
+    "interactive classroom result.classroom",
+  );
+  const revision = requiredInteger(
+    classroom,
+    "revision",
+    "interactive classroom result.classroom",
+  );
+  if (revision < 1) {
+    throw new Error("interactive classroom result.classroom.revision is invalid");
+  }
+  const quotaUnits = requiredInteger(
+    estimate,
+    "quota_units",
+    "interactive classroom result.estimate",
+  );
+  if (quotaUnits < 1) {
+    throw new Error("interactive classroom result.estimate.quota_units is invalid");
+  }
+  const requiresOutlineConfirmation = requiredBoolean(
+    estimate,
+    "requires_outline_confirmation",
+    "interactive classroom result.estimate",
+  );
+  if (requiresOutlineConfirmation !== (mode === "full")) {
+    throw new Error("interactive classroom result outline policy is inconsistent");
+  }
+  const requiresApproval = requiredBoolean(
+    estimate,
+    "requires_approval",
+    "interactive classroom result.estimate",
+  );
+  if (requiresApproval !== (topLevelApprovalId !== null)) {
+    throw new Error("interactive classroom result approval policy is inconsistent");
+  }
+  if (
+    status === "awaiting_approval" &&
+    (topLevelApprovalId === null || topLevelJobId !== null)
+  ) {
+    throw new Error("interactive classroom result approval workflow is inconsistent");
+  }
   return {
     assetId: requiredString(
       classroom,
@@ -338,27 +680,11 @@ function parseStudentClassroomTask(metadata: unknown): StudentClassroomTask {
       "interactive classroom result.classroom",
     ),
     jobId: topLevelJobId,
-    approvalId: nullableString(
-      result,
-      "approval_id",
-      "interactive classroom result",
-    ),
-    status: requiredString(
-      classroom,
-      "status",
-      "interactive classroom result.classroom",
-    ),
+    approvalId: topLevelApprovalId,
+    status,
     mode,
-    revision: requiredInteger(
-      classroom,
-      "revision",
-      "interactive classroom result.classroom",
-    ),
-    outline: nullableRecord(
-      classroom,
-      "outline",
-      "interactive classroom result.classroom",
-    ),
+    revision,
+    outline: classroomOutline,
     estimate: {
       sceneRange: numberRange(estimate, "scene_range", "interactive classroom result.estimate"),
       durationMinutesRange: numberRange(
@@ -366,21 +692,9 @@ function parseStudentClassroomTask(metadata: unknown): StudentClassroomTask {
         "duration_minutes_range",
         "interactive classroom result.estimate",
       ),
-      quotaUnits: requiredInteger(
-        estimate,
-        "quota_units",
-        "interactive classroom result.estimate",
-      ),
-      requiresOutlineConfirmation: requiredBoolean(
-        estimate,
-        "requires_outline_confirmation",
-        "interactive classroom result.estimate",
-      ),
-      requiresApproval: requiredBoolean(
-        estimate,
-        "requires_approval",
-        "interactive classroom result.estimate",
-      ),
+      quotaUnits,
+      requiresOutlineConfirmation,
+      requiresApproval,
     },
   };
 }
@@ -407,14 +721,21 @@ async function requestJson(input: string, init?: RequestInit): Promise<unknown> 
   try {
     payload = await response.json();
   } catch {
-    throw new Error(`Student classroom request failed (${response.status})`);
+    throw new StudentClassroomRequestError(
+      `Student classroom request failed (${response.status})`,
+      response.status,
+    );
   }
   if (!response.ok) {
-    const detail = record(payload, "student classroom error").detail;
-    throw new Error(
+    const detail =
+      payload && typeof payload === "object" && !Array.isArray(payload)
+        ? (payload as Record<string, unknown>).detail
+        : undefined;
+    throw new StudentClassroomRequestError(
       typeof detail === "string"
         ? detail
         : `Student classroom request failed (${response.status})`,
+      response.status,
     );
   }
   return payload;
@@ -430,6 +751,24 @@ function parseStudentClassroomState(
   expectedAssetId: string,
 ): StudentClassroomState {
   const value = record(input, "student classroom response");
+  exactKeys(
+    value,
+    [
+      "assetId",
+      "requestId",
+      "approvalId",
+      "generationJobId",
+      "status",
+      "courseId",
+      "classId",
+      "mode",
+      "ownerId",
+      "revision",
+      "outline",
+      "classroomVersionId",
+    ],
+    "student classroom response",
+  );
   const assetId = requiredString(value, "assetId", "student classroom response");
   if (assetId !== expectedAssetId) {
     throw new Error("Student classroom response asset ID does not match the request");
@@ -440,27 +779,52 @@ function parseStudentClassroomState(
   }
   const revision = requiredInteger(value, "revision", "student classroom response");
   if (revision < 1) throw new Error("student classroom response.revision is invalid");
+  const status = enumString(
+    value,
+    "status",
+    STUDENT_CLASSROOM_STATUSES,
+    "student classroom response",
+  );
+  const approvalId = nullableString(value, "approvalId", "student classroom response");
+  const generationJobId = nullableString(
+    value,
+    "generationJobId",
+    "student classroom response",
+  );
+  const outline = nullableRecord(value, "outline", "student classroom response");
+  const classroomVersionId = nullableString(
+    value,
+    "classroomVersionId",
+    "student classroom response",
+  );
+  if (
+    ["awaiting_approval", "rejected", "expired"].includes(status) &&
+    (approvalId === null || generationJobId !== null)
+  ) {
+    throw new Error("student classroom response approval workflow is inconsistent");
+  }
+  if (
+    studentClassroomRequiresOutline(status) &&
+    (mode !== "full" || outline === null)
+  ) {
+    throw new Error("student classroom response outline workflow is inconsistent");
+  }
+  if (classroomVersionId !== null && status !== "succeeded") {
+    throw new Error("student classroom response version workflow is inconsistent");
+  }
   return {
     assetId,
     requestId: requiredString(value, "requestId", "student classroom response"),
-    approvalId: nullableString(value, "approvalId", "student classroom response"),
-    generationJobId: nullableString(
-      value,
-      "generationJobId",
-      "student classroom response",
-    ),
-    status: requiredString(value, "status", "student classroom response"),
+    approvalId,
+    generationJobId,
+    status,
     courseId: requiredString(value, "courseId", "student classroom response"),
     classId: requiredString(value, "classId", "student classroom response"),
     mode,
     ownerId: requiredString(value, "ownerId", "student classroom response"),
     revision,
-    outline: nullableRecord(value, "outline", "student classroom response"),
-    classroomVersionId: nullableString(
-      value,
-      "classroomVersionId",
-      "student classroom response",
-    ),
+    outline,
+    classroomVersionId,
   };
 }
 
@@ -469,6 +833,26 @@ function parseStudentClassroomJob(
   expectedJobId: string,
 ): StudentClassroomJob {
   const value = record(input, "classroom job response");
+  exactKeys(
+    value,
+    [
+      "job_id",
+      "job_kind",
+      "phase",
+      "status",
+      "progress_percent",
+      "waiting_reason",
+      "cancellable",
+      "retryable",
+      "outline",
+      "error_category",
+      "error_code",
+      "retry_of_job_id",
+      "export_format",
+      "download_ready",
+    ],
+    "classroom job response",
+  );
   const jobId = requiredString(value, "job_id", "classroom job response");
   if (jobId !== expectedJobId) {
     throw new Error("Classroom job response ID does not match the request");
@@ -484,15 +868,69 @@ function parseStudentClassroomJob(
   if (progressPercent < 0 || progressPercent > 100) {
     throw new Error("classroom job response.progress_percent is invalid");
   }
+  const phase = enumString(
+    value,
+    "phase",
+    GENERATION_JOB_PHASES,
+    "classroom job response",
+  );
+  const status = enumString(
+    value,
+    "status",
+    GENERATION_JOB_STATUSES,
+    "classroom job response",
+  );
+  const waitingReason = nullableString(
+    value,
+    "waiting_reason",
+    "classroom job response",
+  );
+  const outline = nullableRecord(value, "outline", "classroom job response");
+  const errorCategory = nullableString(
+    value,
+    "error_category",
+    "classroom job response",
+  );
+  const errorCode = nullableString(value, "error_code", "classroom job response");
+  const terminal = ["succeeded", "failed", "canceled"].includes(status);
+  if (status === "succeeded" && progressPercent !== 100) {
+    throw new Error("classroom job response.progress_percent is inconsistent");
+  }
+  if (
+    (status === "generating_outline" && phase !== "outline") ||
+    (status === "awaiting_confirmation" &&
+      (phase !== "outline" || outline === null)) ||
+    (status === "generating_content" && !["content", "micro"].includes(phase))
+  ) {
+    throw new Error("classroom job response phase workflow is inconsistent");
+  }
+  if (
+    requiredBoolean(value, "cancellable", "classroom job response") === terminal ||
+    requiredBoolean(value, "retryable", "classroom job response") !==
+      ["failed", "canceled"].includes(status) ||
+    (terminal && waitingReason !== null)
+  ) {
+    throw new Error("classroom job response terminal workflow is inconsistent");
+  }
+  if (
+    (errorCategory === null) !== (errorCode === null) ||
+    (!["failed", "canceled"].includes(status) && errorCategory !== null)
+  ) {
+    throw new Error("classroom job response error workflow is inconsistent");
+  }
+  if (value.export_format !== null || value.download_ready !== false) {
+    throw new Error("classroom job response generation artifact is inconsistent");
+  }
+  nullableString(value, "retry_of_job_id", "classroom job response");
   return {
     jobId,
-    phase: requiredString(value, "phase", "classroom job response"),
-    status: requiredString(value, "status", "classroom job response"),
+    phase,
+    status,
     progressPercent,
-    waitingReason: nullableString(value, "waiting_reason", "classroom job response"),
-    outline: nullableRecord(value, "outline", "classroom job response"),
-    errorCategory: nullableString(value, "error_category", "classroom job response"),
-    errorCode: nullableString(value, "error_code", "classroom job response"),
+    waitingReason,
+    outline,
+    errorCategory,
+    errorCode,
   };
 }
 
@@ -516,6 +954,36 @@ export async function listStudentClassroomOptions(
   return parseStudentClassroomOptions(
     await requestJson("/api/v1/student-classrooms/options", {
       cache: "no-store",
+      signal,
+    }),
+  );
+}
+
+export async function estimateStudentClassroom(
+  input: StudentClassroomEstimateInput,
+  signal?: AbortSignal,
+): Promise<StudentClassroomEstimate> {
+  const courseId = input.courseId.trim();
+  if (!courseId) throw new Error("classroom_course_required");
+  const sourceRef = input.sourceRef?.trim();
+  if (input.contentMode === "source_grounded" && !sourceRef) {
+    throw new Error("classroom_source_required");
+  }
+  if (input.contentMode === "open_creation" && sourceRef) {
+    throw new Error("open_creation_cannot_select_source");
+  }
+  return parseStudentClassroomEstimate(
+    await requestJson("/api/v1/student-classrooms/estimate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        courseId,
+        mode: input.mode,
+        contentMode: input.contentMode,
+        ...(sourceRef
+          ? { sourceType: "knowledge_base", sourceRef }
+          : {}),
+      }),
       signal,
     }),
   );

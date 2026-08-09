@@ -78,6 +78,9 @@ export interface SendMessageOptions {
   persistUserMessage?: boolean;
   requestSnapshotOverride?: MessageRequestSnapshot;
   bookReferences?: BookReferencePayload[];
+  /** Per-turn retrieval scope. An explicit empty array suppresses the
+   *  session-level knowledge bases for this turn. */
+  knowledgeBases?: string[];
   /** Edit-branching: when set, the new user message is inserted as a
    *  sibling under this parent rather than appended to the session tail.
    *  ``null`` means "explicitly attach to the session root". */
@@ -1448,7 +1451,9 @@ export function UnifiedChatProvider({
       const effectiveTools =
         replaySnapshot?.enabledTools ?? session.enabledTools;
       const effectiveKnowledgeBases =
-        replaySnapshot?.knowledgeBases ?? session.knowledgeBases;
+        replaySnapshot?.knowledgeBases ??
+        options?.knowledgeBases ??
+        session.knowledgeBases;
       const effectiveLLMSelection =
         replaySnapshot && "llmSelection" in replaySnapshot
           ? (replaySnapshot.llmSelection ?? null)

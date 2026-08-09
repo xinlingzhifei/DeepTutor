@@ -1,11 +1,19 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { BookOpen, Clock3, Layers3, ShieldCheck } from "lucide-react";
+import {
+  BookOpen,
+  Clock3,
+  Layers3,
+  LoaderCircle,
+  ShieldCheck,
+} from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import {
+  estimateStudentClassroom,
   listStudentClassroomOptions,
+  type StudentClassroomEstimate,
   type StudentClassroomContentMode,
   type StudentClassroomFormConfig,
   type StudentClassroomMode,
@@ -15,21 +23,15 @@ import {
 interface StudentClassroomConfigProps {
   value: StudentClassroomFormConfig;
   authorizedSourceCount: number;
+  authorizedSourceRef: string | null;
   onChange: (next: StudentClassroomFormConfig) => void;
   onOptionsChange: (options: StudentClassroomOption[]) => void;
 }
 
-const MODE_SUMMARY: Record<
-  StudentClassroomMode,
-  { scenes: string; minutes: string; quota: string }
-> = {
-  micro: { scenes: "1–5", minutes: "3–25", quota: "≤5" },
-  full: { scenes: "6–24", minutes: "18–120", quota: "≤24" },
-};
-
 export default function StudentClassroomConfig({
   value,
   authorizedSourceCount,
+  authorizedSourceRef,
   onChange,
   onOptionsChange,
 }: StudentClassroomConfigProps) {
@@ -37,6 +39,13 @@ export default function StudentClassroomConfig({
   const [options, setOptions] = useState<StudentClassroomOption[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [estimateResult, setEstimateResult] = useState<{
+    requestKey: string;
+    estimate: StudentClassroomEstimate;
+  } | null>(null);
+  const [estimateFailureKey, setEstimateFailureKey] = useState<string | null>(
+    null,
+  );
 
   useEffect(() => {
     let active = true;
@@ -65,6 +74,58 @@ export default function StudentClassroomConfig({
   }, [onOptionsChange, t]);
 
   const selectedOption = options.find(option => option.courseId === value.courseId) ?? null;
+  const canEstimate = Boolean(
+    value.mode &&
+      selectedOption?.allowedModes.includes(value.mode) &&
+      selectedOption.allowedContentModes.includes(value.contentMode) &&
+      (value.contentMode !== "source_grounded" || authorizedSourceRef),
+  );
+  const estimateRequestKey = canEstimate
+    ? [
+        value.courseId,
+        value.mode,
+        value.contentMode,
+        authorizedSourceRef ?? "",
+      ].join("\u0000")
+    : null;
+  const estimate =
+    estimateResult?.requestKey === estimateRequestKey
+      ? estimateResult.estimate
+      : null;
+  const estimateFailed = estimateFailureKey === estimateRequestKey;
+  const estimateLoading =
+    estimateRequestKey !== null && estimate === null && !estimateFailed;
+
+  useEffect(() => {
+    if (estimateRequestKey === null || value.mode === null) return;
+    let active = true;
+    const controller = new AbortController();
+    estimateStudentClassroom(
+      {
+        courseId: value.courseId,
+        mode: value.mode,
+        contentMode: value.contentMode,
+        ...(authorizedSourceRef ? { sourceRef: authorizedSourceRef } : {}),
+      },
+      controller.signal,
+    )
+      .then(next => {
+        if (!active) return;
+        setEstimateResult({ requestKey: estimateRequestKey, estimate: next });
+        setEstimateFailureKey(current =>
+          current === estimateRequestKey ? null : current,
+        );
+      })
+      .catch(() => {
+        if (active && !controller.signal.aborted) {
+          setEstimateFailureKey(estimateRequestKey);
+        }
+      });
+    return () => {
+      active = false;
+      controller.abort();
+    };
+  }, [authorizedSourceRef, estimateRequestKey, value.contentMode, value.courseId, value.mode]);
 
   const selectMode = (mode: StudentClassroomMode) => {
     onChange({ ...value, mode });
@@ -72,8 +133,6 @@ export default function StudentClassroomConfig({
   const selectContentMode = (contentMode: StudentClassroomContentMode) => {
     onChange({ ...value, contentMode });
   };
-  const estimate = value.mode ? MODE_SUMMARY[value.mode] : null;
-
   return (
     <div className="space-y-4 p-3.5" data-testid="student-classroom-config">
       <label className="block space-y-1.5 text-[12px] font-semibold text-[var(--foreground)]">
@@ -213,27 +272,50 @@ export default function StudentClassroomConfig({
         )}
       </section>
 
-      {estimate ? (
-        <dl className="grid grid-cols-3 gap-2 rounded-lg bg-[var(--primary)]/[0.045] p-2.5 text-center">
+      {estimateLoading ? (
+        <p className="flex items-center gap-1.5 text-[10.5px] text-[var(--muted-foreground)]">
+          <LoaderCircle className="h-3.5 w-3.5 animate-spin" aria-hidden />
+          {t("studentClassroom.config.estimating")}
+        </p>
+      ) : estimate ? (
+        <dl className="grid grid-cols-2 gap-2 rounded-lg bg-[var(--primary)]/[0.045] p-2.5 text-center sm:grid-cols-4">
           <div>
             <dt className="flex items-center justify-center gap-1 text-[9.5px] text-[var(--muted-foreground)]">
               <Layers3 className="h-3 w-3" aria-hidden />
               {t("studentClassroom.estimate.scenes")}
             </dt>
-            <dd className="mt-1 text-[12px] font-semibold">{estimate.scenes}</dd>
+            <dd className="mt-1 text-[12px] font-semibold">
+              {estimate.sceneRange.join("–")}
+            </dd>
           </div>
           <div>
             <dt className="flex items-center justify-center gap-1 text-[9.5px] text-[var(--muted-foreground)]">
               <Clock3 className="h-3 w-3" aria-hidden />
               {t("studentClassroom.estimate.minutes")}
             </dt>
-            <dd className="mt-1 text-[12px] font-semibold">{estimate.minutes}</dd>
+            <dd className="mt-1 text-[12px] font-semibold">
+              {estimate.durationMinutesRange.join("–")}
+            </dd>
           </div>
           <div>
             <dt className="text-[9.5px] text-[var(--muted-foreground)]">
               {t("studentClassroom.estimate.quota")}
             </dt>
-            <dd className="mt-1 text-[12px] font-semibold">{estimate.quota}</dd>
+            <dd className="mt-1 text-[12px] font-semibold">
+              {estimate.quotaUnits}
+            </dd>
+          </div>
+          <div>
+            <dt className="text-[9.5px] text-[var(--muted-foreground)]">
+              {t("studentClassroom.estimate.approval")}
+            </dt>
+            <dd className="mt-1 text-[12px] font-semibold">
+              {t(
+                estimate.requiresApproval
+                  ? "studentClassroom.job.approval.required"
+                  : "studentClassroom.job.approval.notRequired",
+              )}
+            </dd>
           </div>
         </dl>
       ) : (
@@ -241,6 +323,12 @@ export default function StudentClassroomConfig({
           {t("studentClassroom.config.chooseMode")}
         </p>
       )}
+
+      {estimateFailed ? (
+        <p role="alert" className="text-[10.5px] text-[var(--destructive)]">
+          {t("studentClassroom.config.estimateFailed")}
+        </p>
+      ) : null}
 
       {error ? (
         <p role="alert" className="text-[10.5px] text-[var(--destructive)]">

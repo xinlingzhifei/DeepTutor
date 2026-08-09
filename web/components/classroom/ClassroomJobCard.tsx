@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   CheckCircle2,
+  CircleAlert,
   Clock3,
   ExternalLink,
   LoaderCircle,
@@ -16,8 +17,13 @@ import {
   confirmStudentClassroomOutline,
   getStudentClassroom,
   getStudentClassroomJob,
+  resolveStudentClassroomCardState,
+  shouldPollStudentClassroom,
+  studentClassroomApprovalState,
   studentClassroomPlayRoute,
+  studentClassroomPollRetryDelay,
   studentClassroomRequiresOutline,
+  studentClassroomStatusKind,
   updateStudentClassroomOutline,
   type StudentClassroomJob,
   type StudentClassroomState,
@@ -25,13 +31,6 @@ import {
 } from "@/lib/student-classroom-config";
 
 const POLL_INTERVAL_MS = 2500;
-const TERMINAL_FAILURES = new Set([
-  "failed",
-  "canceled",
-  "rejected",
-  "expired",
-]);
-
 function parseOutline(text: string): Record<string, unknown> {
   const parsed: unknown = JSON.parse(text);
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
@@ -60,22 +59,16 @@ export default function ClassroomJobCard({
   const dirtyRef = useRef(outlineDirty);
   dirtyRef.current = outlineDirty;
 
-  const jobId = classroom?.generationJobId ?? task.jobId;
-  const status = job?.status ?? classroom?.status ?? task.status;
-  const outline = job?.outline ?? classroom?.outline ?? task.outline;
-  const versionId = classroom?.classroomVersionId ?? null;
-  const playRoute = studentClassroomPlayRoute(versionId);
+  const cardState = resolveStudentClassroomCardState(task, classroom);
+  const { jobId, status, outline, approvalId, classroomVersionId } = cardState;
+  const playRoute = studentClassroomPlayRoute(classroomVersionId);
   const requiresOutline = studentClassroomRequiresOutline(status);
-  const approvalState =
-    status === "awaiting_approval"
-      ? "waiting"
-      : status === "rejected" || status === "expired"
-        ? "notApproved"
-        : task.estimate.requiresApproval && jobId
-          ? "approved"
-          : task.estimate.requiresApproval
-            ? "required"
-            : "notRequired";
+  const approvalState = studentClassroomApprovalState({
+    status,
+    approvalId,
+    jobId,
+  });
+  const statusKind = studentClassroomStatusKind(status);
 
   useEffect(() => {
     if (!outline || dirtyRef.current) return;
@@ -85,6 +78,7 @@ export default function ClassroomJobCard({
   useEffect(() => {
     let active = true;
     let timer: ReturnType<typeof setTimeout> | null = null;
+    let failureCount = 0;
     const controller = new AbortController();
 
     const refresh = async () => {
@@ -95,23 +89,26 @@ export default function ClassroomJobCard({
         );
         if (!active) return;
         setClassroom(nextClassroom);
+        if (!shouldPollStudentClassroom(nextClassroom)) {
+          setError(null);
+          return;
+        }
         const nextJobId = nextClassroom.generationJobId ?? task.jobId;
         const nextJob = nextJobId
           ? await getStudentClassroomJob(nextJobId, controller.signal)
           : null;
         if (!active) return;
+        failureCount = 0;
         setJob(nextJob);
         setError(null);
 
-        const nextStatus = nextJob?.status ?? nextClassroom.status;
-        const completed =
-          TERMINAL_FAILURES.has(nextStatus) ||
-          (nextStatus === "succeeded" && nextClassroom.classroomVersionId !== null);
-        if (!completed) timer = setTimeout(refresh, POLL_INTERVAL_MS);
+        timer = setTimeout(refresh, POLL_INTERVAL_MS);
       } catch (reason) {
         if (!active || controller.signal.aborted) return;
         setError(reason instanceof Error ? reason.message : String(reason));
-        timer = setTimeout(refresh, POLL_INTERVAL_MS);
+        failureCount += 1;
+        const retryDelay = studentClassroomPollRetryDelay(reason, failureCount);
+        if (retryDelay !== null) timer = setTimeout(refresh, retryDelay);
       }
     };
 
@@ -177,8 +174,12 @@ export default function ClassroomJobCard({
       data-job-id={jobId ?? undefined}
     >
       <header className="flex items-center gap-2 border-b border-[var(--border)]/55 px-4 py-3">
-        {status === "succeeded" ? (
+        {statusKind === "success" ? (
           <CheckCircle2 className="h-4 w-4 text-emerald-600" aria-hidden />
+        ) : statusKind === "failure" ? (
+          <CircleAlert className="h-4 w-4 text-[var(--destructive)]" aria-hidden />
+        ) : statusKind === "waiting" ? (
+          <Clock3 className="h-4 w-4 text-amber-600" aria-hidden />
         ) : (
           <LoaderCircle className="h-4 w-4 animate-spin text-[var(--primary)]" aria-hidden />
         )}
@@ -307,9 +308,9 @@ export default function ClassroomJobCard({
             <ExternalLink className="h-3.5 w-3.5" aria-hidden />
           </a>
         ) : status === "succeeded" ? (
-          <p className="flex items-center gap-1.5 text-[10.5px] text-[var(--muted-foreground)]">
+          <p role="alert" className="flex items-center gap-1.5 text-[10.5px] text-[var(--destructive)]">
             <Clock3 className="h-3.5 w-3.5" aria-hidden />
-            {t("studentClassroom.job.finalizing")}
+            {t("studentClassroom.job.playbackUnavailable")}
           </p>
         ) : null}
 

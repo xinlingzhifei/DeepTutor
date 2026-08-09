@@ -106,6 +106,7 @@ import {
   canConfirmStudentClassroomConfig,
   createStudentClassroomConfig,
   restoreStudentClassroomConfig,
+  studentClassroomTurnKnowledgeBases,
   toCapabilityConfig,
   validateStudentClassroomConfig,
   type StudentClassroomFormConfig,
@@ -605,19 +606,20 @@ export default function ChatPage() {
     isVisualizeMode ||
     isResearchMode ||
     isStudentClassroomMode;
-  const studentAuthorizedSourceCount = useMemo(
+  const studentAuthorizedSourceNames = useMemo(
     () =>
       state.knowledgeBases.filter(selected =>
         knowledgeBases.some(
           item => item.name === selected && item.metadata?.type !== "subagent",
         ),
-      ).length,
+      ),
     [knowledgeBases, state.knowledgeBases],
   );
+  const studentAuthorizedSourceCount = studentAuthorizedSourceNames.length;
   const studentClassroomCanConfirm = canConfirmStudentClassroomConfig(
     studentClassroomConfig,
     {
-      hasAuthorizedSource: studentAuthorizedSourceCount > 0,
+      authorizedSourceCount: studentAuthorizedSourceCount,
       option:
         studentClassroomOptions.find(
           option => option.courseId === studentClassroomConfig.courseId,
@@ -1198,13 +1200,32 @@ export default function ChatPage() {
             cap.allowedTools.includes(tool as ToolName),
           );
       setTools(enabledToolsForCap);
-      if (config.knowledgeBase) setKBs([config.knowledgeBase]);
+      if (cap.value === "interactive_classroom") {
+        const realKnowledgeBaseNames = new Set(
+          knowledgeBases
+            .filter(item => item.metadata?.type !== "subagent")
+            .map(item => item.name),
+        );
+        setKBs(
+          state.knowledgeBases.filter(name => realKnowledgeBaseNames.has(name)),
+        );
+      } else if (config.knowledgeBase) {
+        setKBs([config.knowledgeBase]);
+      }
       // Switching capability invalidates any prior config confirmation —
       // the new capability has its own form that needs explicit confirm.
       setCapabilityConfigConfirmed(false);
       setCapMenuOpen(false);
     },
-    [capabilityConfigs, setCapability, setKBs, setTools, userEnabledTools],
+    [
+      capabilityConfigs,
+      knowledgeBases,
+      setCapability,
+      setKBs,
+      setTools,
+      state.knowledgeBases,
+      userEnabledTools,
+    ],
   );
 
   const fileToAttachment = useCallback(
@@ -1378,6 +1399,14 @@ export default function ChatPage() {
         studentAuthorizedSourceCount === 0
       ) {
         validationErrors.push(t("studentClassroom.validation.sourceRequired"));
+      } else if (
+        studentClassroomConfig.contentMode === "source_grounded" &&
+        selectedOption?.allowedContentModes.includes("source_grounded") &&
+        studentAuthorizedSourceCount > 1
+      ) {
+        validationErrors.push(
+          t("studentClassroom.validation.sourceMustBeSingle"),
+        );
       }
       return (
         <CapabilityConfigCard
@@ -1390,6 +1419,11 @@ export default function ChatPage() {
           <StudentClassroomConfig
             value={studentClassroomConfig}
             authorizedSourceCount={studentAuthorizedSourceCount}
+            authorizedSourceRef={
+              studentAuthorizedSourceCount === 1
+                ? studentAuthorizedSourceNames[0]
+                : null
+            }
             onChange={handleChangeStudentClassroomConfig}
             onOptionsChange={handleStudentClassroomOptionsChange}
           />
@@ -1458,6 +1492,7 @@ export default function ChatPage() {
     studentClassroomCanConfirm,
     studentClassroomOptions,
     studentAuthorizedSourceCount,
+    studentAuthorizedSourceNames,
     handleChangeStudentClassroomConfig,
     handleStudentClassroomOptionsChange,
     t,
@@ -1621,7 +1656,15 @@ export default function ChatPage() {
       }
       // When a connected agent is selected, carry the per-turn consult budget
       // (how many times yFeiSTAI may ask it) so the subagent capability uses it.
-      if (selectedAgent && subagentBudget) {
+      const studentTurnKnowledgeBases = isStudentClassroomMode
+        ? studentClassroomTurnKnowledgeBases(
+            studentClassroomConfig.contentMode,
+            state.knowledgeBases,
+            agentNameSet,
+          )
+        : undefined;
+      if (studentTurnKnowledgeBases === null) return;
+      if (!isStudentClassroomMode && selectedAgent && subagentBudget) {
         config = { ...(config ?? {}), subagent_consult_budget: subagentBudget };
       }
 
@@ -1648,7 +1691,12 @@ export default function ChatPage() {
         config,
         notebookReferencesPayload,
         historyReferencesPayload,
-        { bookReferences: bookReferencesPayload },
+        {
+          bookReferences: bookReferencesPayload,
+          ...(studentTurnKnowledgeBases !== undefined
+            ? { knowledgeBases: studentTurnKnowledgeBases }
+            : {}),
+        },
         questionNotebookReferencesPayload,
         undefined,
         memoryPayload,
@@ -1664,6 +1712,7 @@ export default function ChatPage() {
     },
     [
       attachments,
+      agentNameSet,
       bookReferencesPayload,
       historyReferencesPayload,
       isQuizMode,
@@ -1687,6 +1736,7 @@ export default function ChatPage() {
       sendMessage,
       shouldAutoScrollRef,
       state.isStreaming,
+      state.knowledgeBases,
       subagentBudget,
       studentClassroomCanConfirm,
       studentClassroomConfig,
@@ -2094,11 +2144,15 @@ export default function ChatPage() {
               attachmentError={attachmentError}
               activeCap={activeCap}
               knowledgeBases={kbOptions}
-              connectedAgents={agentOptions}
-              selectedAgent={selectedAgent}
-              onSelectAgent={handleSelectAgent}
-              subagentBudget={subagentBudget}
-              onSubagentBudgetChange={setSubagentBudget}
+              connectedAgents={isStudentClassroomMode ? [] : agentOptions}
+              selectedAgent={isStudentClassroomMode ? null : selectedAgent}
+              onSelectAgent={
+                isStudentClassroomMode ? undefined : handleSelectAgent
+              }
+              subagentBudget={isStudentClassroomMode ? null : subagentBudget}
+              onSubagentBudgetChange={
+                isStudentClassroomMode ? undefined : setSubagentBudget
+              }
               llmOptions={llmOptions}
               activeLLMDefault={activeLLMDefault}
               llmSelection={state.llmSelection}
@@ -2116,7 +2170,10 @@ export default function ChatPage() {
               isStreaming={state.isStreaming}
               isVisualizeMode={isVisualizeMode}
               capabilityNeedsConfig={capabilityNeedsConfig}
-              capabilityConfigConfirmed={capabilityConfigConfirmed}
+              capabilityConfigConfirmed={
+                capabilityConfigConfirmed &&
+                (!isStudentClassroomMode || studentClassroomCanConfirm)
+              }
               onRequestConfigConfirm={ensureActivityPanelOpen}
               capabilities={CAPABILITIES}
               onSetCapMenuOpen={setCapMenuOpen}

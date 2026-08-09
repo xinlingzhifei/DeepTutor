@@ -224,7 +224,7 @@ class InteractiveClassroomCapability(BaseCapability):
                 source=self.name,
                 stage="policy_check",
             )
-            estimate = await service.estimate(tenant_context, request)
+            await service.estimate(tenant_context, request)
 
         try:
             async with stream.stage("briefing", source=self.name):
@@ -249,6 +249,10 @@ class InteractiveClassroomCapability(BaseCapability):
                 stage="policy_check",
             )
             raise
+
+        authoritative_estimate = classroom.estimate
+        if authoritative_estimate is None or classroom.decision_outcome is None:
+            raise RuntimeError("authoritative classroom evaluation is unavailable")
 
         if request.mode == "full":
             async with stream.stage("outline", source=self.name):
@@ -277,15 +281,18 @@ class InteractiveClassroomCapability(BaseCapability):
                 stage="queued",
             )
 
+        classroom_payload = asdict(classroom)
+        classroom_payload.pop("estimate", None)
+        classroom_payload.pop("decision_outcome", None)
         await emit_capability_result(
             stream,
             {
                 "response": i18n.t(status_key, status_default),
-                "estimate": asdict(estimate),
+                "estimate": asdict(authoritative_estimate),
                 "approval_id": classroom.approval_id,
                 "job_id": classroom.generation_job_id,
                 "outline": classroom.outline,
-                "classroom": asdict(classroom),
+                "classroom": classroom_payload,
                 "metadata": {"cost_summary": dict(_ZERO_COST_SUMMARY)},
             },
             source=self.name,

@@ -42,8 +42,10 @@ from deeptutor.teaching.services.classrooms import (
     InvalidClassroomState,
 )
 from deeptutor.teaching.services.student_classroom_runtime import (
+    StudentClassroomBindingUnavailable,
     StudentClassroomOptionsService,
     build_student_classroom_service,
+    resolve_student_class_id,
 )
 from deeptutor.teaching.services.student_classrooms import (
     StudentClassroomConflict,
@@ -78,9 +80,8 @@ class _ApiModel(BaseModel):
     )
 
 
-class StudentClassroomCreateRequest(_ApiModel):
+class _StudentClassroomSelectionRequest(_ApiModel):
     course_id: str = Field(min_length=1, max_length=64)
-    class_id: str = Field(min_length=1, max_length=64)
     mode: Literal["micro", "full"]
     content_mode: Literal["source_grounded", "open_creation"]
     web_search_requested: bool = False
@@ -95,6 +96,14 @@ class StudentClassroomCreateRequest(_ApiModel):
         elif self.source_type is None or self.source_ref is None:
             raise ValueError("source-grounded creation requires a source")
         return self
+
+
+class StudentClassroomEstimateRequest(_StudentClassroomSelectionRequest):
+    pass
+
+
+class StudentClassroomCreateRequest(_StudentClassroomSelectionRequest):
+    class_id: str = Field(min_length=1, max_length=64)
 
 
 class StudentClassroomResponse(_ApiModel):
@@ -275,12 +284,16 @@ def get_student_classroom_service(
     )
 
 
-def get_student_classroom_options_service(
+def get_student_classroom_catalog_repository(
     context: TenantContext = Depends(require_tenant),
+) -> SqlAlchemyCatalogRepository:
+    return SqlAlchemyCatalogRepository(context.tenant_id, get_platform_engine())
+
+
+def get_student_classroom_options_service(
+    repository=Depends(get_student_classroom_catalog_repository),
 ) -> StudentClassroomOptionsService:
-    return StudentClassroomOptionsService(
-        SqlAlchemyCatalogRepository(context.tenant_id, get_platform_engine())
-    )
+    return StudentClassroomOptionsService(repository)
 
 
 def _response(record: object) -> StudentClassroomResponse:
@@ -328,6 +341,7 @@ async def _call(operation):
             detail="Student classroom service is unavailable",
         ) from None
     except (
+        StudentClassroomBindingUnavailable,
         StudentClassroomConflict,
         StudentGenerationApprovalConflict,
         ClassroomRevisionConflict,
@@ -358,12 +372,24 @@ async def _call(operation):
     response_model=StudentGenerationEstimateResponse,
 )
 async def estimate_student_classroom(
-    request: StudentClassroomCreateRequest,
+    request: StudentClassroomEstimateRequest,
     context: TenantContext = Depends(require_tenant),
     service: StudentClassroomServiceLike = Depends(get_student_classroom_service),
+    catalog_repository=Depends(get_student_classroom_catalog_repository),
 ) -> StudentGenerationEstimateResponse:
+    class_id = await _call(
+        resolve_student_class_id(
+            context,
+            request.course_id,
+            repository=catalog_repository,
+        )
+    )
+    trusted_request = StudentClassroomCreateRequest(
+        **request.model_dump(),
+        class_id=class_id,
+    )
     return StudentGenerationEstimateResponse.model_validate(
-        await _call(service.estimate(context, request)),
+        await _call(service.estimate(context, trusted_request)),
         from_attributes=True,
     )
 

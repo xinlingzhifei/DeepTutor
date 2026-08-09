@@ -50,11 +50,18 @@ def _request() -> dict[str, object]:
     }
 
 
+def _estimate_request() -> dict[str, object]:
+    request = _request()
+    request.pop("classId")
+    return request
+
+
 class _StudentClassroomService:
     def __init__(self, *, approval_required: bool = False) -> None:
         self.approval_required = approval_required
         self.create_calls = 0
         self.generation_jobs: list[str] = []
+        self.estimate_requests: list[object] = []
         self.assets: dict[str, dict[str, object]] = {}
 
     async def options(self, _context: TenantContext):
@@ -110,6 +117,7 @@ class _StudentClassroomService:
         return record
 
     async def estimate(self, _context: TenantContext, request):
+        self.estimate_requests.append(request)
         return {
             "scene_range": (1, 5),
             "duration_minutes_range": (3, 25),
@@ -155,6 +163,17 @@ class _StudentClassroomService:
         return record
 
 
+class _StudentClassroomCatalogRepository:
+    async def list_active_enrollment_class_ids(
+        self,
+        course_id: str,
+        learner_id: str,
+    ) -> tuple[str, ...]:
+        assert course_id == "course-a"
+        assert learner_id in {"alice", "bob"}
+        return ("class-a",)
+
+
 def _student_router_module():
     module_name = "deeptutor.api.routers.student_classrooms"
     assert importlib.util.find_spec(module_name) is not None, (
@@ -176,6 +195,9 @@ def _client(service: _StudentClassroomService, selected_user: dict[str, str]) ->
     application.dependency_overrides[
         student_classrooms.get_student_classroom_options_service
     ] = lambda: SimpleNamespace(list=service.options)
+    application.dependency_overrides[
+        student_classrooms.get_student_classroom_catalog_repository
+    ] = _StudentClassroomCatalogRepository
     return TestClient(application)
 
 
@@ -331,7 +353,7 @@ def test_real_app_wires_a_tenant_bound_durable_student_safety_evaluator(
 
 def test_student_source_selection_uses_logical_source_ids_only() -> None:
     service = _StudentClassroomService()
-    source_grounded = _request()
+    source_grounded = _estimate_request()
     source_grounded.update(
         contentMode="source_grounded",
         sourceType="knowledge_base",
@@ -351,6 +373,24 @@ def test_student_source_selection_uses_logical_source_ids_only() -> None:
 
     assert accepted.status_code == 200
     assert rejected.status_code == 422
+
+
+def test_student_estimate_resolves_class_from_current_enrollment() -> None:
+    service = _StudentClassroomService()
+    client = _client(service, {"id": "alice"})
+
+    response = client.post(
+        "/api/v1/student-classrooms/estimate",
+        json=_estimate_request(),
+    )
+    injected = client.post(
+        "/api/v1/student-classrooms/estimate",
+        json=_request(),
+    )
+
+    assert response.status_code == 200
+    assert service.estimate_requests[0].class_id == "class-a"
+    assert injected.status_code == 422
 
 
 def test_student_not_found_errors_hide_asset_identifiers() -> None:
@@ -422,7 +462,10 @@ def test_student_estimate_and_owner_list_use_the_trusted_context() -> None:
     client.post("/api/v1/student-classrooms", json=_request())
     selected_user["id"] = "alice"
 
-    estimate = client.post("/api/v1/student-classrooms/estimate", json=_request())
+    estimate = client.post(
+        "/api/v1/student-classrooms/estimate",
+        json=_estimate_request(),
+    )
     listed = client.get("/api/v1/student-classrooms")
 
     assert estimate.status_code == 200
@@ -755,6 +798,8 @@ async def test_sql_workflow_persists_student_marker_before_any_job() -> None:
     assert repository.created.initial_lifecycle_state == "draft"
     assert record.generation_job_id is None
     assert record.status == "awaiting_approval"
+    assert record.estimate == result.estimate
+    assert record.decision_outcome == "approval_required"
 
 
 @pytest.mark.asyncio

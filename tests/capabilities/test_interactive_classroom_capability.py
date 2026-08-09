@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import logging
 from pathlib import Path
@@ -60,7 +61,17 @@ class _FakeStudentClassroomService:
         if self.error is not None:
             raise self.error
         assert self.record is not None
-        return self.record
+        if self.record.estimate is not None:
+            return self.record
+        return replace(
+            self.record,
+            estimate=self.estimate_value,
+            decision_outcome=(
+                "approval_required"
+                if self.record.approval_id is not None
+                else "accepted"
+            ),
+        )
 
 
 def _tenant() -> TenantContext:
@@ -110,6 +121,8 @@ def _record(
     approval_id: str | None = None,
     job_id: str | None = "job-1",
     outline: dict[str, object] | None = None,
+    estimate: StudentGenerationEstimate | None = None,
+    decision_outcome: str | None = None,
 ) -> StudentClassroomView:
     return StudentClassroomView(
         asset_id="asset-1",
@@ -123,6 +136,8 @@ def _record(
         owner_id="learner-trusted",
         revision=1,
         outline=outline,
+        estimate=estimate,
+        decision_outcome=decision_outcome,
     )
 
 
@@ -331,6 +346,53 @@ async def test_approval_required_returns_approval_without_starting_a_job() -> No
     )
     assert result["approval_id"] == "approval-1"
     assert result["job_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_result_uses_authoritative_create_estimate_after_preflight_changes() -> None:
+    from deeptutor.agents.interactive_classroom.capability import (
+        InteractiveClassroomCapability,
+    )
+
+    authoritative = StudentGenerationEstimate(
+        scene_range=(2, 5),
+        duration_minutes_range=(8, 25),
+        quota_units=5,
+        requires_outline_confirmation=False,
+        requires_approval=True,
+    )
+    service = _FakeStudentClassroomService(
+        _record(
+            status="awaiting_approval",
+            approval_id="approval-authoritative",
+            job_id=None,
+            estimate=authoritative,
+            decision_outcome="approval_required",
+        )
+    )
+    stream = StreamBus()
+    token = set_current_tenant(_tenant())
+    try:
+        await InteractiveClassroomCapability(
+            service=service,
+            class_resolver=_trusted_class_id,
+        ).run(_context(), stream)
+    finally:
+        reset_current_tenant(token)
+
+    result = next(
+        event.metadata
+        for event in stream._history
+        if event.type == StreamEventType.RESULT
+    )
+    assert result["estimate"] == {
+        "scene_range": (2, 5),
+        "duration_minutes_range": (8, 25),
+        "quota_units": 5,
+        "requires_outline_confirmation": False,
+        "requires_approval": True,
+    }
+    assert result["approval_id"] == "approval-authoritative"
 
 
 @pytest.mark.asyncio

@@ -410,15 +410,6 @@ export default memo(function ChatComposer({
     setHasContent((prev) => (prev === next ? prev : next));
   }, []);
 
-  const doSend = useCallback(
-    (content: string) => {
-      onSend(content);
-      setHasContent(false);
-      inputHandleRef.current?.clear();
-    },
-    [onSend],
-  );
-
   const hasReferences =
     !!attachments.length ||
     !!selectedBookReferences.length ||
@@ -436,6 +427,20 @@ export default memo(function ChatComposer({
   const isConfigBlocked = capabilityNeedsConfig && !capabilityConfigConfirmed;
   const canSend =
     (hasContent || hasReferences) && !isStreaming && !isConfigBlocked;
+
+  const doSend = useCallback(
+    (content: string): boolean => {
+      if (!canSend) {
+        if (isConfigBlocked) onRequestConfigConfirm();
+        return false;
+      }
+      onSend(content);
+      setHasContent(false);
+      inputHandleRef.current?.clear();
+      return true;
+    },
+    [canSend, isConfigBlocked, onRequestConfigConfirm, onSend],
+  );
 
   const spaceSelectionCounts: SpaceSelectionCounts = {
     attachments: attachments.length,
