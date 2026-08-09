@@ -1031,20 +1031,31 @@ async def test_review_detail_reads_exact_source_evidence_and_real_publication_ba
                 )
             )
             await session.flush()
-            brief = await session.scalar(select(TeachingBrief).limit(1))
-            assert brief is not None
-            brief.source_snapshot_id = snapshot.snapshot_id
-            brief.document = json.dumps(
-                grounded_brief.model_dump(
-                    mode="json",
-                    by_alias=True,
-                    exclude_none=False,
-                ),
-                ensure_ascii=False,
-                separators=(",", ":"),
-                sort_keys=True,
+            session.add(
+                TeachingBrief(
+                    id=grounded_brief.brief_id,
+                    tenant_id=grounded_brief.tenant_id,
+                    source_snapshot_id=snapshot.snapshot_id,
+                    course_id=grounded_brief.course_id,
+                    class_id=grounded_brief.target_class_id,
+                    brief_version=grounded_brief.brief_version,
+                    document=json.dumps(
+                        grounded_brief.model_dump(
+                            mode="json",
+                            by_alias=True,
+                            exclude_none=False,
+                        ),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                    document_sha256=grounded_brief.content_sha256,
+                    created_by="author-1",
+                )
             )
-            brief.document_sha256 = grounded_brief.content_sha256
+            draft = await session.get(ClassroomDraft, review_database.draft_id)
+            assert draft is not None
+            draft.teaching_brief_id = grounded_brief.brief_id
 
     repository = SqlAlchemyReviewRepository(
         review_database.engine,
