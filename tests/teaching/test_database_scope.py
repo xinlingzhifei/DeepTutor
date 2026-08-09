@@ -88,6 +88,8 @@ def test_model_metadata_uses_only_platform_and_logical_tenant_schemas():
         "tenant.source_snapshots",
         "tenant.source_uploads",
         "tenant.course_generation_policies",
+        "tenant.student_classroom_assets",
+        "tenant.student_classroom_copies",
         "tenant.student_generation_approvals",
         "tenant.student_generation_requests",
         "tenant.teaching_briefs",

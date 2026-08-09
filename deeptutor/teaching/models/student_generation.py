@@ -224,3 +224,100 @@ class StudentGenerationApprovalRecord(TenantBase):
             "requested_at",
         ),
     )
+
+
+class StudentClassroomAssetRecord(TenantBase):
+    """Strong link from one policy request to its existing classroom asset."""
+
+    __tablename__ = "student_classroom_assets"
+
+    asset_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64))
+    request_id: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["asset_id", "tenant_id"],
+            ["tenant.classroom_assets.id", "tenant.classroom_assets.tenant_id"],
+            name="fk_student_classroom_assets_asset_tenant",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["request_id", "tenant_id"],
+            [
+                "tenant.student_generation_requests.id",
+                "tenant.student_generation_requests.tenant_id",
+            ],
+            name="fk_student_classroom_assets_request_tenant",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint(
+            "asset_id",
+            "tenant_id",
+            name="uq_student_classroom_assets_asset_tenant",
+        ),
+        UniqueConstraint(
+            "request_id",
+            "tenant_id",
+            name="uq_student_classroom_assets_request_tenant",
+        ),
+        Index(
+            "ix_student_classroom_assets_tenant_created",
+            "tenant_id",
+            "created_at",
+        ),
+    )
+
+
+class StudentClassroomCopyRecord(TenantBase):
+    """Immutable audit relation for a teacher draft copied from student work."""
+
+    __tablename__ = "student_classroom_copies"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64))
+    source_asset_id: Mapped[str] = mapped_column(String(128))
+    teacher_asset_id: Mapped[str] = mapped_column(String(128))
+    copied_by: Mapped[str] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["source_asset_id", "tenant_id"],
+            [
+                "tenant.student_classroom_assets.asset_id",
+                "tenant.student_classroom_assets.tenant_id",
+            ],
+            name="fk_student_classroom_copies_source_tenant",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["teacher_asset_id", "tenant_id"],
+            ["tenant.classroom_assets.id", "tenant.classroom_assets.tenant_id"],
+            name="fk_student_classroom_copies_teacher_tenant",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint(
+            "id",
+            "tenant_id",
+            name="uq_student_classroom_copies_id_tenant",
+        ),
+        UniqueConstraint(
+            "teacher_asset_id",
+            "tenant_id",
+            name="uq_student_classroom_copies_teacher_tenant",
+        ),
+        Index(
+            "ix_student_classroom_copies_source_created",
+            "tenant_id",
+            "source_asset_id",
+            "created_at",
+        ),
+    )

@@ -34,6 +34,10 @@ from deeptutor.teaching.models.classrooms import (
 )
 from deeptutor.teaching.models.jobs import ClassroomArtifact, GenerationJob
 from deeptutor.teaching.models.platform import AuditLog
+from deeptutor.teaching.models.student_generation import (
+    StudentClassroomAssetRecord,
+    StudentClassroomCopyRecord,
+)
 from deeptutor.teaching.repositories.classroom_version_allocation import (
     ClassroomVersionAllocationError,
     allocate_classroom_version_number,
@@ -50,6 +54,7 @@ from deeptutor.teaching.services.classrooms import (
     InvalidDraftMedia,
     NewClassroomWorkflow,
     NewDraftMedia,
+    TeacherDraftCopyRecord,
     draft_media_relative_path,
     matches_reviewed_outline_binding,
 )
@@ -269,6 +274,9 @@ class SqlAlchemyClassroomRepository:
                 TeachingBriefModel,
                 GenerationJob,
                 ClassroomVersion.id.label("classroom_version_id"),
+                StudentClassroomAssetRecord.request_id.label(
+                    "student_generation_request_id"
+                ),
             )
             .join(
                 ClassroomDraft,
@@ -299,6 +307,13 @@ class SqlAlchemyClassroomRepository:
                     ClassroomVersion.classroom_id == ClassroomAsset.id,
                 ),
             )
+            .outerjoin(
+                StudentClassroomAssetRecord,
+                and_(
+                    StudentClassroomAssetRecord.asset_id == ClassroomAsset.id,
+                    StudentClassroomAssetRecord.tenant_id == ClassroomAsset.tenant_id,
+                ),
+            )
             .where(ClassroomAsset.tenant_id == self._tenant_id)
         )
 
@@ -308,6 +323,7 @@ class SqlAlchemyClassroomRepository:
         brief_model: TeachingBriefModel | None = row[2]
         job: GenerationJob | None = row[3]
         version_id: str | None = row[4]
+        student_generation_request_id: str | None = row[5]
         brief: TeachingBrief | None = None
         if brief_model is not None:
             try:
@@ -362,6 +378,7 @@ class SqlAlchemyClassroomRepository:
             validation_document_sha256=draft.validation_document_sha256,
             creation_idempotency_key=draft.creation_idempotency_key,
             creation_request_sha256=draft.creation_request_sha256,
+            student_generation_request_id=student_generation_request_id,
         )
 
     async def get_creation(self, idempotency_key: str) -> ClassroomRecord | None:
@@ -392,6 +409,8 @@ class SqlAlchemyClassroomRepository:
                 record.creation_request_sha256,
                 workflow.creation_request_sha256,
             )
+            or record.student_generation_request_id
+            != workflow.student_generation_request_id
         ):
             raise ClassroomIdempotencyConflict("classroom idempotency key conflicts")
         return record
@@ -408,6 +427,12 @@ class SqlAlchemyClassroomRepository:
             128,
         )
         _sha256(workflow.creation_request_sha256, "creation_request_sha256")
+        if workflow.initial_lifecycle_state not in {
+            "draft",
+            "generating_outline",
+            "generating_content",
+        }:
+            raise ValueError("initial lifecycle state is invalid")
         existing = await self.get_creation(workflow.creation_idempotency_key)
         if existing is not None:
             return self._verify_creation_binding(existing, workflow)
@@ -460,7 +485,7 @@ class SqlAlchemyClassroomRepository:
                             tenant_id=self._tenant_id,
                             owner_id=workflow.owner_id,
                             title=workflow.title,
-                            lifecycle_state="generating_outline",
+                            lifecycle_state=workflow.initial_lifecycle_state,
                         )
                     )
                     session.add(
@@ -487,6 +512,14 @@ class SqlAlchemyClassroomRepository:
                             updated_by=workflow.owner_id,
                         )
                     )
+                    if workflow.student_generation_request_id is not None:
+                        session.add(
+                            StudentClassroomAssetRecord(
+                                asset_id=workflow.asset_id,
+                                tenant_id=self._tenant_id,
+                                request_id=workflow.student_generation_request_id,
+                            )
+                        )
                     session.add(
                         AuditLog(
                             tenant_id=self._tenant_id,
@@ -529,6 +562,21 @@ class SqlAlchemyClassroomRepository:
             ).one_or_none()
             return self._workflow_record(row) if row is not None else None
 
+    async def get_student_workflow(
+        self,
+        request_id: str,
+    ) -> ClassroomRecord | None:
+        _required(request_id, "request_id", 64)
+        async with self._session_factory() as session:
+            row = (
+                await session.execute(
+                    self._workflow_statement().where(
+                        StudentClassroomAssetRecord.request_id == request_id
+                    )
+                )
+            ).one_or_none()
+            return self._workflow_record(row) if row is not None else None
+
     async def _lock_draft(self, session, asset_id: str):
         row = (
             await session.execute(
@@ -552,7 +600,17 @@ class SqlAlchemyClassroomRepository:
         return row[0], row[1]
 
     async def attach_outline_job(self, asset_id: str, job_id: str) -> ClassroomRecord:
+        return await self.attach_generation_job(asset_id, job_id, "outline")
+
+    async def attach_generation_job(
+        self,
+        asset_id: str,
+        job_id: str,
+        phase: str,
+    ) -> ClassroomRecord:
         _required(job_id, "job_id", 64)
+        if phase not in {"outline", "content"}:
+            raise ValueError("generation job phase is invalid")
         async with self._session_factory() as session:
             async with session.begin():
                 _, draft = await self._lock_draft(session, asset_id)
@@ -561,7 +619,7 @@ class SqlAlchemyClassroomRepository:
                         GenerationJob.id == job_id,
                         GenerationJob.tenant_id == self._tenant_id,
                         GenerationJob.classroom_draft_id == draft.id,
-                        GenerationJob.phase == "outline",
+                        GenerationJob.phase == phase,
                     )
                 )
                 if job is None:
@@ -574,6 +632,189 @@ class SqlAlchemyClassroomRepository:
         if record is None:
             raise ClassroomPersistenceError("classroom workflow is unavailable")
         return record
+
+    async def start_student_generation(
+        self,
+        asset_id: str,
+        mode: str,
+    ) -> ClassroomRecord:
+        if mode not in {"micro", "full"}:
+            raise ValueError("student classroom mode is invalid")
+        target = "generating_content" if mode == "micro" else "generating_outline"
+        async with self._session_factory() as session:
+            async with session.begin():
+                asset, draft = await self._lock_draft(session, asset_id)
+                marker = await session.scalar(
+                    select(StudentClassroomAssetRecord).where(
+                        StudentClassroomAssetRecord.asset_id == asset_id,
+                        StudentClassroomAssetRecord.tenant_id == self._tenant_id,
+                    )
+                )
+                if marker is None or draft.generation_job_id is not None:
+                    raise ClassroomPersistenceError(
+                        "student classroom generation binding is invalid"
+                    )
+                if asset.lifecycle_state == "draft":
+                    asset.lifecycle_state = transition("draft", target)
+                elif asset.lifecycle_state != target:
+                    raise ClassroomPersistenceError(
+                        "student classroom generation state is invalid"
+                    )
+                asset.updated_at = func.now()
+                draft.updated_at = func.now()
+                await session.flush()
+        record = await self.get_workflow(asset_id)
+        if record is None:
+            raise ClassroomPersistenceError("classroom workflow is unavailable")
+        return record
+
+    async def mark_canceled(self, asset_id: str) -> ClassroomRecord:
+        async with self._session_factory() as session:
+            async with session.begin():
+                asset, draft = await self._lock_draft(session, asset_id)
+                marker = await session.scalar(
+                    select(StudentClassroomAssetRecord).where(
+                        StudentClassroomAssetRecord.asset_id == asset_id,
+                        StudentClassroomAssetRecord.tenant_id == self._tenant_id,
+                    )
+                )
+                if marker is None:
+                    raise ClassroomAssetNotFoundError(asset_id)
+                if asset.lifecycle_state != "canceled":
+                    asset.lifecycle_state = transition(asset.lifecycle_state, "canceled")
+                    asset.updated_at = func.now()
+                    draft.updated_at = func.now()
+                    await session.flush()
+        record = await self.get_workflow(asset_id)
+        if record is None:
+            raise ClassroomPersistenceError("classroom workflow is unavailable")
+        return record
+
+    async def copy_student_to_teacher_draft(
+        self,
+        source_asset_id: str,
+        target_asset_id: str,
+        target_draft_id: str,
+        copy_id: str,
+        copied_by: str,
+    ) -> TeacherDraftCopyRecord:
+        _required(source_asset_id, "source_asset_id", 128)
+        _required(target_asset_id, "target_asset_id", 128)
+        _required(target_draft_id, "target_draft_id", 128)
+        _required(copy_id, "copy_id", 64)
+        _required(copied_by, "copied_by", 128)
+        if source_asset_id == target_asset_id:
+            raise ValueError("teacher copy must use a new asset")
+        try:
+            async with self._session_factory() as session:
+                async with session.begin():
+                    row = (
+                        await session.execute(
+                            select(
+                                ClassroomAsset,
+                                ClassroomDraft,
+                                StudentClassroomAssetRecord,
+                            )
+                            .join(
+                                ClassroomDraft,
+                                and_(
+                                    ClassroomDraft.classroom_id == ClassroomAsset.id,
+                                    ClassroomDraft.tenant_id == ClassroomAsset.tenant_id,
+                                ),
+                            )
+                            .join(
+                                StudentClassroomAssetRecord,
+                                and_(
+                                    StudentClassroomAssetRecord.asset_id
+                                    == ClassroomAsset.id,
+                                    StudentClassroomAssetRecord.tenant_id
+                                    == ClassroomAsset.tenant_id,
+                                ),
+                            )
+                            .where(
+                                ClassroomAsset.id == source_asset_id,
+                                ClassroomAsset.tenant_id == self._tenant_id,
+                            )
+                            .with_for_update(
+                                read=True,
+                                of=(ClassroomAsset, ClassroomDraft),
+                            )
+                        )
+                    ).one_or_none()
+                    if row is None:
+                        raise ClassroomAssetNotFoundError(source_asset_id)
+                    source_asset, source_draft, _marker = row
+                    if (
+                        source_asset.lifecycle_state not in {"editing", "validated"}
+                        or source_draft.teaching_brief_id is None
+                    ):
+                        raise ClassroomPersistenceError(
+                            "student classroom is not ready to copy"
+                        )
+                    session.add(
+                        ClassroomAsset(
+                            id=target_asset_id,
+                            tenant_id=self._tenant_id,
+                            owner_id=copied_by,
+                            title=source_asset.title,
+                            lifecycle_state="editing",
+                        )
+                    )
+                    session.add(
+                        ClassroomDraft(
+                            id=target_draft_id,
+                            tenant_id=self._tenant_id,
+                            classroom_id=target_asset_id,
+                            generation_job_id=None,
+                            teaching_brief_id=source_draft.teaching_brief_id,
+                            base_version_id=None,
+                            revision=1,
+                            document=source_draft.document,
+                            document_sha256=source_draft.document_sha256,
+                            outline_document=source_draft.outline_document,
+                            outline_sha256=source_draft.outline_sha256,
+                            confirmed_outline_sha256=(
+                                source_draft.confirmed_outline_sha256
+                            ),
+                            validation_report=None,
+                            validation_report_sha256=None,
+                            validation_revision=None,
+                            validation_document_sha256=None,
+                            creation_idempotency_key=None,
+                            creation_request_sha256=None,
+                            created_by=copied_by,
+                            updated_by=copied_by,
+                        )
+                    )
+                    session.add(
+                        StudentClassroomCopyRecord(
+                            id=copy_id,
+                            tenant_id=self._tenant_id,
+                            source_asset_id=source_asset_id,
+                            teacher_asset_id=target_asset_id,
+                            copied_by=copied_by,
+                        )
+                    )
+                    session.add(
+                        AuditLog(
+                            tenant_id=self._tenant_id,
+                            actor_id=copied_by,
+                            action="student_classroom.copied_to_teacher_draft",
+                            resource_type="classroom_asset",
+                            resource_id=target_asset_id,
+                        )
+                    )
+                    await session.flush()
+        except IntegrityError as exc:
+            raise ClassroomPersistenceError("student classroom copy conflicts") from exc
+        return TeacherDraftCopyRecord(
+            asset_id=target_asset_id,
+            draft_id=target_draft_id,
+            source_student_asset_id=source_asset_id,
+            owner_id=copied_by,
+            status="editing",
+            revision=1,
+        )
 
     async def save_outline(
         self,

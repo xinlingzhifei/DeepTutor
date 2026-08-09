@@ -450,6 +450,25 @@ def _register_teacher_classroom_routes(
     return True
 
 
+def _register_student_classroom_routes(
+    application: FastAPI,
+    *,
+    enabled: bool,
+    dependencies: list[object],
+) -> bool:
+    if not enabled:
+        return False
+    from deeptutor.api.routers import student_classrooms
+
+    application.include_router(
+        student_classrooms.router,
+        prefix="/api/v1",
+        tags=["student-classrooms"],
+        dependencies=dependencies,
+    )
+    return True
+
+
 def _register_classroom_review_routes(
     application: FastAPI,
     *,
@@ -490,6 +509,11 @@ _register_teaching_catalog_routes(
     dependencies=_auth,
 )
 _register_teacher_classroom_routes(
+    app,
+    enabled=load_platform_settings().enabled,
+    dependencies=_auth,
+)
+_register_student_classroom_routes(
     app,
     enabled=load_platform_settings().enabled,
     dependencies=_auth,

@@ -54,6 +54,8 @@ from .platform import (
 )
 from .student_generation import (
     CourseGenerationPolicyRecord,
+    StudentClassroomAssetRecord,
+    StudentClassroomCopyRecord,
     StudentGenerationApprovalRecord,
     StudentGenerationRequestRecord,
 )
@@ -98,6 +100,8 @@ __all__ = [
     "SourceUpload",
     "StudentGenerationApprovalRecord",
     "StudentGenerationRequestRecord",
+    "StudentClassroomAssetRecord",
+    "StudentClassroomCopyRecord",
     "TeachingBrief",
     "TeachingClass",
     "Tenant",

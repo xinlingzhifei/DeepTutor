@@ -24,7 +24,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from .tenant import TenantBase
 
 ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
-    "draft": frozenset({"generating_outline", "canceled"}),
+    "draft": frozenset({"generating_outline", "generating_content", "canceled"}),
     "generating_outline": frozenset({"awaiting_outline", "failed", "canceled"}),
     "awaiting_outline": frozenset({"generating_content", "canceled"}),
     "generating_content": frozenset({"editing", "failed", "canceled"}),

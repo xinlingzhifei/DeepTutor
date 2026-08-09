@@ -16,6 +16,8 @@ from sqlalchemy.schema import DropSchema
 
 from deeptutor.teaching.models.student_generation import (
     CourseGenerationPolicyRecord,
+    StudentClassroomAssetRecord,
+    StudentClassroomCopyRecord,
     StudentGenerationApprovalRecord,
     StudentGenerationRequestRecord,
 )
@@ -164,7 +166,8 @@ async def test_postgres_student_generation_migration_constraints_state_and_downg
                         "SELECT constraint_name FROM information_schema.table_constraints "
                         "WHERE table_schema = :schema_name "
                         "AND table_name IN ('course_generation_policies', "
-                        "'student_generation_requests', 'student_generation_approvals')"
+                        "'student_generation_requests', 'student_generation_approvals', "
+                        "'student_classroom_assets', 'student_classroom_copies')"
                     ),
                     {"schema_name": schema_name},
                 )
@@ -193,7 +196,8 @@ async def test_postgres_student_generation_migration_constraints_state_and_downg
                         "FROM information_schema.columns "
                         "WHERE table_schema = :schema_name "
                         "AND table_name IN ('course_generation_policies', "
-                        "'student_generation_requests', 'student_generation_approvals')"
+                        "'student_generation_requests', 'student_generation_approvals', "
+                        "'student_classroom_assets', 'student_classroom_copies')"
                     ),
                     {"schema_name": schema_name},
                 )
@@ -202,6 +206,8 @@ async def test_postgres_student_generation_migration_constraints_state_and_downg
             "course_generation_policies",
             "student_generation_requests",
             "student_generation_approvals",
+            "student_classroom_assets",
+            "student_classroom_copies",
         }
         assert tables - tables_before == new_tables
         assert {
@@ -216,6 +222,12 @@ async def test_postgres_student_generation_migration_constraints_state_and_downg
             "fk_student_generation_requests_class_course_classes",
             "fk_student_generation_requests_policy_tenant",
             "fk_student_generation_approvals_request_tenant",
+            "fk_student_classroom_assets_asset_tenant",
+            "fk_student_classroom_assets_request_tenant",
+            "fk_student_classroom_copies_source_tenant",
+            "fk_student_classroom_copies_teacher_tenant",
+            "uq_student_classroom_assets_request_tenant",
+            "uq_student_classroom_copies_teacher_tenant",
         }.issubset(constraint_names)
         assert pending_index is not None
         assert "UNIQUE INDEX" in pending_index
@@ -227,6 +239,8 @@ async def test_postgres_student_generation_migration_constraints_state_and_downg
                 CourseGenerationPolicyRecord,
                 StudentGenerationRequestRecord,
                 StudentGenerationApprovalRecord,
+                StudentClassroomAssetRecord,
+                StudentClassroomCopyRecord,
             )
         }
         actual_column_names: dict[str, set[str]] = {table_name: set() for table_name in new_tables}
@@ -242,7 +256,7 @@ async def test_postgres_student_generation_migration_constraints_state_and_downg
             for table_name, table in expected_tables.items()
             for column in table.c
         }
-        assert (revision, state_revision) == ("20260809_0013", "20260809_0013")
+        assert (revision, state_revision) == ("20260809_0014", "20260809_0014")
 
         with pytest.raises(IntegrityError):
             async with engine.begin() as connection:
@@ -317,7 +331,7 @@ async def test_postgres_student_generation_migration_constraints_state_and_downg
                 ),
                 {"schema_name": schema_name},
             )
-        assert (revision, state_revision) == ("20260809_0013", "20260809_0013")
+        assert (revision, state_revision) == ("20260809_0014", "20260809_0014")
     finally:
         async with engine.begin() as connection:
             await connection.execute(

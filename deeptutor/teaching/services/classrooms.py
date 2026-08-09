@@ -112,6 +112,17 @@ class ClassroomRecord:
     validation_document_sha256: str | None = None
     creation_idempotency_key: str | None = None
     creation_request_sha256: str | None = None
+    student_generation_request_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TeacherDraftCopyRecord:
+    asset_id: str
+    draft_id: str
+    source_student_asset_id: str
+    owner_id: str
+    status: str
+    revision: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +135,8 @@ class NewClassroomWorkflow:
     teaching_brief: TeachingBrief
     creation_idempotency_key: str
     creation_request_sha256: str
+    initial_lifecycle_state: str = "generating_outline"
+    student_generation_request_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,6 +214,35 @@ class ClassroomRepository(Protocol):
     async def list_workflows(self) -> tuple[ClassroomRecord, ...]: ...
 
     async def get_workflow(self, asset_id: str) -> ClassroomRecord | None: ...
+
+    async def get_student_workflow(
+        self,
+        request_id: str,
+    ) -> ClassroomRecord | None: ...
+
+    async def attach_generation_job(
+        self,
+        asset_id: str,
+        job_id: str,
+        phase: str,
+    ) -> ClassroomRecord: ...
+
+    async def start_student_generation(
+        self,
+        asset_id: str,
+        mode: str,
+    ) -> ClassroomRecord: ...
+
+    async def mark_canceled(self, asset_id: str) -> ClassroomRecord: ...
+
+    async def copy_student_to_teacher_draft(
+        self,
+        source_asset_id: str,
+        target_asset_id: str,
+        target_draft_id: str,
+        copy_id: str,
+        copied_by: str,
+    ) -> TeacherDraftCopyRecord: ...
 
     async def attach_outline_job(self, asset_id: str, job_id: str) -> ClassroomRecord: ...
 
@@ -1752,12 +1794,14 @@ class ClassroomService:
         store_provider: DraftMediaStoreProvider | None,
         *,
         clock=lambda: datetime.now(timezone.utc),
+        student_owner_only: bool = False,
     ) -> None:
         self._repository = repository
         self._brief_builder = brief_builder
         self._generation = generation
         self._store_provider = store_provider
         self._clock = clock
+        self._student_owner_only = student_owner_only
 
     async def create(
         self,
@@ -1939,7 +1983,16 @@ class ClassroomService:
         return record
 
     def _can_edit(self, context: TenantContext, record: ClassroomRecord) -> bool:
-        return record.tenant_id == context.tenant_id and _allows(
+        if record.tenant_id != context.tenant_id:
+            return False
+        if self._student_owner_only:
+            return (
+                record.student_generation_request_id is not None
+                and record.owner_id == context.user_id
+            )
+        if record.student_generation_request_id is not None:
+            return False
+        return _allows(
             context,
             "classroom.edit",
             course_id=record.course_id,

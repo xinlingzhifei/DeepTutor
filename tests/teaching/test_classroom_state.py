@@ -41,6 +41,7 @@ def test_draft_cannot_publish_before_validation() -> None:
     ("current_state", "target_state"),
     [
         ("draft", "generating_outline"),
+        ("draft", "generating_content"),
         ("generating_outline", "awaiting_outline"),
         ("awaiting_outline", "generating_content"),
         ("generating_content", "editing"),
@@ -69,7 +70,7 @@ def test_terminal_classroom_state_cannot_transition(terminal_state: str) -> None
 
 def test_classroom_lifecycle_matches_the_approved_state_machine() -> None:
     assert ALLOWED_TRANSITIONS == {
-        "draft": frozenset({"generating_outline", "canceled"}),
+        "draft": frozenset({"generating_outline", "generating_content", "canceled"}),
         "generating_outline": frozenset({"awaiting_outline", "failed", "canceled"}),
         "awaiting_outline": frozenset({"generating_content", "canceled"}),
         "generating_content": frozenset({"editing", "failed", "canceled"}),
