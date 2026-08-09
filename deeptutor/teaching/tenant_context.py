@@ -11,6 +11,7 @@ from deeptutor.api.routers.auth import (
     require_platform_identity_from_payload,
 )
 from deeptutor.multi_user.context import (
+    get_current_tenant_or_none,
     get_current_user,
     get_current_user_or_none,
     set_current_tenant,
@@ -60,6 +61,17 @@ def _local_tenant_context(user_id: str) -> TenantContext:
         user_id=user_id,
         permissions=permissions,
     )
+
+
+def resolve_runtime_tenant_context() -> TenantContext:
+    """Return an installed tenant or a trusted local-mode tenant."""
+
+    context = get_current_tenant_or_none()
+    if context is not None:
+        return context
+    if not load_platform_settings().enabled:
+        return _local_tenant_context(get_current_user().id)
+    raise RuntimeError("tenant context is not installed")
 
 
 def _requested_tenant(

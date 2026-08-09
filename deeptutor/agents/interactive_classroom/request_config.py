@@ -22,6 +22,11 @@ class InteractiveClassroomRequestConfig(BaseModel):
             raise ValueError("course_id cannot be blank")
         return value
 
+    @field_validator("question", mode="before")
+    @classmethod
+    def trim_question_before_length_check(cls, value: object) -> object:
+        return value.strip() if isinstance(value, str) else value
+
 
 def validate_interactive_classroom_request_config(
     raw_config: dict[str, Any] | None,

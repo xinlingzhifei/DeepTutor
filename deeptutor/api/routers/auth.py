@@ -328,7 +328,11 @@ async def ws_require_auth(ws: WebSocket) -> _CtxToken | _WsAuthFailed:
         return _install_current_user(None)
 
     token = ws.query_params.get("token") or ws.cookies.get(_COOKIE_NAME)
-    payload = decode_token(token) if token else None
+    payload = (
+        decode_token(token, fresh=True)
+        if token and POCKETBASE_ENABLED
+        else decode_token(token) if token else None
+    )
     if not payload:
         await ws.close(code=4001)
         return ws_auth_failed

@@ -109,13 +109,14 @@ def get_pb_client():
     return _client
 
 
-def validate_pb_token(token: str) -> dict[str, Any] | None:
+def validate_pb_token(token: str, *, fresh: bool = False) -> dict[str, Any] | None:
     """
     Validate a PocketBase user token and return the user payload dict.
 
     Uses PocketBase's /api/collections/users/auth-refresh endpoint.
     Results are cached for ``_TOKEN_CACHE_TTL`` seconds so only the
     first call per provider and token per minute makes a network round-trip.
+    ``fresh=True`` bypasses the cache for security-sensitive handshakes.
 
     Returns a dict with at least ``username`` and ``role`` keys, or
     None if the token is invalid / expired.
@@ -129,12 +130,13 @@ def validate_pb_token(token: str) -> dict[str, Any] | None:
     cache_key = (pocketbase_url, token)
 
     # Cache hit
-    cached = _TOKEN_CACHE.get(cache_key)
-    if cached is not None:
-        payload, expires_at = cached
-        if now < expires_at:
-            return payload
-        del _TOKEN_CACHE[cache_key]
+    if not fresh:
+        cached = _TOKEN_CACHE.get(cache_key)
+        if cached is not None:
+            payload, expires_at = cached
+            if now < expires_at:
+                return payload
+            del _TOKEN_CACHE[cache_key]
 
     # Cache miss — call PocketBase
     try:

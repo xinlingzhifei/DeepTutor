@@ -13,6 +13,8 @@ from deeptutor.core.context import UnifiedContext
 from deeptutor.core.stream import StreamEventType
 from deeptutor.core.stream_bus import StreamBus
 from deeptutor.multi_user.context import (
+    get_current_tenant_or_none,
+    get_current_user,
     reset_current_tenant,
     reset_current_user,
     set_current_tenant,
@@ -74,16 +76,18 @@ def _context(
     mode: str = "micro",
     language: str = "en",
     content_mode: str = "source_grounded",
+    question: str = "A focused Fourier lesson",
+    user_message: str = "Explain Fourier transform",
 ) -> UnifiedContext:
     return UnifiedContext(
         session_id="session-1",
-        user_message="Explain Fourier transform",
+        user_message=user_message,
         active_capability="interactive_classroom",
         knowledge_bases=["kb-authorized"],
         config_overrides={
             "mode": mode,
             "course_id": "course-a",
-            "question": "A focused Fourier lesson",
+            "question": question,
             "content_mode": content_mode,
         },
         language=language,
@@ -200,6 +204,53 @@ async def test_open_creation_does_not_select_context_knowledge_base() -> None:
     assert request.content_mode == "open_creation"
     assert request.source_type is None
     assert request.source_ref is None
+
+
+@pytest.mark.asyncio
+async def test_fallback_question_rejects_more_than_4000_effective_characters() -> None:
+    from deeptutor.agents.interactive_classroom.capability import (
+        InteractiveClassroomCapability,
+    )
+
+    service = _FakeStudentClassroomService(_record())
+    token = set_current_tenant(_tenant())
+    try:
+        with pytest.raises(ValueError, match="question.*4000"):
+            await InteractiveClassroomCapability(
+                service=service,
+                class_resolver=_trusted_class_id,
+            ).run(
+                _context(question="", user_message="x" * 4001),
+                StreamBus(),
+            )
+    finally:
+        reset_current_tenant(token)
+
+    assert service.calls == []
+
+
+@pytest.mark.asyncio
+async def test_fallback_question_accepts_4000_and_caps_title_at_255() -> None:
+    from deeptutor.agents.interactive_classroom.capability import (
+        InteractiveClassroomCapability,
+    )
+
+    service = _FakeStudentClassroomService(_record())
+    token = set_current_tenant(_tenant())
+    try:
+        await InteractiveClassroomCapability(
+            service=service,
+            class_resolver=_trusted_class_id,
+        ).run(
+            _context(question="", user_message=f"  {'x' * 4000}  "),
+            StreamBus(),
+        )
+    finally:
+        reset_current_tenant(token)
+
+    request = service.calls[0][2]
+    assert request.objective == "x" * 4000
+    assert request.title == "x" * 255
 
 
 @pytest.mark.asyncio
@@ -468,10 +519,73 @@ async def test_turn_runtime_executes_zero_arg_builtin_with_trusted_composition(
 
 
 @pytest.mark.asyncio
-async def test_capability_does_not_accept_tenant_identity_from_unified_context() -> None:
+async def test_local_app_alias_runs_zero_arg_builtin_without_installed_tenant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from deeptutor.agents.interactive_classroom import capability as capability_module
+    from deeptutor.app.facade import DeepTutorApp
+    from deeptutor.runtime.orchestrator import ChatOrchestrator
+    from deeptutor.runtime.registry import capability_registry as registry_module
+    from deeptutor.teaching import tenant_context as tenant_context_module
+
+    service = _FakeStudentClassroomService(_record())
+    captured: dict[str, object] = {}
+
+    async def resolve_class(context: TenantContext, course_id: str) -> str:
+        captured["binding_context"] = context
+        captured["course_id"] = course_id
+        return "class-trusted"
+
+    def build_service(context: TenantContext) -> _FakeStudentClassroomService:
+        captured["service_context"] = context
+        return service
+
+    monkeypatch.setattr(
+        tenant_context_module,
+        "load_platform_settings",
+        lambda: SimpleNamespace(enabled=False),
+    )
+    monkeypatch.setattr(
+        capability_module,
+        "resolve_student_class_id",
+        resolve_class,
+    )
+    monkeypatch.setattr(
+        capability_module,
+        "build_student_classroom_service",
+        build_service,
+    )
+    monkeypatch.setattr(registry_module, "_default_registry", None)
+    assert get_current_tenant_or_none() is None
+    current_user = get_current_user()
+    try:
+        app = DeepTutorApp()
+        capability_name = app.resolve_capability("classroom")
+        context = _context()
+        context.active_capability = capability_name
+        events = [event async for event in ChatOrchestrator().handle(context)]
+    finally:
+        registry_module._default_registry = None
+
+    assert capability_name == "interactive_classroom"
+    assert captured["course_id"] == "course-a"
+    tenant = captured["binding_context"]
+    assert tenant is captured["service_context"]
+    assert tenant.tenant_id == "local"
+    assert tenant.user_id == current_user.id
+    assert any(event.type == StreamEventType.RESULT for event in events)
+    assert not any(event.type == StreamEventType.ERROR for event in events)
+    assert get_current_tenant_or_none() is None
+
+
+@pytest.mark.asyncio
+async def test_capability_does_not_accept_tenant_identity_from_unified_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from deeptutor.agents.interactive_classroom.capability import (
         InteractiveClassroomCapability,
     )
+    from deeptutor.teaching import tenant_context as tenant_context_module
 
     context = _context()
     context.metadata["tenant_context"] = {
@@ -479,6 +593,11 @@ async def test_capability_does_not_accept_tenant_identity_from_unified_context()
         "user_id": "learner-from-client",
     }
     service = _FakeStudentClassroomService(_record())
+    monkeypatch.setattr(
+        tenant_context_module,
+        "load_platform_settings",
+        lambda: SimpleNamespace(enabled=True),
+    )
 
     with pytest.raises(RuntimeError, match="tenant context is not installed"):
         await InteractiveClassroomCapability(

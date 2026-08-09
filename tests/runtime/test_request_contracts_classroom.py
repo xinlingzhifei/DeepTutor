@@ -88,6 +88,18 @@ def test_classroom_request_model_forbids_extra_fields_directly() -> None:
         )
 
 
+def test_explicit_question_length_is_checked_after_trimming() -> None:
+    padded = f"  {'x' * 4000}  "
+
+    assert _validate(
+        {
+            "mode": "micro",
+            "course_id": "course-a",
+            "question": padded,
+        }
+    )["question"] == "x" * 4000
+
+
 def test_classroom_manifest_schema_uses_unified_request_contract() -> None:
     schema = get_capability_request_schema("interactive_classroom")
 

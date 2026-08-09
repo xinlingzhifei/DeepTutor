@@ -15,7 +15,6 @@ from deeptutor.core.capability_protocol import BaseCapability, CapabilityManifes
 from deeptutor.core.context import UnifiedContext
 from deeptutor.core.stream_bus import StreamBus
 from deeptutor.i18n import StatusI18n
-from deeptutor.multi_user.context import get_current_tenant
 from deeptutor.runtime.request_contracts import get_capability_request_schema
 from deeptutor.teaching.policies.student_generation import StudentGenerationEstimate
 from deeptutor.teaching.services.student_classroom_runtime import (
@@ -26,7 +25,10 @@ from deeptutor.teaching.services.student_classrooms import (
     StudentClassroomDenied,
     StudentClassroomView,
 )
-from deeptutor.teaching.tenant_context import TenantContext
+from deeptutor.teaching.tenant_context import (
+    TenantContext,
+    resolve_runtime_tenant_context,
+)
 
 
 class StudentClassroomServiceLike(Protocol):
@@ -106,6 +108,8 @@ class InteractiveClassroomCapability(BaseCapability):
             raise ValueError("trusted classroom class_id is unavailable")
 
         question = config.question.strip() or context.user_message.strip()
+        if len(question) > 4000:
+            raise ValueError("question cannot exceed 4000 characters")
         source_ref = (
             context.knowledge_bases[0]
             if config.content_mode == "source_grounded" and context.knowledge_bases
@@ -127,7 +131,7 @@ class InteractiveClassroomCapability(BaseCapability):
         )
 
     async def run(self, context: UnifiedContext, stream: StreamBus) -> None:
-        tenant_context = get_current_tenant()
+        tenant_context = resolve_runtime_tenant_context()
         config = validate_interactive_classroom_request_config(context.config_overrides)
         class_id = await self._class_resolver(tenant_context, config.course_id)
         service = self._resolve_service(tenant_context)

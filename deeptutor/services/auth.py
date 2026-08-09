@@ -235,7 +235,7 @@ def create_token(username: str, role: str = "user", user_id: str | None = None) 
     return jwt.encode(payload, AUTH_SECRET, algorithm=_ALGORITHM)
 
 
-def decode_token(token: str) -> TokenPayload | None:
+def decode_token(token: str, *, fresh: bool = False) -> TokenPayload | None:
     """
     Validate a token and return a TokenPayload, or None if invalid.
 
@@ -251,7 +251,7 @@ def decode_token(token: str) -> TokenPayload | None:
     if POCKETBASE_ENABLED:
         from deeptutor.services.pocketbase_client import validate_pb_token
 
-        payload = validate_pb_token(token)
+        payload = validate_pb_token(token, fresh=fresh)
         if payload is None:
             return None
         return TokenPayload(
