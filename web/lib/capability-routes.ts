@@ -39,6 +39,14 @@ export function capabilityForPath(pathname: string): Capability | null {
   return match ? match.capability : null;
 }
 
+/** Route to the immutable player for a completed student classroom. */
+export function studentClassroomPlayRoute(
+  versionId: string | null,
+): string | null {
+  if (versionId === null || !versionId.trim()) return null;
+  return `/learn/classrooms/${encodeURIComponent(versionId)}`;
+}
+
 /**
  * Human-facing phrase for a capability, used in the "ask your admin" copy.
  * Kept as plain English keys so react-i18next can translate them later.

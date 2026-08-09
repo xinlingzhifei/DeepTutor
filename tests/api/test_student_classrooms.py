@@ -57,6 +57,16 @@ class _StudentClassroomService:
         self.generation_jobs: list[str] = []
         self.assets: dict[str, dict[str, object]] = {}
 
+    async def options(self, _context: TenantContext):
+        return (
+            SimpleNamespace(
+                course_id="course-a",
+                title="Course A",
+                allowed_modes=("micro",),
+                allowed_content_modes=("source_grounded", "open_creation"),
+            ),
+        )
+
     async def create(self, context: TenantContext, request):
         self.create_calls += 1
         asset_id = f"student-asset-{self.create_calls}"
@@ -163,6 +173,9 @@ def _client(service: _StudentClassroomService, selected_user: dict[str, str]) ->
     application.dependency_overrides[
         student_classrooms.get_student_classroom_service
     ] = lambda: service
+    application.dependency_overrides[
+        student_classrooms.get_student_classroom_options_service
+    ] = lambda: SimpleNamespace(list=service.options)
     return TestClient(application)
 
 
@@ -180,6 +193,84 @@ def test_student_asset_is_private_to_its_owner() -> None:
 
     assert hidden.status_code == 404
     assert asset_id not in hidden.text
+
+
+def test_student_options_response_is_minimal_and_camel_cased() -> None:
+    response = _client(_StudentClassroomService(), {"id": "alice"}).get(
+        "/api/v1/student-classrooms/options"
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "items": [
+            {
+                "courseId": "course-a",
+                "title": "Course A",
+                "allowedModes": ["micro"],
+                "allowedContentModes": ["source_grounded", "open_creation"],
+            }
+        ]
+    }
+    assert "classId" not in response.text
+
+
+def test_student_owner_detail_exposes_generated_classroom_version() -> None:
+    class VersionedService(_StudentClassroomService):
+        async def get(self, context: TenantContext, asset_id: str):
+            record = await super().get(context, asset_id)
+            if record is None:
+                return None
+            return SimpleNamespace(
+                **record,
+                classroom_version_id="student-version-1",
+            )
+
+    service = VersionedService()
+    client = _client(service, {"id": "alice"})
+    created = client.post("/api/v1/student-classrooms", json=_request()).json()
+
+    response = client.get(
+        f"/api/v1/student-classrooms/{created['assetId']}"
+    )
+
+    assert response.status_code == 200
+    assert response.json()["classroomVersionId"] == "student-version-1"
+
+
+def test_student_service_view_carries_generated_classroom_version() -> None:
+    service_module = importlib.import_module(
+        "deeptutor.teaching.services.student_classrooms"
+    )
+    record = ClassroomRecord(
+        tenant_id="tenant-a",
+        asset_id="student-asset-1",
+        draft_id="student-draft-1",
+        job_id="student-job-1",
+        lifecycle_state="editing",
+        status="succeeded",
+        title="Student classroom",
+        course_id="course-a",
+        class_id="class-a",
+        owner_id="alice",
+        teaching_brief=SimpleNamespace(),
+        revision=2,
+        outline=None,
+        document={},
+        classroom_version_id="student-version-1",
+        confirmed_outline_sha256=None,
+        validation_report=None,
+        student_generation_request_id="request-1",
+    )
+
+    view = service_module.SqlAlchemyStudentClassroomWorkflow._view(
+        record,
+        request_id="request-1",
+        approval_id=None,
+        mode="micro",
+        status="succeeded",
+    )
+
+    assert view.classroom_version_id == "student-version-1"
 
 
 def test_over_quota_request_waits_for_approval_without_creating_a_job() -> None:

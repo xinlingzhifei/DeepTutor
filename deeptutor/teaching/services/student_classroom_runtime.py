@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
-from typing import Protocol
+from dataclasses import dataclass
+from typing import Literal, Protocol
 
 from deeptutor.services.config import load_platform_settings
 from deeptutor.teaching.brief_builder import TeachingBriefBuilder
 from deeptutor.teaching.database import get_platform_engine
 from deeptutor.teaching.openmaic.data_planes import DataPlaneSelector
+from deeptutor.teaching.permissions import ResourceScope
 from deeptutor.teaching.processes import RuntimeCancellationGateway, RuntimeStoreProvider
-from deeptutor.teaching.repositories.catalog import SqlAlchemyCatalogRepository
+from deeptutor.teaching.repositories.catalog import (
+    SqlAlchemyCatalogRepository,
+    StudentClassroomOptionBinding,
+)
 from deeptutor.teaching.repositories.classrooms import SqlAlchemyClassroomRepository
 from deeptutor.teaching.repositories.data_planes import SqlAlchemyDataPlaneRepository
 from deeptutor.teaching.repositories.jobs import SqlAlchemyGenerationJobRepository
@@ -42,6 +47,81 @@ class _CatalogBindingRepository(Protocol):
         course_id: str,
         learner_id: str,
     ) -> tuple[str, ...]: ...
+
+
+class _StudentClassroomOptionsRepository(Protocol):
+    async def list_student_classroom_option_bindings(
+        self,
+        learner_id: str,
+    ) -> tuple[StudentClassroomOptionBinding, ...]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class StudentClassroomOption:
+    course_id: str
+    title: str
+    allowed_modes: tuple[Literal["micro", "full"], ...]
+    allowed_content_modes: tuple[
+        Literal["source_grounded", "open_creation"], ...
+    ]
+
+
+_CONTENT_MODE_ENCODINGS = {
+    "source_grounded": ("source_grounded",),
+    "open_creation": ("open_creation",),
+    "source_grounded,open_creation": ("source_grounded", "open_creation"),
+}
+
+
+class StudentClassroomOptionsService:
+    """Expose only unambiguous, policy-backed courses for the current learner."""
+
+    def __init__(self, repository: _StudentClassroomOptionsRepository) -> None:
+        self._repository = repository
+
+    async def list(self, context: TenantContext) -> tuple[StudentClassroomOption, ...]:
+        bindings = await self._repository.list_student_classroom_option_bindings(
+            context.user_id
+        )
+        grouped: dict[str, list[StudentClassroomOptionBinding]] = {}
+        for binding in bindings:
+            grouped.setdefault(binding.course_id, []).append(binding)
+
+        options: list[StudentClassroomOption] = []
+        for course_bindings in grouped.values():
+            if len(course_bindings) != 1:
+                continue
+            binding = course_bindings[0]
+            content_modes = _CONTENT_MODE_ENCODINGS.get(binding.allowed_content_modes)
+            if content_modes is None:
+                continue
+            resource = ResourceScope(
+                tenant_id=context.tenant_id,
+                course_id=binding.course_id,
+                class_id=binding.class_id,
+            )
+            allowed_modes: list[Literal["micro", "full"]] = []
+            if binding.allow_student_micro and any(
+                permission.allows_resource("classroom.generate.micro", resource)
+                for permission in context.permissions
+            ):
+                allowed_modes.append("micro")
+            if binding.allow_student_full and any(
+                permission.allows_resource("classroom.generate.full", resource)
+                for permission in context.permissions
+            ):
+                allowed_modes.append("full")
+            if not allowed_modes:
+                continue
+            options.append(
+                StudentClassroomOption(
+                    course_id=binding.course_id,
+                    title=binding.title,
+                    allowed_modes=tuple(allowed_modes),
+                    allowed_content_modes=content_modes,
+                )
+            )
+        return tuple(options)
 
 
 async def resolve_student_class_id(
@@ -165,6 +245,8 @@ def build_student_classroom_service(
 
 __all__ = [
     "StudentClassroomBindingUnavailable",
+    "StudentClassroomOption",
+    "StudentClassroomOptionsService",
     "build_student_classroom_service",
     "resolve_student_class_id",
 ]

@@ -147,6 +147,7 @@ class StudentClassroomView:
     owner_id: str
     revision: int
     outline: dict[str, object] | None
+    classroom_version_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -491,6 +492,7 @@ class SqlAlchemyStudentClassroomWorkflow:
             owner_id=record.owner_id,
             revision=record.revision,
             outline=record.outline,
+            classroom_version_id=record.classroom_version_id,
         )
 
     async def create(

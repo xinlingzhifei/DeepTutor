@@ -20,6 +20,7 @@ from deeptutor.api.routers.teaching_catalog import (
 from deeptutor.teaching.database import get_platform_engine
 from deeptutor.teaching.job_route_binding import DataPlaneBindingUnavailable
 from deeptutor.teaching.quota import InsufficientQuota
+from deeptutor.teaching.repositories.catalog import SqlAlchemyCatalogRepository
 from deeptutor.teaching.repositories.classrooms import (
     ClassroomAssetNotFoundError,
     ClassroomPersistenceError,
@@ -41,6 +42,7 @@ from deeptutor.teaching.services.classrooms import (
     InvalidClassroomState,
 )
 from deeptutor.teaching.services.student_classroom_runtime import (
+    StudentClassroomOptionsService,
     build_student_classroom_service,
 )
 from deeptutor.teaching.services.student_classrooms import (
@@ -107,10 +109,24 @@ class StudentClassroomResponse(_ApiModel):
     owner_id: str
     revision: int
     outline: dict[str, Any] | None = None
+    classroom_version_id: str | None = None
 
 
 class StudentClassroomListResponse(_ApiModel):
     items: list[StudentClassroomResponse]
+
+
+class StudentClassroomOptionResponse(_ApiModel):
+    course_id: str
+    title: str
+    allowed_modes: tuple[Literal["micro", "full"], ...]
+    allowed_content_modes: tuple[
+        Literal["source_grounded", "open_creation"], ...
+    ]
+
+
+class StudentClassroomOptionsResponse(_ApiModel):
+    items: list[StudentClassroomOptionResponse]
 
 
 class StudentGenerationEstimateResponse(_ApiModel):
@@ -207,6 +223,10 @@ class StudentClassroomServiceLike(Protocol):
     ): ...
 
 
+class StudentClassroomOptionsServiceLike(Protocol):
+    async def list(self, context: TenantContext): ...
+
+
 def get_student_safety_evaluator(
     context: TenantContext = Depends(require_tenant),
 ) -> SqlAlchemyStudentSafetyEvaluator:
@@ -252,6 +272,14 @@ def get_student_classroom_service(
         job_repository=job_repository,
         data_plane_selector=data_plane_selector,
         cancellation_gateway=cancellation_gateway,
+    )
+
+
+def get_student_classroom_options_service(
+    context: TenantContext = Depends(require_tenant),
+) -> StudentClassroomOptionsService:
+    return StudentClassroomOptionsService(
+        SqlAlchemyCatalogRepository(context.tenant_id, get_platform_engine())
     )
 
 
@@ -363,6 +391,28 @@ async def list_student_classrooms(
 ) -> StudentClassroomListResponse:
     records = await _call(service.list(context))
     return StudentClassroomListResponse(items=[_response(record) for record in records])
+
+
+@router.get(
+    "/student-classrooms/options",
+    response_model=StudentClassroomOptionsResponse,
+)
+async def list_student_classroom_options(
+    context: TenantContext = Depends(require_tenant),
+    service: StudentClassroomOptionsServiceLike = Depends(
+        get_student_classroom_options_service
+    ),
+) -> StudentClassroomOptionsResponse:
+    records = await _call(service.list(context))
+    return StudentClassroomOptionsResponse(
+        items=[
+            StudentClassroomOptionResponse.model_validate(
+                record,
+                from_attributes=True,
+            )
+            for record in records
+        ]
+    )
 
 
 @router.get(

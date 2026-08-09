@@ -256,7 +256,8 @@ export default memo(function ChatComposer({
   isStreaming: boolean;
   isVisualizeMode: boolean;
   /**
-   * True when the active capability (e.g. Quiz / Visualize / Research)
+   * True when the active capability (e.g. Quiz / Visualize / Research /
+   * Student Classroom)
    * requires explicit configuration before sending. When true, `canSend`
    * is gated on `capabilityConfigConfirmed`.
    */

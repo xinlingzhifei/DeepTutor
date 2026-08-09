@@ -22,6 +22,7 @@ import {
   Clapperboard,
   Microscope,
   PenLine,
+  Presentation,
   type LucideIcon,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
@@ -30,7 +31,8 @@ export type ConfigurableCapability =
   | "deep_question"
   | "math_animator"
   | "visualize"
-  | "deep_research";
+  | "deep_research"
+  | "interactive_classroom";
 
 interface CapabilityChrome {
   icon: LucideIcon;
@@ -42,6 +44,10 @@ const CAPABILITY_CHROME: Record<ConfigurableCapability, CapabilityChrome> = {
   math_animator: { icon: Clapperboard, label: "Animator settings" },
   visualize: { icon: BarChart3, label: "Visualize settings" },
   deep_research: { icon: Microscope, label: "Research settings" },
+  interactive_classroom: {
+    icon: Presentation,
+    label: "Student classroom settings",
+  },
 };
 
 interface CapabilityConfigCardProps {

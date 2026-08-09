@@ -1,7 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { capabilityForPath } from "../lib/capability-routes";
+import {
+  capabilityForPath,
+  studentClassroomPlayRoute,
+} from "../lib/capability-routes";
 
 // ── capabilityForPath ──────────────────────────────────────────────────
 
@@ -36,4 +39,13 @@ test("capabilityForPath returns null for ungated routes", () => {
   assert.equal(capabilityForPath("/memory"), null);
   assert.equal(capabilityForPath("/space"), null);
   assert.equal(capabilityForPath("/settings"), null);
+});
+
+test("student classroom playback keeps an opaque version id on the learn route", () => {
+  assert.equal(
+    studentClassroomPlayRoute("version / 1"),
+    "/learn/classrooms/version%20%2F%201",
+  );
+  assert.equal(studentClassroomPlayRoute(null), null);
+  assert.equal(capabilityForPath("/learn/classrooms/version-1"), null);
 });

@@ -66,6 +66,7 @@ import ContextReferenceTree, {
 import { AssistantActivity } from "./TracePanels";
 import { agentGlyph } from "@/components/agents/agent-icons";
 import { useConnectedAgentKinds } from "@/hooks/useConnectedAgentKinds";
+import { extractStudentClassroomTaskFromEvents } from "@/lib/student-classroom-config";
 
 const MathAnimatorViewer = dynamic(
   () => import("@/components/math-animator/MathAnimatorViewer"),
@@ -80,6 +81,10 @@ const ResearchOutlineEditor = dynamic(
 );
 const VisualizationViewer = dynamic(
   () => import("@/components/visualize/VisualizationViewer"),
+  { ssr: false },
+);
+const ClassroomJobCard = dynamic(
+  () => import("@/components/classroom/ClassroomJobCard"),
   { ssr: false },
 );
 
@@ -110,6 +115,7 @@ function getModeBadgeLabel(capability?: string | null): string {
   if (capability === "math_animator") return "Math Animator";
   if (capability === "visualize") return "Visualize";
   if (capability === "mastery_path") return "Mastery Path";
+  if (capability === "interactive_classroom") return "Student Classroom";
   return capability;
 }
 
@@ -366,6 +372,11 @@ const AssistantMessage = memo(function AssistantMessage({
     return extractVisualizeResult(resultEvent.metadata);
   }, [msg.capability, resultEvent]);
 
+  const studentClassroomTask = useMemo(() => {
+    if (msg.capability !== "interactive_classroom") return null;
+    return extractStudentClassroomTaskFromEvents(msg.events);
+  }, [msg.capability, msg.events]);
+
   // Detect the ``ask_user`` terminator payload: when the assistant turn
   // ended via the ``ask_user`` tool, this is the question the user is
   // expected to answer next. Render option chips below the message.
@@ -410,7 +421,9 @@ const AssistantMessage = memo(function AssistantMessage({
         content={msg.content}
         className="mb-3"
       />
-      {outlinePreview && outlinePreview.sub_topics.length > 0 ? (
+      {studentClassroomTask ? (
+        <ClassroomJobCard task={studentClassroomTask} />
+      ) : outlinePreview && outlinePreview.sub_topics.length > 0 ? (
         <>
           {/* Layout for the merged research bubble:
                 1. trace rows (above, via TraceFlow)

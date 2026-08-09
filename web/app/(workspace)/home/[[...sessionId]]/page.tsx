@@ -26,6 +26,7 @@ import {
   MessageSquare,
   Microscope,
   PenLine,
+  Presentation,
   Sparkles,
   type LucideIcon,
 } from "lucide-react";
@@ -102,6 +103,15 @@ import {
 import { downloadChatMarkdown } from "@/lib/chat-export";
 import type { SpaceMemoryFile } from "@/lib/space-items";
 import {
+  canConfirmStudentClassroomConfig,
+  createStudentClassroomConfig,
+  restoreStudentClassroomConfig,
+  toCapabilityConfig,
+  validateStudentClassroomConfig,
+  type StudentClassroomFormConfig,
+  type StudentClassroomOption,
+} from "@/lib/student-classroom-config";
+import {
   selectedBooksToPayload,
   type SelectedBookReference,
 } from "@/lib/book-references";
@@ -162,6 +172,10 @@ const VisualizeConfigPanel = dynamic(
 );
 const ResearchConfigPanel = dynamic(
   () => import("@/components/research/ResearchConfigPanel"),
+  { ssr: false },
+);
+const StudentClassroomConfig = dynamic(
+  () => import("@/components/classroom/StudentClassroomConfig"),
   { ssr: false },
 );
 
@@ -259,6 +273,14 @@ const CAPABILITIES: CapabilityDef[] = [
     description:
       "Generate charts, diagrams, interactive pages, or math animations",
     icon: BarChart3,
+    allowedTools: [],
+    defaultTools: [],
+  },
+  {
+    value: "interactive_classroom",
+    label: "Student Classroom",
+    description: "Generate a private classroom for this course",
+    icon: Presentation,
     allowedTools: [],
     defaultTools: [],
   },
@@ -426,6 +448,11 @@ export default function ChatPage() {
   const [researchConfig, setResearchConfig] = useState<DeepResearchFormConfig>(
     createEmptyResearchConfig(),
   );
+  const [studentClassroomConfig, setStudentClassroomConfig] =
+    useState<StudentClassroomFormConfig>(() => createStudentClassroomConfig());
+  const [studentClassroomOptions, setStudentClassroomOptions] = useState<
+    StudentClassroomOption[]
+  >([]);
   // Capability-config confirmation gate.
   //
   // For capabilities that need explicit configuration (Quiz, Visualize,
@@ -460,11 +487,17 @@ export default function ChatPage() {
         quizConfig?: DeepQuestionFormConfig;
         visualizeConfig?: VisualizeFormConfig;
         researchConfig?: DeepResearchFormConfig;
+        studentClassroomConfig?: StudentClassroomFormConfig;
         capabilityConfigConfirmed?: boolean;
       };
       if (parsed.quizConfig) setQuizConfig(parsed.quizConfig);
       if (parsed.visualizeConfig) setVisualizeConfig(parsed.visualizeConfig);
       if (parsed.researchConfig) setResearchConfig(parsed.researchConfig);
+      if (parsed.studentClassroomConfig) {
+        setStudentClassroomConfig(
+          restoreStudentClassroomConfig(parsed.studentClassroomConfig),
+        );
+      }
       if (typeof parsed.capabilityConfigConfirmed === "boolean") {
         setCapabilityConfigConfirmed(parsed.capabilityConfigConfirmed);
       }
@@ -483,6 +516,7 @@ export default function ChatPage() {
         quizConfig,
         visualizeConfig,
         researchConfig,
+        studentClassroomConfig,
         capabilityConfigConfirmed,
       }),
     );
@@ -491,6 +525,7 @@ export default function ChatPage() {
     quizConfig,
     visualizeConfig,
     researchConfig,
+    studentClassroomConfig,
     capabilityConfigConfirmed,
   ]);
   const [showSaveModal, setShowSaveModal] = useState(false);
@@ -564,7 +599,31 @@ export default function ChatPage() {
   const isQuizMode = activeCap.value === "deep_question";
   const isVisualizeMode = activeCap.value === "visualize";
   const isResearchMode = activeCap.value === "deep_research";
-  const capabilityNeedsConfig = isQuizMode || isVisualizeMode || isResearchMode;
+  const isStudentClassroomMode = activeCap.value === "interactive_classroom";
+  const capabilityNeedsConfig =
+    isQuizMode ||
+    isVisualizeMode ||
+    isResearchMode ||
+    isStudentClassroomMode;
+  const studentAuthorizedSourceCount = useMemo(
+    () =>
+      state.knowledgeBases.filter(selected =>
+        knowledgeBases.some(
+          item => item.name === selected && item.metadata?.type !== "subagent",
+        ),
+      ).length,
+    [knowledgeBases, state.knowledgeBases],
+  );
+  const studentClassroomCanConfirm = canConfirmStudentClassroomConfig(
+    studentClassroomConfig,
+    {
+      hasAuthorizedSource: studentAuthorizedSourceCount > 0,
+      option:
+        studentClassroomOptions.find(
+          option => option.courseId === studentClassroomConfig.courseId,
+        ) ?? null,
+    },
+  );
 
   // Edit-invalidates-confirm wrappers — flipping any field after the user
   // hit *Confirm* should restore the gate so they re-confirm intentionally.
@@ -592,9 +651,29 @@ export default function ChatPage() {
     },
     [],
   );
+  const handleChangeStudentClassroomConfig = useCallback(
+    (next: StudentClassroomFormConfig) => {
+      setStudentClassroomConfig(next);
+      setCapabilityConfigConfirmed(false);
+    },
+    [],
+  );
+  const handleStudentClassroomOptionsChange = useCallback(
+    (options: StudentClassroomOption[]) => {
+      setStudentClassroomOptions(options);
+      setCapabilityConfigConfirmed(false);
+    },
+    [],
+  );
   const handleConfirmCapabilityConfig = useCallback(() => {
     setCapabilityConfigConfirmed(true);
   }, []);
+
+  useEffect(() => {
+    if (isStudentClassroomMode && !studentClassroomCanConfirm) {
+      setCapabilityConfigConfirmed(false);
+    }
+  }, [isStudentClassroomMode, studentClassroomCanConfirm]);
 
   /**
    * Auto-open the right-side Activity panel when the user switches into a
@@ -1262,6 +1341,61 @@ export default function ChatPage() {
    */
   const capabilityConfigSection = useMemo(() => {
     if (!capabilityNeedsConfig) return null;
+    if (isStudentClassroomMode) {
+      const validation = validateStudentClassroomConfig(studentClassroomConfig);
+      const validationErrors: string[] = [];
+      if (!validation.ok) {
+        validationErrors.push(
+          t(`studentClassroom.validation.${validation.error}`),
+        );
+      }
+      const selectedOption = studentClassroomOptions.find(
+        option => option.courseId === studentClassroomConfig.courseId,
+      );
+      if (studentClassroomConfig.courseId && !selectedOption) {
+        validationErrors.push(
+          t("studentClassroom.validation.courseUnavailable"),
+        );
+      } else if (
+        studentClassroomConfig.mode &&
+        !selectedOption?.allowedModes.includes(studentClassroomConfig.mode)
+      ) {
+        validationErrors.push(t("studentClassroom.validation.modeUnavailable"));
+      }
+      if (
+        selectedOption &&
+        !selectedOption.allowedContentModes.includes(
+          studentClassroomConfig.contentMode,
+        )
+      ) {
+        validationErrors.push(
+          t("studentClassroom.validation.contentModeUnavailable"),
+        );
+      }
+      if (
+        studentClassroomConfig.contentMode === "source_grounded" &&
+        selectedOption?.allowedContentModes.includes("source_grounded") &&
+        studentAuthorizedSourceCount === 0
+      ) {
+        validationErrors.push(t("studentClassroom.validation.sourceRequired"));
+      }
+      return (
+        <CapabilityConfigCard
+          capability="interactive_classroom"
+          confirmed={capabilityConfigConfirmed}
+          canConfirm={studentClassroomCanConfirm}
+          validationErrors={validationErrors}
+          onConfirm={handleConfirmCapabilityConfig}
+        >
+          <StudentClassroomConfig
+            value={studentClassroomConfig}
+            authorizedSourceCount={studentAuthorizedSourceCount}
+            onChange={handleChangeStudentClassroomConfig}
+            onOptionsChange={handleStudentClassroomOptionsChange}
+          />
+        </CapabilityConfigCard>
+      );
+    }
     if (isQuizMode) {
       return (
         <CapabilityConfigCard
@@ -1315,10 +1449,18 @@ export default function ChatPage() {
     );
   }, [
     capabilityNeedsConfig,
+    isStudentClassroomMode,
     isQuizMode,
     isVisualizeMode,
     capabilityConfigConfirmed,
     handleConfirmCapabilityConfig,
+    studentClassroomConfig,
+    studentClassroomCanConfirm,
+    studentClassroomOptions,
+    studentAuthorizedSourceCount,
+    handleChangeStudentClassroomConfig,
+    handleStudentClassroomOptionsChange,
+    t,
     quizConfig,
     quizPdf,
     handleChangeQuizConfig,
@@ -1469,6 +1611,10 @@ export default function ChatPage() {
         }
       }
       if (isVisualizeMode) config = buildVisualizeWSConfig(visualizeConfig);
+      if (isStudentClassroomMode) {
+        if (!studentClassroomCanConfirm) return;
+        config = toCapabilityConfig(studentClassroomConfig);
+      }
       if (isResearchMode) {
         if (!researchValidation.valid) return;
         config = buildResearchWSConfig(researchConfig);
@@ -1522,6 +1668,7 @@ export default function ChatPage() {
       historyReferencesPayload,
       isQuizMode,
       isResearchMode,
+      isStudentClassroomMode,
       isVisualizeMode,
       memoryReferencesPayload,
       notebookReferencesPayload,
@@ -1541,6 +1688,8 @@ export default function ChatPage() {
       shouldAutoScrollRef,
       state.isStreaming,
       subagentBudget,
+      studentClassroomCanConfirm,
+      studentClassroomConfig,
       t,
       visualizeConfig,
     ],

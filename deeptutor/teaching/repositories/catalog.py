@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from deeptutor.teaching.database import get_platform_engine
 from deeptutor.teaching.models.platform import Tenant, TenantMembership
+from deeptutor.teaching.models.student_generation import CourseGenerationPolicyRecord
 from deeptutor.teaching.models.tenant import Course, Enrollment, TeachingClass
 from deeptutor.teaching.schema_names import tenant_schema_name
 
@@ -50,6 +51,18 @@ class EnrollmentRecord:
     learner_id: str
     status: str
     created_at: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class StudentClassroomOptionBinding:
+    """Internal class binding and policy facts for one enrolled course."""
+
+    course_id: str
+    title: str
+    class_id: str
+    allow_student_micro: bool
+    allow_student_full: bool
+    allowed_content_modes: str
 
 
 def _course_record(model: Course) -> CourseRecord:
@@ -206,6 +219,58 @@ class SqlAlchemyCatalogRepository:
         )
         async with self._session_factory() as session:
             return tuple(await session.scalars(statement))
+
+    async def list_student_classroom_option_bindings(
+        self,
+        learner_id: str,
+    ) -> tuple[StudentClassroomOptionBinding, ...]:
+        """Load only active enrollment rows backed by a course policy."""
+
+        statement = (
+            select(
+                Course.id,
+                Course.title,
+                TeachingClass.id,
+                CourseGenerationPolicyRecord.allow_student_micro,
+                CourseGenerationPolicyRecord.allow_student_full,
+                CourseGenerationPolicyRecord.allowed_content_modes,
+            )
+            .select_from(Course)
+            .join(TeachingClass, TeachingClass.course_id == Course.id)
+            .join(Enrollment, Enrollment.class_id == TeachingClass.id)
+            .join(
+                CourseGenerationPolicyRecord,
+                CourseGenerationPolicyRecord.course_id == Course.id,
+            )
+            .where(
+                Course.status == "active",
+                TeachingClass.status == "active",
+                Enrollment.learner_id == learner_id,
+                Enrollment.status == "active",
+                CourseGenerationPolicyRecord.tenant_id == self._tenant_id,
+            )
+            .order_by(Course.title, Course.id, TeachingClass.id)
+        )
+        async with self._session_factory() as session:
+            rows = (await session.execute(statement)).all()
+            return tuple(
+                StudentClassroomOptionBinding(
+                    course_id=course_id,
+                    title=title,
+                    class_id=class_id,
+                    allow_student_micro=allow_student_micro,
+                    allow_student_full=allow_student_full,
+                    allowed_content_modes=allowed_content_modes,
+                )
+                for (
+                    course_id,
+                    title,
+                    class_id,
+                    allow_student_micro,
+                    allow_student_full,
+                    allowed_content_modes,
+                ) in rows
+            )
 
     async def add_enrollment(self, class_id: str, learner_id: str) -> EnrollmentRecord:
         async with self._session_factory() as session:
