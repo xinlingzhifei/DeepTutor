@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 import importlib.util
 import json
 from typing import Any, AsyncIterator
@@ -90,7 +90,9 @@ class DeepTutorApp:
             contracts.append(
                 {
                     **manifest,
-                    "availability": self.get_capability_availability(manifest["name"]).__dict__,
+                    "availability": asdict(
+                        self.get_capability_availability(manifest["name"])
+                    ),
                 }
             )
         return contracts
@@ -101,7 +103,7 @@ class DeepTutorApp:
             if manifest["name"] == resolved:
                 return {
                     **manifest,
-                    "availability": self.get_capability_availability(resolved).__dict__,
+                    "availability": asdict(self.get_capability_availability(resolved)),
                 }
         raise ValueError(f"Capability not found: {resolved}")
 

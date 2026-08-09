@@ -17,14 +17,15 @@ import pytest
 from deeptutor.app import facade as app_facade
 from deeptutor.app.facade import DeepTutorApp, TurnRequest
 from deeptutor.multi_user.context import reset_current_tenant, set_current_tenant
+from deeptutor.runtime.registry.capability_registry import CapabilityRegistry
 from deeptutor.services import config as config_service
 from deeptutor.teaching.tenant_context import TenantContext
 
 _SERVER_MODULES = {"asyncpg", "boto3", "fastapi", "sqlalchemy"}
-_UNAVAILABLE_ERROR = (
-    "Capability `interactive_classroom` is unavailable. "
+_INSTALL_HINT = (
     "Install server dependencies, enable the tenant platform, and select an active tenant."
 )
+_UNAVAILABLE_ERROR = f"Capability `interactive_classroom` is unavailable. {_INSTALL_HINT}"
 
 
 class _Registry:
@@ -59,6 +60,14 @@ def _app() -> DeepTutorApp:
     app.capabilities = _Registry()
     app.runtime = _Runtime()
     app.store = _Store()
+    return app
+
+
+def _builtin_app() -> DeepTutorApp:
+    app = DeepTutorApp.__new__(DeepTutorApp)
+    registry = CapabilityRegistry()
+    registry.load_builtins()
+    app.capabilities = registry
     return app
 
 
@@ -125,6 +134,40 @@ def test_interactive_classroom_availability_requires_server_platform_and_tenant(
             reset_current_tenant(token)
 
     assert availability.available is expected
+
+
+def test_classroom_alias_returns_builtin_capability_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_server_dependencies(monkeypatch, missing="fastapi")
+
+    contract = _builtin_app().get_capability_contract("classroom")
+
+    assert contract["name"] == "interactive_classroom"
+    assert contract["cli_aliases"] == ["classroom"]
+    assert contract["request_schema"]["required"] == ["mode", "course_id"]
+    assert contract["availability"] == {
+        "name": "interactive_classroom",
+        "available": False,
+        "install_hint": _INSTALL_HINT,
+    }
+
+
+def test_builtin_capability_contracts_include_classroom_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_server_dependencies(monkeypatch, missing="fastapi")
+
+    contracts = _builtin_app().get_capability_contracts()
+    contract = next(item for item in contracts if item["name"] == "interactive_classroom")
+
+    assert contract["cli_aliases"] == ["classroom"]
+    assert contract["request_schema"]["required"] == ["mode", "course_id"]
+    assert contract["availability"] == {
+        "name": "interactive_classroom",
+        "available": False,
+        "install_hint": _INSTALL_HINT,
+    }
 
 
 @pytest.mark.asyncio
