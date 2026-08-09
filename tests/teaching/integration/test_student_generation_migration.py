@@ -448,6 +448,13 @@ async def test_real_student_route_uses_exact_current_durable_safety_evidence(
             ).one()
             await connection.execute(
                 text(
+                    f'UPDATE "{schema_name}".student_generation_requests SET '
+                    "quota_state = 'settled' WHERE id = :request_id"
+                ),
+                {"request_id": accepted.json()["requestId"]},
+            )
+            await connection.execute(
+                text(
                     f'UPDATE "{schema_name}".course_generation_policies SET '
                     "micro_scene_limit = 2, daily_student_units = 2, "
                     "monthly_student_units = 2, updated_by = 'teacher-2' "
@@ -619,6 +626,13 @@ async def test_real_student_route_uses_exact_current_durable_safety_evidence(
         )
         assert source_reserved.status == "approved"
         async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    f'UPDATE "{schema_name}".student_generation_requests SET '
+                    "quota_state = 'settled' WHERE id = :request_id"
+                ),
+                {"request_id": source_revoked.json()["requestId"]},
+            )
             source_brief_id = await connection.scalar(
                 text(
                     f'SELECT teaching_brief_id FROM "{schema_name}".classroom_drafts '

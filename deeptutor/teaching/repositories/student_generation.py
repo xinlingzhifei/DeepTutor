@@ -1095,7 +1095,7 @@ class SqlAlchemyStudentGenerationRepository:
                 if replay:
                     if not approved:
                         approval.status = "expired"
-                        if stored_request.quota_state == "reserved":
+                        if stored_request.quota_state in {"reserved", "settled"}:
                             stored_request.quota_state = "released"
                     else:
                         stored_request.scene_min = estimate.scene_range[0]
@@ -1115,6 +1115,7 @@ class SqlAlchemyStudentGenerationRepository:
                         stored_request.evaluated_checks = ",".join(
                             decision.evaluated_checks
                         )
+                        stored_request.quota_state = "reserved"
                 else:
                     approval.status = "approved" if approved else "expired"
                     approval.decided_by = reviewer_id
