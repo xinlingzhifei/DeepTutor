@@ -52,6 +52,7 @@ export default function StudentClassroomConfig({
   const [estimateFailureKey, setEstimateFailureKey] = useState<string | null>(
     null,
   );
+  const [estimateRetryNonce, setEstimateRetryNonce] = useState(0);
 
   useEffect(() => {
     let active = true;
@@ -150,6 +151,7 @@ export default function StudentClassroomConfig({
     };
   }, [
     estimateRequestKey,
+    estimateRetryNonce,
     estimateSourceRef,
     onEstimateReadinessChange,
     value.contentMode,
@@ -162,6 +164,20 @@ export default function StudentClassroomConfig({
   };
   const selectContentMode = (contentMode: StudentClassroomContentMode) => {
     onChange({ ...value, contentMode });
+  };
+  const retryEstimate = () => {
+    if (estimateRequestKey === null) return;
+    setEstimateResult(current =>
+      current?.requestKey === estimateRequestKey ? null : current,
+    );
+    setEstimateFailureKey(current =>
+      current === estimateRequestKey ? null : current,
+    );
+    onEstimateReadinessChange({
+      requestKey: estimateRequestKey,
+      status: "loading",
+    });
+    setEstimateRetryNonce(current => current + 1);
   };
   return (
     <div className="space-y-4 p-3.5" data-testid="student-classroom-config">
@@ -355,9 +371,18 @@ export default function StudentClassroomConfig({
       )}
 
       {estimateFailed ? (
-        <p role="alert" className="text-[10.5px] text-[var(--destructive)]">
-          {t("studentClassroom.config.estimateFailed")}
-        </p>
+        <div className="space-y-1.5">
+          <p role="alert" className="text-[10.5px] text-[var(--destructive)]">
+            {t("studentClassroom.config.estimateFailed")}
+          </p>
+          <button
+            type="button"
+            onClick={retryEstimate}
+            className="rounded-md border border-[var(--border)] px-2 py-1 text-[10.5px] font-semibold text-[var(--foreground)] hover:bg-[var(--muted)]/50"
+          >
+            {t("studentClassroom.config.retryEstimate")}
+          </button>
+        </div>
       ) : null}
 
       {error ? (

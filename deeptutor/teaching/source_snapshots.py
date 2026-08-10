@@ -26,6 +26,7 @@ from fastapi import HTTPException
 from deeptutor.multi_user.knowledge_access import (
     AuthorizedKnowledgeSource,
     resolve_authorized_source,
+    resolve_authorized_source_descriptor,
 )
 from deeptutor.services.rag.retrieval_view import (
     bounded_retrieval_view,
@@ -737,6 +738,9 @@ class SourceSnapshotBuilder:
         knowledge_resolver: Callable[[str], AuthorizedKnowledgeSource] = (
             resolve_authorized_source
         ),
+        knowledge_preflight_resolver: Callable[
+            [str], AuthorizedKnowledgeSource
+        ] = resolve_authorized_source_descriptor,
         rag_service_factory: Callable[[AuthorizedKnowledgeSource], _RagService] | None = None,
         store_provider: _PdfStoreProvider | None = None,
         pdf_extractor: Callable[[str, str], Awaitable[str]] | None = None,
@@ -745,6 +749,7 @@ class SourceSnapshotBuilder:
         self._context = context
         self._repository = repository
         self._knowledge_resolver = knowledge_resolver
+        self._knowledge_preflight_resolver = knowledge_preflight_resolver
         self._rag_service_factory = rag_service_factory
         self._store_provider = store_provider
         self._pdf_extractor = pdf_extractor
@@ -793,9 +798,10 @@ class SourceSnapshotBuilder:
         *,
         course_id: str,
         class_id: str | None,
+        resolver: Callable[[str], AuthorizedKnowledgeSource],
     ) -> tuple[AuthorizedKnowledgeSource, BoundSourceRecord]:
         try:
-            resource = self._knowledge_resolver(kb_ref)
+            resource = resolver(kb_ref)
         except asyncio.CancelledError:
             raise
         except HTTPException as exc:
@@ -835,6 +841,7 @@ class SourceSnapshotBuilder:
             kb_ref,
             course_id=course_id,
             class_id=class_id,
+            resolver=self._knowledge_preflight_resolver,
         )
         return bound
 
@@ -844,6 +851,7 @@ class SourceSnapshotBuilder:
             kb_ref,
             course_id=request.course_id,
             class_id=request.class_id,
+            resolver=self._knowledge_resolver,
         )
         try:
             if self._rag_service_factory is None:

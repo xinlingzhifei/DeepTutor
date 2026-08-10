@@ -108,16 +108,12 @@ export function canConfirmStudentClassroomConfig(
     : true;
 }
 
-export function studentClassroomTurnKnowledgeBases(
+export function studentClassroomEffectiveKnowledgeBases(
   contentMode: StudentClassroomContentMode,
-  selectedKnowledgeBases: readonly string[],
-  subagentNames: ReadonlySet<string>,
+  authorizedSourceNames: readonly string[],
 ): string[] | null {
   if (contentMode === "open_creation") return [];
-  const groundedSources = selectedKnowledgeBases.filter(
-    name => !subagentNames.has(name),
-  );
-  return groundedSources.length === 1 ? groundedSources : null;
+  return authorizedSourceNames.length === 1 ? [...authorizedSourceNames] : null;
 }
 
 export function studentClassroomRequiresOutline(status: string): boolean {

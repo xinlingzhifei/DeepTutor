@@ -3213,6 +3213,7 @@
   "studentClassroom.config.chooseMode": "Choose micro or full before confirming.",
   "studentClassroom.config.estimating": "Checking the current estimate…",
   "studentClassroom.config.estimateFailed": "The current estimate could not be loaded. Review your selections and try again.",
+  "studentClassroom.config.retryEstimate": "Retry estimate",
   "studentClassroom.config.unavailableForCourse": "Not allowed for this course.",
   "studentClassroom.config.contentMode": "Creation mode",
   "studentClassroom.config.sourceGrounded": "Source-grounded creation",

@@ -3213,6 +3213,7 @@
   "studentClassroom.config.chooseMode": "确认前请选择微课堂或完整课堂。",
   "studentClassroom.config.estimating": "正在获取当前估算…",
   "studentClassroom.config.estimateFailed": "无法获取当前估算，请检查所选配置后重试。",
+  "studentClassroom.config.retryEstimate": "重试估算",
   "studentClassroom.config.unavailableForCourse": "当前课程不允许此选项。",
   "studentClassroom.config.contentMode": "创作模式",
   "studentClassroom.config.sourceGrounded": "来源约束创作",

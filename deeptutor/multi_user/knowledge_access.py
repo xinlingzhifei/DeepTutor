@@ -365,14 +365,9 @@ def _has_stable_resource_identity(resource: KnowledgeResource) -> bool:
     )
 
 
-def resolve_authorized_source(kb_ref: str) -> AuthorizedKnowledgeSource:
-    """Resolve a visible KB to a generation-pinned, read-only descriptor.
-
-    Human-readable aliases remain an input convenience only. Callers receive
-    the stable generation identity and cannot serialize the internal KB root.
-    """
-
-    resource = resolve_for_rag(kb_ref)
+def _authorized_source_descriptor(
+    resource: KnowledgeResource | None,
+) -> AuthorizedKnowledgeSource:
     if resource is None or not _has_stable_resource_identity(resource):
         raise HTTPException(status_code=404, detail="Knowledge base not found")
     user = get_current_user()
@@ -396,6 +391,22 @@ def resolve_authorized_source(kb_ref: str) -> AuthorizedKnowledgeSource:
         read_only=True,
         retrieval_provider=provider,
     )
+
+
+def resolve_authorized_source_descriptor(kb_ref: str) -> AuthorizedKnowledgeSource:
+    """Resolve a visible KB descriptor without recording retrieval usage."""
+
+    return _authorized_source_descriptor(resolve_kb(kb_ref, require_write=False))
+
+
+def resolve_authorized_source(kb_ref: str) -> AuthorizedKnowledgeSource:
+    """Resolve a visible KB to an audited, generation-pinned search descriptor.
+
+    Human-readable aliases remain an input convenience only. Callers receive
+    the stable generation identity and cannot serialize the internal KB root.
+    """
+
+    return _authorized_source_descriptor(resolve_for_rag(kb_ref))
 
 
 async def _search_authorized_source(

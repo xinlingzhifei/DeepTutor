@@ -255,7 +255,10 @@ async def test_kb_preflight_resolves_logical_identity_and_exact_target_without_r
     builder = SourceSnapshotBuilder(
         _context(),
         repository,
-        knowledge_resolver=resolve,
+        knowledge_resolver=lambda _kb_ref: pytest.fail(
+            "audited resolver must not run during preflight"
+        ),
+        knowledge_preflight_resolver=resolve,
         rag_service_factory=lambda _source: pytest.fail("RAG must not run"),
     )
 

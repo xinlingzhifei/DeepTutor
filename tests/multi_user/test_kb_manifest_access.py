@@ -18,6 +18,7 @@ import deeptutor.multi_user.knowledge_access as knowledge_access_module
 from deeptutor.multi_user.knowledge_access import (
     AuthorizedKnowledgeSource,
     resolve_authorized_source,
+    resolve_authorized_source_descriptor,
     resolve_kb_manifest,
 )
 from deeptutor.multi_user.models import CurrentUser, KnowledgeResource, UserScope
@@ -102,6 +103,65 @@ def test_authorized_source_exposes_only_generation_pinned_identity(
         assert not hasattr(source, "add_documents")
         assert not hasattr(source, "delete")
         assert str(mu_isolated_root.resolve()) not in repr(source)
+
+
+def test_authorized_source_descriptor_does_not_audit_preflight_but_search_does(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generation = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    resource = KnowledgeResource(
+        id=f"admin:kb:{generation}",
+        name="assigned-kb",
+        base_dir=tmp_path,
+        source="admin",
+        assigned=True,
+        read_only=True,
+        generation_id=generation,
+    )
+
+    class _Manager:
+        base_dir = tmp_path
+
+        def get_kb_entry(self, _name: str) -> dict[str, str]:
+            return {"generation_id": generation}
+
+    audits: list[tuple[str, str, str]] = []
+    monkeypatch.setattr(
+        knowledge_access_module,
+        "resolve_kb",
+        lambda _ref, *, require_write=False: resource,
+    )
+    monkeypatch.setattr(
+        knowledge_access_module,
+        "manager_for_resource",
+        lambda _resource: _Manager(),
+    )
+    monkeypatch.setattr(
+        knowledge_access_module,
+        "get_current_user",
+        lambda: _current_user(tmp_path),
+    )
+    monkeypatch.setattr(
+        "deeptutor.services.rag.provider_binding.resolve_bound_provider",
+        lambda *_args: "llamaindex",
+    )
+    monkeypatch.setattr(
+        "deeptutor.multi_user.audit.log_usage",
+        lambda resource_type, resource_id, action: audits.append(
+            (resource_type, resource_id, action)
+        ),
+    )
+
+    preflight = resolve_authorized_source_descriptor("assigned-kb")
+
+    assert preflight.resource_id == resource.id
+    assert audits == []
+
+    searched = resolve_authorized_source("assigned-kb")
+
+    assert searched == preflight
+    assert audits == [("knowledge_base", resource.id, "rag_query")]
 
 
 def _current_user(tmp_path: Path, user_id: str = "u_alice") -> CurrentUser:

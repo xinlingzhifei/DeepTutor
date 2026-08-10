@@ -22,7 +22,7 @@ import {
   studentClassroomPollIntervalMs,
   studentClassroomPollRetryDelay,
   studentClassroomStatusKind,
-  studentClassroomTurnKnowledgeBases,
+  studentClassroomEffectiveKnowledgeBases,
   studentClassroomPlayRoute,
   studentClassroomRequiresOutline,
   toCapabilityConfig,
@@ -617,30 +617,47 @@ test("approval summary follows actual approval identity and workflow status", ()
   );
 });
 
-test("interactive classroom turns isolate real KBs from connected agents", () => {
+test("interactive classroom turns require exactly one authorized source", () => {
   assert.deepEqual(
-    studentClassroomTurnKnowledgeBases(
+    studentClassroomEffectiveKnowledgeBases(
       "source_grounded",
-      ["agent-codex", "kb-course-a"],
-      new Set(["agent-codex"]),
+      ["kb-course-a"],
     ),
     ["kb-course-a"],
   );
   assert.deepEqual(
-    studentClassroomTurnKnowledgeBases(
+    studentClassroomEffectiveKnowledgeBases(
       "open_creation",
-      ["agent-codex", "kb-course-a"],
-      new Set(["agent-codex"]),
+      ["kb-course-a"],
     ),
     [],
   );
   assert.equal(
-    studentClassroomTurnKnowledgeBases(
+    studentClassroomEffectiveKnowledgeBases(
       "source_grounded",
       ["kb-course-a", "kb-course-b"],
-      new Set(),
     ),
     null,
+  );
+});
+
+test("interactive classroom sends the catalog-authorized source despite stale preferences", () => {
+  const hydratedPreferences = ["kb-stale", "kb-course-a"];
+  const catalogNames = new Set(["kb-course-a"]);
+  const authorizedSourceNames = hydratedPreferences.filter(name =>
+    catalogNames.has(name),
+  );
+
+  assert.deepEqual(
+    studentClassroomEffectiveKnowledgeBases(
+      "source_grounded",
+      authorizedSourceNames,
+    ),
+    ["kb-course-a"],
+  );
+  assert.deepEqual(
+    studentClassroomEffectiveKnowledgeBases("open_creation", authorizedSourceNames),
+    [],
   );
 });
 
@@ -831,6 +848,10 @@ test("home chat wires the explicit config and durable classroom task card", () =
     /replaySnapshot\?\.knowledgeBases\s*\?\?\s*options\?\.knowledgeBases\s*\?\?\s*session\.knowledgeBases/,
   );
   assert.match(home, /knowledgeBases:\s*studentTurnKnowledgeBases/);
+  assert.match(
+    home,
+    /item\.name === selected && item\.metadata\?\.type !== "subagent"/,
+  );
   const capabilitySwitchStart = home.indexOf(
     "const handleSelectCapability = useCallback",
   );
@@ -864,6 +885,37 @@ test("home chat wires the explicit config and durable classroom task card", () =
   assert.match(config, /status:\s*"loading"/);
   assert.match(config, /status:\s*"failed"/);
   assert.match(config, /status:\s*"ready"/);
+  assert.match(config, /estimateRetryNonce/);
+  assert.match(config, /setEstimateRetryNonce\(current => current \+ 1\)/);
+  assert.match(config, /studentClassroom\.config\.retryEstimate/);
+  assert.match(config, /onClick=\{retryEstimate\}/);
+  const estimateEffectStart = config.indexOf(
+    "useEffect(() => {",
+    config.indexOf("const estimateLoading"),
+  );
+  const estimateEffectEnd = config.indexOf("const selectMode", estimateEffectStart);
+  assert.ok(estimateEffectStart >= 0 && estimateEffectEnd > estimateEffectStart);
+  const estimateEffect = config.slice(estimateEffectStart, estimateEffectEnd);
+  assert.match(
+    estimateEffect,
+    /onEstimateReadinessChange\(\{[\s\S]*?requestKey:\s*estimateRequestKey,[\s\S]*?status:\s*"loading"/,
+  );
+  assert.match(
+    estimateEffect,
+    /\[[\s\S]*?estimateRequestKey,[\s\S]*?estimateRetryNonce,[\s\S]*?\]/,
+  );
+  assert.match(estimateEffect, /if \(!active\) return;/);
+  assert.match(estimateEffect, /active && !controller\.signal\.aborted/);
+  assert.match(estimateEffect, /active = false;[\s\S]*?controller\.abort\(\)/);
+  assert.match(
+    home,
+    /studentClassroomEffectiveKnowledgeBases\(\s*studentClassroomConfig\.contentMode,\s*studentAuthorizedSourceNames,?\s*\)/,
+  );
+  assert.doesNotMatch(
+    home,
+    /studentClassroomTurnKnowledgeBases\([\s\S]{0,240}state\.knowledgeBases/,
+    "classroom send must use the same authorized source set as estimate readiness",
+  );
   assert.doesNotMatch(config, /MODE_SUMMARY/);
   assert.doesNotMatch(config, /listTeachingCourses/);
   assert.match(config, /allowedContentModes\.includes\("open_creation"\)/);

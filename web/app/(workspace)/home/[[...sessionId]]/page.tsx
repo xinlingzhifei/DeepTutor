@@ -108,7 +108,7 @@ import {
   restoreStudentClassroomConfig,
   studentClassroomEstimateIsReady,
   studentClassroomEstimateRequestKey,
-  studentClassroomTurnKnowledgeBases,
+  studentClassroomEffectiveKnowledgeBases,
   toCapabilityConfig,
   validateStudentClassroomConfig,
   type StudentClassroomFormConfig,
@@ -1678,16 +1678,17 @@ export default function ChatPage() {
         if (!researchValidation.valid) return;
         config = buildResearchWSConfig(researchConfig);
       }
-      // When a connected agent is selected, carry the per-turn consult budget
-      // (how many times yFeiSTAI may ask it) so the subagent capability uses it.
+      // Classroom turns use the same catalog-authorized source set that keyed
+      // the current estimate and confirmation gate.
       const studentTurnKnowledgeBases = isStudentClassroomMode
-        ? studentClassroomTurnKnowledgeBases(
+        ? studentClassroomEffectiveKnowledgeBases(
             studentClassroomConfig.contentMode,
-            state.knowledgeBases,
-            agentNameSet,
+            studentAuthorizedSourceNames,
           )
         : undefined;
       if (studentTurnKnowledgeBases === null) return;
+      // When a connected agent is selected, carry the per-turn consult budget
+      // (how many times yFeiSTAI may ask it) so the subagent capability uses it.
       if (!isStudentClassroomMode && selectedAgent && subagentBudget) {
         config = { ...(config ?? {}), subagent_consult_budget: subagentBudget };
       }
@@ -1736,7 +1737,6 @@ export default function ChatPage() {
     },
     [
       attachments,
-      agentNameSet,
       bookReferencesPayload,
       historyReferencesPayload,
       isQuizMode,
@@ -1760,8 +1760,8 @@ export default function ChatPage() {
       sendMessage,
       shouldAutoScrollRef,
       state.isStreaming,
-      state.knowledgeBases,
       subagentBudget,
+      studentAuthorizedSourceNames,
       studentClassroomCanConfirm,
       studentClassroomConfig,
       t,
