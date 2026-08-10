@@ -7,6 +7,7 @@ from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 import pytest
 
+from deeptutor.teaching.permissions import permissions_for_roles
 from deeptutor.teaching.schema_names import tenant_schema_name
 from deeptutor.teaching.tenant_context import TenantContext, require_tenant
 from deeptutor.teaching.tickets import TicketScopeError
@@ -75,6 +76,12 @@ def _client(service: _ContentService | None = None) -> tuple[TestClient, _Conten
     application.dependency_overrides[classroom_content.get_classroom_content_service] = lambda: (
         selected
     )
+    application.dependency_overrides[classroom_content.get_classroom_content_reader_service] = (
+        lambda: selected
+    )
+    application.dependency_overrides[classroom_content.get_classroom_content_service_factory] = (
+        lambda: lambda: selected
+    )
     return TestClient(application, raise_server_exceptions=False), selected
 
 
@@ -140,6 +147,87 @@ def test_document_and_media_stream_from_backend_without_storage_identifiers() ->
         ("document", _context(), "version-a", "document-ticket"),
         ("media", _context(), "version-a:media-a", None),
     ]
+
+
+def test_teacher_document_and_media_do_not_construct_ticket_backed_service() -> None:
+    from deeptutor.api.routers import classroom_content
+
+    owner = _context("teacher-owner")
+    teacher = TenantContext(
+        tenant_id="tenant-a",
+        schema_name=tenant_schema_name("tenant-a"),
+        user_id="teacher-scoped",
+        permissions=permissions_for_roles(
+            {"teacher"},
+            scope_type="class",
+            scope_id="class-a",
+            tenant_id="tenant-a",
+        ),
+    )
+    reader = _ContentService()
+    ticket_provider_calls = 0
+
+    def fail_if_ticket_service_is_constructed():
+        nonlocal ticket_provider_calls
+        ticket_provider_calls += 1
+        raise RuntimeError("ticket-backed content service must stay lazy")
+
+    application = FastAPI()
+    application.include_router(classroom_content.router, prefix="/api/v1")
+    application.dependency_overrides[require_tenant] = lambda: owner
+    application.dependency_overrides[classroom_content.get_classroom_content_reader_service] = (
+        lambda: reader
+    )
+    application.dependency_overrides[classroom_content.get_classroom_content_service] = (
+        fail_if_ticket_service_is_constructed
+    )
+    client = TestClient(application, raise_server_exceptions=False)
+
+    document = client.get("/api/v1/classroom-versions/version-a/document")
+    application.dependency_overrides[require_tenant] = lambda: teacher
+    media = client.get("/api/v1/classroom-versions/version-a/media/media-a")
+
+    assert document.status_code == 200
+    assert media.status_code == 200
+    assert ticket_provider_calls == 0
+    assert reader.read_calls == [
+        ("document", owner, "version-a", None),
+        ("media", teacher, "version-a:media-a", None),
+    ]
+
+
+def test_ticketed_media_constructs_ticket_service_and_never_falls_back() -> None:
+    from deeptutor.api.routers import classroom_content
+
+    reader = _ContentService()
+    ticketed = _ContentService()
+    ticket_provider_calls = 0
+
+    def build_ticket_service():
+        nonlocal ticket_provider_calls
+        ticket_provider_calls += 1
+        return ticketed
+
+    application = FastAPI()
+    application.include_router(classroom_content.router, prefix="/api/v1")
+    application.dependency_overrides[require_tenant] = _context
+    application.dependency_overrides[classroom_content.get_classroom_content_reader_service] = (
+        lambda: reader
+    )
+    application.dependency_overrides[classroom_content.get_classroom_content_service_factory] = (
+        lambda: build_ticket_service
+    )
+    client = TestClient(application, raise_server_exceptions=False)
+
+    response = client.get(
+        "/api/v1/classroom-versions/version-a/media/media-a",
+        headers={"X-Classroom-Ticket": "ticket-for-media-b"},
+    )
+
+    assert response.status_code == 403
+    assert ticket_provider_calls == 1
+    assert ticketed.read_calls == [("media", _context(), "version-a:media-a", "ticket-for-media-b")]
+    assert reader.read_calls == []
 
 
 def test_every_content_route_keeps_require_tenant_login_dependency() -> None:

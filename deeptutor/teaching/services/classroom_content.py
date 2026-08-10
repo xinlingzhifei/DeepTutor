@@ -360,7 +360,7 @@ class ClassroomContentService:
         *,
         repository: ClassroomContentRepository,
         stores: StoreProvider,
-        ticket_service: ClassroomTicketService,
+        ticket_service: ClassroomTicketService | None,
     ) -> None:
         self._repository = repository
         self._stores = stores
@@ -404,6 +404,8 @@ class ClassroomContentService:
             if not self._teacher_can_read(context, version):
                 raise ClassroomContentAccessDenied("classroom content access denied")
             return
+        if self._ticket_service is None:
+            raise ClassroomContentAccessDenied("classroom ticket verification is unavailable")
         claims = self._ticket_service.verify_read(
             token,
             expected_tenant_id=context.tenant_id,
@@ -529,6 +531,8 @@ class ClassroomContentService:
                 or export.status not in {"ready", "succeeded"}
             ):
                 raise ClassroomContentAccessDenied("export resource is outside session")
+        if self._ticket_service is None:
+            raise ClassroomContentAccessDenied("classroom ticket issuance is unavailable")
         return self._ticket_service.issue(
             tenant_id=context.tenant_id,
             user_id=context.user_id,

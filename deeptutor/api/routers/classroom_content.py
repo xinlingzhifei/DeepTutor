@@ -75,19 +75,41 @@ class ClassroomContentServiceLike(Protocol):
     ): ...
 
 
-def get_classroom_content_service():
+def _build_classroom_content_service(settings, *, ticket_service):
     from deeptutor.teaching.processes import RuntimeStoreProvider
     from deeptutor.teaching.services.classroom_content import (
         ClassroomContentService,
         SqlAlchemyClassroomContentRepository,
     )
 
-    settings = load_platform_settings()
     return ClassroomContentService(
         repository=SqlAlchemyClassroomContentRepository(engine=get_platform_engine()),
         stores=RuntimeStoreProvider(settings),
+        ticket_service=ticket_service,
+    )
+
+
+def get_classroom_content_reader_service():
+    """Build teacher content reads without loading the classroom ticket secret."""
+
+    return _build_classroom_content_service(
+        load_platform_settings(),
+        ticket_service=None,
+    )
+
+
+def get_classroom_content_service():
+    settings = load_platform_settings()
+    return _build_classroom_content_service(
+        settings,
         ticket_service=ClassroomTicketService.from_settings(settings),
     )
+
+
+def get_classroom_content_service_factory():
+    """Defer the ticket-backed service until a ticketed read is requested."""
+
+    return get_classroom_content_service
 
 
 async def _call(operation):
@@ -153,8 +175,10 @@ async def get_classroom_version_document(
         Header(alias="X-Classroom-Ticket", min_length=1, max_length=8192),
     ] = None,
     context: TenantContext = Depends(require_tenant),
-    service: ClassroomContentServiceLike = Depends(get_classroom_content_service),
+    reader_service: ClassroomContentServiceLike = Depends(get_classroom_content_reader_service),
+    ticket_service_factory=Depends(get_classroom_content_service_factory),
 ):
+    service = reader_service if ticket is None else ticket_service_factory()
     return _stream(
         await _call(
             service.open_document(
@@ -175,8 +199,10 @@ async def get_classroom_version_media(
         Header(alias="X-Classroom-Ticket", min_length=1, max_length=8192),
     ] = None,
     context: TenantContext = Depends(require_tenant),
-    service: ClassroomContentServiceLike = Depends(get_classroom_content_service),
+    reader_service: ClassroomContentServiceLike = Depends(get_classroom_content_reader_service),
+    ticket_service_factory=Depends(get_classroom_content_service_factory),
 ):
+    service = reader_service if ticket is None else ticket_service_factory()
     return _stream(
         await _call(
             service.open_media(
@@ -189,4 +215,9 @@ async def get_classroom_version_media(
     )
 
 
-__all__ = ["get_classroom_content_service", "router"]
+__all__ = [
+    "get_classroom_content_reader_service",
+    "get_classroom_content_service",
+    "get_classroom_content_service_factory",
+    "router",
+]
