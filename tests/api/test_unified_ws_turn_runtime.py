@@ -623,6 +623,173 @@ async def test_regenerate_reuses_snapshot_or_override_llm_selection(tmp_path) ->
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("content_mode", "turn_knowledge_bases"),
+    [("open_creation", []), ("source_grounded", ["kb-course-a"])],
+)
+async def test_classroom_kb_override_is_transient_and_regenerate_replays_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    content_mode: str,
+    turn_knowledge_bases: list[str],
+) -> None:
+    store = SQLiteSessionStore(tmp_path / f"classroom-{content_mode}.db")
+    runtime = TurnRuntimeManager(store)
+    contexts: list[tuple[str | None, list[str], dict[str, object]]] = []
+
+    class FakeContextBuilder:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        async def build(self, **_kwargs):
+            return SimpleNamespace(
+                conversation_history=[],
+                conversation_summary="",
+                context_text="",
+                token_count=0,
+                budget=0,
+            )
+
+    class FakeOrchestrator:
+        async def handle(self, context):
+            contexts.append(
+                (
+                    context.active_capability,
+                    list(context.knowledge_bases),
+                    dict(context.config_overrides),
+                )
+            )
+            yield StreamEvent(
+                type=StreamEventType.CONTENT,
+                source=str(context.active_capability or "chat"),
+                content="done",
+                metadata={"call_kind": "llm_final_response"},
+            )
+            yield StreamEvent(
+                type=StreamEventType.DONE,
+                source=str(context.active_capability or "chat"),
+            )
+
+    monkeypatch.setattr(
+        "deeptutor.services.llm.config.get_llm_config",
+        lambda: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        "deeptutor.services.session.context_builder.ContextBuilder",
+        FakeContextBuilder,
+    )
+    monkeypatch.setattr(
+        "deeptutor.runtime.orchestrator.ChatOrchestrator",
+        FakeOrchestrator,
+    )
+    monkeypatch.setattr(
+        "deeptutor.book.context.build_book_context",
+        lambda *_args, **_kwargs: SimpleNamespace(text="", references=[], warnings=[]),
+    )
+    monkeypatch.setattr(
+        "deeptutor.services.memory.get_memory_store",
+        lambda: SimpleNamespace(read_l3_concat=lambda: "", emit=_noop_async),
+    )
+    monkeypatch.setattr(
+        "deeptutor.services.skill.get_skill_service",
+        _fake_skill_service,
+    )
+    monkeypatch.setattr(
+        "deeptutor.services.persona.get_persona_service",
+        _fake_persona_service,
+    )
+    monkeypatch.setattr(runtime, "_maybe_generate_session_title", _noop_async)
+
+    original_session_kbs = ["agent-codex", "kb-course-a", "kb-other"]
+    session = await store.create_session(session_id=f"session-{content_mode}")
+    await store.update_session_preferences(
+        session["id"],
+        {
+            "capability": "chat",
+            "tools": ["rag"],
+            "knowledge_bases": original_session_kbs,
+            "language": "en",
+        },
+    )
+    classroom_config = {
+        "mode": "micro",
+        "course_id": "course-a",
+        "question": "",
+        "content_mode": content_mode,
+    }
+
+    same_session, classroom_turn = await runtime.start_turn(
+        {
+            "type": "start_turn",
+            "content": "Build my classroom",
+            "session_id": session["id"],
+            "capability": "interactive_classroom",
+            "tools": [],
+            "knowledge_bases": turn_knowledge_bases,
+            "attachments": [],
+            "language": "en",
+            "config": classroom_config,
+        }
+    )
+    async for _event in runtime.subscribe_turn(classroom_turn["id"], after_seq=0):
+        pass
+
+    detail = await store.get_session_with_messages(session["id"])
+    assert same_session["id"] == session["id"]
+    assert detail is not None
+    assert detail["preferences"]["knowledge_bases"] == original_session_kbs
+    user_message = next(
+        message for message in detail["messages"] if message["role"] == "user"
+    )
+    snapshot = user_message["metadata"]["request_snapshot"]
+    assert snapshot["knowledgeBases"] == turn_knowledge_bases
+    assert snapshot["capability"] == "interactive_classroom"
+    assert snapshot["config"] == classroom_config
+    assert contexts[-1][0:2] == ("interactive_classroom", turn_knowledge_bases)
+
+    captured_regenerate_payloads: list[dict[str, object]] = []
+    original_start_turn = runtime.start_turn
+
+    async def capture_start_turn(payload: dict[str, object]):
+        captured_regenerate_payloads.append(payload)
+        return await original_start_turn(payload)
+
+    monkeypatch.setattr(runtime, "start_turn", capture_start_turn)
+    _, regenerated_turn = await runtime.regenerate_last_turn(session["id"])
+    regenerate_payload = captured_regenerate_payloads[-1]
+    assert regenerate_payload["capability"] == "interactive_classroom"
+    assert regenerate_payload["knowledge_bases"] == turn_knowledge_bases
+    assert {
+        key: value
+        for key, value in dict(regenerate_payload["config"]).items()
+        if not key.startswith("_")
+    } == classroom_config
+    async for _event in runtime.subscribe_turn(regenerated_turn["id"], after_seq=0):
+        pass
+    assert contexts[-1][0:2] == ("interactive_classroom", turn_knowledge_bases)
+
+    reloaded = await store.get_session_with_messages(session["id"])
+    assert reloaded is not None
+    assert reloaded["preferences"]["knowledge_bases"] == original_session_kbs
+    _, chat_turn = await original_start_turn(
+        {
+            "type": "start_turn",
+            "content": "Back to chat",
+            "session_id": session["id"],
+            "capability": "chat",
+            "tools": ["rag"],
+            "knowledge_bases": reloaded["preferences"]["knowledge_bases"],
+            "attachments": [],
+            "language": "en",
+            "config": {},
+        }
+    )
+    async for _event in runtime.subscribe_turn(chat_turn["id"], after_seq=0):
+        pass
+    assert contexts[-1][0:2] == ("chat", original_session_kbs)
+
+
+@pytest.mark.asyncio
 async def test_turn_runtime_bootstraps_question_followup_context_once(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,

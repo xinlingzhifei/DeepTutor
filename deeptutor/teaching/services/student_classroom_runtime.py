@@ -240,6 +240,7 @@ def build_student_classroom_service(
             tenant_id=context.tenant_id,
             repository=request_repository,
         ),
+        source_authorizer=snapshots,
     )
 
 

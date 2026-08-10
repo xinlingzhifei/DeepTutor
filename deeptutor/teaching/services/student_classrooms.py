@@ -34,6 +34,7 @@ from deeptutor.teaching.services.student_generation import (
     StudentGenerationResult,
     StudentGenerationService,
 )
+from deeptutor.teaching.source_snapshots import SourceSnapshotUnavailable
 from deeptutor.teaching.tenant_context import TenantContext
 
 
@@ -934,10 +935,12 @@ class StudentClassroomService:
         policy_service: StudentGenerationService,
         workflow: StudentClassroomWorkflow,
         approval_service: StudentGenerationApprovalService,
+        source_authorizer=None,
     ) -> None:
         self._policy_service = policy_service
         self._workflow = workflow
         self._approval_service = approval_service
+        self._source_authorizer = source_authorizer
 
     @staticmethod
     def _policy_request(request: object) -> StudentGenerationRequest:
@@ -949,7 +952,34 @@ class StudentClassroomService:
             web_search_requested=getattr(request, "web_search_requested"),
         )
 
+    async def _authorize_estimate_source(self, request: object) -> None:
+        content_mode = getattr(request, "content_mode")
+        source_type = getattr(request, "source_type", None)
+        source_ref = getattr(request, "source_ref", None)
+        if content_mode == "open_creation":
+            if source_type is not None or source_ref is not None:
+                raise ValueError("open creation cannot select a source")
+            return
+        if (
+            content_mode != "source_grounded"
+            or source_type not in {"knowledge_base", "pdf"}
+            or not isinstance(source_ref, str)
+            or not source_ref.strip()
+        ):
+            raise ValueError("source-grounded estimate requires a source")
+        if self._source_authorizer is None:
+            raise SourceSnapshotUnavailable("student estimate source authorizer is unavailable")
+        target = {
+            "course_id": str(getattr(request, "course_id")),
+            "class_id": str(getattr(request, "class_id")),
+        }
+        if source_type == "knowledge_base":
+            await self._source_authorizer.require_authorized_kb(source_ref, **target)
+        else:
+            await self._source_authorizer.require_authorized_pdf(source_ref, **target)
+
     async def estimate(self, _context: TenantContext, request: object):
+        await self._authorize_estimate_source(request)
         return await self._policy_service.estimate(self._policy_request(request))
 
     async def create(self, context: TenantContext, request: object):

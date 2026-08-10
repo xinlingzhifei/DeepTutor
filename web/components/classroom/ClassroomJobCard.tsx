@@ -21,6 +21,7 @@ import {
   shouldPollStudentClassroom,
   studentClassroomApprovalState,
   studentClassroomPlayRoute,
+  studentClassroomPollIntervalMs,
   studentClassroomPollRetryDelay,
   studentClassroomRequiresOutline,
   studentClassroomStatusKind,
@@ -30,7 +31,6 @@ import {
   type StudentClassroomTask,
 } from "@/lib/student-classroom-config";
 
-const POLL_INTERVAL_MS = 2500;
 function parseOutline(text: string): Record<string, unknown> {
   const parsed: unknown = JSON.parse(text);
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
@@ -102,7 +102,10 @@ export default function ClassroomJobCard({
         setJob(nextJob);
         setError(null);
 
-        timer = setTimeout(refresh, POLL_INTERVAL_MS);
+        timer = setTimeout(
+          refresh,
+          studentClassroomPollIntervalMs(nextClassroom.status),
+        );
       } catch (reason) {
         if (!active || controller.signal.aborted) return;
         setError(reason instanceof Error ? reason.message : String(reason));

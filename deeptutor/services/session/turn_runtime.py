@@ -800,9 +800,12 @@ class TurnRuntimeManager:
         preference_update: dict[str, Any] = {
             "capability": capability,
             "tools": list(payload.get("tools") or []),
-            "knowledge_bases": list(payload.get("knowledge_bases") or []),
             "language": _normalize_response_language(payload.get("language")),
         }
+        if capability != "interactive_classroom":
+            preference_update["knowledge_bases"] = list(
+                payload.get("knowledge_bases") or []
+            )
         if llm_selection:
             preference_update["llm_selection"] = llm_selection
         if persona_explicit:
@@ -890,6 +893,7 @@ class TurnRuntimeManager:
 
         capability = str(
             overrides.get("capability")
+            or snapshot.get("capability")
             or last_user.get("capability")
             or preferences.get("capability")
             or "chat"
@@ -902,13 +906,25 @@ class TurnRuntimeManager:
         knowledge_bases = list(
             overrides.get("knowledge_bases")
             if overrides.get("knowledge_bases") is not None
-            else preferences.get("knowledge_bases") or []
+            else (
+                _string_list(snapshot.get("knowledgeBases"))
+                if isinstance(snapshot.get("knowledgeBases"), list)
+                else preferences.get("knowledge_bases") or []
+            )
         )
         language = _normalize_response_language(
             overrides.get("language") or preferences.get("language")
         )
 
-        config: dict[str, Any] = dict(overrides.get("config") or {})
+        config: dict[str, Any] = dict(
+            overrides.get("config")
+            if overrides.get("config") is not None
+            else (
+                snapshot.get("config")
+                if isinstance(snapshot.get("config"), dict)
+                else {}
+            )
+        )
         config.update(
             {
                 "_persist_user_message": False,

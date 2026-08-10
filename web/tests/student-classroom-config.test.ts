@@ -17,6 +17,9 @@ import {
   shouldPollStudentClassroom,
   StudentClassroomRequestError,
   studentClassroomApprovalState,
+  studentClassroomEstimateIsReady,
+  studentClassroomEstimateRequestKey,
+  studentClassroomPollIntervalMs,
   studentClassroomPollRetryDelay,
   studentClassroomStatusKind,
   studentClassroomTurnKnowledgeBases,
@@ -168,21 +171,21 @@ test("source-grounded confirmation requires a course, explicit mode, and KB", ()
   assert.equal(
     canConfirmStudentClassroomConfig(
       { courseId: "course-a", mode: null, contentMode: "source_grounded" },
-      { authorizedSourceCount: 1, option },
+      { authorizedSourceCount: 1, option, estimateReady: true },
     ),
     false,
   );
   assert.equal(
     canConfirmStudentClassroomConfig(
       { courseId: "course-a", mode: "micro", contentMode: "source_grounded" },
-      { authorizedSourceCount: 0, option },
+      { authorizedSourceCount: 0, option, estimateReady: true },
     ),
     false,
   );
   assert.equal(
     canConfirmStudentClassroomConfig(
       { courseId: "course-a", mode: "micro", contentMode: "source_grounded" },
-      { authorizedSourceCount: 1, option },
+      { authorizedSourceCount: 1, option, estimateReady: true },
     ),
     true,
   );
@@ -192,6 +195,7 @@ test("source-grounded confirmation requires a course, explicit mode, and KB", ()
       {
         authorizedSourceCount: 0,
         option: { ...option, allowedContentModes: ["source_grounded"] },
+        estimateReady: true,
       },
     ),
     false,
@@ -199,14 +203,21 @@ test("source-grounded confirmation requires a course, explicit mode, and KB", ()
   assert.equal(
     canConfirmStudentClassroomConfig(
       { courseId: "course-a", mode: "micro", contentMode: "open_creation" },
-      { authorizedSourceCount: 0, option },
+      { authorizedSourceCount: 0, option, estimateReady: true },
     ),
     true,
   );
   assert.equal(
     canConfirmStudentClassroomConfig(
       { courseId: "course-a", mode: "full", contentMode: "open_creation" },
-      { authorizedSourceCount: 0, option },
+      { authorizedSourceCount: 0, option, estimateReady: true },
+    ),
+    false,
+  );
+  assert.equal(
+    canConfirmStudentClassroomConfig(
+      { courseId: "course-a", mode: "micro", contentMode: "source_grounded" },
+      { authorizedSourceCount: 1, option, estimateReady: false },
     ),
     false,
   );
@@ -296,6 +307,64 @@ test("config estimate uses the student-scoped contract without a class id", asyn
     requiresOutlineConfirmation: true,
     requiresApproval: true,
   });
+});
+
+test("only the current successful estimate request unlocks confirmation", () => {
+  const currentRequestKey = studentClassroomEstimateRequestKey({
+    courseId: "course-a",
+    mode: "full",
+    contentMode: "source_grounded",
+    sourceRef: "kb-course-a",
+  });
+  const staleRequestKey = studentClassroomEstimateRequestKey({
+    courseId: "course-a",
+    mode: "micro",
+    contentMode: "source_grounded",
+    sourceRef: "kb-course-a",
+  });
+
+  assert.equal(studentClassroomEstimateIsReady(currentRequestKey, null), false);
+  assert.equal(
+    studentClassroomEstimateIsReady(currentRequestKey, {
+      requestKey: currentRequestKey,
+      status: "loading",
+    }),
+    false,
+  );
+  assert.equal(
+    studentClassroomEstimateIsReady(currentRequestKey, {
+      requestKey: currentRequestKey,
+      status: "failed",
+    }),
+    false,
+  );
+  assert.equal(
+    studentClassroomEstimateIsReady(currentRequestKey, {
+      requestKey: staleRequestKey,
+      status: "ready",
+    }),
+    false,
+  );
+  assert.equal(
+    studentClassroomEstimateIsReady(currentRequestKey, {
+      requestKey: currentRequestKey,
+      status: "ready",
+    }),
+    true,
+  );
+  assert.equal(
+    studentClassroomEstimateRequestKey({
+      courseId: "course-a",
+      mode: "micro",
+      contentMode: "open_creation",
+    }),
+    studentClassroomEstimateRequestKey({
+      courseId: "course-a",
+      mode: "micro",
+      contentMode: "open_creation",
+      sourceRef: "ignored-session-kb",
+    }),
+  );
 });
 
 test("malformed classroom statuses, estimates, and job invariants fail closed", async () => {
@@ -424,7 +493,7 @@ test("student detail is authoritative for workflow status and outline", () => {
   });
 });
 
-test("terminal and owner-action classroom states do not poll", () => {
+test("terminal and outline-wait states stop while approval wait keeps polling", () => {
   assert.equal(
     shouldPollStudentClassroom({
       status: "succeeded",
@@ -444,7 +513,7 @@ test("terminal and owner-action classroom states do not poll", () => {
       status: "awaiting_approval",
       classroomVersionId: null,
     }),
-    false,
+    true,
   );
   assert.equal(
     shouldPollStudentClassroom({
@@ -453,6 +522,11 @@ test("terminal and owner-action classroom states do not poll", () => {
     }),
     true,
   );
+});
+
+test("approval wait polls at a low frequency until the teacher decides", () => {
+  assert.equal(studentClassroomPollIntervalMs("awaiting_approval"), 15_000);
+  assert.equal(studentClassroomPollIntervalMs("generating_content"), 2_500);
 });
 
 test("classroom polling stops on stable access errors and bounds transient retries", async () => {
@@ -473,7 +547,8 @@ test("classroom polling stops on stable access errors and bounds transient retri
   assert.equal(studentClassroomPollRetryDelay(new Error("temporary"), 1), 2500);
   assert.equal(studentClassroomPollRetryDelay(new Error("temporary"), 2), 5000);
   assert.equal(studentClassroomPollRetryDelay(new Error("temporary"), 3), 10000);
-  assert.equal(studentClassroomPollRetryDelay(new Error("temporary"), 4), null);
+  assert.equal(studentClassroomPollRetryDelay(new Error("temporary"), 4), 30000);
+  assert.equal(studentClassroomPollRetryDelay(new Error("temporary"), 10), 30000);
 
   const malformedNotFound = await withFetch(
     async () => jsonResponse("missing", 404),
@@ -756,6 +831,24 @@ test("home chat wires the explicit config and durable classroom task card", () =
     /replaySnapshot\?\.knowledgeBases\s*\?\?\s*options\?\.knowledgeBases\s*\?\?\s*session\.knowledgeBases/,
   );
   assert.match(home, /knowledgeBases:\s*studentTurnKnowledgeBases/);
+  const capabilitySwitchStart = home.indexOf(
+    "const handleSelectCapability = useCallback",
+  );
+  const capabilitySwitchEnd = home.indexOf(
+    "const fileToAttachment",
+    capabilitySwitchStart,
+  );
+  assert.ok(capabilitySwitchStart >= 0 && capabilitySwitchEnd > capabilitySwitchStart);
+  const capabilitySwitch = home.slice(capabilitySwitchStart, capabilitySwitchEnd);
+  assert.match(
+    capabilitySwitch,
+    /cap\.value !== "interactive_classroom" && config\.knowledgeBase/,
+  );
+  assert.doesNotMatch(
+    capabilitySwitch,
+    /realKnowledgeBaseNames|state\.knowledgeBases\.filter\(/,
+    "classroom capability switches must not rewrite session KB preferences",
+  );
   assert.match(
     home,
     /if \(!isStudentClassroomMode && selectedAgent && subagentBudget\)/,
@@ -767,6 +860,10 @@ test("home chat wires the explicit config and durable classroom task card", () =
   assert.match(config, /type="radio"/);
   assert.match(config, /listStudentClassroomOptions/);
   assert.match(config, /estimateStudentClassroom/);
+  assert.match(config, /onEstimateReadinessChange/);
+  assert.match(config, /status:\s*"loading"/);
+  assert.match(config, /status:\s*"failed"/);
+  assert.match(config, /status:\s*"ready"/);
   assert.doesNotMatch(config, /MODE_SUMMARY/);
   assert.doesNotMatch(config, /listTeachingCourses/);
   assert.match(config, /allowedContentModes\.includes\("open_creation"\)/);
@@ -784,5 +881,11 @@ test("home chat wires the explicit config and durable classroom task card", () =
   assert.match(
     home,
     /capabilityConfigConfirmed=\{[\s\S]*?studentClassroomCanConfirm[\s\S]*?\}/,
+  );
+  assert.match(home, /studentClassroomEstimateIsReady/);
+  assert.match(home, /estimateReady:\s*studentClassroomEstimateReady/);
+  assert.match(
+    home,
+    /onEstimateReadinessChange=\{setStudentClassroomEstimateReadiness\}/,
   );
 });

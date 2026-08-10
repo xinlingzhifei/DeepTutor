@@ -787,8 +787,13 @@ class SourceSnapshotBuilder:
             ) from exc
         return replace(snapshot, snapshot_id=saved.snapshot_id, created_at=saved.created_at)
 
-    async def from_kb(self, kb_ref: str, request: SnapshotRequest) -> SourceSnapshot:
-        permission = _scope_permission(self._context, request)
+    async def _resolve_authorized_kb(
+        self,
+        kb_ref: str,
+        *,
+        course_id: str,
+        class_id: str | None,
+    ) -> tuple[AuthorizedKnowledgeSource, BoundSourceRecord]:
         try:
             resource = self._knowledge_resolver(kb_ref)
         except asyncio.CancelledError:
@@ -804,8 +809,8 @@ class SourceSnapshotBuilder:
                 source_type="knowledge_base",
                 source_id=resource.resource_id,
                 resource_owner_id=resource.resource_owner_id,
-                course_id=request.course_id,
-                class_id=request.class_id,
+                course_id=course_id,
+                class_id=class_id,
                 binding_id=None,
             )
         except (SourceNotFoundError, SourceEntitlementDeniedError) as exc:
@@ -815,6 +820,31 @@ class SourceSnapshotBuilder:
             or bound.resource_owner_id != resource.resource_owner_id
         ):
             raise SourceAccessDenied("knowledge source identity does not match its binding")
+        return resource, bound
+
+    async def require_authorized_kb(
+        self,
+        kb_ref: str,
+        *,
+        course_id: str,
+        class_id: str | None,
+    ) -> BoundSourceRecord:
+        """Resolve the current user's logical KB and require its exact target binding."""
+
+        _resource, bound = await self._resolve_authorized_kb(
+            kb_ref,
+            course_id=course_id,
+            class_id=class_id,
+        )
+        return bound
+
+    async def from_kb(self, kb_ref: str, request: SnapshotRequest) -> SourceSnapshot:
+        permission = _scope_permission(self._context, request)
+        resource, bound = await self._resolve_authorized_kb(
+            kb_ref,
+            course_id=request.course_id,
+            class_id=request.class_id,
+        )
         try:
             if self._rag_service_factory is None:
                 result = await resource.search(request.query)
@@ -899,19 +929,32 @@ class SourceSnapshotBuilder:
         )
         return await self._persist(bound, snapshot, request)
 
-    async def from_pdf(self, binding_id: str, request: SnapshotRequest) -> SourceSnapshot:
-        permission = _scope_permission(self._context, request)
+    async def require_authorized_pdf(
+        self,
+        binding_id: str,
+        *,
+        course_id: str,
+        class_id: str | None,
+    ) -> BoundSourceRecord:
         try:
-            bound = await self._repository.require_authorized_source(
+            return await self._repository.require_authorized_source(
                 source_type="pdf",
                 source_id=None,
                 resource_owner_id=None,
-                course_id=request.course_id,
-                class_id=request.class_id,
+                course_id=course_id,
+                class_id=class_id,
                 binding_id=binding_id,
             )
         except SourceNotFoundError as exc:
             raise SourceAccessDenied("PDF source is not bound to this tenant scope") from exc
+
+    async def from_pdf(self, binding_id: str, request: SnapshotRequest) -> SourceSnapshot:
+        permission = _scope_permission(self._context, request)
+        bound = await self.require_authorized_pdf(
+            binding_id,
+            course_id=request.course_id,
+            class_id=request.class_id,
+        )
         if self._store_provider is None or bound.object_key is None:
             raise SourceSnapshotUnavailable("PDF source reader is not configured")
         handle = None

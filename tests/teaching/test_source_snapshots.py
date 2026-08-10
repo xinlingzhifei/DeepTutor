@@ -154,8 +154,10 @@ class _Repository:
     def __init__(self, bound: BoundSourceRecord | Exception | None = None) -> None:
         self.bound = bound or _bound_source()
         self.persisted = []
+        self.authorization_requests: list[dict[str, object]] = []
 
     async def require_authorized_source(self, **kwargs) -> BoundSourceRecord:
+        self.authorization_requests.append(kwargs)
         if isinstance(self.bound, Exception):
             raise self.bound
         return self.bound
@@ -236,6 +238,45 @@ async def test_source_bound_to_other_tenant_is_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(SourceAccessDenied, match="not bound"):
         await builder.from_kb(RESOURCE_ID, _request())
+
+
+@pytest.mark.asyncio
+async def test_kb_preflight_resolves_logical_identity_and_exact_target_without_rag(
+    tmp_path: Path,
+) -> None:
+    repository = _Repository()
+    resolved_refs: list[str] = []
+    source = _resource(tmp_path)
+
+    def resolve(kb_ref: str) -> AuthorizedKnowledgeSource:
+        resolved_refs.append(kb_ref)
+        return source
+
+    builder = SourceSnapshotBuilder(
+        _context(),
+        repository,
+        knowledge_resolver=resolve,
+        rag_service_factory=lambda _source: pytest.fail("RAG must not run"),
+    )
+
+    bound = await builder.require_authorized_kb(
+        "kb-visible-alias",
+        course_id="course-a",
+        class_id="class-a",
+    )
+
+    assert bound == _bound_source()
+    assert resolved_refs == ["kb-visible-alias"]
+    assert repository.authorization_requests == [
+        {
+            "source_type": "knowledge_base",
+            "source_id": RESOURCE_ID,
+            "resource_owner_id": "teacher-a",
+            "course_id": "course-a",
+            "class_id": "class-a",
+            "binding_id": None,
+        }
+    ]
 
 
 @pytest.mark.asyncio

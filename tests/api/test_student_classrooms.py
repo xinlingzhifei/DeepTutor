@@ -453,6 +453,27 @@ def test_unauthorized_source_is_hidden_as_not_found() -> None:
     assert "kb-private" not in response.text
 
 
+def test_unauthorized_estimate_source_is_hidden_as_not_found() -> None:
+    class HiddenEstimateSourceService(_StudentClassroomService):
+        async def estimate(self, _context: TenantContext, request):
+            raise SourceAccessDenied(f"private:{request.source_ref}")
+
+    body = _estimate_request()
+    body.update(
+        contentMode="source_grounded",
+        sourceType="knowledge_base",
+        sourceRef="kb-private",
+    )
+    response = _client(HiddenEstimateSourceService(), {"id": "alice"}).post(
+        "/api/v1/student-classrooms/estimate",
+        json=body,
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Student classroom not found"}
+    assert "kb-private" not in response.text
+
+
 def test_student_estimate_and_owner_list_use_the_trusted_context() -> None:
     service = _StudentClassroomService()
     selected_user = {"id": "alice"}
@@ -566,6 +587,113 @@ async def _build_real_student_service(*, outcome: str):
         approval_service=SimpleNamespace(),
     )
     return service, events
+
+
+@pytest.mark.asyncio
+async def test_real_estimate_authorizes_the_exact_selected_kb_before_policy() -> None:
+    service_module = importlib.import_module(
+        "deeptutor.teaching.services.student_classrooms"
+    )
+    events: list[object] = []
+    allowed_refs = {"kb-a"}
+
+    class PolicyService:
+        async def estimate(self, _request):
+            events.append("policy")
+            return StudentGenerationEstimate(
+                scene_range=(1, 5),
+                duration_minutes_range=(3, 25),
+                quota_units=5,
+                requires_outline_confirmation=False,
+                requires_approval=False,
+            )
+
+    class SourceAuthorizer:
+        async def require_authorized_kb(
+            self,
+            kb_ref: str,
+            *,
+            course_id: str,
+            class_id: str,
+        ) -> None:
+            events.append(("source", kb_ref, course_id, class_id))
+            if kb_ref not in allowed_refs:
+                raise SourceAccessDenied("selected source is unavailable")
+
+    service = service_module.StudentClassroomService(
+        policy_service=PolicyService(),
+        workflow=SimpleNamespace(),
+        approval_service=SimpleNamespace(),
+        source_authorizer=SourceAuthorizer(),
+    )
+
+    def request(source_ref: str):
+        return SimpleNamespace(
+            course_id="course-a",
+            class_id="class-a",
+            mode="micro",
+            content_mode="source_grounded",
+            web_search_requested=False,
+            source_type="knowledge_base",
+            source_ref=source_ref,
+        )
+
+    with pytest.raises(SourceAccessDenied):
+        await service.estimate(_context("alice"), request("kb-b"))
+    assert events == [("source", "kb-b", "course-a", "class-a")]
+
+    await service.estimate(_context("alice"), request("kb-a"))
+    assert events[-2:] == [
+        ("source", "kb-a", "course-a", "class-a"),
+        "policy",
+    ]
+
+    allowed_refs.clear()
+    with pytest.raises(SourceAccessDenied):
+        await service.estimate(_context("alice"), request("kb-a"))
+    assert events[-1] == ("source", "kb-a", "course-a", "class-a")
+    assert events.count("policy") == 1
+
+
+@pytest.mark.asyncio
+async def test_real_open_creation_estimate_never_resolves_a_source() -> None:
+    service_module = importlib.import_module(
+        "deeptutor.teaching.services.student_classrooms"
+    )
+
+    class PolicyService:
+        async def estimate(self, _request):
+            return StudentGenerationEstimate(
+                scene_range=(1, 5),
+                duration_minutes_range=(3, 25),
+                quota_units=5,
+                requires_outline_confirmation=False,
+                requires_approval=False,
+            )
+
+    class SourceAuthorizer:
+        async def require_authorized_kb(self, *_args, **_kwargs) -> None:
+            pytest.fail("open creation must not resolve a source")
+
+    service = service_module.StudentClassroomService(
+        policy_service=PolicyService(),
+        workflow=SimpleNamespace(),
+        approval_service=SimpleNamespace(),
+        source_authorizer=SourceAuthorizer(),
+    )
+    request = SimpleNamespace(
+        course_id="course-a",
+        class_id="class-a",
+        mode="micro",
+        content_mode="open_creation",
+        web_search_requested=False,
+        source_type=None,
+        source_ref=None,
+    )
+
+    estimate = await service.estimate(_context("alice"), request)
+
+    assert estimate.quota_units == 5
 
 
 @pytest.mark.asyncio

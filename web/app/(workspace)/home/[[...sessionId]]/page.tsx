@@ -106,10 +106,13 @@ import {
   canConfirmStudentClassroomConfig,
   createStudentClassroomConfig,
   restoreStudentClassroomConfig,
+  studentClassroomEstimateIsReady,
+  studentClassroomEstimateRequestKey,
   studentClassroomTurnKnowledgeBases,
   toCapabilityConfig,
   validateStudentClassroomConfig,
   type StudentClassroomFormConfig,
+  type StudentClassroomEstimateReadiness,
   type StudentClassroomOption,
 } from "@/lib/student-classroom-config";
 import {
@@ -454,6 +457,8 @@ export default function ChatPage() {
   const [studentClassroomOptions, setStudentClassroomOptions] = useState<
     StudentClassroomOption[]
   >([]);
+  const [studentClassroomEstimateReadiness, setStudentClassroomEstimateReadiness] =
+    useState<StudentClassroomEstimateReadiness | null>(null);
   // Capability-config confirmation gate.
   //
   // For capabilities that need explicit configuration (Quiz, Visualize,
@@ -616,14 +621,40 @@ export default function ChatPage() {
     [knowledgeBases, state.knowledgeBases],
   );
   const studentAuthorizedSourceCount = studentAuthorizedSourceNames.length;
+  const selectedStudentClassroomOption =
+    studentClassroomOptions.find(
+      option => option.courseId === studentClassroomConfig.courseId,
+    ) ?? null;
+  const studentClassroomSelectionCanConfirm = canConfirmStudentClassroomConfig(
+    studentClassroomConfig,
+    {
+      authorizedSourceCount: studentAuthorizedSourceCount,
+      option: selectedStudentClassroomOption,
+      estimateReady: true,
+    },
+  );
+  const currentStudentClassroomEstimateRequestKey =
+    studentClassroomSelectionCanConfirm && studentClassroomConfig.mode
+      ? studentClassroomEstimateRequestKey({
+          courseId: studentClassroomConfig.courseId,
+          mode: studentClassroomConfig.mode,
+          contentMode: studentClassroomConfig.contentMode,
+          ...(studentClassroomConfig.contentMode === "source_grounded" &&
+          studentAuthorizedSourceNames.length === 1
+            ? { sourceRef: studentAuthorizedSourceNames[0] }
+            : {}),
+        })
+      : null;
+  const studentClassroomEstimateReady = studentClassroomEstimateIsReady(
+    currentStudentClassroomEstimateRequestKey,
+    studentClassroomEstimateReadiness,
+  );
   const studentClassroomCanConfirm = canConfirmStudentClassroomConfig(
     studentClassroomConfig,
     {
       authorizedSourceCount: studentAuthorizedSourceCount,
-      option:
-        studentClassroomOptions.find(
-          option => option.courseId === studentClassroomConfig.courseId,
-        ) ?? null,
+      option: selectedStudentClassroomOption,
+      estimateReady: studentClassroomEstimateReady,
     },
   );
 
@@ -656,6 +687,7 @@ export default function ChatPage() {
   const handleChangeStudentClassroomConfig = useCallback(
     (next: StudentClassroomFormConfig) => {
       setStudentClassroomConfig(next);
+      setStudentClassroomEstimateReadiness(null);
       setCapabilityConfigConfirmed(false);
     },
     [],
@@ -663,6 +695,7 @@ export default function ChatPage() {
   const handleStudentClassroomOptionsChange = useCallback(
     (options: StudentClassroomOption[]) => {
       setStudentClassroomOptions(options);
+      setStudentClassroomEstimateReadiness(null);
       setCapabilityConfigConfirmed(false);
     },
     [],
@@ -1200,30 +1233,20 @@ export default function ChatPage() {
             cap.allowedTools.includes(tool as ToolName),
           );
       setTools(enabledToolsForCap);
-      if (cap.value === "interactive_classroom") {
-        const realKnowledgeBaseNames = new Set(
-          knowledgeBases
-            .filter(item => item.metadata?.type !== "subagent")
-            .map(item => item.name),
-        );
-        setKBs(
-          state.knowledgeBases.filter(name => realKnowledgeBaseNames.has(name)),
-        );
-      } else if (config.knowledgeBase) {
+      if (cap.value !== "interactive_classroom" && config.knowledgeBase) {
         setKBs([config.knowledgeBase]);
       }
       // Switching capability invalidates any prior config confirmation —
       // the new capability has its own form that needs explicit confirm.
+      setStudentClassroomEstimateReadiness(null);
       setCapabilityConfigConfirmed(false);
       setCapMenuOpen(false);
     },
     [
       capabilityConfigs,
-      knowledgeBases,
       setCapability,
       setKBs,
       setTools,
-      state.knowledgeBases,
       userEnabledTools,
     ],
   );
@@ -1426,6 +1449,7 @@ export default function ChatPage() {
             }
             onChange={handleChangeStudentClassroomConfig}
             onOptionsChange={handleStudentClassroomOptionsChange}
+            onEstimateReadinessChange={setStudentClassroomEstimateReadiness}
           />
         </CapabilityConfigCard>
       );
@@ -1796,13 +1820,16 @@ export default function ChatPage() {
   const handleToggleKB = useCallback(
     (name: string) => {
       const current = state.knowledgeBases;
+      if (isStudentClassroomMode) {
+        setStudentClassroomEstimateReadiness(null);
+      }
       setKBs(
         current.includes(name)
           ? current.filter((kb) => kb !== name)
           : [...current, name],
       );
     },
-    [setKBs, state.knowledgeBases],
+    [isStudentClassroomMode, setKBs, state.knowledgeBases],
   );
 
   // Real knowledge bases and connected subagents render as separate composer

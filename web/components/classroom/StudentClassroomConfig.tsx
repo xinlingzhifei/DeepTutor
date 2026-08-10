@@ -13,7 +13,9 @@ import { useTranslation } from "react-i18next";
 import {
   estimateStudentClassroom,
   listStudentClassroomOptions,
+  studentClassroomEstimateRequestKey,
   type StudentClassroomEstimate,
+  type StudentClassroomEstimateReadiness,
   type StudentClassroomContentMode,
   type StudentClassroomFormConfig,
   type StudentClassroomMode,
@@ -26,6 +28,9 @@ interface StudentClassroomConfigProps {
   authorizedSourceRef: string | null;
   onChange: (next: StudentClassroomFormConfig) => void;
   onOptionsChange: (options: StudentClassroomOption[]) => void;
+  onEstimateReadinessChange: (
+    readiness: StudentClassroomEstimateReadiness | null,
+  ) => void;
 }
 
 export default function StudentClassroomConfig({
@@ -34,6 +39,7 @@ export default function StudentClassroomConfig({
   authorizedSourceRef,
   onChange,
   onOptionsChange,
+  onEstimateReadinessChange,
 }: StudentClassroomConfigProps) {
   const { t } = useTranslation();
   const [options, setOptions] = useState<StudentClassroomOption[]>([]);
@@ -80,13 +86,15 @@ export default function StudentClassroomConfig({
       selectedOption.allowedContentModes.includes(value.contentMode) &&
       (value.contentMode !== "source_grounded" || authorizedSourceRef),
   );
-  const estimateRequestKey = canEstimate
-    ? [
-        value.courseId,
-        value.mode,
-        value.contentMode,
-        authorizedSourceRef ?? "",
-      ].join("\u0000")
+  const estimateSourceRef =
+    value.contentMode === "source_grounded" ? authorizedSourceRef : null;
+  const estimateRequestKey = canEstimate && value.mode
+    ? studentClassroomEstimateRequestKey({
+        courseId: value.courseId,
+        mode: value.mode,
+        contentMode: value.contentMode,
+        ...(estimateSourceRef ? { sourceRef: estimateSourceRef } : {}),
+      })
     : null;
   const estimate =
     estimateResult?.requestKey === estimateRequestKey
@@ -97,15 +105,22 @@ export default function StudentClassroomConfig({
     estimateRequestKey !== null && estimate === null && !estimateFailed;
 
   useEffect(() => {
-    if (estimateRequestKey === null || value.mode === null) return;
+    if (estimateRequestKey === null || value.mode === null) {
+      onEstimateReadinessChange(null);
+      return;
+    }
     let active = true;
     const controller = new AbortController();
+    onEstimateReadinessChange({
+      requestKey: estimateRequestKey,
+      status: "loading",
+    });
     estimateStudentClassroom(
       {
         courseId: value.courseId,
         mode: value.mode,
         contentMode: value.contentMode,
-        ...(authorizedSourceRef ? { sourceRef: authorizedSourceRef } : {}),
+        ...(estimateSourceRef ? { sourceRef: estimateSourceRef } : {}),
       },
       controller.signal,
     )
@@ -115,17 +130,32 @@ export default function StudentClassroomConfig({
         setEstimateFailureKey(current =>
           current === estimateRequestKey ? null : current,
         );
+        onEstimateReadinessChange({
+          requestKey: estimateRequestKey,
+          status: "ready",
+        });
       })
       .catch(() => {
         if (active && !controller.signal.aborted) {
           setEstimateFailureKey(estimateRequestKey);
+          onEstimateReadinessChange({
+            requestKey: estimateRequestKey,
+            status: "failed",
+          });
         }
       });
     return () => {
       active = false;
       controller.abort();
     };
-  }, [authorizedSourceRef, estimateRequestKey, value.contentMode, value.courseId, value.mode]);
+  }, [
+    estimateRequestKey,
+    estimateSourceRef,
+    onEstimateReadinessChange,
+    value.contentMode,
+    value.courseId,
+    value.mode,
+  ]);
 
   const selectMode = (mode: StudentClassroomMode) => {
     onChange({ ...value, mode });

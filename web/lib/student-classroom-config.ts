@@ -91,6 +91,7 @@ export function canConfirmStudentClassroomConfig(
   availability: {
     authorizedSourceCount: number;
     option: StudentClassroomOption | null;
+    estimateReady: boolean;
   },
 ): boolean {
   if (!validateStudentClassroomConfig(input).ok) return false;
@@ -101,6 +102,7 @@ export function canConfirmStudentClassroomConfig(
   if (!option.allowedModes.includes(input.mode)) return false;
   const contentMode = input.contentMode ?? "source_grounded";
   if (!option.allowedContentModes.includes(contentMode)) return false;
+  if (!availability.estimateReady) return false;
   return contentMode === "source_grounded"
     ? availability.authorizedSourceCount === 1
     : true;
@@ -138,6 +140,35 @@ export interface StudentClassroomEstimateInput {
   mode: StudentClassroomMode;
   contentMode: StudentClassroomContentMode;
   sourceRef?: string;
+}
+
+export interface StudentClassroomEstimateReadiness {
+  requestKey: string;
+  status: "loading" | "failed" | "ready";
+}
+
+export function studentClassroomEstimateRequestKey(
+  input: StudentClassroomEstimateInput,
+): string {
+  return JSON.stringify([
+    input.courseId.trim(),
+    input.mode,
+    input.contentMode,
+    input.contentMode === "source_grounded"
+      ? (input.sourceRef?.trim() ?? "")
+      : "",
+  ]);
+}
+
+export function studentClassroomEstimateIsReady(
+  currentRequestKey: string | null,
+  readiness: StudentClassroomEstimateReadiness | null,
+): boolean {
+  return (
+    currentRequestKey !== null &&
+    readiness?.requestKey === currentRequestKey &&
+    readiness.status === "ready"
+  );
 }
 
 export interface StudentClassroomTask {
@@ -252,7 +283,6 @@ const TERMINAL_STUDENT_CLASSROOM_STATUSES = new Set([
 ]);
 
 const OWNER_ACTION_STUDENT_CLASSROOM_STATUSES = new Set([
-  "awaiting_approval",
   "awaiting_confirmation",
   "awaiting_outline_confirmation",
 ]);
@@ -277,7 +307,12 @@ export function studentClassroomStatusKind(
 ): StudentClassroomStatusKind {
   if (status === "succeeded") return "success";
   if (TERMINAL_STUDENT_CLASSROOM_STATUSES.has(status)) return "failure";
-  if (OWNER_ACTION_STUDENT_CLASSROOM_STATUSES.has(status)) return "waiting";
+  if (
+    status === "awaiting_approval" ||
+    OWNER_ACTION_STUDENT_CLASSROOM_STATUSES.has(status)
+  ) {
+    return "waiting";
+  }
   return "running";
 }
 
@@ -291,6 +326,10 @@ export class StudentClassroomRequestError extends Error {
   }
 }
 
+export function studentClassroomPollIntervalMs(status: string): number {
+  return status === "awaiting_approval" ? 15_000 : 2_500;
+}
+
 export function studentClassroomPollRetryDelay(
   error: unknown,
   failureCount: number,
@@ -300,12 +339,11 @@ export function studentClassroomPollRetryDelay(
       (error.status === 403 || error.status === 404)) ||
     (error instanceof Error && error.name === "AbortError") ||
     !Number.isInteger(failureCount) ||
-    failureCount < 1 ||
-    failureCount > 3
+    failureCount < 1
   ) {
     return null;
   }
-  return 2500 * 2 ** (failureCount - 1);
+  return failureCount <= 3 ? 2500 * 2 ** (failureCount - 1) : 30_000;
 }
 
 export type StudentClassroomApprovalState =
