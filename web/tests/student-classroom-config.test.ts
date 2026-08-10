@@ -367,6 +367,28 @@ test("only the current successful estimate request unlocks confirmation", () => 
   );
 });
 
+test("language changes preserve a successful student classroom estimate", () => {
+  const config = readFileSync(
+    "components/classroom/StudentClassroomConfig.tsx",
+    "utf8",
+  );
+  const optionsEffectStart = config.indexOf(
+    "useEffect(() => {",
+    config.indexOf("const [options"),
+  );
+  const optionsEffectEnd = config.indexOf(
+    "const selectedOption",
+    optionsEffectStart,
+  );
+  assert.ok(optionsEffectStart >= 0 && optionsEffectEnd > optionsEffectStart);
+  const optionsEffect = config.slice(optionsEffectStart, optionsEffectEnd);
+
+  assert.match(optionsEffect, /\}, \[onOptionsChange\]\);/);
+  assert.doesNotMatch(optionsEffect, /\bt\(/);
+  assert.match(config, /setErrorKey\("studentClassroom\.config\.courseLoadFailed"\)/);
+  assert.match(config, /errorKey\s*\?\s*\([\s\S]*?\{t\(errorKey\)\}/);
+});
+
 test("malformed classroom statuses, estimates, and job invariants fail closed", async () => {
   assert.equal(
     extractStudentClassroomTaskFromEvents([

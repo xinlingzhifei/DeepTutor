@@ -44,7 +44,7 @@ export default function StudentClassroomConfig({
   const { t } = useTranslation();
   const [options, setOptions] = useState<StudentClassroomOption[]>([]);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [errorKey, setErrorKey] = useState<string | null>(null);
   const [estimateResult, setEstimateResult] = useState<{
     requestKey: string;
     estimate: StudentClassroomEstimate;
@@ -62,13 +62,13 @@ export default function StudentClassroomConfig({
         if (!active) return;
         setOptions(items);
         onOptionsChange(items);
-        setError(null);
+        setErrorKey(null);
       })
       .catch(() => {
         if (active && !controller.signal.aborted) {
           setOptions([]);
           onOptionsChange([]);
-          setError(t("studentClassroom.config.courseLoadFailed"));
+          setErrorKey("studentClassroom.config.courseLoadFailed");
         }
       })
       .finally(() => {
@@ -78,7 +78,7 @@ export default function StudentClassroomConfig({
       active = false;
       controller.abort();
     };
-  }, [onOptionsChange, t]);
+  }, [onOptionsChange]);
 
   const selectedOption = options.find(option => option.courseId === value.courseId) ?? null;
   const canEstimate = Boolean(
@@ -385,9 +385,9 @@ export default function StudentClassroomConfig({
         </div>
       ) : null}
 
-      {error ? (
+      {errorKey ? (
         <p role="alert" className="text-[10.5px] text-[var(--destructive)]">
-          {error}
+          {t(errorKey)}
         </p>
       ) : null}
     </div>
