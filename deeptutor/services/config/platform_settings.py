@@ -80,6 +80,11 @@ class PlatformSettings(BaseModel):
                 or parsed.fragment
             ):
                 raise ValueError("object store public download origins must be HTTPS origins")
+        if (
+            self.classroom_ticket_secret_file is not None
+            and not self.classroom_ticket_secret_file.is_absolute()
+        ):
+            raise ValueError("classroom_ticket_secret_file must be an absolute path")
         return self
 
 
@@ -149,6 +154,8 @@ def _safe_validation_error_message(error: ValidationError) -> str:
             issues.append("database_url or database_password_file")
         elif "S3 endpoint" in message:
             issues.append("S3 endpoint, bucket, and absolute tenant credentials directory")
+        elif "classroom_ticket_secret_file" in message:
+            issues.append("classroom_ticket_secret_file")
         else:
             issues.append("model")
 

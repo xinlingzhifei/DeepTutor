@@ -77,6 +77,7 @@ def test_model_metadata_uses_only_platform_and_logical_tenant_schemas():
         "tenant.classroom_publication_materializations",
         "tenant.classroom_review_policies",
         "tenant.classroom_review_requests",
+        "tenant.classroom_ticket_consumptions",
         "tenant.classroom_versions",
         "tenant.class_learning_states",
         "tenant.classes",

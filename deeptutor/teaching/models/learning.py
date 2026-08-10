@@ -90,6 +90,46 @@ class LearningSession(TenantBase):
     )
 
 
+class ClassroomTicketConsumption(TenantBase):
+    """Durable single-use ticket fact committed with its protected action."""
+
+    __tablename__ = "classroom_ticket_consumptions"
+
+    jti: Mapped[str] = mapped_column(String(128), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(64))
+    session_id: Mapped[str] = mapped_column(String(128))
+    user_id: Mapped[str] = mapped_column(String(128))
+    classroom_version_id: Mapped[str] = mapped_column(String(128))
+    allowed_action: Mapped[str] = mapped_column(String(64))
+    issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    consumed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["session_id", "tenant_id"],
+            ["tenant.learning_sessions.id", "tenant.learning_sessions.tenant_id"],
+            name="fk_classroom_ticket_consumptions_session_tenant",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["classroom_version_id"],
+            ["tenant.classroom_versions.id"],
+            name="fk_classroom_ticket_consumptions_version",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint("expires_at > issued_at", name="validity"),
+        CheckConstraint(
+            "allowed_action = 'learning_event.append'",
+            name="allowed_action",
+        ),
+        Index("ix_classroom_ticket_consumptions_expires_at", "expires_at"),
+    )
+
+
 class LearningEvent(TenantBase):
     """Immutable, server-bound classroom event with a per-session sequence."""
 
@@ -392,6 +432,7 @@ class LearningEventQuarantine(TenantBase):
 
 
 __all__ = [
+    "ClassroomTicketConsumption",
     "LearningEvent",
     "LearningEventQuarantine",
     "LearningProgress",

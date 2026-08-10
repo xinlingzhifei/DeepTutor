@@ -386,6 +386,30 @@ def test_enabled_s3_accepts_tenant_credentials_root(tmp_path: Path) -> None:
     assert loaded.object_store_tenant_credentials_dir == credentials_dir
 
 
+def test_classroom_ticket_secret_path_must_be_absolute(tmp_path: Path) -> None:
+    settings = _write_settings(
+        tmp_path,
+        {"classroom_ticket_secret_file": "relative/classroom-ticket-secret"},
+    )
+
+    with pytest.raises(ValueError, match="classroom_ticket_secret_file"):
+        load_platform_settings(settings)
+
+
+def test_classroom_ticket_secret_path_existence_is_checked_at_runtime(
+    tmp_path: Path,
+) -> None:
+    missing_secret = tmp_path / "not-mounted-yet"
+    settings = _write_settings(
+        tmp_path,
+        {"classroom_ticket_secret_file": str(missing_secret)},
+    )
+
+    loaded = load_platform_settings(settings)
+
+    assert loaded.classroom_ticket_secret_file == missing_secret
+
+
 @pytest.mark.parametrize(
     "origin",
     [

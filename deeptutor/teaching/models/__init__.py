@@ -38,6 +38,7 @@ from .jobs import (
     require_job_transition,
 )
 from .learning import (
+    ClassroomTicketConsumption,
     LearningEvent,
     LearningEventQuarantine,
     LearningProgress,
@@ -85,6 +86,7 @@ __all__ = [
     "CourseGenerationPolicyRecord",
     "ClassroomArtifact",
     "ClassroomAsset",
+    "ClassroomTicketConsumption",
     "ClassroomDraft",
     "ClassroomDraftMedia",
     "ClassroomExport",
