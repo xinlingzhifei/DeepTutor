@@ -24,7 +24,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 FOUNDATION_REVISION = "20260728_0001"
 SCOPED_GRANTS_REVISION = "20260730_0002"
 PROVISIONING_REVISION = "20260730_0003"
-HEAD_REVISION = "20260809_0015"
+HEAD_REVISION = "20260810_0016"
 
 
 @dataclass(frozen=True)
@@ -468,13 +468,27 @@ def test_migration_runs_from_outside_repository(
         "classroom_versions",
         "class_learning_states",
         "classes",
+        "course_generation_policies",
         "courses",
         "enrollments",
         "generation_jobs",
+        "learning_event_quarantine",
+        "learning_events",
+        "learning_progress",
+        "learning_projection_queue",
+        "learning_sessions",
+        "mastery_evidence",
+        "mastery_levels",
         "publications",
+        "quiz_attempts",
         "quota_ledger",
         "source_snapshots",
         "source_uploads",
+        "student_classroom_assets",
+        "student_classroom_copies",
+        "student_generation_approvals",
+        "student_generation_requests",
+        "student_safety_assessments",
         "teaching_briefs",
         "tenant_source_bindings",
     }
@@ -523,6 +537,7 @@ def test_wheel_packages_migrations_and_full_app_entrypoint(
         "deeptutor/teaching/migrations/versions/20260809_0013_student_generation.py",
         "deeptutor/teaching/migrations/versions/20260809_0014_student_classroom_api.py",
         "deeptutor/teaching/migrations/versions/20260809_0015_student_safety_assessments.py",
+        "deeptutor/teaching/migrations/versions/20260810_0016_learning_events.py",
     }.issubset(names)
     assert "deeptutor-migrate = deeptutor.teaching.migrations.cli:main" in entry_points
     assert "deeptutor-provisioner = deeptutor.teaching.provisioning_cli:main" in entry_points
@@ -607,13 +622,27 @@ def test_packaged_entrypoint_runs_platform_and_tenant_scopes(
         "classroom_versions",
         "class_learning_states",
         "classes",
+        "course_generation_policies",
         "courses",
         "enrollments",
         "generation_jobs",
+        "learning_event_quarantine",
+        "learning_events",
+        "learning_progress",
+        "learning_projection_queue",
+        "learning_sessions",
+        "mastery_evidence",
+        "mastery_levels",
         "publications",
+        "quiz_attempts",
         "quota_ledger",
         "source_snapshots",
         "source_uploads",
+        "student_classroom_assets",
+        "student_classroom_copies",
+        "student_generation_approvals",
+        "student_generation_requests",
+        "student_safety_assessments",
         "teaching_briefs",
         "tenant_source_bindings",
     }

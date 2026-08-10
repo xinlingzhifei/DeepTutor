@@ -1,0 +1,129 @@
+from __future__ import annotations
+
+from datetime import UTC, datetime
+import importlib
+import importlib.util
+
+import pytest
+from sqlalchemy import CheckConstraint, UniqueConstraint
+from sqlalchemy.dialects.postgresql import JSONB
+
+
+def _learning_models():
+    assert importlib.util.find_spec("deeptutor.teaching.models.learning") is not None
+    return importlib.import_module("deeptutor.teaching.models.learning")
+
+
+def _learning_repository():
+    assert importlib.util.find_spec("deeptutor.teaching.repositories.learning_events") is not None
+    return importlib.import_module("deeptutor.teaching.repositories.learning_events")
+
+
+def test_learning_models_declare_the_eight_plan06_tables() -> None:
+    models = _learning_models()
+
+    assert {
+        models.LearningSession.__table__.name,
+        models.LearningEvent.__table__.name,
+        models.LearningProjectionQueueItem.__table__.name,
+        models.QuizAttempt.__table__.name,
+        models.MasteryEvidence.__table__.name,
+        models.MasteryLevel.__table__.name,
+        models.LearningProgress.__table__.name,
+        models.LearningEventQuarantine.__table__.name,
+    } == {
+        "learning_sessions",
+        "learning_events",
+        "learning_projection_queue",
+        "quiz_attempts",
+        "mastery_evidence",
+        "mastery_levels",
+        "learning_progress",
+        "learning_event_quarantine",
+    }
+
+
+def test_learning_event_metadata_keeps_payload_jsonb_and_query_fields_independent() -> None:
+    models = _learning_models()
+    table = models.LearningEvent.__table__
+
+    assert isinstance(table.c.payload.type, JSONB)
+    assert {
+        "event_type",
+        "occurred_at",
+        "session_id",
+        "classroom_version_id",
+        "knowledge_point_id",
+    }.issubset(table.c.keys())
+    assert {
+        "ix_learning_events_event_type",
+        "ix_learning_events_occurred_at",
+        "ix_learning_events_session_id",
+        "ix_learning_events_classroom_version_id",
+        "ix_learning_events_knowledge_point_id",
+    }.issubset({index.name for index in table.indexes})
+
+
+def test_learning_event_metadata_enforces_idempotency_and_session_order() -> None:
+    models = _learning_models()
+
+    def unique_columns(model) -> set[tuple[str, ...]]:
+        return {
+            tuple(constraint.columns.keys())
+            for constraint in model.__table__.constraints
+            if isinstance(constraint, UniqueConstraint)
+        }
+
+    assert ("event_id",) in unique_columns(models.LearningEvent)
+    assert ("session_id", "seq") in unique_columns(models.LearningEvent)
+    assert ("event_id",) in unique_columns(models.QuizAttempt)
+    assert ("event_id",) in unique_columns(models.MasteryEvidence)
+    assert ("user_id", "knowledge_point_id") in unique_columns(models.MasteryLevel)
+
+
+def test_learning_session_requires_exactly_one_authority_reference() -> None:
+    models = _learning_models()
+    checks = {
+        constraint.name: str(constraint.sqltext)
+        for constraint in models.LearningSession.__table__.constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+
+    assert checks["ck_learning_sessions_authority"] == (
+        "(assignment_id IS NOT NULL AND student_asset_id IS NULL) OR "
+        "(assignment_id IS NULL AND student_asset_id IS NOT NULL)"
+    )
+
+
+def test_append_command_rejects_naive_occurrence_time() -> None:
+    repository = _learning_repository()
+
+    with pytest.raises(ValueError, match="occurred_at must be timezone-aware"):
+        repository.LearningEventAppend(
+            event_id="event-1",
+            tenant_id="tenant-a",
+            session_id="session-1",
+            user_id="student-1",
+            classroom_version_id="version-1",
+            event_type="scene.completed",
+            occurred_at=datetime(2026, 8, 10, 12, 0),
+            payload={"scene_id": "scene-1"},
+        )
+
+    command = repository.LearningEventAppend(
+        event_id="event-1",
+        tenant_id="tenant-a",
+        session_id="session-1",
+        user_id="student-1",
+        classroom_version_id="version-1",
+        event_type="scene.completed",
+        occurred_at=datetime(2026, 8, 10, 12, 0, tzinfo=UTC),
+        payload={"scene_id": "scene-1"},
+    )
+    assert command.event_id == "event-1"
+
+
+def test_learning_revision_is_the_tenant_schema_head() -> None:
+    from deeptutor.teaching.provisioning_worker import TENANT_SCHEMA_REVISION
+
+    assert TENANT_SCHEMA_REVISION == "20260810_0016"

@@ -1208,7 +1208,17 @@ async def test_postgres_student_generation_migration_constraints_state_and_downg
             "student_classroom_copies",
             "student_safety_assessments",
         }
-        assert tables - tables_before == new_tables
+        learning_tables = {
+            "learning_sessions",
+            "learning_events",
+            "learning_projection_queue",
+            "quiz_attempts",
+            "mastery_evidence",
+            "mastery_levels",
+            "learning_progress",
+            "learning_event_quarantine",
+        }
+        assert tables - tables_before == new_tables | learning_tables
         assert {
             "ck_course_generation_policies_micro_scene_limit",
             "ck_course_generation_policies_full_scene_limit",
@@ -1259,7 +1269,7 @@ async def test_postgres_student_generation_migration_constraints_state_and_downg
             for table_name, table in expected_tables.items()
             for column in table.c
         }
-        assert (revision, state_revision) == ("20260809_0015", "20260809_0015")
+        assert (revision, state_revision) == ("20260810_0016", "20260810_0016")
 
         with pytest.raises(IntegrityError):
             async with engine.begin() as connection:
@@ -1334,7 +1344,7 @@ async def test_postgres_student_generation_migration_constraints_state_and_downg
                 ),
                 {"schema_name": schema_name},
             )
-        assert (revision, state_revision) == ("20260809_0015", "20260809_0015")
+        assert (revision, state_revision) == ("20260810_0016", "20260810_0016")
     finally:
         async with engine.begin() as connection:
             await connection.execute(
