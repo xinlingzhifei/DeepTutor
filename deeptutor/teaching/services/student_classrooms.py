@@ -8,7 +8,7 @@ from typing import Protocol
 import uuid
 
 from deeptutor.teaching.brief_builder import KnowledgePointSpec, TeachingBriefSpec
-from deeptutor.teaching.contracts import GenerationRequest, canonical_json_bytes
+from deeptutor.teaching.contracts import GenerationRequest
 from deeptutor.teaching.openmaic.data_planes import DataPlaneSelector
 from deeptutor.teaching.permissions import ResourceScope
 from deeptutor.teaching.policies.student_generation import (
@@ -26,6 +26,7 @@ from deeptutor.teaching.services.classrooms import (
     GenerationStage,
     NewClassroomWorkflow,
     SqlAlchemyClassroomGeneration,
+    _generation_request_payload,
 )
 from deeptutor.teaching.services.student_generation import (
     StudentGenerationApprovalDetails,
@@ -286,7 +287,7 @@ class SqlAlchemyStudentClassroomGeneration:
             data_plane_route_id=selection.route_ref,
             priority=priority,
         )
-        payload = canonical_json_bytes(generation).decode("utf-8")
+        payload = _generation_request_payload(generation)
         request_sha256 = hashlib.sha256(payload.encode("utf-8")).hexdigest()
         job_request = GenerationJobRequest(
             tenant_id=context.tenant_id,

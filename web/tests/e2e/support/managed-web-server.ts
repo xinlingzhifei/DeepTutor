@@ -393,6 +393,7 @@ export default async function setupManagedWebServer(): Promise<
     cwd: WEB_ROOT,
     env: {
       ...process.env,
+      NODE_OPTIONS: `--max-old-space-size=${MANAGED_HEAP_LIMIT_MB}`,
       NODE_ENV: "development",
       NEXT_FONT_GOOGLE_MOCKED_RESPONSES: FONT_MOCKS_PATH,
       PW_VISUAL_BASELINE: "1",
