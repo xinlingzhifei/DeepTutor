@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 from fastapi import FastAPI
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 import pytest
+from starlette.requests import ClientDisconnect
 
 from deeptutor.teaching.permissions import permissions_for_roles
 from deeptutor.teaching.schema_names import tenant_schema_name
@@ -45,25 +47,117 @@ class _ContentService:
         self.read_calls.append(("document", context, version_id, token))
         if self.read_error is not None:
             raise self.read_error
-        return SimpleNamespace(
-            body=b'{"schemaVersion":"1.0","safe":true}',
+        return _StreamingResource(
+            (b'{"schemaVersion":"1.0","safe":true}',),
             mime_type="application/json",
             sha256="a" * 64,
-            size_bytes=35,
-            filename=None,
         )
 
     async def open_media(self, context, *, version_id, media_id, token):
         self.read_calls.append(("media", context, f"{version_id}:{media_id}", token))
         if token == "ticket-for-media-b":
             raise TicketScopeError("wrong resource")
-        return SimpleNamespace(
-            body=b"media-a",
+        return _StreamingResource(
+            (b"media-a",),
             mime_type="image/png",
             sha256="b" * 64,
-            size_bytes=7,
-            filename=None,
         )
+
+
+class _StreamingResource:
+    def __init__(
+        self,
+        chunks: tuple[bytes, ...],
+        *,
+        mime_type: str = "application/octet-stream",
+        sha256: str = "c" * 64,
+        filename: str | None = None,
+    ) -> None:
+        self.chunks = chunks
+        self.body = b"".join(chunks)
+        self.mime_type = mime_type
+        self.sha256 = sha256
+        self.size_bytes = len(self.body)
+        self.filename = filename
+        self.closed = False
+
+    def iter_chunks(self):
+        yield from self.chunks
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _asgi_scope() -> dict[str, object]:
+    return {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.4"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": "/content",
+        "raw_path": b"/content",
+        "query_string": b"",
+        "headers": [],
+        "client": ("test", 123),
+        "server": ("test", 80),
+    }
+
+
+@pytest.mark.asyncio
+async def test_content_response_sends_multiple_chunks_and_closes_resource() -> None:
+    from deeptutor.api.routers import classroom_content
+
+    resource = _StreamingResource((b"chunk-a", b"chunk-b", b"chunk-c"))
+    response = classroom_content.classroom_content_response(resource)
+    messages: list[dict[str, object]] = []
+
+    async def receive():
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        messages.append(message)
+
+    await response(_asgi_scope(), receive, send)
+
+    start = next(message for message in messages if message["type"] == "http.response.start")
+    headers = {key.decode(): value.decode() for key, value in start["headers"]}
+    assert [
+        message["body"]
+        for message in messages
+        if message["type"] == "http.response.body" and message.get("body")
+    ] == list(resource.chunks)
+    assert headers["content-length"] == str(resource.size_bytes)
+    assert headers["etag"] == f'"sha256-{resource.sha256}"'
+    assert resource.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        (RuntimeError, RuntimeError),
+        (OSError, ClientDisconnect),
+        (asyncio.CancelledError, asyncio.CancelledError),
+    ],
+)
+async def test_content_response_closes_resource_on_stream_failure(failure, expected) -> None:
+    from deeptutor.api.routers import classroom_content
+
+    resource = _StreamingResource((b"chunk-a", b"chunk-b"))
+    response = classroom_content.classroom_content_response(resource)
+
+    async def receive():
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        if message["type"] == "http.response.body" and message.get("body"):
+            raise failure("stream interrupted")
+
+    with pytest.raises(expected):
+        await response(_asgi_scope(), receive, send)
+
+    assert resource.closed
 
 
 def _client(service: _ContentService | None = None) -> tuple[TestClient, _ContentService]:

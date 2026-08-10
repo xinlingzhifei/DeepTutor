@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import json
 from types import SimpleNamespace
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.testclient import TestClient
+import pytest
 
 from deeptutor.teaching.schema_names import tenant_schema_name
 from deeptutor.teaching.tenant_context import TenantContext, require_tenant
@@ -179,6 +181,78 @@ def test_event_api_rejects_actual_body_larger_than_256_kib() -> None:
 
     assert response.status_code == 413
     assert ingestion.calls == []
+
+
+@pytest.mark.asyncio
+async def test_event_api_stops_consuming_chunks_immediately_after_size_limit() -> None:
+    from deeptutor.api.routers import classroom_learning
+
+    ingestion = _IngestionService()
+    chunks = [
+        (b"x" * classroom_learning.MAX_EVENT_BATCH_BYTES, True),
+        (b"y", True),
+        (b"must-not-be-consumed", False),
+    ]
+    received: list[int] = []
+
+    async def receive():
+        index = len(received)
+        received.append(index)
+        body, more_body = chunks[index]
+        return {"type": "http.request", "body": body, "more_body": more_body}
+
+    request = Request({"type": "http", "method": "POST", "headers": []}, receive)
+
+    with pytest.raises(HTTPException) as raised:
+        await classroom_learning.append_learning_events(
+            session_id="session-a",
+            request=request,
+            ticket="event-ticket",
+            context=_context(),
+            service=ingestion,
+        )
+
+    assert raised.value.status_code == 413
+    assert received == [0, 1]
+    assert ingestion.calls == []
+
+
+@pytest.mark.asyncio
+async def test_event_api_accepts_chunked_body_at_exact_size_limit() -> None:
+    from deeptutor.api.routers import classroom_learning
+
+    ingestion = _IngestionService()
+    encoded = json.dumps({"events": [_event()]}, separators=(",", ":")).encode()
+    body = encoded + (b" " * (classroom_learning.MAX_EVENT_BATCH_BYTES - len(encoded)))
+    chunks = [
+        body[:17],
+        body[17:131_072],
+        body[131_072:],
+    ]
+    received: list[int] = []
+
+    async def receive():
+        index = len(received)
+        received.append(index)
+        return {
+            "type": "http.request",
+            "body": chunks[index],
+            "more_body": index < len(chunks) - 1,
+        }
+
+    request = Request({"type": "http", "method": "POST", "headers": []}, receive)
+
+    result = await classroom_learning.append_learning_events(
+        session_id="session-a",
+        request=request,
+        ticket="event-ticket",
+        context=_context(),
+        service=ingestion,
+    )
+
+    assert [item.event_id for item in result.accepted] == ["event-1"]
+    assert received == [0, 1, 2]
+    assert len(ingestion.calls) == 1
 
 
 def test_session_cursor_get_complete_and_event_ticket_are_server_bound() -> None:

@@ -12,7 +12,10 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy.exc import SQLAlchemyError
 
 from deeptutor.api.routers.auth import require_platform_enabled
-from deeptutor.api.routers.classroom_content import get_classroom_content_service
+from deeptutor.api.routers.classroom_content import (
+    classroom_content_response,
+    get_classroom_content_service,
+)
 from deeptutor.services.config import load_platform_settings
 from deeptutor.teaching.database import get_platform_engine
 from deeptutor.teaching.job_route_binding import DataPlaneBindingUnavailable
@@ -366,16 +369,9 @@ async def download_classroom_export(
                 status_code=503,
                 detail="Export download is unavailable",
             ) from None
-        filename = quote(content.filename or export_id, safe="")
-        return StreamingResponse(
-            iter((content.body,)),
-            media_type=content.mime_type,
-            headers={
-                "Content-Length": str(content.size_bytes),
-                "ETag": f'"sha256-{content.sha256}"',
-                "Cache-Control": "private, no-store",
-                "Content-Disposition": f"attachment; filename*=UTF-8''{filename}",
-            },
+        return classroom_content_response(
+            content,
+            attachment_filename=content.filename or export_id,
         )
     record = await _authorized_export(service, context, export_id)
     if not _ready(record):

@@ -255,9 +255,11 @@ async def append_learning_events(
     context: TenantContext = Depends(require_tenant),
     service: LearningEventIngestionServiceLike = Depends(get_learning_event_ingestion_service),
 ) -> EventIngestionResponse:
-    body = await request.body()
-    if len(body) > MAX_EVENT_BATCH_BYTES:
-        raise HTTPException(status_code=413, detail="Learning event batch is too large")
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > MAX_EVENT_BATCH_BYTES:
+            raise HTTPException(status_code=413, detail="Learning event batch is too large")
+        body.extend(chunk)
     try:
         batch = LearningEventBatch.model_validate_json(body)
     except ValidationError as exc:

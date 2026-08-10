@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import tempfile
+from types import SimpleNamespace
 
 import pytest
 
@@ -30,6 +32,143 @@ def _context(user_id: str, role: str | None = None) -> TenantContext:
         user_id=user_id,
         permissions=permissions,
     )
+
+
+def _read_content(content) -> bytes:
+    try:
+        return content.stream.read()
+    finally:
+        content.close()
+
+
+@pytest.mark.asyncio
+async def test_verified_content_spools_large_chunks_without_materializing_bytes(
+    monkeypatch,
+) -> None:
+    from deeptutor.teaching.services import classroom_content
+    from deeptutor.teaching.services.classroom_content import (
+        ClassroomContentService,
+        ContentArtifactReceipt,
+    )
+
+    chunks = (
+        b"a" * 600_000,
+        b"b" * 600_000,
+        b"c" * 257,
+    )
+    digest = hashlib.sha256()
+    for chunk in chunks:
+        digest.update(chunk)
+    receipt = ContentArtifactReceipt(
+        artifact_kind="media",
+        media_id="media-a",
+        relative_name="media/large.bin",
+        object_key="private/large-object",
+        sha256=digest.hexdigest(),
+        size_bytes=sum(len(chunk) for chunk in chunks),
+        mime_type="application/octet-stream",
+    )
+
+    class Store:
+        async def open(self, object_key):
+            assert object_key == "private/large-object"
+
+            async def stream():
+                for chunk in chunks:
+                    yield chunk
+
+            return stream()
+
+    class Stores:
+        async def store_for_tenant(self, tenant_id):
+            assert tenant_id == "tenant-a"
+            return Store()
+
+    def forbid_bytes_materialization(*_args, **_kwargs):
+        raise AssertionError("verified content must not be materialized with bytes()")
+
+    monkeypatch.setattr(classroom_content, "bytes", forbid_bytes_materialization, raising=False)
+    service = ClassroomContentService(
+        repository=object(),
+        stores=Stores(),
+        ticket_service=None,
+    )
+
+    spool = await service._read("tenant-a", receipt)
+
+    assert spool.tell() == 0
+    assert spool._rolled is True
+    assert spool.read(3) == b"aaa"
+    spool.seek(600_000)
+    assert spool.read(3) == b"bbb"
+    spool.close()
+    assert spool.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mismatch", ["size", "hash"])
+async def test_verified_content_closes_spool_on_receipt_mismatch(
+    monkeypatch,
+    mismatch: str,
+) -> None:
+    from deeptutor.teaching.services import classroom_content
+    from deeptutor.teaching.services.classroom_content import (
+        ClassroomContentIntegrityError,
+        ClassroomContentService,
+        ContentArtifactReceipt,
+    )
+
+    payload = b"verified-content"
+    created: list[object] = []
+    upstream_closed: list[bool] = []
+
+    def tracking_spool(*args, **kwargs):
+        spool = tempfile.SpooledTemporaryFile(*args, **kwargs)
+        created.append(spool)
+        return spool
+
+    monkeypatch.setattr(
+        classroom_content,
+        "tempfile",
+        SimpleNamespace(SpooledTemporaryFile=tracking_spool),
+        raising=False,
+    )
+    receipt = ContentArtifactReceipt(
+        artifact_kind="media",
+        media_id="media-a",
+        relative_name="media/a.bin",
+        object_key="private/a",
+        sha256=("0" * 64 if mismatch == "hash" else hashlib.sha256(payload).hexdigest()),
+        size_bytes=(len(payload) - 1 if mismatch == "size" else len(payload)),
+        mime_type="application/octet-stream",
+    )
+
+    class Store:
+        async def open(self, _object_key):
+            async def stream():
+                try:
+                    yield payload
+                finally:
+                    upstream_closed.append(True)
+
+            return stream()
+
+    class Stores:
+        async def store_for_tenant(self, _tenant_id):
+            return Store()
+
+    service = ClassroomContentService(
+        repository=object(),
+        stores=Stores(),
+        ticket_service=None,
+    )
+
+    with pytest.raises(ClassroomContentIntegrityError):
+        await service._read("tenant-a", receipt)
+
+    assert len(created) == 1
+    assert created[0].closed
+    assert upstream_closed == [True]
 
 
 @pytest.mark.asyncio
@@ -194,32 +333,33 @@ async def test_content_service_pins_tickets_and_reads_exact_receipts_without_url
         "resource_id": "media-1",
         "ttl_seconds": 60,
     }
-    rendered = json.loads(delivered_document.body)
+    delivered_document_body = _read_content(delivered_document)
+    delivered_media_body = _read_content(delivered_media)
+    rendered = json.loads(delivered_document_body)
     assert rendered["classroomVersionId"] == "source-version-a"
     assert rendered["exportManifest"] == []
     assert rendered["mediaManifest"][0]["temporaryDownloadPath"] == (
         "/api/v1/classroom-versions/version-a/media/media-1"
     )
-    assert "private/" not in delivered_document.body.decode()
-    assert "/api/yfeistai/" not in delivered_document.body.decode()
-    assert delivered_media.body == media_body
+    assert "private/" not in delivered_document_body.decode()
+    assert "/api/yfeistai/" not in delivered_document_body.decode()
+    assert delivered_media_body == media_body
 
-    assert (
-        await service.open_document(
-            _context("teacher-owner"),
-            version_id="version-a",
-            token=None,
-        )
-    ).mime_type == "application/json"
+    owner_document = await service.open_document(
+        _context("teacher-owner"),
+        version_id="version-a",
+        token=None,
+    )
+    assert owner_document.mime_type == "application/json"
+    owner_document.close()
     teacher = _context("teacher-other", "teacher")
-    assert (
-        await service.open_media(
-            teacher,
-            version_id="version-a",
-            media_id="media-1",
-            token=None,
-        )
-    ).body == media_body
+    teacher_media = await service.open_media(
+        teacher,
+        version_id="version-a",
+        media_id="media-1",
+        token=None,
+    )
+    assert _read_content(teacher_media) == media_body
     with pytest.raises(ClassroomContentAccessDenied):
         await service.open_document(
             _context("student-b"),

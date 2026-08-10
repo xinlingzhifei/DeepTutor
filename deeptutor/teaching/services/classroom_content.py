@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 import hashlib
 import json
 from pathlib import PurePosixPath
-from typing import Literal, Protocol
+import tempfile
+from typing import BinaryIO, Literal, Protocol
 
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
@@ -44,6 +46,9 @@ _TEACHER_READ_PERMISSIONS = (
     "classroom.publish",
     "tenant.manage",
 )
+CONTENT_SPOOL_MAX_MEMORY_BYTES = 1024 * 1024
+CONTENT_STREAM_CHUNK_BYTES = 64 * 1024
+MAX_CLASSROOM_DOCUMENT_BYTES = 8 * 1024 * 1024
 
 
 class ClassroomContentError(RuntimeError):
@@ -106,11 +111,60 @@ class ExportContentRecord:
 
 @dataclass(frozen=True, slots=True)
 class ClassroomContent:
-    body: bytes
+    stream: BinaryIO
     mime_type: str
     sha256: str
     size_bytes: int
     filename: str | None = None
+
+    @classmethod
+    def from_bytes(
+        cls,
+        body: bytes,
+        *,
+        mime_type: str,
+        sha256: str,
+        filename: str | None = None,
+    ) -> ClassroomContent:
+        stream = _new_content_spool()
+        try:
+            stream.write(body)
+            stream.seek(0)
+            return cls(
+                stream=stream,
+                mime_type=mime_type,
+                sha256=sha256,
+                size_bytes=len(body),
+                filename=filename,
+            )
+        except BaseException:
+            stream.close()
+            raise
+
+    def iter_chunks(self) -> Iterator[bytes]:
+        try:
+            while chunk := self.stream.read(CONTENT_STREAM_CHUNK_BYTES):
+                yield chunk
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        self.stream.close()
+
+    @property
+    def closed(self) -> bool:
+        return self.stream.closed
+
+    @property
+    def rolled_to_disk(self) -> bool:
+        return bool(getattr(self.stream, "_rolled", False))
+
+
+def _new_content_spool() -> BinaryIO:
+    return tempfile.SpooledTemporaryFile(
+        max_size=CONTENT_SPOOL_MAX_MEMORY_BYTES,
+        mode="w+b",
+    )
 
 
 class ClassroomContentRepository(Protocol):
@@ -424,28 +478,40 @@ class ClassroomContentService:
         ):
             raise ClassroomContentAccessDenied("classroom learning session is unavailable")
 
-    async def _read(self, tenant_id: str, receipt: ContentArtifactReceipt) -> bytes:
+    async def _read(self, tenant_id: str, receipt: ContentArtifactReceipt) -> BinaryIO:
+        spool = _new_content_spool()
         try:
             store = await self._stores.store_for_tenant(tenant_id)
             chunks = await store.open(receipt.object_key)
-            body = bytearray()
-            async for chunk in chunks:
-                body.extend(chunk)
-                if len(body) > receipt.size_bytes:
-                    raise ClassroomContentIntegrityError("classroom object size is invalid")
+            digest = hashlib.sha256()
+            size = 0
+            try:
+                async for chunk in chunks:
+                    size += len(chunk)
+                    if size > receipt.size_bytes:
+                        raise ClassroomContentIntegrityError("classroom object size is invalid")
+                    spool.write(chunk)
+                    digest.update(chunk)
+            finally:
+                close_chunks = getattr(chunks, "aclose", None)
+                if close_chunks is not None:
+                    await close_chunks()
+            if size != receipt.size_bytes or digest.hexdigest() != receipt.sha256:
+                raise ClassroomContentIntegrityError("classroom object receipt is invalid")
+            spool.seek(0)
+            return spool
         except ClassroomContentIntegrityError:
+            spool.close()
             raise
         except (ObjectStoreNotFound, ObjectStoreAccessDenied):
+            spool.close()
             raise ClassroomContentNotFound("classroom object is unavailable") from None
         except (ObjectStoreIntegrityError, ObjectStoreError):
+            spool.close()
             raise ClassroomContentIntegrityError("classroom object is invalid") from None
-        materialized = bytes(body)
-        if (
-            len(materialized) != receipt.size_bytes
-            or hashlib.sha256(materialized).hexdigest() != receipt.sha256
-        ):
-            raise ClassroomContentIntegrityError("classroom object receipt is invalid")
-        return materialized
+        except BaseException:
+            spool.close()
+            raise
 
     @staticmethod
     def _validate_document_bindings(
@@ -480,11 +546,19 @@ class ClassroomContentService:
         context: TenantContext,
         version: VersionContentRecord,
     ) -> tuple[ClassroomDocument, bytes]:
-        body = await self._read(context.tenant_id, version.document)
+        if version.document.size_bytes > MAX_CLASSROOM_DOCUMENT_BYTES:
+            raise ClassroomContentIntegrityError("classroom document is too large")
+        stream = await self._read(context.tenant_id, version.document)
         try:
-            document = ClassroomDocument.model_validate_json(body)
-        except ValueError:
-            raise ClassroomContentIntegrityError("classroom document is invalid") from None
+            body = stream.read(MAX_CLASSROOM_DOCUMENT_BYTES + 1)
+            if len(body) > MAX_CLASSROOM_DOCUMENT_BYTES:
+                raise ClassroomContentIntegrityError("classroom document is too large")
+            try:
+                document = ClassroomDocument.model_validate_json(body)
+            except ValueError:
+                raise ClassroomContentIntegrityError("classroom document is invalid") from None
+        finally:
+            stream.close()
         self._validate_document_bindings(version, document)
         return document, body
 
@@ -568,11 +642,10 @@ class ClassroomContentService:
                 )
                 item.pop("expiresAt", None)
         body = canonical_json_bytes(rendered)
-        return ClassroomContent(
-            body=body,
+        return ClassroomContent.from_bytes(
+            body,
             mime_type="application/json",
             sha256=hashlib.sha256(body).hexdigest(),
-            size_bytes=len(body),
         )
 
     async def open_media(
@@ -604,9 +677,9 @@ class ClassroomContentService:
             )
         if declared is None or receipt is None:
             raise ClassroomContentNotFound("classroom media is unavailable")
-        body = await self._read(context.tenant_id, receipt)
+        stream = await self._read(context.tenant_id, receipt)
         return ClassroomContent(
-            body=body,
+            stream=stream,
             mime_type=receipt.mime_type,
             sha256=receipt.sha256,
             size_bytes=receipt.size_bytes,
@@ -634,9 +707,9 @@ class ClassroomContentService:
             action="classroom.export.read",
             resource_id=export_id,
         )
-        body = await self._read(context.tenant_id, export.receipt)
+        stream = await self._read(context.tenant_id, export.receipt)
         return ClassroomContent(
-            body=body,
+            stream=stream,
             mime_type=export.receipt.mime_type,
             sha256=export.receipt.sha256,
             size_bytes=export.receipt.size_bytes,

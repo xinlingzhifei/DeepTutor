@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Annotated, Literal, Protocol
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 from fastapi.responses import StreamingResponse
@@ -132,17 +133,36 @@ async def _call(operation):
         ) from None
 
 
-def _stream(resource) -> StreamingResponse:
+class _ClosingStreamingResponse(StreamingResponse):
+    def __init__(self, resource, *, headers: dict[str, str]) -> None:
+        self._resource = resource
+        super().__init__(
+            resource.iter_chunks(),
+            media_type=resource.mime_type,
+            headers=headers,
+        )
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._resource.close()
+
+
+def classroom_content_response(
+    resource,
+    *,
+    attachment_filename: str | None = None,
+) -> StreamingResponse:
     headers = {
         "Content-Length": str(resource.size_bytes),
         "ETag": f'"sha256-{resource.sha256}"',
         "Cache-Control": "private, no-store",
     }
-    return StreamingResponse(
-        iter((resource.body,)),
-        media_type=resource.mime_type,
-        headers=headers,
-    )
+    if attachment_filename is not None:
+        filename = quote(attachment_filename, safe="")
+        headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{filename}"
+    return _ClosingStreamingResponse(resource, headers=headers)
 
 
 @router.post(
@@ -179,7 +199,7 @@ async def get_classroom_version_document(
     ticket_service_factory=Depends(get_classroom_content_service_factory),
 ):
     service = reader_service if ticket is None else ticket_service_factory()
-    return _stream(
+    return classroom_content_response(
         await _call(
             service.open_document(
                 context,
@@ -203,7 +223,7 @@ async def get_classroom_version_media(
     ticket_service_factory=Depends(get_classroom_content_service_factory),
 ):
     service = reader_service if ticket is None else ticket_service_factory()
-    return _stream(
+    return classroom_content_response(
         await _call(
             service.open_media(
                 context,
@@ -216,6 +236,7 @@ async def get_classroom_version_media(
 
 
 __all__ = [
+    "classroom_content_response",
     "get_classroom_content_reader_service",
     "get_classroom_content_service",
     "get_classroom_content_service_factory",

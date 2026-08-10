@@ -16,6 +16,7 @@ from deeptutor.teaching.object_store import (
     ObjectStoreIntegrityError,
 )
 from deeptutor.teaching.permissions import permissions_for_roles
+from deeptutor.teaching.services.classroom_content import ClassroomContent
 from deeptutor.teaching.services.exports import (
     ClassroomExportService,
     ExportPolicyDenied,
@@ -157,18 +158,20 @@ class FakeStores:
 class FakeStudentContentService:
     def __init__(self) -> None:
         self.calls: list[tuple[object, str, str]] = []
+        self.last_content: ClassroomContent | None = None
 
     async def open_export(self, context, *, export_id, token):
         self.calls.append((context, export_id, token))
         if token == "wrong-export-ticket":
             raise TicketScopeError("wrong export")
-        return SimpleNamespace(
-            body=b"student-export",
+        content = ClassroomContent.from_bytes(
+            b"student-export",
             mime_type="application/zip",
             sha256="e" * 64,
-            size_bytes=14,
             filename="student-classroom.zip",
         )
+        self.last_content = content
+        return content
 
 
 @pytest.fixture
@@ -406,6 +409,7 @@ def test_student_export_download_uses_exact_ticket_without_teacher_fallback(
         "attachment; filename*=UTF-8''student-classroom.zip"
     )
     assert app.state.student_content.calls == [(_context(), "export-a", "student-export-ticket")]
+    assert app.state.student_content.last_content.closed
     assert stores.tenants == []
     assert store.open_calls == []
 
