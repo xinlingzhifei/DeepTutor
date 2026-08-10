@@ -203,6 +203,46 @@ class ClassroomTicketService:
         expected_action: ClassroomTicketAction,
         expected_resource_id: str | None = None,
     ) -> ClassroomTicketClaims:
+        claims = self._verified_claims(token)
+        expected = (
+            (claims.tenant_id, expected_tenant_id),
+            (claims.user_id, expected_user_id),
+            (claims.session_id, expected_session_id),
+            (claims.classroom_version_id, expected_version_id),
+            (claims.allowed_action, expected_action),
+            (claims.resource_id, expected_resource_id),
+        )
+        if any(actual != required for actual, required in expected):
+            raise TicketScopeError("classroom ticket scope does not match request")
+        return claims
+
+    def verify_read(
+        self,
+        token: str,
+        *,
+        expected_tenant_id: str,
+        expected_user_id: str,
+        expected_version_id: str,
+        expected_action: ClassroomTicketAction,
+        expected_resource_id: str,
+    ) -> ClassroomTicketClaims:
+        """Verify a read ticket before resolving its signed session id in the database."""
+
+        if expected_action not in _READ_ACTIONS:
+            raise TicketScopeError("classroom ticket scope does not match request")
+        claims = self._verified_claims(token)
+        expected = (
+            (claims.tenant_id, expected_tenant_id),
+            (claims.user_id, expected_user_id),
+            (claims.classroom_version_id, expected_version_id),
+            (claims.allowed_action, expected_action),
+            (claims.resource_id, expected_resource_id),
+        )
+        if any(actual != required for actual, required in expected):
+            raise TicketScopeError("classroom ticket scope does not match request")
+        return claims
+
+    def _verified_claims(self, token: str) -> ClassroomTicketClaims:
         try:
             payload = jwt.decode(
                 token,
@@ -228,17 +268,6 @@ class ClassroomTicketService:
             or len(claims.jti) < 22
         ):
             raise TicketInvalid("classroom ticket is invalid")
-
-        expected = (
-            (claims.tenant_id, expected_tenant_id),
-            (claims.user_id, expected_user_id),
-            (claims.session_id, expected_session_id),
-            (claims.classroom_version_id, expected_version_id),
-            (claims.allowed_action, expected_action),
-            (claims.resource_id, expected_resource_id),
-        )
-        if any(actual != required for actual, required in expected):
-            raise TicketScopeError("classroom ticket scope does not match request")
         return claims
 
 

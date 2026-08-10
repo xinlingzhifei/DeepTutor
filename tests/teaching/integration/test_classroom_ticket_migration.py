@@ -7,6 +7,7 @@ import importlib
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 import uuid
 
 import pytest
@@ -731,6 +732,148 @@ async def test_failed_protected_action_rolls_back_jti_and_allows_same_ticket_ret
             )
         assert consumption_count == 1
         assert cursor == {"last_event_seq": 1}
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_event_ingestion_commits_ticket_events_queue_and_quarantine_atomically(
+    learning_runtime: LearningRuntime,
+) -> None:
+    from deeptutor.teaching.learning_events import LearningEventBatch
+    from deeptutor.teaching.services.classroom_learning import (
+        ClassroomLearningEventIngestionService,
+    )
+
+    engine, _, sessions = _runtime_service(learning_runtime)
+    context = _context(learning_runtime)
+    quoted_schema = f'"{learning_runtime.schema_name}"'
+    document = SimpleNamespace(
+        openmaic=SimpleNamespace(
+            scenes=[
+                SimpleNamespace(
+                    id="scene-quiz",
+                    type="quiz",
+                    content=SimpleNamespace(
+                        questions=[SimpleNamespace(id="question-1")],
+                    ),
+                )
+            ]
+        ),
+        knowledge_point_mappings=[
+            SimpleNamespace(
+                knowledge_point_id="kp-quiz",
+                scene_ids=["scene-quiz"],
+            )
+        ],
+    )
+
+    class DocumentLoader:
+        async def load_version_document(self, load_context, version_id):
+            assert load_context == context
+            assert version_id == "version-assigned"
+            return document
+
+    ingestion = ClassroomLearningEventIngestionService(
+        engine=engine,
+        sessions=sessions,
+        document_loader=DocumentLoader(),
+    )
+
+    async def session_fact_counts(connection, session_id: str) -> tuple[int, ...]:
+        counts: list[int] = []
+        for table_name in (
+            "classroom_ticket_consumptions",
+            "learning_events",
+            "learning_projection_queue",
+            "learning_event_quarantine",
+        ):
+            count = await connection.scalar(
+                text(
+                    f"SELECT count(*) FROM {quoted_schema}.{table_name} "
+                    "WHERE session_id = :session_id"
+                ),
+                {"session_id": session_id},
+            )
+            counts.append(int(count or 0))
+        return tuple(counts)
+
+    try:
+        learning_session = await sessions.create(
+            context,
+            assignment_id="assignment-valid",
+        )
+        token = await sessions.issue_event_ticket(
+            context,
+            session_id=learning_session.id,
+        )
+        base = {
+            "schema_version": "1.0",
+            "event_id": "event-atomic",
+            "event_type": "scene.completed",
+            "scene_id": "scene-quiz",
+            "knowledge_point_id": "kp-quiz",
+        }
+        failing = LearningEventBatch.model_validate(
+            {
+                "events": [
+                    {**base, "occurred_at": "2026-08-10T12:00:00Z"},
+                    {**base, "occurred_at": "2026-08-10T12:00:01Z"},
+                ]
+            }
+        )
+
+        with pytest.raises(
+            importlib.import_module(
+                "deeptutor.teaching.repositories.learning_events"
+            ).LearningEventBindingError,
+            match="changed",
+        ):
+            await ingestion.ingest(
+                context,
+                session_id=learning_session.id,
+                token=token,
+                batch=failing,
+            )
+
+        async with engine.connect() as connection:
+            rolled_back = await session_fact_counts(connection, learning_session.id)
+        assert rolled_back == (0, 0, 0, 0)
+
+        corrected = LearningEventBatch.model_validate(
+            {
+                "events": [
+                    {**base, "occurred_at": "2026-08-10T12:00:00Z"},
+                    {**base, "occurred_at": "2026-08-10T12:00:00Z"},
+                    {
+                        "schema_version": "1.0",
+                        "event_id": "event-quarantine",
+                        "event_type": "quiz.graded",
+                        "occurred_at": "2026-08-10T12:00:02Z",
+                        "scene_id": "scene-quiz",
+                        "knowledge_point_id": "kp-quiz",
+                        "assessment_id": "missing",
+                        "question_id": "question-1",
+                        "answer": ["option-a"],
+                    },
+                ]
+            }
+        )
+        retried = await ingestion.ingest(
+            context,
+            session_id=learning_session.id,
+            token=token,
+            batch=corrected,
+        )
+
+        assert [(item.event_id, item.seq) for item in retried.accepted] == [("event-atomic", 1)]
+        assert [(item.event_id, item.seq) for item in retried.duplicate] == [("event-atomic", 1)]
+        assert [(item.event_id, item.reason) for item in retried.quarantined] == [
+            ("event-quarantine", "assessment_not_in_version")
+        ]
+        async with engine.connect() as connection:
+            committed = await session_fact_counts(connection, learning_session.id)
+        assert committed == (1, 1, 1, 1)
     finally:
         await engine.dispose()
 

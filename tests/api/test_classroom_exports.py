@@ -22,6 +22,7 @@ from deeptutor.teaching.services.exports import (
     ExportRecord,
 )
 from deeptutor.teaching.tenant_context import TenantContext, require_tenant
+from deeptutor.teaching.tickets import TicketScopeError
 
 
 def _context(*, tenant_id: str = "tenant-a") -> TenantContext:
@@ -104,9 +105,7 @@ class FakeService:
         *,
         idempotency_key,
     ):
-        self.version_calls.append(
-            (context, version_id, export_format, idempotency_key)
-        )
+        self.version_calls.append((context, version_id, export_format, idempotency_key))
         if self.create_error is not None:
             raise self.create_error
         return replace(
@@ -155,19 +154,39 @@ class FakeStores:
         return self.store
 
 
+class FakeStudentContentService:
+    def __init__(self) -> None:
+        self.calls: list[tuple[object, str, str]] = []
+
+    async def open_export(self, context, *, export_id, token):
+        self.calls.append((context, export_id, token))
+        if token == "wrong-export-ticket":
+            raise TicketScopeError("wrong export")
+        return SimpleNamespace(
+            body=b"student-export",
+            mime_type="application/zip",
+            sha256="e" * 64,
+            size_bytes=14,
+            filename="student-classroom.zip",
+        )
+
+
 @pytest.fixture
 def api_harness():
     app = FastAPI()
     service = FakeService()
     store = FakeStore()
     stores = FakeStores(store)
+    student_content = FakeStudentContentService()
     app.include_router(exports_router.router, prefix="/api/v1")
     app.dependency_overrides[auth_router.require_platform_enabled] = lambda: None
     app.dependency_overrides[require_tenant] = _context
-    app.dependency_overrides[exports_router.get_classroom_export_service] = (
-        lambda: service
-    )
+    app.dependency_overrides[exports_router.get_classroom_export_service] = lambda: service
     app.dependency_overrides[exports_router.get_export_store_provider] = lambda: stores
+    app.dependency_overrides[exports_router.get_classroom_content_service_factory] = lambda: (
+        lambda: student_content
+    )
+    app.state.student_content = student_content
     return app, service, stores, store
 
 
@@ -249,9 +268,7 @@ def test_teacher_cannot_export_a_student_classroom_through_the_draft_route() -> 
     app.include_router(exports_router.router, prefix="/api/v1")
     app.dependency_overrides[auth_router.require_platform_enabled] = lambda: None
     app.dependency_overrides[require_tenant] = lambda: context
-    app.dependency_overrides[exports_router.get_classroom_export_service] = (
-        lambda: service
-    )
+    app.dependency_overrides[exports_router.get_classroom_export_service] = lambda: service
 
     response = TestClient(app).post(
         "/api/v1/classrooms/asset-a/draft/exports",
@@ -323,9 +340,7 @@ def test_other_tenant_or_unauthorized_actor_observes_export_as_not_found(
     service.hidden = True
 
     status_response = TestClient(app).get("/api/v1/classroom-exports/export-a")
-    download_response = TestClient(app).get(
-        "/api/v1/classroom-exports/export-a/download"
-    )
+    download_response = TestClient(app).get("/api/v1/classroom-exports/export-a/download")
 
     assert status_response.status_code == 404
     assert download_response.status_code == 404
@@ -373,6 +388,45 @@ def test_download_remains_a_controlled_stream_even_if_store_can_presign(
     assert store.open_calls == [service.record.object_key]
 
 
+def test_student_export_download_uses_exact_ticket_without_teacher_fallback(
+    api_harness,
+) -> None:
+    app, service, stores, store = api_harness
+    service.record = _record(status="succeeded")
+    service.hidden = True
+
+    response = TestClient(app).get(
+        "/api/v1/classroom-exports/export-a/download",
+        headers={"X-Classroom-Ticket": "student-export-ticket"},
+    )
+
+    assert response.status_code == 200
+    assert response.content == b"student-export"
+    assert response.headers["content-disposition"] == (
+        "attachment; filename*=UTF-8''student-classroom.zip"
+    )
+    assert app.state.student_content.calls == [(_context(), "export-a", "student-export-ticket")]
+    assert stores.tenants == []
+    assert store.open_calls == []
+
+
+def test_invalid_student_export_ticket_never_falls_back_to_teacher_access(
+    api_harness,
+) -> None:
+    app, service, stores, store = api_harness
+    service.record = _record(status="succeeded")
+
+    response = TestClient(app).get(
+        "/api/v1/classroom-exports/export-a/download",
+        headers={"X-Classroom-Ticket": "wrong-export-ticket"},
+    )
+
+    assert response.status_code == 403
+    assert app.state.student_content.calls == [(_context(), "export-a", "wrong-export-ticket")]
+    assert stores.tenants == []
+    assert store.open_calls == []
+
+
 def test_download_rejects_an_export_that_is_not_ready_without_opening_storage(
     api_harness,
 ) -> None:
@@ -383,6 +437,25 @@ def test_download_rejects_an_export_that_is_not_ready_without_opening_storage(
     assert response.status_code == 409
     assert stores.tenants == []
     assert store.open_calls == []
+
+
+def test_teacher_download_without_ticket_does_not_construct_student_content_service(
+    api_harness,
+) -> None:
+    app, service, _stores, _store = api_harness
+    service.record = _record(status="succeeded")
+
+    def fail_if_constructed():
+        raise RuntimeError("student content service must stay lazy")
+
+    app.dependency_overrides[exports_router.get_classroom_content_service_factory] = lambda: (
+        fail_if_constructed
+    )
+
+    response = TestClient(app).get("/api/v1/classroom-exports/export-a/download")
+
+    assert response.status_code == 200
+    assert response.content == b"verified-export"
 
 
 @pytest.mark.parametrize(

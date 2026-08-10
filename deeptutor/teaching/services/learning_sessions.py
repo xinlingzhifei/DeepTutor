@@ -353,6 +353,61 @@ class LearningSessionService:
                 record = self._record(model)
         return record
 
+    async def get(
+        self,
+        context: TenantContext,
+        *,
+        session_id: str,
+    ) -> LearningSessionRecord:
+        if not session_id.strip():
+            raise LearningSessionAuthorityError("session_id must not be blank")
+        session_factory = self._session_factory(context)
+        async with session_factory() as database_session:
+            model = await database_session.scalar(
+                select(LearningSession).where(
+                    LearningSession.id == session_id,
+                    LearningSession.tenant_id == context.tenant_id,
+                    LearningSession.user_id == context.user_id,
+                )
+            )
+        if model is None:
+            raise LearningSessionAuthorityError("learning session is unavailable to learner")
+        return self._record(model)
+
+    async def update_cursor(
+        self,
+        context: TenantContext,
+        *,
+        session_id: str,
+        cursor: dict[str, object],
+    ) -> LearningSessionRecord:
+        if not session_id.strip():
+            raise LearningSessionAuthorityError("session_id must not be blank")
+        if not isinstance(cursor, dict):
+            raise LearningSessionAuthorityError("learning cursor must be a JSON object")
+        session_factory = self._session_factory(context)
+        async with session_factory() as database_session:
+            async with database_session.begin():
+                model = await database_session.scalar(
+                    select(LearningSession)
+                    .where(
+                        LearningSession.id == session_id,
+                        LearningSession.tenant_id == context.tenant_id,
+                        LearningSession.user_id == context.user_id,
+                        LearningSession.status == "active",
+                    )
+                    .with_for_update()
+                )
+                if model is None:
+                    raise LearningSessionAuthorityError(
+                        "learning session is not active for learner"
+                    )
+                model.last_cursor = dict(cursor)
+                await database_session.flush()
+                await database_session.refresh(model)
+                record = self._record(model)
+        return record
+
     async def complete(
         self,
         context: TenantContext,

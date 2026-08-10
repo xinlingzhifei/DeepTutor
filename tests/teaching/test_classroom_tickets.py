@@ -139,6 +139,39 @@ def test_read_ticket_is_resource_bound_and_repeatable(
         service.verify(token, **(expected | {"expected_resource_id": "resource-b"}))
 
 
+def test_read_ticket_can_be_verified_before_trusted_session_lookup(tmp_path: Path) -> None:
+    service = _ticket_service(tmp_path)
+    token = service.issue(
+        tenant_id="tenant-a",
+        user_id="student-a",
+        session_id="session-a",
+        classroom_version_id="version-a",
+        allowed_action="classroom.media.read",
+        resource_id="media-a",
+        ttl_seconds=60,
+    )
+
+    claims = service.verify_read(
+        token,
+        expected_tenant_id="tenant-a",
+        expected_user_id="student-a",
+        expected_version_id="version-a",
+        expected_action="classroom.media.read",
+        expected_resource_id="media-a",
+    )
+
+    assert claims.session_id == "session-a"
+    with pytest.raises(TicketScopeError):
+        service.verify_read(
+            _event_token(service),
+            expected_tenant_id="tenant-a",
+            expected_user_id="student-a",
+            expected_version_id="version-a",
+            expected_action="classroom.media.read",
+            expected_resource_id="media-a",
+        )
+
+
 @pytest.mark.parametrize(
     ("action", "resource_id", "ttl_seconds"),
     [

@@ -7,10 +7,11 @@ from datetime import datetime
 from typing import Literal
 
 from sqlalchemy import func, select, text
-from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from deeptutor.teaching.models import (
     LearningEvent,
+    LearningEventQuarantine,
     LearningProjectionQueueItem,
     LearningSession,
 )
@@ -80,84 +81,111 @@ class SqlAlchemyLearningEventRepository:
         )
 
     async def append(self, event: LearningEventAppend) -> LearningEventAppendResult:
+        async with self._session_factory() as database_session:
+            async with database_session.begin():
+                return await self.append_in_session(database_session, event)
+
+    async def append_in_session(
+        self,
+        database_session: AsyncSession,
+        event: LearningEventAppend,
+    ) -> LearningEventAppendResult:
+        """Append inside a transaction owned by the caller."""
         if event.tenant_id != self._tenant_id:
             raise LearningEventBindingError("learning event tenant does not match repository")
 
-        async with self._session_factory() as database_session:
-            async with database_session.begin():
-                await database_session.execute(
-                    text("SELECT pg_advisory_xact_lock(hashtextextended(:event_id, 0))"),
-                    {"event_id": event.event_id},
-                )
-                learning_session = await database_session.scalar(
-                    select(LearningSession)
-                    .where(
-                        LearningSession.id == event.session_id,
-                        LearningSession.tenant_id == self._tenant_id,
-                    )
-                    .with_for_update()
-                )
-                if learning_session is None:
-                    raise LearningSessionUnavailable("learning session is unavailable")
-                if (
-                    learning_session.user_id != event.user_id
-                    or learning_session.classroom_version_id != event.classroom_version_id
-                ):
-                    raise LearningEventBindingError(
-                        "learning event does not match its server-owned session"
-                    )
+        await database_session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:event_id, 0))"),
+            {"event_id": event.event_id},
+        )
+        learning_session = await database_session.scalar(
+            select(LearningSession)
+            .where(
+                LearningSession.id == event.session_id,
+                LearningSession.tenant_id == self._tenant_id,
+            )
+            .with_for_update()
+        )
+        if learning_session is None:
+            raise LearningSessionUnavailable("learning session is unavailable")
+        if (
+            learning_session.user_id != event.user_id
+            or learning_session.classroom_version_id != event.classroom_version_id
+        ):
+            raise LearningEventBindingError(
+                "learning event does not match its server-owned session"
+            )
 
-                existing = await database_session.scalar(
-                    select(LearningEvent).where(LearningEvent.event_id == event.event_id)
+        existing = await database_session.scalar(
+            select(LearningEvent).where(LearningEvent.event_id == event.event_id)
+        )
+        if existing is not None:
+            if (
+                existing.tenant_id != self._tenant_id
+                or existing.session_id != event.session_id
+                or existing.user_id != event.user_id
+                or existing.classroom_version_id != event.classroom_version_id
+            ):
+                raise LearningEventBindingError(
+                    "learning event id belongs to another session binding"
                 )
-                if existing is not None:
-                    if (
-                        existing.tenant_id != self._tenant_id
-                        or existing.session_id != event.session_id
-                        or existing.user_id != event.user_id
-                        or existing.classroom_version_id != event.classroom_version_id
-                    ):
-                        raise LearningEventBindingError(
-                            "learning event id belongs to another session binding"
-                        )
-                    return LearningEventAppendResult(
-                        event_id=existing.event_id,
-                        outcome="duplicate",
-                        seq=existing.seq,
-                    )
-                if learning_session.status != "active":
-                    raise LearningSessionUnavailable("learning session does not accept new events")
+            if (
+                existing.event_type != event.event_type
+                or existing.occurred_at != event.occurred_at
+                or existing.scene_id != event.scene_id
+                or existing.knowledge_point_id != event.knowledge_point_id
+                or existing.payload != event.payload
+            ):
+                raise LearningEventBindingError(
+                    "learning event id was reused with changed event facts"
+                )
+            return LearningEventAppendResult(
+                event_id=existing.event_id,
+                outcome="duplicate",
+                seq=existing.seq,
+            )
+        quarantined = await database_session.scalar(
+            select(LearningEventQuarantine).where(
+                LearningEventQuarantine.event_id == event.event_id
+            )
+        )
+        if quarantined is not None:
+            raise LearningEventBindingError(
+                "learning event id is already bound to a quarantined event"
+            )
+        if learning_session.status != "active":
+            raise LearningSessionUnavailable("learning session does not accept new events")
 
-                seq = learning_session.next_seq
-                learning_session.next_seq = seq + 1
-                stored = LearningEvent(
-                    event_id=event.event_id,
-                    tenant_id=self._tenant_id,
-                    session_id=event.session_id,
-                    user_id=event.user_id,
-                    classroom_version_id=event.classroom_version_id,
-                    seq=seq,
-                    event_type=event.event_type,
-                    occurred_at=event.occurred_at,
-                    scene_id=event.scene_id,
-                    knowledge_point_id=event.knowledge_point_id,
-                    payload=dict(event.payload),
-                )
-                database_session.add(stored)
-                await database_session.flush()
-                database_session.add(
-                    LearningProjectionQueueItem(
-                        event_id=event.event_id,
-                        tenant_id=self._tenant_id,
-                        session_id=event.session_id,
-                    )
-                )
-                await database_session.flush()
-                return LearningEventAppendResult(
-                    event_id=event.event_id,
-                    outcome="accepted",
-                    seq=seq,
-                )
+        seq = learning_session.next_seq
+        learning_session.next_seq = seq + 1
+        stored = LearningEvent(
+            event_id=event.event_id,
+            tenant_id=self._tenant_id,
+            session_id=event.session_id,
+            user_id=event.user_id,
+            classroom_version_id=event.classroom_version_id,
+            seq=seq,
+            event_type=event.event_type,
+            occurred_at=event.occurred_at,
+            scene_id=event.scene_id,
+            knowledge_point_id=event.knowledge_point_id,
+            payload=dict(event.payload),
+        )
+        database_session.add(stored)
+        await database_session.flush()
+        database_session.add(
+            LearningProjectionQueueItem(
+                event_id=event.event_id,
+                tenant_id=self._tenant_id,
+                session_id=event.session_id,
+            )
+        )
+        await database_session.flush()
+        return LearningEventAppendResult(
+            event_id=event.event_id,
+            outcome="accepted",
+            seq=seq,
+        )
 
     async def count_events(self, session_id: str) -> int:
         async with self._session_factory() as database_session:

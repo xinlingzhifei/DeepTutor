@@ -46,3 +46,15 @@ def test_create_session_api_has_no_client_tenant_user_or_version_authority() -> 
     assert "user_id" not in parameters
     assert "classroom_version_id" not in parameters
     assert {"context", "assignment_id", "student_asset_id"}.issubset(parameters)
+
+
+def test_session_read_and_cursor_apis_accept_only_trusted_context_and_session_id() -> None:
+    get_parameters = inspect.signature(LearningSessionService.get).parameters
+    cursor_parameters = inspect.signature(LearningSessionService.update_cursor).parameters
+
+    assert set(get_parameters) == {"self", "context", "session_id"}
+    assert set(cursor_parameters) == {"self", "context", "session_id", "cursor"}
+    for parameters in (get_parameters, cursor_parameters):
+        assert "tenant_id" not in parameters
+        assert "user_id" not in parameters
+        assert "classroom_version_id" not in parameters

@@ -127,3 +127,201 @@ def test_learning_revision_is_the_tenant_schema_head() -> None:
     from deeptutor.teaching.provisioning_worker import TENANT_SCHEMA_REVISION
 
     assert TENANT_SCHEMA_REVISION == "20260810_0017"
+
+
+@pytest.mark.asyncio
+async def test_append_in_session_uses_caller_transaction_without_finishing_it() -> None:
+    models = _learning_models()
+    repository_module = _learning_repository()
+
+    learning_session = models.LearningSession(
+        id="session-1",
+        tenant_id="tenant-a",
+        user_id="student-1",
+        classroom_version_id="version-1",
+        assignment_id="assignment-1",
+        student_asset_id=None,
+        status="active",
+        next_seq=1,
+        last_cursor={"last_event_seq": 0},
+    )
+
+    class CallerManagedSession:
+        def __init__(self) -> None:
+            self.scalar_results = [learning_session, None, None]
+            self.added: list[object] = []
+            self.flush_count = 0
+            self.finished = False
+
+        async def execute(self, _statement, _parameters=None):
+            return None
+
+        async def scalar(self, _statement):
+            return self.scalar_results.pop(0)
+
+        def add(self, value: object) -> None:
+            self.added.append(value)
+
+        async def flush(self) -> None:
+            self.flush_count += 1
+
+        async def commit(self) -> None:
+            self.finished = True
+            raise AssertionError("repository must not commit the caller transaction")
+
+        async def rollback(self) -> None:
+            self.finished = True
+            raise AssertionError("repository must not roll back the caller transaction")
+
+        async def close(self) -> None:
+            self.finished = True
+            raise AssertionError("repository must not close the caller session")
+
+    database_session = CallerManagedSession()
+    repository = object.__new__(repository_module.SqlAlchemyLearningEventRepository)
+    repository._tenant_id = "tenant-a"
+    event = repository_module.LearningEventAppend(
+        event_id="event-1",
+        tenant_id="tenant-a",
+        session_id="session-1",
+        user_id="student-1",
+        classroom_version_id="version-1",
+        event_type="scene.completed",
+        occurred_at=datetime(2026, 8, 10, 12, 0, tzinfo=UTC),
+        payload={"schema_version": "1.0", "scene_id": "scene-1"},
+        scene_id="scene-1",
+    )
+
+    result = await repository.append_in_session(database_session, event)
+
+    assert (result.outcome, result.seq) == ("accepted", 1)
+    assert [type(value) for value in database_session.added] == [
+        models.LearningEvent,
+        models.LearningProjectionQueueItem,
+    ]
+    assert database_session.flush_count == 2
+    assert database_session.finished is False
+
+
+@pytest.mark.asyncio
+async def test_duplicate_event_id_with_changed_payload_is_rejected() -> None:
+    models = _learning_models()
+    repository_module = _learning_repository()
+    occurred_at = datetime(2026, 8, 10, 12, 0, tzinfo=UTC)
+    learning_session = models.LearningSession(
+        id="session-1",
+        tenant_id="tenant-a",
+        user_id="student-1",
+        classroom_version_id="version-1",
+        assignment_id="assignment-1",
+        student_asset_id=None,
+        status="active",
+        next_seq=2,
+        last_cursor={"last_event_seq": 1},
+    )
+    existing = models.LearningEvent(
+        event_id="event-1",
+        tenant_id="tenant-a",
+        session_id="session-1",
+        user_id="student-1",
+        classroom_version_id="version-1",
+        seq=1,
+        event_type="scene.completed",
+        occurred_at=occurred_at,
+        scene_id="scene-1",
+        knowledge_point_id="kp-1",
+        payload={"schema_version": "1.0", "scene_id": "scene-1"},
+    )
+
+    class DatabaseSession:
+        def __init__(self) -> None:
+            self.scalar_results = [learning_session, existing]
+
+        async def execute(self, _statement, _parameters=None):
+            return None
+
+        async def scalar(self, _statement):
+            return self.scalar_results.pop(0)
+
+    repository = object.__new__(repository_module.SqlAlchemyLearningEventRepository)
+    repository._tenant_id = "tenant-a"
+    changed = repository_module.LearningEventAppend(
+        event_id="event-1",
+        tenant_id="tenant-a",
+        session_id="session-1",
+        user_id="student-1",
+        classroom_version_id="version-1",
+        event_type="scene.completed",
+        occurred_at=occurred_at,
+        payload={"schema_version": "1.0", "scene_id": "scene-2"},
+        scene_id="scene-2",
+        knowledge_point_id="kp-1",
+    )
+
+    with pytest.raises(repository_module.LearningEventBindingError, match="changed"):
+        await repository.append_in_session(DatabaseSession(), changed)
+
+
+@pytest.mark.asyncio
+async def test_accepted_event_cannot_reuse_a_quarantined_event_id() -> None:
+    models = _learning_models()
+    repository_module = _learning_repository()
+    occurred_at = datetime(2026, 8, 10, 12, 0, tzinfo=UTC)
+    learning_session = models.LearningSession(
+        id="session-1",
+        tenant_id="tenant-a",
+        user_id="student-1",
+        classroom_version_id="version-1",
+        assignment_id="assignment-1",
+        student_asset_id=None,
+        status="active",
+        next_seq=1,
+        last_cursor={"last_event_seq": 0},
+    )
+    quarantined = models.LearningEventQuarantine(
+        event_id="event-1",
+        tenant_id="tenant-a",
+        session_id="session-1",
+        user_id="student-1",
+        classroom_version_id="version-1",
+        event_type="quiz.graded",
+        occurred_at=occurred_at,
+        knowledge_point_id="kp-1",
+        payload={"schema_version": "1.0", "assessment_id": "missing"},
+        reason_code="assessment_not_in_version",
+        details=None,
+    )
+
+    class DatabaseSession:
+        def __init__(self) -> None:
+            self.scalar_results = [learning_session, None, quarantined]
+
+        async def execute(self, _statement, _parameters=None):
+            return None
+
+        async def scalar(self, _statement):
+            return self.scalar_results.pop(0)
+
+        def add(self, _value: object) -> None:
+            return None
+
+        async def flush(self) -> None:
+            return None
+
+    repository = object.__new__(repository_module.SqlAlchemyLearningEventRepository)
+    repository._tenant_id = "tenant-a"
+    event = repository_module.LearningEventAppend(
+        event_id="event-1",
+        tenant_id="tenant-a",
+        session_id="session-1",
+        user_id="student-1",
+        classroom_version_id="version-1",
+        event_type="scene.completed",
+        occurred_at=occurred_at,
+        payload={"schema_version": "1.0", "scene_id": "scene-1"},
+        scene_id="scene-1",
+        knowledge_point_id="kp-1",
+    )
+
+    with pytest.raises(repository_module.LearningEventBindingError, match="quarantined"):
+        await repository.append_in_session(DatabaseSession(), event)

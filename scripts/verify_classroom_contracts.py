@@ -22,6 +22,7 @@ from deeptutor.teaching.contracts import (  # noqa: E402
     OutlineBundle,
     TeachingBrief,
 )
+from deeptutor.teaching.learning_events import LearningEventBatch  # noqa: E402
 
 JsonObject: TypeAlias = dict[str, object]
 
@@ -34,6 +35,7 @@ CONTRACT_SCHEMA_MODELS: dict[str, type[BaseModel]] = {
     "generation-job.schema.json": GenerationJob,
     "export-request.schema.json": ExportRequest,
     "export-job.schema.json": ExportJob,
+    "learning-event.schema.json": LearningEventBatch,
 }
 CONTRACT_SCHEMA_FILENAMES = tuple(CONTRACT_SCHEMA_MODELS)
 
