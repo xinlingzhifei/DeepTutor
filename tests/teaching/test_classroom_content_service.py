@@ -172,6 +172,87 @@ async def test_verified_content_closes_spool_on_receipt_mismatch(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("store_error", "expected_error"),
+    [
+        ("not_found", "ClassroomContentNotFound"),
+        ("integrity", "ClassroomContentIntegrityError"),
+        ("configuration", "ClassroomContentUnavailable"),
+        ("operational", "ClassroomContentUnavailable"),
+    ],
+)
+async def test_content_read_classifies_permanent_and_operational_store_failures(
+    monkeypatch,
+    store_error: str,
+    expected_error: str,
+) -> None:
+    from deeptutor.teaching.object_store import (
+        ObjectStoreConfigurationError,
+        ObjectStoreError,
+        ObjectStoreIntegrityError,
+        ObjectStoreNotFound,
+    )
+    from deeptutor.teaching.services import classroom_content
+    from deeptutor.teaching.services.classroom_content import (
+        ClassroomContentIntegrityError,
+        ClassroomContentNotFound,
+        ClassroomContentService,
+        ClassroomContentUnavailable,
+        ContentArtifactReceipt,
+    )
+
+    errors = {
+        "not_found": ObjectStoreNotFound("private detail"),
+        "integrity": ObjectStoreIntegrityError("private detail"),
+        "configuration": ObjectStoreConfigurationError("private detail"),
+        "operational": ObjectStoreError("private detail"),
+    }
+    expected = {
+        "ClassroomContentNotFound": ClassroomContentNotFound,
+        "ClassroomContentIntegrityError": ClassroomContentIntegrityError,
+        "ClassroomContentUnavailable": ClassroomContentUnavailable,
+    }[expected_error]
+    created: list[object] = []
+
+    def tracking_spool(*args, **kwargs):
+        spool = tempfile.SpooledTemporaryFile(*args, **kwargs)
+        created.append(spool)
+        return spool
+
+    monkeypatch.setattr(
+        classroom_content,
+        "tempfile",
+        SimpleNamespace(SpooledTemporaryFile=tracking_spool),
+        raising=False,
+    )
+
+    class Stores:
+        async def store_for_tenant(self, _tenant_id):
+            raise errors[store_error]
+
+    service = ClassroomContentService(
+        repository=object(),
+        stores=Stores(),
+        ticket_service=None,
+    )
+    receipt = ContentArtifactReceipt(
+        artifact_kind="dsl_json",
+        media_id=None,
+        relative_name="classroom.json",
+        object_key="private/document",
+        sha256="a" * 64,
+        size_bytes=1,
+        mime_type="application/json",
+    )
+
+    with pytest.raises(expected):
+        await service._read("tenant-a", receipt)
+
+    assert len(created) == 1
+    assert created[0].closed
+
+
+@pytest.mark.asyncio
 async def test_sql_content_repository_rejects_mismatched_tenant_schema() -> None:
     from deeptutor.teaching.services.classroom_content import (
         ClassroomContentAccessDenied,

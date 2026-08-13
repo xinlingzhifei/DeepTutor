@@ -13,6 +13,7 @@ from sqlalchemy import make_url, text
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 from testcontainers.community.postgres import PostgresContainer
+from testcontainers.core.wait_strategies import LogMessageWaitStrategy
 
 from deeptutor.teaching.schema_names import tenant_schema_name
 
@@ -62,12 +63,17 @@ def _clean_python_environment() -> dict[str, str]:
 @pytest.fixture(scope="session")
 def generation_database(tmp_path_factory) -> GenerationDatabase:
     password = "GENERATION_PASSWORD_SENTINEL_7d3c1"
-    with PostgresContainer(
+    postgres = PostgresContainer(
         "postgres:16-alpine",
         username="generation_user",
         password=password,
         dbname="teaching_jobs",
-    ) as postgres:
+    ).waiting_for(
+        LogMessageWaitStrategy(
+            "PostgreSQL init process complete; ready for start up."
+        ).with_startup_timeout(120)
+    )
+    with postgres:
         sync_url = make_url(postgres.get_connection_url())
         async_url = sync_url.set(drivername="postgresql+asyncpg").render_as_string(
             hide_password=False

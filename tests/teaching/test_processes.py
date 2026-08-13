@@ -21,6 +21,7 @@ def test_process_module_exposes_exact_lifecycle_commands() -> None:
         "worker",
         "export-worker",
         "reaper",
+        "learning-projector",
     )
 
 
@@ -34,11 +35,33 @@ def test_process_module_help_does_not_touch_external_services() -> None:
     )
 
     assert completed.returncode == 0, completed.stderr
-    for name in ("dispatcher", "worker", "export-worker", "reaper"):
+    for name in ("dispatcher", "worker", "export-worker", "reaper", "learning-projector"):
         assert name in completed.stdout
 
 
-@pytest.mark.parametrize("process_name", ("dispatcher", "worker", "export-worker", "reaper"))
+def test_process_module_lazy_loads_learning_projector_dependencies() -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; import deeptutor.teaching.processes; "
+            "print('deeptutor.teaching.projector_worker' in sys.modules); "
+            "print('deeptutor.teaching.services.classroom_content' in sys.modules)",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.splitlines() == ["False", "False"]
+
+
+@pytest.mark.parametrize(
+    "process_name",
+    ("dispatcher", "worker", "export-worker", "reaper", "learning-projector"),
+)
 def test_disabled_platform_processes_return_without_external_work(process_name: str) -> None:
     from deeptutor.teaching.processes import run_process
 
@@ -105,3 +128,61 @@ def test_worker_client_rejects_cross_route_before_repository_access() -> None:
         return repository.calls
 
     assert asyncio.run(run()) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("content_error", "reason_code"),
+    [
+        ("not_found", "classroom_document_unavailable"),
+        ("integrity", "classroom_document_integrity_invalid"),
+        ("access_denied", "classroom_document_binding_invalid"),
+    ],
+)
+async def test_runtime_projection_documents_classifies_permanent_content_failures(
+    content_error: str,
+    reason_code: str,
+) -> None:
+    from deeptutor.teaching.processes import RuntimeProjectionDocuments
+    from deeptutor.teaching.projectors.mastery import DeterministicProjectionError
+    from deeptutor.teaching.services.classroom_content import (
+        ClassroomContentAccessDenied,
+        ClassroomContentIntegrityError,
+        ClassroomContentNotFound,
+    )
+
+    errors = {
+        "not_found": ClassroomContentNotFound("private detail"),
+        "integrity": ClassroomContentIntegrityError("private detail"),
+        "access_denied": ClassroomContentAccessDenied("private detail"),
+    }
+
+    class Service:
+        async def load_version_document(self, context, version_id):
+            raise errors[content_error]
+
+    documents = RuntimeProjectionDocuments.__new__(RuntimeProjectionDocuments)
+    documents._service = Service()
+
+    with pytest.raises(DeterministicProjectionError, match=reason_code):
+        await documents.load_version_document("tenant-a", "version-a")
+
+
+@pytest.mark.asyncio
+async def test_runtime_projection_documents_preserves_operational_unavailability() -> None:
+    from deeptutor.teaching.processes import RuntimeProjectionDocuments
+    from deeptutor.teaching.services.classroom_content import ClassroomContentUnavailable
+
+    sentinel = ClassroomContentUnavailable("temporary storage outage")
+
+    class Service:
+        async def load_version_document(self, context, version_id):
+            raise sentinel
+
+    documents = RuntimeProjectionDocuments.__new__(RuntimeProjectionDocuments)
+    documents._service = Service()
+
+    with pytest.raises(ClassroomContentUnavailable) as caught:
+        await documents.load_version_document("tenant-a", "version-a")
+
+    assert caught.value is sentinel

@@ -21,12 +21,14 @@ def test_teaching_processes_are_spawned_only_when_platform_is_enabled() -> None:
         "teaching-worker",
         "teaching-export-worker",
         "teaching-reaper",
+        "teaching-learning-projector",
     )
     assert tuple(command[-1] for _name, command in commands) == (
         "dispatcher",
         "worker",
         "export-worker",
         "reaper",
+        "learning-projector",
     )
 
 

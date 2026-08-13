@@ -73,7 +73,13 @@ def _teaching_process_commands(enabled: bool) -> tuple[tuple[str, list[str]], ..
             f"teaching-{process_name}",
             [sys.executable, "-m", "deeptutor.teaching.processes", process_name],
         )
-        for process_name in ("dispatcher", "worker", "export-worker", "reaper")
+        for process_name in (
+            "dispatcher",
+            "worker",
+            "export-worker",
+            "reaper",
+            "learning-projector",
+        )
     )
 
 

@@ -15,6 +15,7 @@ from deeptutor.teaching.services.classroom_content import (
     ClassroomContentAccessDenied,
     ClassroomContentIntegrityError,
     ClassroomContentNotFound,
+    ClassroomContentUnavailable,
 )
 from deeptutor.teaching.tenant_context import TenantContext, require_tenant
 from deeptutor.teaching.tickets import (
@@ -127,6 +128,11 @@ async def _call(operation):
     except ClassroomContentNotFound:
         raise HTTPException(status_code=404, detail="Classroom content not found") from None
     except ClassroomContentIntegrityError:
+        raise HTTPException(
+            status_code=503,
+            detail="Classroom content is unavailable",
+        ) from None
+    except ClassroomContentUnavailable:
         raise HTTPException(
             status_code=503,
             detail="Classroom content is unavailable",

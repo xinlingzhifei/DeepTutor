@@ -42,6 +42,7 @@ from deeptutor.teaching.services.classroom_content import (
     ClassroomContentAccessDenied,
     ClassroomContentIntegrityError,
     ClassroomContentNotFound,
+    ClassroomContentUnavailable,
 )
 from deeptutor.teaching.services.export_jobs import SqlAlchemyExportJobGateway
 from deeptutor.teaching.services.exports import (
@@ -365,6 +366,11 @@ async def download_classroom_export(
         except ClassroomContentNotFound:
             raise HTTPException(status_code=404, detail="Export not found") from None
         except ClassroomContentIntegrityError:
+            raise HTTPException(
+                status_code=503,
+                detail="Export download is unavailable",
+            ) from None
+        except ClassroomContentUnavailable:
             raise HTTPException(
                 status_code=503,
                 detail="Export download is unavailable",

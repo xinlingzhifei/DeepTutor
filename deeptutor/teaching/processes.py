@@ -47,6 +47,7 @@ PROCESS_NAMES = (
     "worker",
     "export-worker",
     "reaper",
+    "learning-projector",
 )
 _IDLE_SECONDS = 0.5
 
@@ -288,6 +289,46 @@ class RuntimeStoreProvider:
             reset_current_tenant(token)
 
 
+class RuntimeProjectionDocuments:
+    """Load immutable version documents for the internal projector identity."""
+
+    def __init__(self, settings: PlatformSettings) -> None:
+        from deeptutor.teaching.services.classroom_content import (
+            ClassroomContentService,
+            SqlAlchemyClassroomContentRepository,
+        )
+
+        engine = get_platform_engine()
+        self._service = ClassroomContentService(
+            repository=SqlAlchemyClassroomContentRepository(engine=engine),
+            stores=RuntimeStoreProvider(settings),
+            ticket_service=None,
+        )
+
+    async def load_version_document(self, tenant_id: str, version_id: str) -> object:
+        from deeptutor.teaching.projectors.mastery import DeterministicProjectionError
+        from deeptutor.teaching.services.classroom_content import (
+            ClassroomContentAccessDenied,
+            ClassroomContentIntegrityError,
+            ClassroomContentNotFound,
+        )
+
+        context = TenantContext(
+            tenant_id=tenant_id,
+            schema_name=tenant_schema_name(tenant_id),
+            user_id="learning-projector",
+            permissions=frozenset(),
+        )
+        try:
+            return await self._service.load_version_document(context, version_id)
+        except ClassroomContentNotFound:
+            raise DeterministicProjectionError("classroom_document_unavailable") from None
+        except ClassroomContentIntegrityError:
+            raise DeterministicProjectionError("classroom_document_integrity_invalid") from None
+        except ClassroomContentAccessDenied:
+            raise DeterministicProjectionError("classroom_document_binding_invalid") from None
+
+
 async def _queued_bindings(
     job_kind: str,
     boundary: WorkerRuntimeBoundary,
@@ -453,6 +494,21 @@ async def _run_worker(
         return await _run_loop(step, once=once)
 
 
+async def _run_learning_projector(
+    settings: PlatformSettings,
+    *,
+    once: bool,
+) -> bool:
+    from deeptutor.teaching.projector_worker import LearningProjectionWorker
+
+    worker = LearningProjectionWorker(
+        engine=get_platform_engine(),
+        documents=RuntimeProjectionDocuments(settings),
+        worker_id=f"{socket.gethostname()}-learning-projector-{os.getpid()}",
+    )
+    return await _run_loop(worker.run_once, once=once)
+
+
 async def run_process(
     process_name: str,
     *,
@@ -468,6 +524,8 @@ async def run_process(
         return await _run_dispatcher(once=once)
     if process_name == "reaper":
         return await _run_reaper(once=once)
+    if process_name == "learning-projector":
+        return await _run_learning_projector(resolved, once=once)
     return await _run_worker(
         resolved,
         job_kind="generation" if process_name == "worker" else "export",
@@ -499,6 +557,7 @@ __all__ = [
     "PROCESS_NAMES",
     "RuntimeCancellationGateway",
     "RuntimeOpenMAICClients",
+    "RuntimeProjectionDocuments",
     "RuntimeStoreProvider",
     "WorkerRuntimeBoundary",
     "main",

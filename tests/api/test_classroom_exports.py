@@ -159,9 +159,12 @@ class FakeStudentContentService:
     def __init__(self) -> None:
         self.calls: list[tuple[object, str, str]] = []
         self.last_content: ClassroomContent | None = None
+        self.error: Exception | None = None
 
     async def open_export(self, context, *, export_id, token):
         self.calls.append((context, export_id, token))
+        if self.error is not None:
+            raise self.error
         if token == "wrong-export-ticket":
             raise TicketScopeError("wrong export")
         content = ClassroomContent.from_bytes(
@@ -460,6 +463,22 @@ def test_teacher_download_without_ticket_does_not_construct_student_content_serv
 
     assert response.status_code == 200
     assert response.content == b"verified-export"
+
+
+def test_ticketed_export_maps_content_unavailability_to_sanitized_503(api_harness) -> None:
+    from deeptutor.teaching.services.classroom_content import ClassroomContentUnavailable
+
+    app, service, _stores, _store = api_harness
+    service.record = _record(status="succeeded")
+    app.state.student_content.error = ClassroomContentUnavailable("private storage detail")
+
+    response = TestClient(app).get(
+        "/api/v1/classroom-exports/export-a/download",
+        headers={"X-Classroom-Ticket": "ticket-a"},
+    )
+
+    assert response.status_code == 503
+    assert "private storage detail" not in response.text
 
 
 @pytest.mark.parametrize(

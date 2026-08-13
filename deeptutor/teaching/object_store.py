@@ -1510,6 +1510,13 @@ def _is_s3_precondition_error(error: ClientError) -> bool:
     }
 
 
+def _is_s3_missing_object(error: ClientError) -> bool:
+    response = error.response
+    code = str(response.get("Error", {}).get("Code", ""))
+    status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+    return code in {"NoSuchKey", "NotFound"} or (status == 404 and code != "NoSuchBucket")
+
+
 def _raise_s3_error(error: BaseException) -> None:
     if isinstance(error, ClientError):
         response = error.response
@@ -1521,12 +1528,10 @@ def _raise_s3_error(error: BaseException) -> None:
             "InvalidAccessKeyId",
             "SignatureDoesNotMatch",
         }:
-            raise ObjectStoreAccessDenied("S3 access was denied") from None
-        if status == 404 or code in {
-            "NoSuchBucket",
-            "NoSuchKey",
-            "NotFound",
-        }:
+            raise ObjectStoreConfigurationError("S3 access is unavailable") from None
+        if code == "NoSuchBucket":
+            raise ObjectStoreConfigurationError("S3 bucket is unavailable") from None
+        if status == 404 or code in {"NoSuchKey", "NotFound"}:
             raise ObjectStoreNotFound("S3 object was not found") from None
         if _is_s3_precondition_error(error):
             raise ObjectStoreConflictError("classroom artifact version already exists") from None
@@ -1670,10 +1675,7 @@ class S3ClassroomArtifactStore(_TenantScopedStore):
                 **arguments,
             )
         except ClientError as exc:
-            response = exc.response
-            code = str(response.get("Error", {}).get("Code", ""))
-            status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
-            if status == 404 or code in {"NoSuchBucket", "NoSuchKey", "NotFound"}:
+            if _is_s3_missing_object(exc):
                 return None
             _raise_s3_error(exc)
         except BotoCoreError as exc:
@@ -1688,10 +1690,7 @@ class S3ClassroomArtifactStore(_TenantScopedStore):
                 Key=safe_key,
             )
         except ClientError as exc:
-            response_data = exc.response
-            code = str(response_data.get("Error", {}).get("Code", ""))
-            status = response_data.get("ResponseMetadata", {}).get("HTTPStatusCode")
-            if status == 404 or code in {"NoSuchKey", "NotFound"}:
+            if _is_s3_missing_object(exc):
                 return None
             _raise_s3_error(exc)
         except BotoCoreError as exc:

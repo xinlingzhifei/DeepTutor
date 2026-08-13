@@ -26,6 +26,8 @@ from deeptutor.teaching.models import (
 )
 from deeptutor.teaching.object_store import (
     ObjectStoreAccessDenied,
+    ObjectStoreConfigurationError,
+    ObjectStoreConflictError,
     ObjectStoreError,
     ObjectStoreIntegrityError,
     ObjectStoreNotFound,
@@ -65,6 +67,10 @@ class ClassroomContentAccessDenied(ClassroomContentError):
 
 class ClassroomContentIntegrityError(ClassroomContentError):
     """The database receipt and immutable object do not agree."""
+
+
+class ClassroomContentUnavailable(ClassroomContentError):
+    """The content service or its configured storage is temporarily unavailable."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -506,9 +512,12 @@ class ClassroomContentService:
         except (ObjectStoreNotFound, ObjectStoreAccessDenied):
             spool.close()
             raise ClassroomContentNotFound("classroom object is unavailable") from None
-        except (ObjectStoreIntegrityError, ObjectStoreError):
+        except (ObjectStoreIntegrityError, ObjectStoreConflictError):
             spool.close()
             raise ClassroomContentIntegrityError("classroom object is invalid") from None
+        except (ObjectStoreConfigurationError, ObjectStoreError):
+            spool.close()
+            raise ClassroomContentUnavailable("classroom object is unavailable") from None
         except BaseException:
             spool.close()
             raise
@@ -723,6 +732,7 @@ __all__ = [
     "ClassroomContentError",
     "ClassroomContentIntegrityError",
     "ClassroomContentNotFound",
+    "ClassroomContentUnavailable",
     "ClassroomContentService",
     "ContentArtifactReceipt",
     "ExportContentRecord",

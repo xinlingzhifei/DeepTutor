@@ -344,6 +344,7 @@ def test_every_content_route_keeps_require_tenant_login_dependency() -> None:
         ("denied", 403),
         ("not_found", 404),
         ("integrity", 503),
+        ("unavailable", 503),
     ],
 )
 def test_content_failures_have_stable_sanitized_status(
@@ -354,12 +355,14 @@ def test_content_failures_have_stable_sanitized_status(
         ClassroomContentAccessDenied,
         ClassroomContentIntegrityError,
         ClassroomContentNotFound,
+        ClassroomContentUnavailable,
     )
 
     errors = {
         "denied": ClassroomContentAccessDenied("private detail"),
         "not_found": ClassroomContentNotFound("private detail"),
         "integrity": ClassroomContentIntegrityError("private detail"),
+        "unavailable": ClassroomContentUnavailable("private detail"),
     }
     service = _ContentService()
     service.read_error = errors[error_name]

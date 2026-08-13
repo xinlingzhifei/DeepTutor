@@ -796,11 +796,65 @@ async def test_s3_access_error_is_mapped_without_credential_leak(
 
     store = _s3_store(monkeypatch, DeniedClient())
 
-    with pytest.raises(ObjectStoreAccessDenied) as caught:
+    with pytest.raises(ObjectStoreConfigurationError) as caught:
         await store.list_prefix("tenants/tenant-a/")
 
     assert secret not in str(caught.value)
     assert caught.value.__cause__ is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("code", "expected_error"),
+    [
+        ("NoSuchBucket", ObjectStoreConfigurationError),
+        ("NoSuchKey", ObjectStoreNotFound),
+    ],
+)
+async def test_s3_distinguishes_missing_bucket_from_missing_immutable_key(
+    monkeypatch,
+    code: str,
+    expected_error: type[Exception],
+) -> None:
+    class MissingClient:
+        def list_objects_v2(self, **_kwargs):
+            raise _client_error(code, 404, "ListObjectsV2")
+
+    store = _s3_store(monkeypatch, MissingClient())
+
+    with pytest.raises(expected_error):
+        await store.list_prefix("tenants/tenant-a/")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("code", "status"),
+    [("NoSuchBucket", 404), ("AccessDenied", 403)],
+)
+async def test_s3_marker_read_treats_bucket_failure_as_configuration_error(
+    monkeypatch,
+    code: str,
+    status: int,
+) -> None:
+    class UnavailableBucketClient:
+        def get_object(self, **_kwargs):
+            raise _client_error(code, status, "GetObject")
+
+    store = _s3_store(monkeypatch, UnavailableBucketClient())
+
+    with pytest.raises(ObjectStoreConfigurationError):
+        await store.confirmed_publish(_manifest(b"{}", "unavailable-bucket-marker"))
+
+
+@pytest.mark.asyncio
+async def test_s3_marker_read_treats_missing_key_as_unpublished(monkeypatch) -> None:
+    class MissingKeyClient:
+        def get_object(self, **_kwargs):
+            raise _client_error("NoSuchKey", 404, "GetObject")
+
+    store = _s3_store(monkeypatch, MissingKeyClient())
+
+    assert await store.confirmed_publish(_manifest(b"{}", "missing-marker")) is None
 
 
 def test_s3_store_never_falls_back_when_explicit_credentials_are_missing(
@@ -1568,10 +1622,13 @@ async def test_committed_publish_is_confirmed_and_promotion_is_idempotent(tmp_pa
     )
 
     assert await store.confirmed_publish(manifest) == promoted
-    assert await service.promote(
-        manifest,
-        {"classroom.json": _body(payload)},
-    ) == promoted
+    assert (
+        await service.promote(
+            manifest,
+            {"classroom.json": _body(payload)},
+        )
+        == promoted
+    )
 
 
 @pytest.mark.asyncio

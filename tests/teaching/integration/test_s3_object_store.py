@@ -31,6 +31,7 @@ from deeptutor.teaching.object_store import (
     ClassroomArtifactPromotionService,
     ClassroomArtifactStoreFactory,
     ObjectStoreAccessDenied,
+    ObjectStoreConfigurationError,
     ObjectStoreConflictError,
     ObjectStoreError,
     ObjectStoreIntegrityError,
@@ -417,7 +418,7 @@ async def test_factory_and_promotion_use_distinct_tenant_clients(
         access_key=tenant_a_access,
         secret_key=tenant_a_secret,
     )
-    with pytest.raises(ObjectStoreAccessDenied):
+    with pytest.raises(ObjectStoreConfigurationError):
         await policy_mismatched_store.list_prefix("tenants/tenant-b/")
 
     payload = b'{"scenes":[{"id":"intro"}]}'
