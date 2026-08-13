@@ -317,6 +317,16 @@ async def test_content_service_pins_tickets_and_reads_exact_receipts_without_url
         document=document_receipt,
         media=(media_receipt,),
     )
+    sessions = {
+        status: SessionContentAccess(
+            session_id=f"session-{status}",
+            tenant_id="tenant-a",
+            user_id="student-a",
+            classroom_version_id="version-a",
+            status=status,
+        )
+        for status in ("active", "completed", "abandoned", "unknown")
+    }
     active_session = SessionContentAccess(
         session_id="session-a",
         tenant_id="tenant-a",
@@ -332,7 +342,12 @@ async def test_content_service_pins_tickets_and_reads_exact_receipts_without_url
 
         async def get_session(self, context, session_id):
             assert context.tenant_id == "tenant-a"
-            return active_session if session_id == "session-a" else None
+            if session_id == "session-a":
+                return active_session
+            return next(
+                (record for record in sessions.values() if record.session_id == session_id),
+                None,
+            )
 
         async def get_export(self, context, export_id):
             return None
@@ -414,6 +429,20 @@ async def test_content_service_pins_tickets_and_reads_exact_receipts_without_url
         "resource_id": "media-1",
         "ttl_seconds": 60,
     }
+    assert await service.issue_read_ticket(
+        student,
+        session_id="session-completed",
+        action="classroom.document.read",
+        resource_id="version-a",
+    ) == "read-ticket"
+    for denied_status in ("abandoned", "unknown"):
+        with pytest.raises(ClassroomContentAccessDenied):
+            await service.issue_read_ticket(
+                student,
+                session_id=f"session-{denied_status}",
+                action="classroom.document.read",
+                resource_id="version-a",
+            )
     delivered_document_body = _read_content(delivered_document)
     delivered_media_body = _read_content(delivered_media)
     rendered = json.loads(delivered_document_body)

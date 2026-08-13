@@ -4,6 +4,7 @@ export type ClassroomLearningEventType =
   | 'action.completed'
   | 'quiz.answered'
   | 'quiz.graded'
+  | 'hint.used'
   | 'interactive.event'
   | 'pbl.milestone'
   | 'classroom.completed'

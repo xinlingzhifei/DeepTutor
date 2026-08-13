@@ -1078,11 +1078,10 @@ function resolveMediaReferences(
 
 export function resolveClassroomMediaReferences(
   input: ClassroomDocument,
+  mediaUrl: (mediaId: string) => string = mediaId =>
+    classroomMediaUrl(input.classroomVersionId, mediaId),
 ): ClassroomDocument {
-  return resolveMediaReferences(
-    input,
-    mediaId => classroomMediaUrl(input.classroomVersionId, mediaId),
-  );
+  return resolveMediaReferences(input, mediaUrl);
 }
 
 export function resolveDraftClassroomMediaReferences(

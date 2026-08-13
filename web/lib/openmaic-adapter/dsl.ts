@@ -32,6 +32,7 @@ import { sanitizeRendererSlide } from "./sanitize";
 
 export interface ReadClassroomDocumentOptions {
   theme?: ClassroomThemeId;
+  mediaUrl?: (mediaId: string) => string;
 }
 
 export type RenderableSlideScene = OpenMaicScene<Action, OpenMaicSlideContent>;
@@ -370,7 +371,7 @@ export function readClassroomDocument(
     ...parsed,
     openmaic: migratedOpenMaicDocument(parsed.openmaic),
   };
-  const resolved = resolveClassroomMediaReferences(migrated);
+  const resolved = resolveClassroomMediaReferences(migrated, options.mediaUrl);
   validateOpenMaicDocument(resolved, options);
   return resolved;
 }

@@ -477,7 +477,7 @@ class ClassroomContentService:
         session = await self._repository.get_session(context, claims.session_id)
         if (
             session is None
-            or session.status != "active"
+            or session.status not in {"active", "completed"}
             or session.tenant_id != context.tenant_id
             or session.user_id != context.user_id
             or session.classroom_version_id != version.version_id
@@ -592,7 +592,7 @@ class ClassroomContentService:
         session = await self._repository.get_session(context, session_id)
         if (
             session is None
-            or session.status != "active"
+            or session.status not in {"active", "completed"}
             or session.tenant_id != context.tenant_id
             or session.user_id != context.user_id
         ):

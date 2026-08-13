@@ -49,7 +49,9 @@ export interface ClassroomPlayerProps {
   initialCursor?: PlaybackCursor
   theme?: ClassroomThemeId
   autoStart?: boolean
+  readOnly?: boolean
   className?: string
+  mediaUrl?(mediaId: string): string
   gradeQuiz(
     sceneId: string,
     questionId: string,
@@ -125,7 +127,9 @@ export function ClassroomPlayer({
   initialCursor,
   theme = 'snow',
   autoStart = false,
+  readOnly = false,
   className = '',
+  mediaUrl,
   gradeQuiz,
   handleInteractiveEvent,
   completePblMilestone,
@@ -135,7 +139,7 @@ export function ClassroomPlayer({
   const { t } = useTranslation()
   const translationRef = useRef(t)
   translationRef.current = t
-  const document = useMemo(() => readClassroomDocument(input), [input])
+  const document = useMemo(() => readClassroomDocument(input, { mediaUrl }), [input, mediaUrl])
   const bindingKey = `${document.classroomVersionId}:${document.fileSha256}`
   const portBindingRef = useRef<VersionPortBinding | null>(null)
   if (portBindingRef.current?.document !== document) {
@@ -331,6 +335,7 @@ export function ClassroomPlayer({
   useEffect(() => {
     if (
       !autoStart ||
+      readOnly ||
       !controllerReady ||
       controllerRef.current !== controller ||
       controller.state === 'running' ||
@@ -352,20 +357,20 @@ export function ClassroomPlayer({
       mounted = false
       void controller.stop().catch(() => undefined)
     }
-  }, [autoStart, controller, controllerReady, reportError])
+  }, [autoStart, controller, controllerReady, readOnly, reportError])
 
   const sceneIndex = Math.max(
     0,
     orderedScenes.findIndex(scene => scene.id === sceneId)
   )
   const scene = orderedScenes[sceneIndex] ?? initialScene
-  const controlsDisabled = !controllerReady || playbackState === 'switching'
+  const controlsDisabled = readOnly || !controllerReady || playbackState === 'switching'
   const consumedInteractionKeys = new Set(controller.snapshot().consumed)
   const isConsumed = (interactionId: string) =>
     consumedInteractionKeys.has(playbackInteractionKey(scene.id, interactionId))
 
   const startOrPause = async () => {
-    if (!controllerReady || playbackState === 'switching') return
+    if (controlsDisabled) return
     setPlaybackError(null)
     if (controller.state === 'running') {
       await controller.pause()
@@ -384,7 +389,7 @@ export function ClassroomPlayer({
   }
 
   const stop = async () => {
-    if (!controllerReady || playbackState === 'switching') return
+    if (controlsDisabled) return
     try {
       await controller.stop()
     } catch (reason) {
@@ -395,7 +400,7 @@ export function ClassroomPlayer({
   }
 
   const switchScene = async (nextIndex: number) => {
-    if (!controllerReady || playbackState === 'switching') return
+    if (controlsDisabled) return
     setPlaybackError(null)
     setPlaybackState('switching')
     try {
@@ -462,9 +467,7 @@ export function ClassroomPlayer({
                 sceneId: pending.sceneId,
                 interactionId: pending.questionId,
                 payload: {
-                  attemptId: grade.attemptId,
-                  status: grade.status,
-                  score: grade.score,
+                  answer: pending.answer,
                 },
               }
             ),
@@ -478,7 +481,7 @@ export function ClassroomPlayer({
     questionId: string,
     answer: { optionIds?: string[]; text?: string }
   ) => {
-    if (!controllerReady || playbackState === 'switching') {
+    if (controlsDisabled) {
       throw new Error(translationRef.current('classroom.player.failed'))
     }
     ensureCurrentBinding()
@@ -509,7 +512,7 @@ export function ClassroomPlayer({
   }
 
   const receiveInteractive = async (event: InteractiveEvent) => {
-    if (!controllerReady || playbackState === 'switching') {
+    if (controlsDisabled) {
       throw new Error(translationRef.current('classroom.player.failed'))
     }
     ensureCurrentBinding()
@@ -544,8 +547,33 @@ export function ClassroomPlayer({
     eventTimesRef.current.delete(learningEventId)
   }
 
+  const useHint = async (questionId: string) => {
+    if (controlsDisabled) {
+      throw new Error(translationRef.current('classroom.player.failed'))
+    }
+    ensureCurrentBinding()
+    const operationId = playbackStableId(
+      'quiz-hint',
+      document.classroomVersionId,
+      document.fileSha256,
+      scene.id,
+      questionId
+    )
+    const eventId = playbackStableId('event', operationId, 'hint.used')
+    const eventTime = eventTimesRef.current.get(eventId) ?? new Date().toISOString()
+    eventTimesRef.current.set(eventId, eventTime)
+    await controller.commitEvents(operationId, [
+      learningEvent('hint.used', document.classroomVersionId, eventTime, {
+        eventId,
+        sceneId: scene.id,
+        interactionId: questionId,
+      }),
+    ])
+    eventTimesRef.current.delete(eventId)
+  }
+
   const completeMilestone = async (milestoneId: string) => {
-    if (!controllerReady || playbackState === 'switching') {
+    if (controlsDisabled) {
       throw new Error(translationRef.current('classroom.player.failed'))
     }
     ensureCurrentBinding()
@@ -595,6 +623,7 @@ export function ClassroomPlayer({
             .filter(question => isConsumed(question.id))
             .map(question => question.id)}
           onSubmit={submitQuiz}
+          onHint={useHint}
         />
       )
     }

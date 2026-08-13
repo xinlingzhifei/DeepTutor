@@ -23,18 +23,21 @@ export interface QuizSceneProps {
     answer: { optionIds?: string[]; text?: string }
   ): Promise<QuizGradeResult>
   onGraded?(questionId: string, result: QuizGradeResult): Promise<void> | void
+  onHint?(questionId: string): Promise<void> | void
 }
 
 function Question({
   question,
   onSubmit,
   onGraded,
+  onHint,
   alreadySubmitted,
   disabled,
 }: {
   question: QuizQuestion
   onSubmit: QuizSceneProps['onSubmit']
   onGraded: QuizSceneProps['onGraded']
+  onHint: QuizSceneProps['onHint']
   alreadySubmitted: boolean
   disabled: boolean
 }) {
@@ -46,6 +49,7 @@ function Question({
   const [result, setResult] = useState<QuizGradeResult | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [retryAnswer, setRetryAnswer] = useState<QuizAnswer | null>(null)
+  const [hintVisible, setHintVisible] = useState(false)
 
   const selectOption = (optionId: string) => {
     if (question.questionType === 'single_choice') {
@@ -80,6 +84,17 @@ function Question({
       setError(reason instanceof Error ? reason.message : t('classroom.quiz.unableSubmit'))
     } finally {
       setSubmitting(false)
+    }
+  }
+
+  const showHint = async () => {
+    if (disabled || submitting || hintVisible || alreadySubmitted) return
+    setError(null)
+    try {
+      await onHint?.(question.id)
+      setHintVisible(true)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : t('classroom.quiz.unableHint'))
     }
   }
 
@@ -148,6 +163,14 @@ function Question({
               ? t('classroom.quiz.submitted')
               : t('classroom.quiz.submit')}
         </button>
+        <button
+          type="button"
+          onClick={() => void showHint()}
+          disabled={disabled || submitting || hintVisible || alreadySubmitted}
+          className="rounded-lg border border-[var(--border)] px-4 py-2 text-sm font-medium text-[var(--foreground)] disabled:opacity-50"
+        >
+          {hintVisible ? t('classroom.quiz.hintShown') : t('classroom.quiz.hint')}
+        </button>
         {result?.status === 'graded' && (
           <output className="text-sm text-[var(--muted-foreground)]">
             {result.score === null
@@ -156,6 +179,12 @@ function Question({
           </output>
         )}
       </div>
+
+      {hintVisible && (
+        <p className="mt-3 rounded-lg bg-[var(--muted)]/50 px-3 py-2 text-sm text-[var(--foreground)]">
+          {question.explanation}
+        </p>
+      )}
 
       {result?.feedback && (
         <p className="mt-3 text-sm text-[var(--muted-foreground)]" role="status">
@@ -177,6 +206,7 @@ export function QuizScene({
   disabled = false,
   onSubmit,
   onGraded,
+  onHint,
 }: QuizSceneProps) {
   const { t } = useTranslation()
   return (
@@ -187,6 +217,7 @@ export function QuizScene({
           question={question}
           onSubmit={onSubmit}
           onGraded={onGraded}
+          onHint={onHint}
           alreadySubmitted={submittedQuestionIds.includes(question.id)}
           disabled={disabled}
         />
