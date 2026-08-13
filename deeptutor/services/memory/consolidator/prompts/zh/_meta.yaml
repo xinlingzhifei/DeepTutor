@@ -22,6 +22,9 @@ surfaces:
   cowriter:
     focus: "写作风格偏好、反复修改的模式、用户起草的话题。"
     sections: ["风格", "反复修改", "话题"]
+  classroom:
+    focus: "课堂完成情况、困难知识点和受信任的有效测验结果聚合。不得从完整答案或 Provider 元数据推断。"
+    sections: ["完成情况", "困难知识点", "有效测验"]
 
 slots:
   recent:

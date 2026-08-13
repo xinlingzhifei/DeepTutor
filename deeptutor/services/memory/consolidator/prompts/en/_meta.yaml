@@ -23,6 +23,9 @@ surfaces:
   cowriter:
     focus: "Writing style preferences, recurring revisions, and topics the user drafts about."
     sections: ["Style", "Recurring revisions", "Topics"]
+  classroom:
+    focus: "Aggregated classroom completion, difficult knowledge points, and trusted quiz outcomes. Never infer from raw answers or provider metadata."
+    sections: ["Completion", "Difficult knowledge points", "Valid quizzes"]
 
 slots:
   recent:

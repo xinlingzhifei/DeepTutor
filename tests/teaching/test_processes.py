@@ -186,3 +186,33 @@ async def test_runtime_projection_documents_preserves_operational_unavailability
         await documents.load_version_document("tenant-a", "version-a")
 
     assert caught.value is sentinel
+
+
+@pytest.mark.asyncio
+async def test_learning_projector_process_installs_memory_projection(monkeypatch) -> None:
+    from deeptutor.teaching import processes
+
+    captured: dict[str, object] = {}
+
+    class Worker:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        async def run_once(self):
+            return False
+
+    monkeypatch.setattr(
+        "deeptutor.teaching.projector_worker.LearningProjectionWorker",
+        Worker,
+    )
+    monkeypatch.setattr(processes, "get_platform_engine", lambda: object())
+
+    assert not await processes._run_learning_projector(
+        PlatformSettings(
+            enabled=True,
+            database_url=SecretStr("postgresql+asyncpg://user:pass@db/platform"),
+        ),
+        once=True,
+    )
+    assert captured["memory_projector"].__class__.__name__ == "ClassroomMemoryProjector"
+    assert captured["memory_targets"].__class__.__name__ == "ClassroomMemoryTargetResolver"

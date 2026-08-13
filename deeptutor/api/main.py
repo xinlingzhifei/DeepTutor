@@ -496,7 +496,7 @@ def _register_classroom_learning_routes(
 ) -> bool:
     if not enabled:
         return False
-    from deeptutor.api.routers import classroom_content, classroom_learning
+    from deeptutor.api.routers import classroom_content, classroom_learning, teaching_reports
 
     application.include_router(
         classroom_learning.router,
@@ -508,6 +508,12 @@ def _register_classroom_learning_routes(
         classroom_content.router,
         prefix="/api/v1",
         tags=["classroom-content"],
+        dependencies=dependencies,
+    )
+    application.include_router(
+        teaching_reports.router,
+        prefix="/api/v1/teaching-reports",
+        tags=["teaching-reports"],
         dependencies=dependencies,
     )
     return True

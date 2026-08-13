@@ -52,6 +52,7 @@ Surface = Literal[
     "book",
     "partner",
     "cowriter",
+    "classroom",
 ]
 L3Slot = Literal["recent", "profile", "scope", "preferences"]
 

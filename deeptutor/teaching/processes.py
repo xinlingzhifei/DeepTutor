@@ -15,8 +15,6 @@ import httpx
 from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from deeptutor.multi_user.context import reset_current_tenant, set_current_tenant
-from deeptutor.runtime.home import get_runtime_data_root
 from deeptutor.services.config import PlatformSettings, load_platform_settings
 from deeptutor.teaching.database import get_platform_engine
 from deeptutor.teaching.dispatcher import OutboxDispatcher
@@ -78,9 +76,7 @@ class WorkerRuntimeBoundary:
                 raise ValueError("worker runtime boundary is invalid")
         if self.mode == "shared" and self.tenant_id is not None:
             raise ValueError("shared worker boundary cannot select a tenant")
-        if self.mode == "dedicated" and (
-            self.route_id is None or self.tenant_id is None
-        ):
+        if self.mode == "dedicated" and (self.route_id is None or self.tenant_id is None):
             raise ValueError("dedicated worker boundary requires route and tenant")
 
     def bind_route(self, route_id: str) -> WorkerRuntimeBoundary:
@@ -93,18 +89,12 @@ class WorkerRuntimeBoundary:
         )
 
     def allows_binding(self, *, tenant_id: str, route_id: str) -> bool:
-        return (
-            self.route_id == route_id
-            and (self.mode == "shared" or self.tenant_id == tenant_id)
-        )
+        return self.route_id == route_id and (self.mode == "shared" or self.tenant_id == tenant_id)
 
     def allows_selection(self, selection: DataPlaneSelection) -> bool:
-        return (
-            selection.mode == self.mode
-            and self.allows_binding(
-                tenant_id=selection.tenant_id,
-                route_id=selection.route_ref,
-            )
+        return selection.mode == self.mode and self.allows_binding(
+            tenant_id=selection.tenant_id,
+            route_id=selection.route_ref,
         )
 
 
@@ -247,9 +237,7 @@ class RuntimeCancellationGateway:
                 boundary=WorkerRuntimeBoundary(
                     mode=selection.mode,
                     route_id=selection.route_ref,
-                    tenant_id=(
-                        selection.tenant_id if selection.mode == "dedicated" else None
-                    ),
+                    tenant_id=(selection.tenant_id if selection.mode == "dedicated" else None),
                 ),
                 repository=repository,
             )
@@ -267,9 +255,15 @@ class RuntimeStoreProvider:
         local_root: Path | None = None,
     ) -> None:
         self._settings = settings
-        self._local_root = local_root or get_runtime_data_root() / "teaching" / "object-store"
+        if local_root is None:
+            from deeptutor.runtime.home import get_runtime_data_root
+
+            local_root = get_runtime_data_root() / "teaching" / "object-store"
+        self._local_root = local_root
 
     async def store_for_tenant(self, tenant_id: str) -> ClassroomArtifactStore:
+        from deeptutor.multi_user.context import reset_current_tenant, set_current_tenant
+
         token = set_current_tenant(
             TenantContext(
                 tenant_id=tenant_id,
@@ -500,11 +494,17 @@ async def _run_learning_projector(
     once: bool,
 ) -> bool:
     from deeptutor.teaching.projector_worker import LearningProjectionWorker
+    from deeptutor.teaching.projectors.memory import (
+        ClassroomMemoryProjector,
+        ClassroomMemoryTargetResolver,
+    )
 
     worker = LearningProjectionWorker(
         engine=get_platform_engine(),
         documents=RuntimeProjectionDocuments(settings),
         worker_id=f"{socket.gethostname()}-learning-projector-{os.getpid()}",
+        memory_projector=ClassroomMemoryProjector(),
+        memory_targets=ClassroomMemoryTargetResolver(),
     )
     return await _run_loop(worker.run_once, once=once)
 

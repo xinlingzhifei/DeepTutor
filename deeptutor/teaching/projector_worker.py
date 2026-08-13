@@ -72,6 +72,15 @@ class ProjectionQueueRepository(Protocol):
         lease_seconds: int,
     ) -> None: ...
 
+    async def project_for_memory(
+        self,
+        claim: ProjectionClaim,
+        *,
+        document: object | None,
+    ): ...
+
+    async def complete(self, claim: ProjectionClaim) -> None: ...
+
     async def project(self, claim: ProjectionClaim, *, document: object | None) -> None: ...
 
     async def quarantine(self, claim: ProjectionClaim, *, reason_code: str) -> None: ...
@@ -108,6 +117,10 @@ def _mastery_lock_key(tenant_id: str, user_id: str, knowledge_point_id: str) -> 
         f"{len(user_id)}:{user_id}"
         f"{len(knowledge_point_id)}:{knowledge_point_id}"
     )
+
+
+def _memory_projection_lock_key(tenant_id: str, user_id: str) -> str:
+    return f"memory:{len(tenant_id)}:{tenant_id}{len(user_id)}:{user_id}"
 
 
 class _SessionMasteryRepository:
@@ -513,12 +526,111 @@ class SqlAlchemyProjectionQueueRepository:
         session_factory = self._tenant_sessions(claim.event.tenant_id)
         async with session_factory() as session:
             async with session.begin():
-                item, _event = await self._locked_claim(session, claim)
-                await self._apply_progress(session, claim.event)
-                mastery = MasteryProjector(
-                    _SessionMasteryRepository(session, claim.event.tenant_id)
+                item = await self._apply_projection(session, claim, document=document)
+                item.status = "completed"
+                item.last_error_code = None
+                _clear_lease(item)
+
+    async def _apply_projection(
+        self,
+        session: AsyncSession,
+        claim: ProjectionClaim,
+        *,
+        document: object | None,
+    ) -> LearningProjectionQueueItem:
+        item, _event = await self._locked_claim(session, claim)
+        await self._apply_progress(session, claim.event)
+        mastery = MasteryProjector(_SessionMasteryRepository(session, claim.event.tenant_id))
+        await mastery.apply(claim.event, document=document)
+        return item
+
+    async def project_for_memory(
+        self,
+        claim: ProjectionClaim,
+        *,
+        document: object | None,
+    ):
+        """Commit idempotent DB projections while retaining the queue lease."""
+
+        from deeptutor.teaching.projectors.memory import ClassroomMemoryAggregate
+
+        session_factory = self._tenant_sessions(claim.event.tenant_id)
+        async with session_factory() as session:
+            async with session.begin():
+                lock_key = _memory_projection_lock_key(
+                    claim.event.tenant_id,
+                    claim.event.user_id,
                 )
-                await mastery.apply(claim.event, document=document)
+                await session.execute(
+                    select(func.pg_advisory_xact_lock(func.hashtextextended(lock_key, 0)))
+                )
+                await self._apply_projection(session, claim, document=document)
+                progress_count, completed_count, completed_scene_count = (
+                    await session.execute(
+                        select(
+                            func.count(LearningProgress.session_id),
+                            func.count(LearningProgress.session_id).filter(
+                                LearningProgress.status == "completed"
+                            ),
+                            func.coalesce(
+                                func.sum(LearningProgress.completed_scene_count),
+                                0,
+                            ),
+                        ).where(
+                            LearningProgress.tenant_id == claim.event.tenant_id,
+                            LearningProgress.user_id == claim.event.user_id,
+                        )
+                    )
+                ).one()
+                valid_quiz_count = await session.scalar(
+                    select(func.count())
+                    .select_from(QuizAttempt)
+                    .where(
+                        QuizAttempt.tenant_id == claim.event.tenant_id,
+                        QuizAttempt.user_id == claim.event.user_id,
+                    )
+                )
+                correct_quiz_count = await session.scalar(
+                    select(func.count())
+                    .select_from(QuizAttempt)
+                    .where(
+                        QuizAttempt.tenant_id == claim.event.tenant_id,
+                        QuizAttempt.user_id == claim.event.user_id,
+                        QuizAttempt.is_correct.is_(True),
+                    )
+                )
+                difficult = tuple(
+                    await session.scalars(
+                        select(MasteryLevel.knowledge_point_id)
+                        .where(
+                            MasteryLevel.tenant_id == claim.event.tenant_id,
+                            MasteryLevel.user_id == claim.event.user_id,
+                            MasteryLevel.evidence_count > 0,
+                            MasteryLevel.level < 0.6,
+                        )
+                        .order_by(MasteryLevel.knowledge_point_id)
+                    )
+                )
+                projection_revision = await session.scalar(select(func.txid_current()))
+                return ClassroomMemoryAggregate(
+                    status=(
+                        "completed"
+                        if int(progress_count or 0) > 0
+                        and int(progress_count or 0) == int(completed_count or 0)
+                        else "active"
+                    ),
+                    completed_scene_count=int(completed_scene_count or 0),
+                    valid_quiz_count=int(valid_quiz_count or 0),
+                    correct_quiz_count=int(correct_quiz_count or 0),
+                    difficult_knowledge_points=difficult,
+                    projection_revision=int(projection_revision or 0),
+                )
+
+    async def complete(self, claim: ProjectionClaim) -> None:
+        session_factory = self._tenant_sessions(claim.event.tenant_id)
+        async with session_factory() as session:
+            async with session.begin():
+                item, _event = await self._locked_claim(session, claim)
                 item.status = "completed"
                 item.last_error_code = None
                 _clear_lease(item)
@@ -562,6 +674,8 @@ class LearningProjectionWorker:
         engine: AsyncEngine | None = None,
         repository: ProjectionQueueRepository | None = None,
         lease_seconds: int = 60,
+        memory_projector: object | None = None,
+        memory_targets: object | None = None,
     ) -> None:
         if repository is None:
             if engine is None:
@@ -576,6 +690,10 @@ class LearningProjectionWorker:
         self._worker_id = worker_id
         self._lease_seconds = lease_seconds
         self._tenant_cursor = 0
+        self._memory_projector = memory_projector
+        self._memory_targets = memory_targets
+        if (memory_projector is None) != (memory_targets is None):
+            raise ValueError("memory projector and target resolver must be provided together")
 
     async def _heartbeat_until_cancelled(self, claim: ProjectionClaim) -> None:
         interval = max(0.1, self._lease_seconds / 3)
@@ -607,6 +725,42 @@ class LearningProjectionWorker:
                 if not task.done():
                     task.cancel()
             await asyncio.gather(load_task, heartbeat_task, return_exceptions=True)
+
+    async def _project_memory_with_heartbeat(
+        self,
+        claim: ProjectionClaim,
+        *,
+        aggregate: object,
+    ) -> None:
+        if self._memory_projector is None or self._memory_targets is None:
+            return
+
+        async def write_memory() -> None:
+            try:
+                target = self._memory_targets.path_service_for_user(claim.event.user_id)
+            except ValueError:
+                raise DeterministicProjectionError("memory_user_binding_invalid") from None
+            await self._memory_projector.project(
+                claim.event,
+                aggregate=aggregate,
+                target_path_service=target,
+            )
+
+        memory_task = asyncio.create_task(write_memory())
+        heartbeat_task = asyncio.create_task(self._heartbeat_until_cancelled(claim))
+        try:
+            done, _pending = await asyncio.wait(
+                {memory_task, heartbeat_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if heartbeat_task in done:
+                await heartbeat_task
+            await memory_task
+        finally:
+            for task in (memory_task, heartbeat_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(memory_task, heartbeat_task, return_exceptions=True)
 
     async def run_once(self, *, tenant_id: str | None = None) -> bool:
         if tenant_id is not None:
@@ -640,7 +794,26 @@ class LearningProjectionWorker:
                     claim,
                     lease_seconds=self._lease_seconds,
                 )
-                await self._repository.project(claim, document=document)
+                if self._memory_projector is None:
+                    await self._repository.project(claim, document=document)
+                else:
+                    aggregate = await self._repository.project_for_memory(
+                        claim,
+                        document=document,
+                    )
+                    await self._repository.heartbeat(
+                        claim,
+                        lease_seconds=self._lease_seconds,
+                    )
+                    await self._project_memory_with_heartbeat(
+                        claim,
+                        aggregate=aggregate,
+                    )
+                    await self._repository.heartbeat(
+                        claim,
+                        lease_seconds=self._lease_seconds,
+                    )
+                    await self._repository.complete(claim)
             except DeterministicProjectionError as exc:
                 try:
                     await self._repository.quarantine(
