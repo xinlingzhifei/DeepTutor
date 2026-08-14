@@ -45,6 +45,7 @@ export default defineConfig({
         "**/e2e/teacher-classroom-flow.spec.ts",
         "**/e2e/content-operations-flow.spec.ts",
         "**/e2e/student-classroom-flow.spec.ts",
+        "**/e2e/classroom-learning-loop.spec.ts",
       ],
       workers: 1,
       use: {
