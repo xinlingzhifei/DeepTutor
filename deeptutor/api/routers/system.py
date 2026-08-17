@@ -152,7 +152,7 @@ async def get_system_status():
 
 @router.get("/memory")
 async def get_memory_usage():
-    """Resident memory of the running DeepTutor process tree.
+    """Resident memory of the running yFeiSTAI process tree.
 
     Deliberately separate from ``/status``: that snapshot resolves the LLM,
     embedding and search configs and is fetched once per settings mount, while

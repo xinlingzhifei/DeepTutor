@@ -135,7 +135,7 @@ class LightRagPipeline:
 
         The RAG instance is constructed and consumed in one worker thread, so
         its mutable stores and asyncio primitives never cross event loops.
-        DeepTutor-owned network calls and progress callbacks cross back through
+        yFeiSTAI-owned network calls and progress callbacks cross back through
         ``OwnerLoopBridge`` and remain responsive while local JSON storage is
         busy in the worker.
         """

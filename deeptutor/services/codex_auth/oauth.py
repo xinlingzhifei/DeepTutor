@@ -239,7 +239,7 @@ class LoopbackCallback:
             raise CodexAuthError(
                 "login_timeout",
                 (
-                    "The DeepTutor server did not receive the Codex OAuth callback "
+                    "The yFeiSTAI server did not receive the Codex OAuth callback "
                     f"on localhost:{self.port}. For a remote deployment, keep the "
                     "SSH port-forwarding tunnel open and try again."
                 ),

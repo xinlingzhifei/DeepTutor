@@ -154,7 +154,7 @@ on every recreate. It now mounts the whole tree, matching
 `docker-compose.yml` and `compose.yaml`.
 
 **Before your first `up -d` after upgrading**, copy that state out of the
-running container, or the empty host directories shadow it and DeepTutor
+running container, or the empty host directories shadow it and yFeiSTAI
 regenerates the auth secret (logging everyone out) and starts with no
 non-admin accounts:
 

@@ -1,4 +1,4 @@
-"""Regression tests for DeepTutor's GraphRAG completion compatibility seam."""
+"""Regression tests for yFeiSTAI's GraphRAG completion compatibility seam."""
 
 from __future__ import annotations
 

@@ -8,7 +8,7 @@ socket and raced to close it; a FIN landing on a socket the pool was handing to
 a new request killed it with ``ECONNRESET``, which the proxy turned into a 500
 ("Failed to proxy ... socket hang up" -> "Failed to load sessions" in the UI).
 ``--timeout-keep-alive`` fixes it, and ``--ws-max-size`` has the same shape:
-correct only if *every* launch point passes it, and DeepTutor has five (two
+correct only if *every* launch point passes it, and yFeiSTAI has five (two
 Dockerfile stages, the ``deeptutor start`` launcher, the CLI, run_server). A
 launch point that forgets one reintroduces the bug for whoever starts the
 backend that way, which no per-module test would catch.

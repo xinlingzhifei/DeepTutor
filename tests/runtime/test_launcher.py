@@ -60,9 +60,9 @@ def test_runtime_home_rejects_project_data_paths(monkeypatch, tmp_path: Path) ->
     package_root = tmp_path / "package"
     monkeypatch.setattr("deeptutor.runtime.home.PACKAGE_ROOT", package_root)
 
-    with pytest.raises(ValueError, match="Invalid DeepTutor runtime home"):
+    with pytest.raises(ValueError, match="Invalid yFeiSTAI runtime home"):
         validate_runtime_home(package_root / "data")
-    with pytest.raises(ValueError, match="Invalid DeepTutor runtime home"):
+    with pytest.raises(ValueError, match="Invalid yFeiSTAI runtime home"):
         validate_runtime_home(package_root / "data" / "user")
 
 
@@ -72,7 +72,7 @@ def test_start_does_not_create_nested_data_tree(monkeypatch, tmp_path: Path) -> 
     monkeypatch.setattr("deeptutor.runtime.home.PACKAGE_ROOT", package_root)
     monkeypatch.setattr(launcher, "get_runtime_home", lambda _home=None: bad_home)
 
-    with pytest.raises(SystemExit, match="Invalid DeepTutor runtime home"):
+    with pytest.raises(SystemExit, match="Invalid yFeiSTAI runtime home"):
         launcher.start(bad_home)
 
     assert not bad_home.exists()

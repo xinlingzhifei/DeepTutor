@@ -214,7 +214,7 @@ async def test_direct_openai_gpt5_agentic_tools_use_provider_adapter(monkeypatch
                 id="fc_123",
                 call_id="call_123",
                 name="web_search",
-                arguments='{"query":"DeepTutor"}',
+                arguments='{"query":"yFeiSTAI"}',
             )
 
             async def events():

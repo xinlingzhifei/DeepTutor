@@ -18,6 +18,7 @@ const config = [
       "node_modules/**",
       ".next/**",
       ".next-deeptutor/**",
+      "dist/**",
       "out/**",
       "public/vendor/maic-importer/**",
     ],

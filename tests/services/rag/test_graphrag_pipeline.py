@@ -636,7 +636,7 @@ def test_embedding_preflight_uses_graphrag_client_and_checks_dimension(monkeypat
     asyncio.run(engine._probe_embedding_model_impl(object()))
 
     assert captured == {
-        "input": ["DeepTutor GraphRAG embedding compatibility test"],
+        "input": ["yFeiSTAI GraphRAG embedding compatibility test"],
         "timeout": 25,
     }
 

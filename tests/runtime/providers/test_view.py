@@ -270,7 +270,7 @@ async def test_a_slow_personal_server_costs_only_its_own_tools(
 ) -> None:
     """This runs before the turn's first stream event.
 
-    A third-party host that hangs must not present to the user as DeepTutor
+    A third-party host that hangs must not present to the user as yFeiSTAI
     hanging, so the scope connect is bounded and the turn proceeds without it.
     """
     from deeptutor.runtime.providers import view as view_module

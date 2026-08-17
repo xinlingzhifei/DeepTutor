@@ -1936,7 +1936,7 @@ function CommandMark(props: MarkProps) {
 
 /** A connected service — two half-rings coupled by a short bar, reading as a
  *  link rather than a socket. Used for MCP servers: the row is naming something
- *  outside DeepTutor that the turn is talking to. */
+ *  outside yFeiSTAI that the turn is talking to. */
 function LinkMark(props: MarkProps) {
   return (
     <MarkSvg {...props}>

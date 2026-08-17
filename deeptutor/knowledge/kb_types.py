@@ -93,11 +93,11 @@ def is_connected_kb(entry: Any) -> bool:
 
 
 def supports_local_raw_files(entry: Any) -> bool:
-    """Whether the KB owns a DeepTutor-managed local ``raw/`` directory.
+    """Whether the KB owns a yFeiSTAI-managed local ``raw/`` directory.
 
     Connected KBs are pointers to external resources.  Some point at a local
     folder and others at a remote service, but neither kind participates in
-    DeepTutor's raw-file upload and management API.
+    yFeiSTAI's raw-file upload and management API.
     """
     return isinstance(entry, dict) and not is_connected_kb(entry)
 

@@ -479,7 +479,7 @@ Settings 是操作控制面板，带有实时状态条（后端健康状况与�
 
 大多数部分采用草稿-应用流程，因此你可以在提交前测试提供商配置。开箱即提供四种主题 — Default、Cream、Dark 和 Glass。项目根目录的 `.env` 文件被刻意忽略；运行时配置存储在 `data/user/settings/*.json` 下，除非 `DEEPTUTOR_HOME` 或 `deeptutor start --home` 将应用指向其他位置。
 
-**OpenAI Codex OAuth（实验性）。** 在 **模型 → LLM** 下选择 **OpenAI Codex**，会用基于你自己 ChatGPT 订阅运行的浏览器登录取代 API Key 输入框，因此无需 `OPENAI_API_KEY`。令牌仅保存在 `data/system/user-secrets/<owner>/private/openai-codex/` 中 — 在多容器 Compose 部署中，位于 exec 沙箱可触及的所有目录树之外 — DeepTutor 绝不会读取或修改你的 `~/.codex` CLI 登录状态。模型列表来自该账号的实时目录；只有尚未配置任何 LLM 时，登录后的 Codex 才会成为活跃模型。令牌只授权一个人的订阅，无法通过用户授权共享，因此每个账号都需自行登录 — 普通用户也不例外：他们的卡片位于**模型 → LLM**下，产生的模型、目录和退出登录操作均只对该账号私有。
+**OpenAI Codex OAuth（实验性）。** 在 **模型 → LLM** 下选择 **OpenAI Codex**，会用基于你自己 ChatGPT 订阅运行的浏览器登录取代 API Key 输入框，因此无需 `OPENAI_API_KEY`。令牌仅保存在 `data/system/user-secrets/<owner>/private/openai-codex/` 中 — 在多容器 Compose 部署中，位于 exec 沙箱可触及的所有目录树之外 — yFeiSTAI 绝不会读取或修改你的 `~/.codex` CLI 登录状态。模型列表来自该账号的实时目录；只有尚未配置任何 LLM 时，登录后的 Codex 才会成为活跃模型。令牌只授权一个人的订阅，无法通过用户授权共享，因此每个账号都需自行登录 — 普通用户也不例外：他们的卡片位于**模型 → LLM**下，产生的模型、目录和退出登录操作均只对该账号私有。
 
 默认的本地 Docker 和 Podman 部署各自使用独立的回环网络，登录时需要一个临时桥接。具体的 Docker、Compose、Podman 及拆除命令请参阅[临时本地 Codex OAuth 桥接指南](../../CONTAINERIZATION.md#temporary-local-codex-oauth-bridge)。
 
@@ -489,13 +489,13 @@ Settings 是操作控制面板，带有实时状态条（后端健康状况与�
 ssh -N -L 1455:127.0.0.1:3782 <ssh-user>@<server-host>
 ```
 
-若 DeepTutor 显示 fallback callback 端口 `1457`，则使用：
+若 yFeiSTAI 显示 fallback callback 端口 `1457`，则使用：
 
 ```bash
 ssh -N -L 1457:127.0.0.1:3782 <ssh-user>@<server-host>
 ```
 
-只运行与实际 callback 端口对应的其中一条命令，不能两条都运行。`3782` 只是示例 Web 端口：它是 DeepTutor 配置并作为 `callback_forward_port` 显示的 frontend/container 端口，不保证 SSH 主机的 `127.0.0.1` 正在监听同一端口。若 Docker/Podman 映射到不同宿主机端口，或反向代理监听不同端口，只替换 SSH 命令右侧的目标端口（上例中的 `3782`）为 SSH 主机 `127.0.0.1` 实际监听的 Web 端口；左侧 callback 端口仍保持 `1455` 或 `1457`。`<server-host>` 是该 loopback 监听端口所在的 SSH 主机；若浏览器域名指向反向代理或负载均衡器，请替换为正确的 SSH 前端主机。
+只运行与实际 callback 端口对应的其中一条命令，不能两条都运行。`3782` 只是示例 Web 端口：它是 yFeiSTAI 配置并作为 `callback_forward_port` 显示的 frontend/container 端口，不保证 SSH 主机的 `127.0.0.1` 正在监听同一端口。若 Docker/Podman 映射到不同宿主机端口，或反向代理监听不同端口，只替换 SSH 命令右侧的目标端口（上例中的 `3782`）为 SSH 主机 `127.0.0.1` 实际监听的 Web 端口；左侧 callback 端口仍保持 `1455` 或 `1457`。`<server-host>` 是该 loopback 监听端口所在的 SSH 主机；若浏览器域名指向反向代理或负载均衡器，请替换为正确的 SSH 前端主机。
 
 CLI 会先打印隧道命令，随后立即尝试打开浏览器。远程用户应先保持授权页打开但不要完成授权，在另一终端建立所显示的隧道，然后再继续授权。
 

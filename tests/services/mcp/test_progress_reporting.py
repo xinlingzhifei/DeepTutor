@@ -86,7 +86,7 @@ async def test_a_total_of_zero_does_not_divide_by_it() -> None:
 
 @pytest.mark.asyncio
 async def test_a_progress_beyond_the_total_is_clamped() -> None:
-    """Servers do overshoot. A 130% status line reads as a bug in DeepTutor."""
+    """Servers do overshoot. A 130% status line reads as a bug in yFeiSTAI."""
     sink = _Sink()
     await _progress_reporter(sink, "crawler")(13, 10, "almost")
 

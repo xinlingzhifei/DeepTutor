@@ -51,7 +51,7 @@ RESPONSE_TYPE = "Multiple Paragraphs"
 DEFAULT_COMMUNITY_LEVEL = 2
 PROBE_MAX_TOKENS = 1024
 PROBE_TIMEOUT_SECONDS = 25
-EMBEDDING_PROBE_TEXT = "DeepTutor GraphRAG embedding compatibility test"
+EMBEDDING_PROBE_TEXT = "yFeiSTAI GraphRAG embedding compatibility test"
 
 # Per-mode output tables the query API needs (mirrors graphrag.cli.query).
 _OUTPUTS_BY_MODE: dict[str, tuple[list[str], list[str]]] = {
@@ -172,7 +172,7 @@ async def _validate_probe_completion(completion: Any, response_model: type) -> N
 
 
 async def _probe_completion_model_impl(llm_cfg: Any) -> None:
-    """Probe a resolved DeepTutor model through the GraphRAG adapter."""
+    """Probe a resolved yFeiSTAI model through the GraphRAG adapter."""
     await _validate_probe_completion(*_create_probe_completion(llm_cfg))
 
 

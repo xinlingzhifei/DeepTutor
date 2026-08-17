@@ -7,7 +7,7 @@ but owns no index: an ``ima`` KB is a connection pointer (``type: ima`` in
 matching passages, and shapes them for the ``rag`` tool. Documents are added in
 IMA, so :meth:`initialize` / :meth:`add_documents` are not part of this engine's
 job and fail with a clear message; :meth:`delete` is a no-op because deleting the
-KB only drops DeepTutor's pointer (handled by the manager) and must never touch
+KB only drops yFeiSTAI's pointer (handled by the manager) and must never touch
 the user's IMA library.
 """
 
@@ -132,7 +132,7 @@ class ImaPipeline:
 
     async def initialize(self, kb_name: str, file_paths: List[str], **kwargs) -> bool:
         raise RuntimeError(
-            "Tencent IMA knowledge bases are indexed by IMA; DeepTutor does not "
+            "Tencent IMA knowledge bases are indexed by IMA; yFeiSTAI does not "
             "build or store their index. Add documents in IMA directly."
         )
 
@@ -148,7 +148,7 @@ class ImaPipeline:
 
 
 def _sources_from_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Map IMA search items into DeepTutor's ``sources`` shape.
+    """Map IMA search items into yFeiSTAI's ``sources`` shape.
 
     ``highlight_content`` is the matched snippet IMA returns; items whose match
     was on the title alone carry none and are still listed, so the model can see

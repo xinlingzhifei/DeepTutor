@@ -3,7 +3,7 @@
 Every IMA call is ``POST https://ima.qq.com/openapi/wiki/v1/<method>`` with a
 JSON body, authenticated by two headers, and answers with a
 ``{"code", "msg", "data"}`` envelope where ``code == 0`` means success. Only the
-read-only calls DeepTutor needs are wrapped:
+read-only calls yFeiSTAI needs are wrapped:
 
 * ``search_knowledge`` — retrieval inside one knowledge base. Returns matching
   items with a ``highlight_content`` snippet, cursor-paginated.

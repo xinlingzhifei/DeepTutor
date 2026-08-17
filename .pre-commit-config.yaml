@@ -13,7 +13,7 @@ repos:
   - repo: local
     hooks:
       - id: deeptutor-repo-hygiene
-        name: DeepTutor repository hygiene
+        name: yFeiSTAI repository hygiene
         entry: python3 scripts/check_repo_hygiene.py
         language: system
         pass_filenames: false

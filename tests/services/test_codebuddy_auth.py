@@ -137,7 +137,7 @@ async def test_status_accepts_ide_session_without_the_sdk(tmp_path, monkeypatch)
 
 @pytest.mark.asyncio
 async def test_logout_explains_that_an_ide_session_ends_in_the_ide(tmp_path, monkeypatch) -> None:
-    """DeepTutor never ends a session it does not own.
+    """yFeiSTAI never ends a session it does not own.
 
     The auth file is shared with the IDE plugin and the CLI on this host —
     signing it out from a web endpoint would sign the operator out of their

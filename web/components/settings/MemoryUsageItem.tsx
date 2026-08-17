@@ -11,7 +11,7 @@ import { StatusStripDivider } from "@/components/settings/shared";
  * now that the model/search items moved into their own pages.
  *
  * Backed by `/api/v1/system/memory` (deeptutor/runtime/memory_probe.py), which
- * walks the whole DeepTutor process tree — backend, the Next.js server, and
+ * walks the whole yFeiSTAI process tree — backend, the Next.js server, and
  * whatever sandboxes and subagent CLIs are alive — rather than just this
  * process. Its own endpoint, not part of `/system/status`: that snapshot
  * resolves model configs and is fetched once per mount, while this polls.
@@ -166,7 +166,7 @@ export default function MemoryUsageItem() {
         {usage.partial && (
           <span
             title={t(
-              "Only the backend and its own children. Start DeepTutor through the launcher to include the web server.",
+              "Only the backend and its own children. Start yFeiSTAI through the launcher to include the web server.",
             )}
           >
             {t("(backend only)")}

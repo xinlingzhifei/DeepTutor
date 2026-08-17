@@ -1,8 +1,8 @@
 <div align="center">
 
-<p align="center"><img src="../../assets/figs/logo/logo.png" alt="DeepTutor 標誌" height="56" style="vertical-align: middle;">&nbsp;<img src="../../assets/figs/logo/banner.png" alt="DeepTutor" height="48" style="vertical-align: middle;"></p>
+<p align="center"><img src="../../assets/figs/logo/logo.png" alt="yFeiSTAI 標誌" height="56" style="vertical-align: middle;">&nbsp;<img src="../../assets/figs/logo/banner.png" alt="yFeiSTAI" height="48" style="vertical-align: middle;"></p>
 
-# DeepTutor：終身個人化學習導師
+# yFeiSTAI：終身個人化學習導師
 
 <p align="center">
   <a href="https://deeptutor.info" target="_blank"><img alt="Docs — deeptutor.info" src="https://img.shields.io/badge/Docs-deeptutor.info%20%E2%86%97-0A0A0A?style=for-the-badge&labelColor=F5F5F4" height="36"></a>
@@ -51,14 +51,14 @@
 
 - **2026-05-22** 🌐 官方文件網站 [**deeptutor.info**](https://deeptutor.info/) 正式上線 — 指南、參考資料與能力導覽集中在同一處。
 - **2026-04-19** 🎉 111 天內突破 2 萬顆 Star！感謝大家對真正個人化智慧教學的支持。
-- **2026-04-10** 📄 論文已登上 arXiv — 閱讀[預印本](https://arxiv.org/abs/2604.26962)，了解 DeepTutor 背後的設計與理念。
+- **2026-04-10** 📄 論文已登上 arXiv — 閱讀[預印本](https://arxiv.org/abs/2604.26962)，了解 yFeiSTAI 背後的設計與理念。
 - **2026-02-06** 🚀 僅 39 天便突破 1 萬顆 Star！衷心感謝傑出的社群。
-- **2026-01-01** 🎊 新年快樂！加入我們的 [Discord](https://discord.gg/eRsjPgMU4t)、[WeChat](https://github.com/HKUDS/DeepTutor/issues/78) 或 [Discussions](https://github.com/HKUDS/DeepTutor/discussions) — 一起塑造 DeepTutor。
-- **2025-12-29** 🎓 DeepTutor 正式發布！
+- **2026-01-01** 🎊 新年快樂！加入我們的 [Discord](https://discord.gg/eRsjPgMU4t)、[WeChat](https://github.com/HKUDS/DeepTutor/issues/78) 或 [Discussions](https://github.com/HKUDS/DeepTutor/discussions) — 一起塑造 yFeiSTAI。
+- **2025-12-29** 🎓 yFeiSTAI 正式發布！
 
 ## ✨ 主要功能
 
-DeepTutor 是代理程式原生的學習工作區，在同一個可擴充系統中串聯教學、解題、測驗生成、研究、視覺化與精熟練習。
+yFeiSTAI 是代理程式原生的學習工作區，在同一個可擴充系統中串聯教學、解題、測驗生成、研究、視覺化與精熟練習。
 
 - **所有模式共用一套執行階段** — Chat、Quiz、Research、Visualize、Solve 與 Mastery Path 在同一個代理程式迴圈上運作；你切換的是目標而非引擎，學習情境會一路跟隨學習者。
 - **相互連結的學習情境** — 知識庫、書籍、Co-Writer 草稿、筆記本、題庫、角色設定與 Memory 在每個工作流程中皆可使用，不再分散於彼此隔離的工具。
@@ -71,7 +71,7 @@ DeepTutor 是代理程式原生的學習工作區，在同一個可擴充系統�
 
 ## 🚀 開始使用
 
-DeepTutor 提供四種安裝方式。它們共用相同的工作區配置：設定會儲存在啟動目錄下的 `data/user/settings/`（若明確設定 `DEEPTUTOR_HOME` 或 `deeptutor start --home`，則儲存在該位置）。完整應用程式的建議流程是：**選擇工作區目錄 → 安裝 → `deeptutor init` → `deeptutor start`**。
+yFeiSTAI 提供四種安裝方式。它們共用相同的工作區配置：設定會儲存在啟動目錄下的 `data/user/settings/`（若明確設定 `DEEPTUTOR_HOME` 或 `deeptutor start --home`，則儲存在該位置）。完整應用程式的建議流程是：**選擇工作區目錄 → 安裝 → `deeptutor init` → `deeptutor start`**。
 
 <details>
 <summary><b>方式一 — 從 PyPI 安裝</b> · 完整本機 Web 應用程式＋CLI，無須 clone</summary>
@@ -98,7 +98,7 @@ deeptutor start    # starts backend + frontend; keep the terminal open
 
 ```bash
 git clone https://github.com/HKUDS/DeepTutor.git
-cd DeepTutor
+cd yFeiSTAI
 
 # Create a venv (macOS/Linux). Windows PowerShell:
 #   py -3.11 -m venv .venv ; .\.venv\Scripts\Activate.ps1
@@ -187,7 +187,7 @@ docker run --rm --name deeptutor \
 }
 ```
 
-`next_public_api_base_external`（及其別名 `public_api_base`）可作為優先順序較低的備援值。CORS 使用前端 **origin**，而不是 API URL。停用驗證時，DeepTutor 預設允許一般 HTTP／HTTPS 瀏覽器 origin；啟用驗證時，請加入精確的前端 origin：
+`next_public_api_base_external`（及其別名 `public_api_base`）可作為優先順序較低的備援值。CORS 使用前端 **origin**，而不是 API URL。停用驗證時，yFeiSTAI 預設允許一般 HTTP／HTTPS 瀏覽器 origin；啟用驗證時，請加入精確的前端 origin：
 
 ```json
 {
@@ -231,7 +231,7 @@ Docker Desktop（macOS／Windows）通常不加 `--add-host` 也能解析 `host.
 
 ```bash
 git clone https://github.com/HKUDS/DeepTutor.git
-cd DeepTutor
+cd yFeiSTAI
 
 # Create a venv (macOS/Linux). Windows PowerShell:
 #   py -3.11 -m venv .venv-cli ; .\.venv-cli\Scripts\Activate.ps1
@@ -295,19 +295,19 @@ deeptutor config show
 
 </details>
 
-## 📖 探索 DeepTutor
+## 📖 探索 yFeiSTAI
 
 先從日常最常使用的主要介面開始：Chat、Partners、My Agents、Co-Writer、Book、Knowledge Center、Learning Space、Memory 與 Settings。導覽最後會介紹用於共享且相互隔離工作區的 Multi-User 部署。
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/OVERVIEW.png" alt="DeepTutor 首頁 — 側邊欄包含所有功能入口的 Chat 工作區" width="900">
+<img src="../../assets/figs/web-1.4.6+/OVERVIEW.png" alt="yFeiSTAI 首頁 — 側邊欄包含所有功能入口的 Chat 工作區" width="900">
 </div>
 
 <details>
 <summary><b>🏗️ 系統架構</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/system/system%20architecture.png" alt="DeepTutor 系統架構" width="900">
+<img src="../../assets/figs/system/system%20architecture.png" alt="yFeiSTAI 系統架構" width="900">
 </div>
 
 </details>
@@ -318,13 +318,13 @@ deeptutor config show
 Chat 是預設能力，也是大多數工作的起點。單一對話可以進行一般交談、呼叫工具、根據選定的知識庫建立回答依據、讀取附件、生成影像、諮詢子代理程式、寫入筆記本紀錄，並在各回合之間沿用相同情境。
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/home/00-overview.png" alt="DeepTutor Chat 工作區" width="900">
+<img src="../../assets/figs/web-1.4.6+/home/00-overview.png" alt="yFeiSTAI Chat 工作區" width="900">
 </div>
 
 這個迴圈刻意保持簡單：模型分輪思考、在有幫助時呼叫工具、觀察結果，最後以不含工具呼叫的訊息完成回合。`ask_user` 比較特殊；代理程式不必猜測，而是可以暫停回合、提出結構化的釐清問題，並在你回答後繼續。
 
 <div align="center">
-<img src="../../assets/figs/system/chat-agent-loop.png" alt="DeepTutor Chat 代理程式迴圈" width="900">
+<img src="../../assets/figs/system/chat-agent-loop.png" alt="yFeiSTAI Chat 代理程式迴圈" width="900">
 </div>
 
 使用者可切換的工具包括 `brainstorm`、`web_search`、`paper_search`、`reason` 與 `geogebra_analysis`；設定對應的生成模型後，還會有 `imagegen` 與 `videogen`。`rag`、`kb_files`、`read_source`、`read_memory`、`write_memory`、`read_skill`、`load_tools`、`exec`、`web_fetch`、`ask_user`、`list_notebook`、`write_note`、`github` 與 `consult_subagent` 等情境式工具，會在回合具有相符情境時自動掛載。
@@ -339,13 +339,13 @@ Chat 也是進階能力的起點：**Quiz** 用於產生題目、**Research** �
 <summary><b>🤝 Partner — 共用同一套核心的持續型夥伴</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/partners/00-partners%20overview.png" alt="DeepTutor Partners 工作區" width="900">
+<img src="../../assets/figs/web-1.4.6+/partners/00-partners%20overview.png" alt="yFeiSTAI Partners 工作區" width="900">
 </div>
 
 Partners 是持續運作的夥伴，各自擁有 soul、模型政策、知識庫、記憶與頻道。它們不是另一套 bot 引擎；每一則從 Web 或 IM 收到的訊息，都會在限定於該 partner 的工作區內成為一般的 `ChatOrchestrator` 回合。Partner 就像是「擁有個性與電話號碼的聊天」。
 
 <div align="center">
-<img src="../../assets/figs/system/partners-architecture.png" alt="DeepTutor Partners 架構" width="900">
+<img src="../../assets/figs/system/partners-architecture.png" alt="yFeiSTAI Partners 架構" width="900">
 </div>
 
 每個 partner 都有 `SOUL.md`、模型選擇、頻道、工具政策與指派的知識庫。知識庫、技能與筆記本會複製到 `data/partners/<id>/workspace/`，因此同一套 RAG、skill、notebook 與 memory 工具都能直接運作，無須特殊處理。Partner 可以讀取擁有者的記憶，但只會寫入自己的記憶。
@@ -362,16 +362,16 @@ Partners 是持續運作的夥伴，各自擁有 soul、模型政策、知識庫
 <summary><b>🧑‍🚀 My Agents — 諮詢與匯入其他代理程式</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/myagents/00-overview.png" alt="DeepTutor My Agents 工作區" width="900">
+<img src="../../assets/figs/web-1.4.6+/myagents/00-overview.png" alt="yFeiSTAI My Agents 工作區" width="900">
 </div>
 
-My Agents 會將其他代理程式變成 DeepTutor 的情境，並提供兩項不同功能。**連接即時代理程式** — 連接電腦上的 Claude Code、Codex、Gemini、Kimi、opencode 或 MiMo Code CLI，或你自己的 Partner，並從聊天回合內諮詢它。DeepTutor 會實際*執行*其他代理程式，再透過 `consult_subagent` 工具將其工作即時串流至 Activity 面板。使用 Agent chip（或輸入 `@`）選取代理程式，並設定諮詢可進行的回合數。
+My Agents 會將其他代理程式變成 yFeiSTAI 的情境，並提供兩項不同功能。**連接即時代理程式** — 連接電腦上的 Claude Code、Codex、Gemini、Kimi、opencode 或 MiMo Code CLI，或你自己的 Partner，並從聊天回合內諮詢它。yFeiSTAI 會實際*執行*其他代理程式，再透過 `consult_subagent` 工具將其工作即時串流至 Activity 面板。使用 Agent chip（或輸入 `@`）選取代理程式，並設定諮詢可進行的回合數。
 
 <div align="center">
 <img src="../../assets/figs/web-1.4.6+/home/08-subagent%20demo%20with%20claude%20code.png" alt="即時諮詢 Claude Code 子代理程式" width="900">
 </div>
 
-**匯入過往對話** — 將現有的 Claude Code 與 Codex 記錄匯入為可命名、搜尋及繼續的代理程式。選擇要匯入哪些日期，重新整理時便會再次同步。你可以在任何聊天回合中透過 `+` → My Agents 參照匯入的對話；DeepTutor 會將其讀作第三方逐字稿，保留為*對方*的對話，而不是 DeepTutor 自己的口吻。
+**匯入過往對話** — 將現有的 Claude Code 與 Codex 記錄匯入為可命名、搜尋及繼續的代理程式。選擇要匯入哪些日期，重新整理時便會再次同步。你可以在任何聊天回合中透過 `+` → My Agents 參照匯入的對話；yFeiSTAI 會將其讀作第三方逐字稿，保留為*對方*的對話，而不是 yFeiSTAI 自己的口吻。
 
 </details>
 
@@ -379,7 +379,7 @@ My Agents 會將其他代理程式變成 DeepTutor 的情境，並提供兩項�
 <summary><b>✍️ Co-Writer — 能感知選取範圍的 Markdown 寫作</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/co-writer/00-overview.png" alt="DeepTutor Co-Writer 工作區" width="900">
+<img src="../../assets/figs/web-1.4.6+/co-writer/00-overview.png" alt="yFeiSTAI Co-Writer 工作區" width="900">
 </div>
 
 Co-Writer 是用於報告、教學文章、筆記與長篇學習作品的分割檢視 Markdown 工作區。文件會自動儲存並呈現即時預覽（KaTeX 數學式、圖解 fences）；草稿成為可重複使用的情境後，也能存回筆記本。
@@ -388,7 +388,7 @@ Co-Writer 是用於報告、教學文章、筆記與長篇學習作品的分割�
 <img src="../../assets/figs/web-1.4.6+/co-writer/01-edit%20panel.png" alt="Co-Writer 編輯器與即時預覽" width="900">
 </div>
 
-它的核心概念是**精準編輯**：選取一段內容，請 DeepTutor 改寫、擴寫或縮短。編輯代理程式可以知識庫或 Web 證據作為修改依據、保留工具呼叫軌跡，並將每項變更顯示成可接受／拒絕的 diff；只有在你核准後才會套用。
+它的核心概念是**精準編輯**：選取一段內容，請 yFeiSTAI 改寫、擴寫或縮短。編輯代理程式可以知識庫或 Web 證據作為修改依據、保留工具呼叫軌跡，並將每項變更顯示成可接受／拒絕的 diff；只有在你核准後才會套用。
 
 </details>
 
@@ -396,7 +396,7 @@ Co-Writer 是用於報告、教學文章、筆記與長篇學習作品的分割�
 <summary><b>📖 Book — 從你的素材建立活書</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/book/00-book_overview.png" alt="DeepTutor 書籍庫" width="900">
+<img src="../../assets/figs/web-1.4.6+/book/00-book_overview.png" alt="yFeiSTAI 書籍庫" width="900">
 </div>
 
 Book 會將選定來源轉換成互動式**活書**；它不是靜態 PDF，而是由具型別區塊組成的閱讀環境。書籍可從知識庫、筆記本、題庫或聊天記錄建立；生成內容前，建立流程會先提出章節大綱，讓你審視整體架構，而非直接接受無從確認的單次輸出。
@@ -417,7 +417,7 @@ Book 會將選定來源轉換成互動式**活書**；它不是靜態 PDF，而�
 <summary><b>📚 Knowledge Center — 多引擎 RAG 知識庫</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/knowledge/00-overview.png" alt="DeepTutor Knowledge Center" width="900">
+<img src="../../assets/figs/web-1.4.6+/knowledge/00-overview.png" alt="yFeiSTAI Knowledge Center" width="900">
 </div>
 
 知識庫是 RAG 背後的文件集合，可為 Chat 回合、Co-Writer 編輯、Book 生成與 Partner 對話提供依據。其特色在於可**選擇檢索引擎**：**LlamaIndex**（預設，本機 vector＋BM25）、**PageIndex**（託管式、可推理的檢索並附頁面層級引用）、**GraphRAG** 與 **LightRAG**（知識圖譜檢索）、**LightRAG Server**（透過 HTTP 連接的外部 LightRAG 執行個體負責檢索）、**Tencent IMA**（在 IMA 中整理並透過其 OpenAPI 搜尋的知識庫），或讓導師就地讀寫的已連結 **Obsidian** vault。每個知識庫都會繫結至單一引擎。
@@ -434,7 +434,7 @@ Book 會將選定來源轉換成互動式**活書**；它不是靜態 PDF，而�
 <summary><b>🌐 Learning Space — 技能、角色設定與可重複使用的情境</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/learning-space/00-overview.png" alt="DeepTutor Learning Space 中心" width="900">
+<img src="../../assets/figs/web-1.4.6+/learning-space/00-overview.png" alt="yFeiSTAI Learning Space 中心" width="900">
 </div>
 
 Learning Space 是資源庫與個人化層，也是各種持續保存內容所在之處。**Conversations & Materials** 保存聊天記錄、筆記本與題庫（每道儲存的題目都會保留你的答案、參考答案與解說）。**Personalization** 保存精熟學習路徑、角色設定（例如 *同儕*、*研究助理*、*教師*等行為預設）、技能（模型按需讀取的 `SKILL.md` 操作手冊）、**MCP Services**（為自己一鍵安裝的託管式 MCP 伺服器精選商店，以及你透過 URL 設定的任何遠端伺服器），還有 **CLI Apps**：來自 [CLI-Anything](https://github.com/HKUDS/CLI-Anything) 型錄的命令列工具，聊天代理程式可直接呼叫，並按需載入各應用程式的使用指南。這裡的所有內容都能從 Chat、Partners、Co-Writer 與 Book 重複使用。
@@ -451,13 +451,13 @@ Learning Space 是資源庫與個人化層，也是各種持續保存內容所�
 <summary><b>🧠 Memory — 可檢視的個人化</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/memory/00-overview.png" alt="DeepTutor Memory 總覽" width="900">
+<img src="../../assets/figs/web-1.4.6+/memory/00-overview.png" alt="yFeiSTAI Memory 總覽" width="900">
 </div>
 
 Memory 是以檔案為基礎、可讀取、整理及稽核的三層系統；它刻意*不使用*隱藏的向量儲存區。**L1** 是工作區鏡像與僅附加的事件軌跡（`trace/<surface>/<date>.jsonl`）；**L2** 是各介面整理後的事實（`L2/<surface>.md`）；**L3** 是跨介面的綜整（`L3/<profile|recent|scope|preferences>.md`）。由於 L2 引用 L1、L3 引用 L2，個人資料中的每項內容都有跡可循。
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/memory/01-3%20layer%20memory%20graph.png" alt="DeepTutor Memory Graph" width="900">
+<img src="../../assets/figs/web-1.4.6+/memory/01-3%20layer%20memory%20graph.png" alt="yFeiSTAI Memory Graph" width="900">
 </div>
 
 Memory Graph 會呈現完整金字塔：L3 綜整位於中央、L2 位於中圈、L1 軌跡則在外圈，因此可將任何綜整後的主張追溯到背後的確切原始事件。Memory 會追蹤 `chat`、`notebook`、`quiz`、`kb`、`book`、partner 與 `cowriter` 等介面；綜整器的 Update／Audit／Dedup 預算可在 **Settings → Memory** 調整。
@@ -468,18 +468,18 @@ Memory Graph 會呈現完整金字塔：L3 綜整位於中央、L2 位於中圈�
 <summary><b>⚙️ Settings — 統一控制中心</b></summary>
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/settings/00-setting%20overview.png" alt="DeepTutor Settings 中心" width="900">
+<img src="../../assets/figs/web-1.4.6+/settings/00-setting%20overview.png" alt="yFeiSTAI Settings 中心" width="900">
 </div>
 
 Settings 是操作控制中心，提供即時狀態列（後端健康狀況，以及整個處理程序樹的常駐記憶體），各領域則各有一張卡片：**Appearance**（主題、介面與模型輸出語言、程式碼區塊樣式）、**Network**（API base、連接埠、CORS）、**Models**（LLM、Embedding、Search、Text-to-Speech、Speech-to-Text、Image Generation、Video Generation）、**Knowledge Base**（文件解析引擎）、**Chat**（工具、各能力參數、附件上限）、**Partners & Agents**（可在回合中諮詢的子代理程式），以及 **Memory**（綜整器預算）。
 
 <div align="center">
-<img src="../../assets/figs/web-1.4.6+/settings/01-appearance%20settings.png" alt="DeepTutor 外觀設定與主題" width="900">
+<img src="../../assets/figs/web-1.4.6+/settings/01-appearance%20settings.png" alt="yFeiSTAI 外觀設定與主題" width="900">
 </div>
 
 大多數區段採用草稿後套用的流程，因此可先測試供應商再確認變更。內建四種主題：Default、Cream、Dark 與 Glass。系統會刻意忽略專案根目錄的 `.env` 檔案；除非 `DEEPTUTOR_HOME` 或 `deeptutor start --home` 將應用程式指向其他位置，否則執行階段設定位於 `data/user/settings/*.json`。
 
-**OpenAI Codex OAuth（實驗性功能）。** 在 Models → LLM 下選擇 **OpenAI Codex** 後，API key 欄位會改為透過瀏覽器登入自己的 ChatGPT 方案，因此不需要 `OPENAI_API_KEY`。Token 只會存放在 `data/system/user-secrets/<owner>/private/openai-codex/`；在多容器 Compose 部署中，此位置不屬於 exec 沙箱可觸及的任何目錄，而 DeepTutor 絕不會讀取或修改 `~/.codex` CLI 登入。模型清單來自該帳號的即時型錄；登入會發布設定檔，但只有在尚未設定 LLM 時，才會將其設為目前使用的模型。由於 token 授權的是個人方案，該設定檔不能透過使用者授權分享；每個帳號（包括一般使用者）都要自行登入。其卡片位於 Models → LLM，產生的模型、型錄與登出狀態也只屬於該帳號。
+**OpenAI Codex OAuth（實驗性功能）。** 在 Models → LLM 下選擇 **OpenAI Codex** 後，API key 欄位會改為透過瀏覽器登入自己的 ChatGPT 方案，因此不需要 `OPENAI_API_KEY`。Token 只會存放在 `data/system/user-secrets/<owner>/private/openai-codex/`；在多容器 Compose 部署中，此位置不屬於 exec 沙箱可觸及的任何目錄，而 yFeiSTAI 絕不會讀取或修改 `~/.codex` CLI 登入。模型清單來自該帳號的即時型錄；登入會發布設定檔，但只有在尚未設定 LLM 時，才會將其設為目前使用的模型。由於 token 授權的是個人方案，該設定檔不能透過使用者授權分享；每個帳號（包括一般使用者）都要自行登入。其卡片位於 Models → LLM，產生的模型、型錄與登出狀態也只屬於該帳號。
 
 預設本機 Docker 與 Podman 部署各自使用獨立的 loopback 網路，登入期間需要暫時橋接。請依照[暫時性本機 Codex OAuth 橋接指南](../../CONTAINERIZATION.md#temporary-local-codex-oauth-bridge)，使用確切的 Docker、Compose、Podman 與拆除指令。
 
@@ -489,7 +489,7 @@ Settings 是操作控制中心，提供即時狀態列（後端健康狀況，�
 ssh -N -L 1455:127.0.0.1:3782 <ssh-user>@<server-host>
 ```
 
-若 DeepTutor 回報備援 callback 連接埠 `1457`，請使用：
+若 yFeiSTAI 回報備援 callback 連接埠 `1457`，請使用：
 
 ```bash
 ssh -N -L 1457:127.0.0.1:3782 <ssh-user>@<server-host>
@@ -506,7 +506,7 @@ CLI 會顯示通道指令，接著立即嘗試開啟瀏覽器。在遠端部署�
 <details>
 <summary><b>👥 Multi-User — 共享部署</b> · 選用驗證、相互隔離的每位使用者工作區</summary>
 
-驗證功能**預設關閉**，DeepTutor 會以單一使用者模式執行。開啟後，一個 `data/` 目錄樹便能並列容納管理員工作區、相互隔離的每位使用者工作區，以及 partner 工作區：
+驗證功能**預設關閉**，yFeiSTAI 會以單一使用者模式執行。開啟後，一個 `data/` 目錄樹便能並列容納管理員工作區、相互隔離的每位使用者工作區，以及 partner 工作區：
 
 ```text
 data/
@@ -525,9 +525,9 @@ data/
 
 </details>
 
-## ⌨️ DeepTutor CLI — 代理程式原生介面
+## ⌨️ yFeiSTAI CLI — 代理程式原生介面
 
-一個 `deeptutor` 執行檔，提供兩種入口：給終端機使用者的互動式 **REPL**，以及讓其他代理程式驅動 DeepTutor 的結構化 **JSON**。兩者使用相同的能力、工具與知識庫。
+一個 `deeptutor` 執行檔，提供兩種入口：給終端機使用者的互動式 **REPL**，以及讓其他代理程式驅動 yFeiSTAI 的結構化 **JSON**。兩者使用相同的能力、工具與知識庫。
 
 <details>
 <summary><b>自行操作</b></summary>
@@ -549,7 +549,7 @@ Web 應用程式能做的事在這裡也都能完成，包括知識庫（`kb`）
 <details>
 <summary><b>讓代理程式操作</b></summary>
 
-DeepTutor 從設計上就能*由其他代理程式操作*。對任何 `run` 加上 `--format json`，每個回合便會以 **NDJSON — 每行一個事件**（`content`、`tool_call`、`tool_result`、`done` 等）串流，且每行都會標上 `session_id`。執行流程可安全用於 headless 環境：若 `ask_user` 在沒有 TTY 的情況下暫停，系統會自動以空白回覆處理，而不會無限等待。
+yFeiSTAI 從設計上就能*由其他代理程式操作*。對任何 `run` 加上 `--format json`，每個回合便會以 **NDJSON — 每行一個事件**（`content`、`tool_call`、`tool_result`、`done` 等）串流，且每行都會標上 `session_id`。執行流程可安全用於 headless 環境：若 `ask_user` 在沒有 TTY 的情況下暫停，系統會自動以空白回覆處理，而不會無限等待。
 
 ```bash
 # One shot, machine-readable
@@ -604,12 +604,12 @@ python -m pip install -e ./packaging/deeptutor-cli
 
 ## 🧩 生態系 — EduHub 與技能社群
 
-DeepTutor 技能採用開放的 **Agent-Skills** 格式，也就是包含 `SKILL.md` 操作手冊（YAML frontmatter＋Markdown）與選用參考檔案的資料夾。這個格式並非 DeepTutor 專屬，因此任何支援此格式的 registry 都能成為你的知識庫來源。DeepTutor 內建我們以教育為核心的技能 registry **[EduHub](https://eduhub.deeptutor.info/)**，並將其設為預設 hub。
+yFeiSTAI 技能採用開放的 **Agent-Skills** 格式，也就是包含 `SKILL.md` 操作手冊（YAML frontmatter＋Markdown）與選用參考檔案的資料夾。這個格式並非 yFeiSTAI 專屬，因此任何支援此格式的 registry 都能成為你的知識庫來源。yFeiSTAI 內建我們以教育為核心的技能 registry **[EduHub](https://eduhub.deeptutor.info/)**，並將其設為預設 hub。
 
 <details>
-<summary><b>EduHub — DeepTutor 的技能生態系</b></summary>
+<summary><b>EduHub — yFeiSTAI 的技能生態系</b></summary>
 
-[**EduHub**](https://eduhub.deeptutor.info/) 是 DeepTutor 推出的社群中心，用於分享教學導向的代理程式技能，包括蘇格拉底式導師、單字卡建立工具、文章回饋、考試藍圖、概念解說等。它已整合至 DeepTutor，無須任何設定；只輸入 slug 或加上 `eduhub:` 前置字串都會解析至此。
+[**EduHub**](https://eduhub.deeptutor.info/) 是 yFeiSTAI 推出的社群中心，用於分享教學導向的代理程式技能，包括蘇格拉底式導師、單字卡建立工具、文章回饋、考試藍圖、概念解說等。它已整合至 yFeiSTAI，無須任何設定；只輸入 slug 或加上 `eduhub:` 前置字串都會解析至此。
 
 **尋找並安裝** — 在瀏覽器中開啟 **Learning Space → Skills → Import from EduHub**，即可瀏覽型錄並將技能直接下載到知識庫。若從終端機操作：
 
@@ -628,7 +628,7 @@ deeptutor skill publish ./my-skill                    # interactive: pick a trac
 deeptutor skill update                                # roll back or release a new version
 ```
 
-EduHub 也是獨立且相容於 ClawHub 的 registry，因此不是 DeepTutor 的代理程式（Claude Code、Codex 等）也能直接透過 `eduhub` CLI 使用：`npx eduhub install socratic-tutor`。
+EduHub 也是獨立且相容於 ClawHub 的 registry，因此不是 yFeiSTAI 的代理程式（Claude Code、Codex 等）也能直接透過 `eduhub` CLI 使用：`npx eduhub install socratic-tutor`。
 
 </details>
 
@@ -639,7 +639,7 @@ EduHub 也是獨立且相容於 ClawHub 的 registry，因此不是 DeepTutor �
 
 - 系統會先檢查 registry 的**安全性判定**；除非傳入 `--allow-unverified`，否則會拒絕標記有問題的套件；
 - 壓縮檔會在文字／指令碼**副檔名白名單**限制下進行防禦性解壓縮（防範 zip-slip／zip-bomb），因此二進位檔案不會進入工作區；
-- frontmatter 會正規化成 DeepTutor 的結構描述，並**移除** `always:`，因此下載的技能無法強迫自己進入每一個系統提示；
+- frontmatter 會正規化成 yFeiSTAI 的結構描述，並**移除** `always:`，因此下載的技能無法強迫自己進入每一個系統提示；
 - 來源資訊（hub、版本、判定與安裝時間）會寫入 `.hub-lock.json`，供稽核與更新使用。
 
 在多使用者部署中，只有管理員可以安裝。新技能會先進入管理員型錄，並在透過授權指派給其他使用者前保持不可見，讓管理員能在全面推出前先行審查。
@@ -649,7 +649,7 @@ EduHub 也是獨立且相容於 ClawHub 的 registry，因此不是 DeepTutor �
 <details>
 <summary><b>同時相容於 ClawHub</b></summary>
 
-由於 DeepTutor 支援開放的 Agent-Skills 格式，**[ClawHub](https://clawhub.ai/)** 也是第一級來源，並與 EduHub 一同內建。可透過 hub 前置字串選擇：
+由於 yFeiSTAI 支援開放的 Agent-Skills 格式，**[ClawHub](https://clawhub.ai/)** 也是第一級來源，並與 EduHub 一同內建。可透過 hub 前置字串選擇：
 
 ```bash
 deeptutor skill search "git release notes" --hub clawhub
@@ -680,13 +680,13 @@ deeptutor skill install clawhub:git-release-notes@1.0.1
 
 ### 📮 聯絡方式
 
-DeepTutor 是由 [HKUDS](https://github.com/HKUDS) 團隊的 [Bingxi Zhao](https://github.com/pancacake) 主導的開放原始碼專案，並以**完全開放原始碼的形式**持續迭代，與社群共同打造。目前我們**不提供**任何形式的付費線上產品。如欲討論、分享構想或洽談合作，歡迎來信 **bingxizhao39@gmail.com**。
+yFeiSTAI 是由 [HKUDS](https://github.com/HKUDS) 團隊的 [Bingxi Zhao](https://github.com/pancacake) 主導的開放原始碼專案，並以**完全開放原始碼的形式**持續迭代，與社群共同打造。目前我們**不提供**任何形式的付費線上產品。如欲討論、分享構想或洽談合作，歡迎來信 **bingxizhao39@gmail.com**。
 
 ### 🙏 致謝
 
-衷心感謝香港大學 Data Intelligence Lab 主任 [**Chao Huang**](https://sites.google.com/view/chaoh)，以及 HKUDS 實驗室夥伴的熱情支持；特別感謝 [**Jiahao Zhang**](https://github.com/zzhtx258)、[**Zirui Guo**](https://github.com/LarFii) 與 [**Xubin Ren**](https://github.com/Re-bin)。我們也深深感謝**開放原始碼社群**；你們的 stars、issues、pull requests 與 discussions 每一天都在形塑 DeepTutor。
+衷心感謝香港大學 Data Intelligence Lab 主任 [**Chao Huang**](https://sites.google.com/view/chaoh)，以及 HKUDS 實驗室夥伴的熱情支持；特別感謝 [**Jiahao Zhang**](https://github.com/zzhtx258)、[**Zirui Guo**](https://github.com/LarFii) 與 [**Xubin Ren**](https://github.com/Re-bin)。我們也深深感謝**開放原始碼社群**；你們的 stars、issues、pull requests 與 discussions 每一天都在形塑 yFeiSTAI。
 
-DeepTutor 也站在許多傑出開放原始碼專案的肩膀上；它們同時提供了工具與靈感：
+yFeiSTAI 也站在許多傑出開放原始碼專案的肩膀上；它們同時提供了工具與靈感：
 
 | 專案 | 角色／啟發 |
 |:---|:---|
@@ -697,16 +697,16 @@ DeepTutor 也站在許多傑出開放原始碼專案的肩膀上；它們同時�
 | [**AI-Researcher**](https://github.com/HKUDS/AI-Researcher) | 自動化研究管線（*HKUDS*） |
 | [**OpenClaw**](https://github.com/openclaw/openclaw) | ClawHub 背後的開放代理程式閘道與技能生態系 |
 | [**Codex**](https://github.com/openai/codex) | 啟發 CLI 工作流程的代理程式原生程式設計 CLI |
-| [**Claude Code**](https://github.com/anthropics/claude-code) | 啟發 DeepTutor 代理程式迴圈的代理式程式設計 CLI |
+| [**Claude Code**](https://github.com/anthropics/claude-code) | 啟發 yFeiSTAI 代理程式迴圈的代理式程式設計 CLI |
 | [**ManimCat**](https://github.com/Wing900/ManimCat) | AI 驅動的 Math Animator 數學動畫生成 |
 
 ### 🗺️ Roadmap 與貢獻
 
-我們希望 DeepTutor 持續迭代與進步，最終成為回饋開放原始碼社群的一份禮物。我們會持續更新[**roadmap**](https://github.com/HKUDS/DeepTutor/issues/498)；歡迎到該處為項目投票或提出新構想。如果你想參與貢獻，請參閱[**貢獻指南**](../../CONTRIBUTING.md)，了解分支策略、程式碼規範與開始方式。
+我們希望 yFeiSTAI 持續迭代與進步，最終成為回饋開放原始碼社群的一份禮物。我們會持續更新[**roadmap**](https://github.com/HKUDS/DeepTutor/issues/498)；歡迎到該處為項目投票或提出新構想。如果你想參與貢獻，請參閱[**貢獻指南**](../../CONTRIBUTING.md)，了解分支策略、程式碼規範與開始方式。
 
 <div align="center">
 
-我們希望 DeepTutor 成為送給社群的一份禮物。🎁
+我們希望 yFeiSTAI 成為送給社群的一份禮物。🎁
 
 <a href="https://github.com/HKUDS/DeepTutor/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=HKUDS/DeepTutor&max=999" alt="貢獻者" />

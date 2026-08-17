@@ -148,7 +148,7 @@ const ENGINE_PREREQUISITES: Record<string, string> = {
     "Local knowledge-graph retrieval. Needs the optional dependency installed; indexing is LLM-heavy. Requires an active chat model and embedding model.",
   lightrag:
     "Graph + vector retrieval with multimodal parsing. Needs the optional dependency installed; indexing is LLM-heavy. Requires active chat and embedding models; multimodal also needs a vision model.",
-  ima: "Hosted engine: the library lives in Tencent IMA and DeepTutor keeps no copy. Requires an IMA Client ID and API key; retrieval is read-only and loads bounded source text when IMA omits a matched snippet.",
+  ima: "Hosted engine: the library lives in Tencent IMA and yFeiSTAI keeps no copy. Requires an IMA Client ID and API key; retrieval is read-only and loads bounded source text when IMA omits a matched snippet.",
 };
 
 function StatusBadge({ status }: { status: ProviderConnectionStatus }) {

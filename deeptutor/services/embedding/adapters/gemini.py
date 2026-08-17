@@ -177,7 +177,7 @@ class GeminiEmbeddingAdapter(OpenAICompatibleEmbeddingAdapter):
             )
         if request.contents:
             raise ValueError(
-                "DeepTutor's Gemini embedding adapter currently supports text only; "
+                "yFeiSTAI's Gemini embedding adapter currently supports text only; "
                 "multimodal `contents` require a dedicated native content mapper."
             )
 
@@ -360,7 +360,7 @@ class GeminiEmbeddingAdapter(OpenAICompatibleEmbeddingAdapter):
             "dimensions": model_info["default"],
             "supported_dimensions": list(model_info["dimensions"]),
             "supports_variable_dimensions": True,
-            # The current DeepTutor content contract is text-only. Advertising
+            # The current yFeiSTAI content contract is text-only. Advertising
             # multimodal here would route images into an unsupported payload.
             "multimodal": False,
             "provider": "gemini",

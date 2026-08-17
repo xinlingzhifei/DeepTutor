@@ -55,7 +55,7 @@ SUPPORTED_MODES = ("local", "global", "drift", "basic")
 DEFAULT_MODE = "local"
 
 # GraphRAG's stock LiteLLM embedding client uses an OpenAI-style transport and
-# appends the ``/embeddings`` operation path to ``api_base``. DeepTutor stores a
+# appends the ``/embeddings`` operation path to ``api_base``. yFeiSTAI stores a
 # complete operation URL for these bindings, so only this explicitly compatible
 # set can be translated safely. Native Cohere, Ollama, DashScope, and Azure
 # transports require separate provider adapters and must not be guessed here.
@@ -106,9 +106,9 @@ def normalize_mode(mode: str | None) -> str:
 
 
 def graphrag_embedding_api_base(binding: str | None, endpoint: str | None) -> str:
-    """Translate a DeepTutor embedding endpoint into GraphRAG ``api_base``.
+    """Translate a yFeiSTAI embedding endpoint into GraphRAG ``api_base``.
 
-    DeepTutor's public embedding contract stores and calls the complete
+    yFeiSTAI's public embedding contract stores and calls the complete
     operation URL. GraphRAG's LiteLLM client expects the API root and appends
     ``/embeddings`` itself. Strip exactly one terminal path segment only for
     known OpenAI-compatible transports. Query-bearing URLs are left untouched
@@ -116,7 +116,7 @@ def graphrag_embedding_api_base(binding: str | None, endpoint: str | None) -> st
     query parameters are embedded in ``base_url``.
 
     Args:
-        binding: Active DeepTutor embedding binding.
+        binding: Active yFeiSTAI embedding binding.
         endpoint: Fully qualified endpoint saved in the model catalog.
 
     Returns:
@@ -149,7 +149,7 @@ def ensure_graphrag_embedding_transport(
     provider = canonical_embedding_provider_name(binding)
     if provider not in OPENAI_COMPATIBLE_EMBEDDING_BINDINGS:
         raise GraphRagEmbeddingProviderUnsupportedError()
-    # Gemini can use either DeepTutor's native ``batchEmbedContents`` adapter
+    # Gemini can use either yFeiSTAI's native ``batchEmbedContents`` adapter
     # or its legacy OpenAI-compatible endpoint. GraphRAG only supports the
     # latter; a provider name alone is no longer enough after Gemini 2 support.
     if provider == "gemini" and not urlsplit(str(endpoint or "")).path.rstrip("/").endswith(

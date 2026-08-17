@@ -165,7 +165,7 @@ deliberately need a local `main` commit may opt in once with
 `git config deeptutor.allowMainCommit true`, then remove the setting immediately
 afterward.
 
-Use a separate Git worktree for each feature (`git worktree add ../DeepTutor-<task>
+Use a separate Git worktree for each feature (`git worktree add ../yFeiSTAI-<task>
 -b <branch> dev`) and keep the primary checkout clean. This lets builds, tests,
 and long-running agents operate independently without rewriting one another's
 outputs. Before removing a worktree, commit or explicitly preserve its changes;

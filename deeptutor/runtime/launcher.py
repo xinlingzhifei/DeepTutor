@@ -1064,7 +1064,7 @@ def start(home: str | Path | None = None, *, dev: bool = False) -> None:
     common_env["PYTHONIOENCODING"] = "utf-8:replace"
     # Anchor for deeptutor.runtime.memory_probe: the backend and the frontend
     # are siblings under this process, so only the supervisor's pid identifies
-    # the tree that is "DeepTutor". Without it the probe can only measure the
+    # the tree that is "yFeiSTAI". Without it the probe can only measure the
     # backend itself.
     common_env[SUPERVISOR_PID_ENV] = str(os.getpid())
     _apply_single_user_allocator_env(common_env)
