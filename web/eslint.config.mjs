@@ -17,6 +17,7 @@ const config = [
     ignores: [
       "node_modules/**",
       ".next/**",
+      ".next-deeptutor/**",
       "out/**",
       "public/vendor/maic-importer/**",
     ],

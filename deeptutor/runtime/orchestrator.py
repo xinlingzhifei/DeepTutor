@@ -53,6 +53,14 @@ class ChatOrchestrator:
                 f"Unknown capability: {cap_name}. "
                 f"Available: {self._cap_registry.list_capabilities()}",
                 source="orchestrator",
+                metadata={"turn_terminal": True, "status": "failed"},
+            )
+            await bus.emit(
+                StreamEvent(
+                    type=StreamEventType.DONE,
+                    source="orchestrator",
+                    metadata={"status": "failed"},
+                )
             )
             await bus.close()
             async for event in bus.subscribe():
@@ -87,14 +95,24 @@ class ChatOrchestrator:
                     message = "The capability could not complete this request."
                     code = "capability_execution_failed"
                     terminal_status = "failed"
+                error_metadata: dict[str, Any] = {
+                    "code": code,
+                    "status": terminal_status,
+                    "turn_terminal": True,
+                }
+                error_code = getattr(exc, "error_code", None)
+                if isinstance(error_code, str) and error_code:
+                    error_metadata["error_code"] = error_code
+                retryable = getattr(exc, "retryable", None)
+                if isinstance(retryable, bool):
+                    error_metadata["retryable"] = retryable
+                partial_response = getattr(exc, "partial_response", None)
+                if isinstance(partial_response, bool):
+                    error_metadata["partial_response"] = partial_response
                 await bus.error(
                     message,
                     source=cap_name,
-                    metadata={
-                        "code": code,
-                        "status": terminal_status,
-                        "turn_terminal": True,
-                    },
+                    metadata=error_metadata,
                 )
             finally:
                 await bus.emit(

@@ -27,6 +27,7 @@ from deeptutor.services.llm import (
 )
 from deeptutor.services.llm import stream as llm_stream
 from deeptutor.services.prompt import get_prompt_manager
+from deeptutor.services.prompt.language import normalize_language
 
 
 class BaseAgent(ABC):
@@ -80,8 +81,7 @@ class BaseAgent(ABC):
         """
         self.module_name = module_name
         self.agent_name = agent_name
-        normalized_language = str(language or "").strip().lower().replace("_", "-")
-        self.language = "en" if normalized_language.startswith("en") else "zh"
+        self.language = normalize_language(language)
         self._trace_callback: BaseAgent.TraceCallback | None = None
         # Ensure config is always a dict (not a dataclass like LLMConfig)
         if config is None:

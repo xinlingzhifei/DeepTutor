@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any
 
 from deeptutor.knowledge.kb_types import (
+    IMA_KB_TYPE,
     LIGHTRAG_SERVER_KB_TYPE,
     SUBAGENT_KB_TYPE,
     external_root_of,
@@ -60,6 +61,7 @@ UNAVAILABLE_MISSING = "missing"
 # as non-enumerable instead.
 _NON_DOCUMENT_KB_TYPES: dict[str, str] = {
     LIGHTRAG_SERVER_KB_TYPE: UNAVAILABLE_REMOTE,
+    IMA_KB_TYPE: UNAVAILABLE_REMOTE,
     SUBAGENT_KB_TYPE: UNAVAILABLE_AGENT,
 }
 

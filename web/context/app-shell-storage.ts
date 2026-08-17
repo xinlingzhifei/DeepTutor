@@ -11,6 +11,7 @@ export type { AppLanguage };
 
 export const ACTIVE_SESSION_STORAGE_KEY = "deeptutor.activeSessionId.tab";
 export const LANGUAGE_STORAGE_KEY = "deeptutor-language";
+export const RESPONSE_LANGUAGE_STORAGE_KEY = "deeptutor-response-language";
 export const SIDEBAR_COLLAPSED_STORAGE_KEY = "deeptutor.sidebarCollapsed";
 export const CHAT_RESPONSE_TIMEOUT_STORAGE_KEY =
   "deeptutor.chatResponseTimeout";
@@ -63,8 +64,17 @@ export function writeStoredChatResponseTimeout(seconds: number): void {
 
 export const ACTIVE_SESSION_EVENT = "deeptutor:active-session";
 export const LANGUAGE_EVENT = "deeptutor:language";
+export const RESPONSE_LANGUAGE_EVENT = "deeptutor:response-language";
 export const SIDEBAR_COLLAPSED_EVENT = "deeptutor:sidebar-collapsed";
 export const CODE_BLOCK_SETTINGS_EVENT = "deeptutor:code-block-settings";
+
+export function resolveResponseLanguage(
+  value: string | null | undefined,
+  legacyLanguage: string | null | undefined = DEFAULT_APP_LANGUAGE,
+): AppLanguage {
+  if (value === "zh" || value === "en") return value;
+  return normalizeLanguage(legacyLanguage);
+}
 
 export function readStoredLanguage(): AppLanguage {
   if (typeof window === "undefined") return DEFAULT_APP_LANGUAGE;
@@ -75,12 +85,54 @@ export function readStoredLanguage(): AppLanguage {
   }
 }
 
+/** Whether this browser has ever recorded a choice.
+ *
+ * ``readStoredLanguage`` cannot answer this: it normalizes a missing value to
+ * the Chinese application default. The
+ * bootstrap needs the difference — it may only consult the server-side
+ * preference when the browser has no choice of its own to honour.
+ */
+export function hasStoredLanguage(): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    return window.localStorage.getItem(LANGUAGE_STORAGE_KEY) !== null;
+  } catch {
+    return false;
+  }
+}
+
 export function writeStoredLanguage(language: AppLanguage): void {
   if (typeof window === "undefined") return;
   try {
     window.localStorage.setItem(LANGUAGE_STORAGE_KEY, language);
     window.dispatchEvent(
       new CustomEvent(LANGUAGE_EVENT, {
+        detail: { language },
+      }),
+    );
+  } catch {
+    // localStorage may be unavailable
+  }
+}
+
+export function readStoredResponseLanguage(): AppLanguage {
+  if (typeof window === "undefined") return DEFAULT_APP_LANGUAGE;
+  try {
+    return resolveResponseLanguage(
+      window.localStorage.getItem(RESPONSE_LANGUAGE_STORAGE_KEY),
+      window.localStorage.getItem(LANGUAGE_STORAGE_KEY),
+    );
+  } catch {
+    return DEFAULT_APP_LANGUAGE;
+  }
+}
+
+export function writeStoredResponseLanguage(language: AppLanguage): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(RESPONSE_LANGUAGE_STORAGE_KEY, language);
+    window.dispatchEvent(
+      new CustomEvent(RESPONSE_LANGUAGE_EVENT, {
         detail: { language },
       }),
     );
