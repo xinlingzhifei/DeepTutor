@@ -1,0 +1,62 @@
+x-images:
+  openmaic: &openmaic-image "ghcr.io/xinlingzhifei/openmaic:0.3.1-0cf2a330@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  openmaic-render: &openmaic-render-image "ghcr.io/xinlingzhifei/openmaic-render:0.3.1-0cf2a330@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+
+services:
+  openmaic:
+    image: *openmaic-image
+    restart: unless-stopped
+    environment:
+      YFEISTAI_OPENMAIC_STATE_ROOT: /tmp/yfeistai-openmaic-state
+      YFEISTAI_OPENMAIC_ARTIFACT_ROOT: /tmp/yfeistai-openmaic-artifacts
+      YFEISTAI_OPENMAIC_RENDER_ENDPOINT: http://openmaic-render:9000
+      YFEISTAI_DATA_PLANE_ID: "${YFEISTAI_DATA_PLANE_ID:?set data-plane id}"
+    secrets:
+      - openmaic_service_secret
+    volumes:
+      - openmaic-data:/tmp
+    networks:
+      - tenant-data-plane
+      - tenant-provider-egress
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://localhost:3000/api/yfeistai/v1/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 15s
+      timeout: 5s
+      retries: 12
+
+  openmaic-render:
+    image: *openmaic-render-image
+    restart: unless-stopped
+    profiles:
+      - mp4-export
+    cap_add:
+      - NET_ADMIN
+    networks:
+      - tenant-data-plane
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://localhost:9000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 15s
+      timeout: 5s
+      retries: 12
+
+networks:
+  tenant-data-plane:
+    driver: bridge
+    internal: true
+  tenant-provider-egress:
+    driver: bridge
+
+volumes:
+  openmaic-data:
+
+secrets:
+  openmaic_service_secret:
+    file: "${YFEISTAI_DATA_PLANE_SECRET_DIR:?set data-plane secret directory}/openmaic_service_secret"

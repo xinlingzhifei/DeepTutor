@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
+import pytest
 import yaml
 
 from deeptutor.services.config import PlatformSettings
@@ -66,6 +69,363 @@ def test_render_docker_env_uses_defaults_for_missing_or_invalid_json(tmp_path: P
     assert values["DEEPTUTOR_DOCKER_POCKETBASE_PORT"] == "8090"
 
 
+def test_render_docker_env_adds_only_non_sensitive_platform_values(
+    tmp_path: Path,
+) -> None:
+    module = _load_module()
+    settings_dir = tmp_path / "settings"
+    settings_dir.mkdir()
+    sensitive_database_url = "postgresql+asyncpg://platform:do-not-render@postgres/yfeistai"
+    (settings_dir / "platform.json").write_text(
+        json.dumps(
+            {
+                "enabled": True,
+                "database_url": sensitive_database_url,
+                "database_host": "postgres",
+                "database_port": 5432,
+                "database_name": "yfeistai",
+                "database_user": "yfeistai_app",
+                "database_password_file": "/run/secrets/platform_database_password",
+                "object_store_mode": "s3",
+                "object_store_endpoint": "http://minio:9000",
+                "object_store_bucket": "yfeistai-classrooms",
+                "object_store_region": "us-east-1",
+                "shared_generation_limit": 20,
+                "default_tenant_generation_limit": 2,
+            }
+        ),
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "docker.env"
+
+    values = module.render_docker_env(settings_dir, output_path)
+
+    assert values["YFEISTAI_PLATFORM_DATABASE_HOST"] == "postgres"
+    assert values["YFEISTAI_PLATFORM_DATABASE_NAME"] == "yfeistai"
+    assert values["YFEISTAI_PLATFORM_DATABASE_USER"] == "yfeistai_app"
+    assert values["YFEISTAI_OBJECT_STORE_ENDPOINT"] == "http://minio:9000"
+    assert values["YFEISTAI_SHARED_GENERATION_LIMIT"] == "20"
+    saved = output_path.read_text(encoding="utf-8")
+    assert sensitive_database_url not in saved
+    assert "do-not-render" not in saved
+    assert "database_password_file" not in saved
+
+
+def test_render_docker_env_rejects_platform_newline_injection(tmp_path: Path) -> None:
+    module = _load_module()
+    settings_dir = tmp_path / "settings"
+    settings_dir.mkdir()
+    (settings_dir / "platform.json").write_text(
+        json.dumps(
+            {
+                "enabled": True,
+                "database_host": "postgres\nEXPOSE_SECRET=value",
+            }
+        ),
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "docker.env"
+
+    with pytest.raises(ValueError, match="platform compose setting"):
+        module.render_docker_env(settings_dir, output_path)
+    assert not output_path.exists()
+
+
+def test_render_docker_env_rejects_credentials_inside_endpoint(tmp_path: Path) -> None:
+    module = _load_module()
+    settings_dir = tmp_path / "settings"
+    settings_dir.mkdir()
+    (settings_dir / "platform.json").write_text(
+        json.dumps(
+            {
+                "enabled": True,
+                "object_store_endpoint": "http://access:do-not-render@minio:9000",
+            }
+        ),
+        encoding="utf-8",
+    )
+    output_path = tmp_path / "docker.env"
+
+    with pytest.raises(ValueError, match="object_store_endpoint"):
+        module.render_docker_env(settings_dir, output_path)
+    assert not output_path.exists()
+
+
+def test_compose_command_selects_platform_or_isolated_data_plane(monkeypatch) -> None:
+    module = _load_module()
+    monkeypatch.setattr(module.shutil, "which", lambda executable: "docker.exe")
+
+    platform = module._compose_command(["--platform", "up", "-d"])
+    assert platform[-6:] == [
+        "-f",
+        str(module.PROJECT_ROOT / "docker-compose.yml"),
+        "-f",
+        str(module.PROJECT_ROOT / "docker-compose.platform.yml"),
+        "up",
+        "-d",
+    ]
+
+    data_plane = module._compose_command(["--data-plane", "tenant-acme", "up", "-d"])
+    assert data_plane[-6:] == [
+        "--project-name",
+        "yfeistai-tenant-acme",
+        "-f",
+        str(module.PROJECT_ROOT / "docker-compose.data-plane.yml"),
+        "up",
+        "-d",
+    ]
+
+    data_plane_with_render = module._compose_command(
+        [
+            "--data-plane",
+            "tenant-acme",
+            "--profile",
+            "mp4-export",
+            "up",
+            "-d",
+        ]
+    )
+    assert data_plane_with_render[-4:] == [
+        "--profile",
+        "mp4-export",
+        "up",
+        "-d",
+    ]
+
+
+def test_data_plane_env_uses_a_hashed_dedicated_secret_directory(tmp_path: Path) -> None:
+    module = _load_module()
+    settings_dir = tmp_path / "settings"
+    settings_dir.mkdir()
+    output_path = tmp_path / "docker.env"
+
+    values = module.render_docker_env(
+        settings_dir,
+        output_path,
+        data_plane="tenant-acme",
+    )
+
+    tenant_hash = hashlib.sha256(b"tenant-acme").hexdigest()[:16]
+    assert values["YFEISTAI_DATA_PLANE_ID"] == "tenant-acme"
+    assert values["YFEISTAI_DATA_PLANE_SECRET_DIR"] == (
+        f"./data/system/secrets/data-planes/tenant_{tenant_hash}"
+    )
+
+
+def test_compose_command_rejects_ambiguous_or_unsafe_topology(monkeypatch) -> None:
+    module = _load_module()
+    monkeypatch.setattr(module.shutil, "which", lambda executable: "docker.exe")
+
+    for arguments in (
+        ["--platform", "--data-plane", "tenant-acme", "up"],
+        ["--data-plane", "../tenant-acme", "up"],
+        ["--data-plane", "Tenant_Acme", "up"],
+    ):
+        try:
+            module._compose_command(arguments)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError(f"unsafe compose arguments were accepted: {arguments}")
+
+
+def _isolate_production_wrapper_subprocess(module, monkeypatch):
+    subprocess_calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def record_subprocess(command: list[str], **kwargs) -> SimpleNamespace:
+        subprocess_calls.append((command, kwargs))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(module, "_validate_production_image_lock", lambda: None)
+    monkeypatch.setattr(
+        module,
+        "render_docker_env",
+        lambda **_kwargs: {
+            "DEEPTUTOR_DOCKER_BACKEND_PORT": "8001",
+            "DEEPTUTOR_DOCKER_FRONTEND_PORT": "3782",
+            "DEEPTUTOR_DOCKER_POCKETBASE_PORT": "8090",
+        },
+    )
+    monkeypatch.setattr(module.shutil, "which", lambda executable: "docker.exe")
+    monkeypatch.setattr(module.subprocess, "run", record_subprocess)
+    return subprocess_calls
+
+
+@pytest.mark.parametrize(
+    "topology_arguments",
+    [
+        pytest.param(["--platform"], id="platform"),
+        pytest.param(["--data-plane", "tenant-acme"], id="data-plane"),
+    ],
+)
+def test_production_wrapper_rejects_user_topology_overrides_before_subprocess(
+    topology_arguments: list[str],
+    monkeypatch,
+) -> None:
+    module = _load_module()
+    subprocess_calls = _isolate_production_wrapper_subprocess(module, monkeypatch)
+    cases = (
+        ("file-short-separated", ["-f", "compose.extra.yml", "config"]),
+        ("file-short-equals", ["-f=compose.extra.yml", "config"]),
+        ("file-short-attached", ["-fcompose.extra.yml", "config"]),
+        ("file-long-separated", ["--file", "compose.extra.yml", "config"]),
+        ("file-long-equals", ["--file=compose.extra.yml", "config"]),
+        ("env-file-separated", ["--env-file", "compose.env", "config"]),
+        ("env-file-equals", ["--env-file=compose.env", "config"]),
+        (
+            "project-directory-separated",
+            ["--project-directory", "alternate-root", "config"],
+        ),
+        (
+            "project-directory-equals",
+            ["--project-directory=alternate-root", "config"],
+        ),
+        ("project-name-short-separated", ["-p", "alternate", "config"]),
+        ("project-name-short-equals", ["-p=alternate", "config"]),
+        ("project-name-short-attached", ["-palternate", "config"]),
+        (
+            "project-name-long-separated",
+            ["--project-name", "alternate", "config"],
+        ),
+        ("project-name-long-equals", ["--project-name=alternate", "config"]),
+    )
+    accepted: list[str] = []
+    reached_subprocess: list[str] = []
+
+    for case_name, compose_arguments in cases:
+        calls_before = len(subprocess_calls)
+        try:
+            module.main([*topology_arguments, *compose_arguments])
+        except SystemExit:
+            pass
+        else:
+            accepted.append(case_name)
+        if len(subprocess_calls) != calls_before:
+            reached_subprocess.append(case_name)
+
+    assert accepted == []
+    assert reached_subprocess == []
+
+
+def test_platform_wrapper_rejects_all_profiles_before_subprocess(monkeypatch) -> None:
+    module = _load_module()
+    subprocess_calls = _isolate_production_wrapper_subprocess(module, monkeypatch)
+    cases = (
+        ("legacy-local-separated", ["--profile", "legacy-local", "config"]),
+        ("local-sandbox-equals", ["--profile=local-sandbox", "config"]),
+        ("mp4-export-separated", ["--profile", "mp4-export", "config"]),
+        ("arbitrary-equals", ["--profile=arbitrary", "config"]),
+        ("wildcard-separated", ["--profile", "*", "config"]),
+        ("wildcard-equals", ["--profile=*", "config"]),
+    )
+    accepted: list[str] = []
+    reached_subprocess: list[str] = []
+
+    for case_name, compose_arguments in cases:
+        calls_before = len(subprocess_calls)
+        try:
+            module.main(["--platform", *compose_arguments])
+        except SystemExit:
+            pass
+        else:
+            accepted.append(case_name)
+        if len(subprocess_calls) != calls_before:
+            reached_subprocess.append(case_name)
+
+    assert accepted == []
+    assert reached_subprocess == []
+
+
+def test_data_plane_wrapper_rejects_profiles_other_than_mp4_export_before_subprocess(
+    monkeypatch,
+) -> None:
+    module = _load_module()
+    subprocess_calls = _isolate_production_wrapper_subprocess(module, monkeypatch)
+    cases = (
+        ("legacy-local-separated", ["--profile", "legacy-local", "config"]),
+        ("local-sandbox-equals", ["--profile=local-sandbox", "config"]),
+        ("wildcard-separated", ["--profile", "*", "config"]),
+        ("wildcard-equals", ["--profile=*", "config"]),
+        (
+            "allowed-then-wildcard",
+            ["--profile", "mp4-export", "--profile", "*", "config"],
+        ),
+    )
+    accepted: list[str] = []
+    reached_subprocess: list[str] = []
+
+    for case_name, compose_arguments in cases:
+        calls_before = len(subprocess_calls)
+        try:
+            module.main(["--data-plane", "tenant-acme", *compose_arguments])
+        except SystemExit:
+            pass
+        else:
+            accepted.append(case_name)
+        if len(subprocess_calls) != calls_before:
+            reached_subprocess.append(case_name)
+
+    assert accepted == []
+    assert reached_subprocess == []
+
+
+def test_platform_wrapper_removes_host_compose_topology_environment(
+    monkeypatch,
+) -> None:
+    module = _load_module()
+    subprocess_calls = _isolate_production_wrapper_subprocess(module, monkeypatch)
+    monkeypatch.setenv("COMPOSE_PROFILES", "legacy-local,local-sandbox")
+    monkeypatch.setenv("COMPOSE_FILE", "compose.extra.yml")
+
+    assert module.main(["--platform", "config"]) == 0
+
+    assert len(subprocess_calls) == 1
+    command, options = subprocess_calls[0]
+    assert command[-5:] == [
+        "-f",
+        str(module.PROJECT_ROOT / "docker-compose.yml"),
+        "-f",
+        str(module.PROJECT_ROOT / "docker-compose.platform.yml"),
+        "config",
+    ]
+    assert "COMPOSE_PROFILES" not in options["env"]
+    assert "COMPOSE_FILE" not in options["env"]
+
+
+def test_data_plane_wrapper_allows_only_mp4_export_and_removes_host_topology_environment(
+    monkeypatch,
+) -> None:
+    module = _load_module()
+    subprocess_calls = _isolate_production_wrapper_subprocess(module, monkeypatch)
+    monkeypatch.setenv("COMPOSE_PROFILES", "*")
+    monkeypatch.setenv("COMPOSE_FILE", "compose.extra.yml")
+
+    assert (
+        module.main(
+            [
+                "--data-plane",
+                "tenant-acme",
+                "--profile",
+                "mp4-export",
+                "config",
+            ]
+        )
+        == 0
+    )
+
+    assert len(subprocess_calls) == 1
+    command, options = subprocess_calls[0]
+    assert command[-5:] == [
+        "-f",
+        str(module.PROJECT_ROOT / "docker-compose.data-plane.yml"),
+        "--profile",
+        "mp4-export",
+        "config",
+    ]
+    assert "COMPOSE_PROFILES" not in options["env"]
+    assert "COMPOSE_FILE" not in options["env"]
+
+
 def test_compose_files_do_not_consume_legacy_env_names() -> None:
     root = Path(__file__).resolve().parents[2]
     for name in ("docker-compose.yml", "docker-compose.ghcr.yml"):
@@ -75,6 +435,97 @@ def test_compose_files_do_not_consume_legacy_env_names() -> None:
         assert "\n      - BACKEND_PORT" not in content
         assert "\n      - AUTH_ENABLED" not in content
         assert "DEEPTUTOR_DOCKER_BACKEND_PORT" in content
+
+
+def test_platform_wrapper_rejects_invalid_image_lock_before_subprocess(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = _load_module()
+    root = Path(__file__).resolve().parents[2]
+    source_lock = json.loads((root / "deploy" / "image-lock.json").read_text(encoding="utf-8"))
+    subprocess_calls: list[list[str]] = []
+    outcomes: dict[str, str | None] = {}
+
+    def record_subprocess(command: list[str], **_kwargs) -> SimpleNamespace:
+        subprocess_calls.append(command)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(module.shutil, "which", lambda executable: "docker.exe")
+    monkeypatch.setattr(module.subprocess, "run", record_subprocess)
+
+    for scenario in ("zero-digest", "compose-drift"):
+        case_root = tmp_path / scenario
+        settings_dir = case_root / "data" / "user" / "settings"
+        settings_dir.mkdir(parents=True)
+        deploy_dir = case_root / "deploy"
+        deploy_dir.mkdir()
+
+        lock = json.loads(json.dumps(source_lock))
+        replacements: dict[str, str] = {}
+        for index, record in enumerate(lock["images"].values(), start=1):
+            previous = record["reference"]
+            digest = "sha256:" + f"{index:064x}"
+            record["digest"] = digest
+            record["reference"] = f"{record['repository']}:{record['tag']}@{digest}"
+            replacements[previous] = record["reference"]
+
+        if scenario == "zero-digest":
+            record = lock["images"]["deeptutor"]
+            zero_digest = "sha256:" + ("0" * 64)
+            record["digest"] = zero_digest
+            record["reference"] = f"{record['repository']}:{record['tag']}@{zero_digest}"
+            replacements[source_lock["images"]["deeptutor"]["reference"]] = record["reference"]
+
+        compose_paths = (
+            case_root / "docker-compose.platform.yml",
+            case_root / "docker-compose.data-plane.yml",
+        )
+        for source_name, destination in zip(
+            ("docker-compose.platform.yml", "docker-compose.data-plane.yml"),
+            compose_paths,
+            strict=True,
+        ):
+            rendered = (root / source_name).read_text(encoding="utf-8")
+            for previous, replacement in replacements.items():
+                rendered = rendered.replace(previous, replacement)
+            destination.write_text(rendered, encoding="utf-8")
+
+        if scenario == "compose-drift":
+            record = lock["images"]["deeptutor"]
+            drifted = record["reference"].replace(
+                record["digest"],
+                "sha256:" + ("f" * 64),
+            )
+            compose_paths[0].write_text(
+                compose_paths[0].read_text(encoding="utf-8").replace(record["reference"], drifted),
+                encoding="utf-8",
+            )
+
+        (deploy_dir / "image-lock.json").write_text(
+            json.dumps(lock),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(module, "PROJECT_ROOT", case_root)
+        monkeypatch.setattr(module, "SETTINGS_DIR", settings_dir)
+        monkeypatch.setattr(
+            module,
+            "DOCKER_ENV_PATH",
+            settings_dir / "docker.env",
+        )
+
+        try:
+            module.main(["--platform", "config"])
+        except ValueError as exc:
+            outcomes[scenario] = str(exc)
+        else:
+            outcomes[scenario] = None
+
+    assert subprocess_calls == []
+    assert outcomes == {
+        "zero-digest": "image lock entry is invalid for deeptutor",
+        "compose-drift": "production Compose image references do not match image lock",
+    }
 
 
 def test_dockerfile_is_json_driven_without_bundle_sed() -> None:
@@ -93,6 +544,62 @@ def test_dockerfile_is_json_driven_without_bundle_sed() -> None:
     assert "DEEPTUTOR_IGNORE_PROCESS_ENV_OVERRIDES=1" in content
     assert 'unset "$key"' in content
     assert "export_runtime_settings_to_env" in content
+
+
+def test_production_dockerfile_can_use_ephemeral_signed_debian_sources() -> None:
+    root = Path(__file__).resolve().parents[2]
+    content = (root / "Dockerfile").read_text(encoding="utf-8")
+    mount = (
+        "--mount=type=secret,id=debian_sources,"
+        "target=/etc/apt/sources.list.d/debian.sources,required=false"
+    )
+
+    assert content.count(f"RUN {mount} \\") == 2
+
+
+def test_production_dockerfile_installs_rust_from_the_signed_debian_source() -> None:
+    root = Path(__file__).resolve().parents[2]
+    content = (root / "Dockerfile").read_text(encoding="utf-8")
+    python_base = content.split("FROM python:3.11-slim AS python-base", 1)[1].split(
+        "FROM python:3.11-slim AS production", 1
+    )[0]
+
+    assert "    rustc \\\n" in python_base
+    assert "    cargo \\\n" in python_base
+    assert "sh.rustup.rs" not in python_base
+
+
+def test_production_dockerfile_accepts_ephemeral_pip_configuration() -> None:
+    root = Path(__file__).resolve().parents[2]
+    content = (root / "Dockerfile").read_text(encoding="utf-8")
+    python_base = content.split("FROM python:3.11-slim AS python-base", 1)[1].split(
+        "FROM python:3.11-slim AS production", 1
+    )[0]
+    mount = "--mount=type=secret,id=pip_config,target=/etc/pip.conf,required=false"
+
+    assert f"RUN {mount} \\\n" in python_base
+    assert "pip install --upgrade pip" not in python_base
+
+
+def test_production_dockerfile_reuses_pip_downloads_after_interruption() -> None:
+    root = Path(__file__).resolve().parents[2]
+    content = (root / "Dockerfile").read_text(encoding="utf-8")
+    python_base = content.split("FROM python:3.11-slim AS python-base", 1)[1].split(
+        "FROM python:3.11-slim AS production", 1
+    )[0]
+
+    assert "--mount=type=cache,target=/root/.cache/pip,sharing=locked" in python_base
+    assert "PIP_NO_CACHE_DIR=1" not in python_base
+
+
+def test_production_dockerfile_skips_build_time_python_bytecode() -> None:
+    root = Path(__file__).resolve().parents[2]
+    content = (root / "Dockerfile").read_text(encoding="utf-8")
+    python_base = content.split("FROM python:3.11-slim AS python-base", 1)[1].split(
+        "FROM python:3.11-slim AS production", 1
+    )[0]
+
+    assert "python -m pip install --no-compile -r requirements.txt" in python_base
 
 
 def test_supervisord_runs_as_root_with_unprivileged_children() -> None:

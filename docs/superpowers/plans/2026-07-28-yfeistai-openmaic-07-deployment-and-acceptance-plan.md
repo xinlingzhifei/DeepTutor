@@ -14,6 +14,8 @@
 
 **Files:**
 
+- Modify: `Dockerfile`
+- Create: `.github/workflows/private-platform-images.yml`
 - Create: `docker-compose.platform.yml`
 - Create: `docker-compose.data-plane.yml`
 - Create: `deploy/image-lock.json`
@@ -22,6 +24,7 @@
 - Create: `tests/scripts/test_platform_compose.py`
 - Modify: `scripts/docker_compose.py`
 - Modify: `tests/scripts/test_docker_compose.py`
+- Modify: `docs/superpowers/plans/2026-07-28-yfeistai-openmaic-07-deployment-and-acceptance-plan.md`
 
 - [ ] Step 1: 写网络暴露和服务依赖失败测试
 
@@ -81,7 +84,7 @@ teaching-reaper
 learning-projector
 ```
 
-`deeptutor` 与以上服务合并到同一内部网络。`gateway` 是唯一具有主机端口的服务；平台覆盖文件使用 Docker Compose v2.24.4+ 的 `!reset []` 清除基础 Compose 中 `deeptutor` 和 `pocketbase` 的端口，测试必须检查两份文件合并后的配置而不是只解析覆盖文件。`tenant-provisioner` 是唯一同时拥有数据库迁移权限、租户 Secret 写目录和 MinIO bootstrap 凭据的内部进程；API 与普通 Worker 没有该权限。OpenMAIC 镜像由 `integrations/openmaic/Dockerfile` 构建为 `yfeistai/openmaic:0.3.1-0cf2a330`；`openmaic-render` 从同一锁版源码的 `render-service` 构建，只在私网接收 MP4 导出。共享生成 Worker 初始并发 20；MP4 导出使用独立 Worker/槽位；数据库槽位仍是最终并发约束。
+`deeptutor` 与以上服务合并到同一内部网络。`gateway` 是唯一具有主机端口的服务；平台覆盖文件使用 Docker Compose v2.24.4+ 的 `!reset []` 清除基础 Compose 中 `deeptutor` 和 `pocketbase` 的端口，测试必须检查两份文件合并后的配置而不是只解析覆盖文件。`tenant-provisioner` 是唯一同时拥有数据库迁移权限、租户 Secret 写目录和 MinIO bootstrap 凭据的内部进程；API 与普通 Worker 没有该权限。OpenMAIC 镜像由 `integrations/openmaic/Dockerfile` 构建为 `ghcr.io/xinlingzhifei/openmaic:0.3.1-0cf2a330`；`openmaic-render` 从同一锁版源码的 `render-service` 构建并发布为 `ghcr.io/xinlingzhifei/openmaic-render:0.3.1-0cf2a330`，只在私网接收 MP4 导出；平台应用镜像发布为 `ghcr.io/xinlingzhifei/deeptutor:first-release`。共享生成 Worker 初始并发 20；MP4 导出使用独立 Worker/槽位；数据库槽位仍是最终并发约束。
 
 - [ ] Step 4: 增加独立数据面模板
 
@@ -98,15 +101,24 @@ python scripts/docker_compose.py --data-plane tenant-acme up -d
 
 包装器从 `data/user/settings/platform.json` 渲染非敏感参数，从 Docker Secret 文件读取敏感值。不得把密钥写入 `docker.env`。
 
+选择 `--platform` 或 `--data-plane` 后，包装器必须 fail-closed：拒绝调用方追加
+`-f/--file`、`--env-file`、`--project-directory` 或 `-p/--project-name`
+来改变受审计拓扑；平台模式拒绝所有 profile，独立数据面只允许显式
+`mp4-export`。传给 Docker Compose 的环境必须移除宿主 `COMPOSE_FILE` 和
+`COMPOSE_PROFILES`，防止启用基础 Compose 的本地源码构建、浮动镜像或覆盖
+专属数据面 project。
+
 - [ ] Step 6: 锁定镜像摘要
 
-构建后运行：
+专用 CI workflow 以固定的 yFeiSTAI 提交和 OpenMAIC 提交构建并推送三张自定义镜像；三张镜像全部推送成功后运行：
 
 ```powershell
 python scripts/render_platform_compose.py --write-image-lock
 ```
 
 `deploy/image-lock.json` 记录 yFeiSTAI、OpenMAIC、OpenMAIC Render、Nginx、PostgreSQL 和 MinIO 的仓库、标签及实际内容摘要。生产渲染只接受带摘要的镜像。
+远端摘要解析使用 `docker buildx imagetools inspect --raw` 返回的原始 manifest
+字节计算 SHA-256；不得假设 manifest JSON 自带其自身摘要，也不得依赖本地镜像缓存。
 
 - [ ] Step 7: 运行测试
 
@@ -122,7 +134,7 @@ Expected: PASS。
 - [ ] Step 8: 提交
 
 ```powershell
-git add docker-compose.platform.yml docker-compose.data-plane.yml deploy/image-lock.json deploy/platform.example.json scripts/render_platform_compose.py scripts/docker_compose.py tests/scripts/test_platform_compose.py tests/scripts/test_docker_compose.py
+git add Dockerfile .github/workflows/private-platform-images.yml docker-compose.platform.yml docker-compose.data-plane.yml deploy/image-lock.json deploy/platform.example.json scripts/render_platform_compose.py scripts/docker_compose.py tests/scripts/test_platform_compose.py tests/scripts/test_docker_compose.py docs/superpowers/plans/2026-07-28-yfeistai-openmaic-07-deployment-and-acceptance-plan.md
 git commit -m "feat(deploy): add private teaching platform topology"
 ```
 
@@ -168,6 +180,11 @@ async def test_provisioned_tenant_credentials_are_prefix_scoped(minio):
     assert tenant_a.secret_ref != tenant_b.secret_ref
 ```
 
+同一 RED 还必须覆盖 `python -m deeptutor.teaching.processes tenant-provisioner`
+的运行时装配：当平台对象存储为 S3/MinIO 时，进程必须注入可用的租户存储
+管理适配器，并明确拒绝落入 `UnavailableS3TenantStorageAdmin`；仅验证 Compose
+进程名不算完成。
+
 - [ ] Step 2: 运行并确认失败
 
 Run:
@@ -184,13 +201,15 @@ Expected: FAIL。
 
 ```text
 platform_database_password
+platform_database_app_password
+platform_database_migration_password
 minio_bootstrap_access_key
 minio_bootstrap_secret_key
 classroom_ticket_secret
 openmaic_service_secret
 ```
 
-采用安全随机值、原子落盘和仅服务账户可读权限；已存在文件不覆盖，内容不打印。MinIO bootstrap 凭据只挂载到 `minio`、`minio-bootstrap` 和一次性租户存储 provisioner，不挂载到 `deeptutor`、Worker 或 OpenMAIC。
+采用安全随机值、原子落盘和仅服务账户可读权限；已存在文件不覆盖，内容不打印。`platform_database_password` 仅用于首次 PostgreSQL 管理与角色初始化；角色初始化创建独立的应用角色和迁移角色，并分别读取 `platform_database_app_password` 与 `platform_database_migration_password`，普通 API 不获得管理或迁移凭据。MinIO bootstrap 凭据只挂载到 `minio`、`minio-bootstrap` 和一次性租户存储 provisioner，不挂载到 `deeptutor`、Worker 或 OpenMAIC。
 
 TLS 的 `gateway_fullchain_pem` 与 `gateway_private_key_pem` 由部署方或证书自动化系统提供，初始化脚本不得生成自签名证书冒充生产证书。Compose 以只读 Secret 挂载，Preflight 校验证书域名、密钥匹配和剩余有效期至少 14 天。
 

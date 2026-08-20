@@ -1,0 +1,18 @@
+{
+  "enabled": true,
+  "database_host": "postgres",
+  "database_port": 5432,
+  "database_name": "yfeistai",
+  "database_user": "yfeistai_app",
+  "database_password_file": "/run/secrets/platform_database_app_password",
+  "object_store_mode": "s3",
+  "object_store_endpoint": "http://minio:9000",
+  "object_store_bucket": "yfeistai-classrooms",
+  "object_store_region": "us-east-1",
+  "object_store_tenant_credentials_dir": "/run/yfeistai/tenant-secrets",
+  "object_store_public_download_origins": [],
+  "classroom_ticket_secret_file": "/run/secrets/classroom_ticket_secret",
+  "openmaic_service_secret_file": "/run/secrets/openmaic_service_secret",
+  "shared_generation_limit": 20,
+  "default_tenant_generation_limit": 2
+}

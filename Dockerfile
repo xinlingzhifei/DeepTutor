@@ -67,7 +67,6 @@ FROM python:3.11-slim AS python-base
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONIOENCODING=utf-8 \
-    PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
 WORKDIR /app
@@ -75,7 +74,8 @@ WORKDIR /app
 # Install system dependencies
 # Note: libgl1 and libglib2.0-0 are required for OpenCV (used by mineru)
 # Rust is required for building tiktoken and other packages without pre-built wheels
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN --mount=type=secret,id=debian_sources,target=/etc/apt/sources.list.d/debian.sources,required=false \
+    apt-get update && apt-get install -y --no-install-recommends \
     curl \
     git \
     build-essential \
@@ -86,17 +86,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxrender1 \
     pkg-config \
     libssl-dev \
-    && rm -rf /var/lib/apt/lists/* \
-    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-
-# Add Rust to PATH
-ENV PATH="/root/.cargo/bin:${PATH}"
+    rustc \
+    cargo \
+    && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements and install Python dependencies
 COPY requirements/ ./requirements/
 COPY requirements.txt ./
-RUN pip install --upgrade pip && \
-    pip install -r requirements.txt
+RUN --mount=type=secret,id=pip_config,target=/etc/pip.conf,required=false \
+    --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    python -m pip install --no-compile -r requirements.txt
 
 # ============================================
 # Stage 3: Production Image
@@ -126,7 +125,8 @@ WORKDIR /app
 
 # Install system dependencies
 # Note: libgl1 and libglib2.0-0 are required for OpenCV (used by mineru)
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN --mount=type=secret,id=debian_sources,target=/etc/apt/sources.list.d/debian.sources,required=false \
+    apt-get update && apt-get install -y --no-install-recommends \
     curl \
     ca-certificates \
     bash \

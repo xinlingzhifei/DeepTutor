@@ -1,0 +1,57 @@
+{
+  "schemaVersion": 1,
+  "images": {
+    "deeptutor": {
+      "repository": "ghcr.io/xinlingzhifei/deeptutor",
+      "tag": "first-release",
+      "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "reference": "ghcr.io/xinlingzhifei/deeptutor:first-release@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "openmaic": {
+      "repository": "ghcr.io/xinlingzhifei/openmaic",
+      "tag": "0.3.1-0cf2a330",
+      "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "reference": "ghcr.io/xinlingzhifei/openmaic:0.3.1-0cf2a330@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "source": {
+        "repository": "https://github.com/xinlingzhifei/OpenMAIC.git",
+        "revision": "0cf2a330411681190e89f48e20f305345ff99f87",
+        "dockerfile": "integrations/openmaic/Dockerfile"
+      }
+    },
+    "openmaic_render": {
+      "repository": "ghcr.io/xinlingzhifei/openmaic-render",
+      "tag": "0.3.1-0cf2a330",
+      "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "reference": "ghcr.io/xinlingzhifei/openmaic-render:0.3.1-0cf2a330@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "source": {
+        "repository": "https://github.com/xinlingzhifei/OpenMAIC.git",
+        "revision": "0cf2a330411681190e89f48e20f305345ff99f87",
+        "dockerfile": "render-service/Dockerfile"
+      }
+    },
+    "nginx": {
+      "repository": "nginx",
+      "tag": "1.29.8-alpine3.23",
+      "digest": "sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de",
+      "reference": "nginx:1.29.8-alpine3.23@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de"
+    },
+    "postgres": {
+      "repository": "postgres",
+      "tag": "16.14-alpine3.24",
+      "digest": "sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777",
+      "reference": "postgres:16.14-alpine3.24@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777"
+    },
+    "minio": {
+      "repository": "minio/minio",
+      "tag": "RELEASE.2025-04-22T22-12-26Z",
+      "digest": "sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e",
+      "reference": "minio/minio:RELEASE.2025-04-22T22-12-26Z@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e"
+    },
+    "minio_client": {
+      "repository": "minio/mc",
+      "tag": "RELEASE.2025-04-16T18-13-26Z",
+      "digest": "sha256:aead63c77f9db9107f1696fb08ecb0faeda23729cde94b0f663edf4fe09728e3",
+      "reference": "minio/mc:RELEASE.2025-04-16T18-13-26Z@sha256:aead63c77f9db9107f1696fb08ecb0faeda23729cde94b0f663edf4fe09728e3"
+    }
+  }
+}
