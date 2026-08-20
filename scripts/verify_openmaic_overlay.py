@@ -74,6 +74,8 @@ TASK6_SOURCE_FILES = {
     Path("app/api/yfeistai/v1/export-inputs/[jobId]/commit/route.ts"),
     Path("app/api/yfeistai/v1/export-inputs/[jobId]/files/[fileId]/route.ts"),
     Path("lib/yfeistai/artifact-manifest.ts"),
+    Path("lib/yfeistai/content-generation.ts"),
+    Path("lib/yfeistai/export-generation.ts"),
     Path("lib/yfeistai/export-input-staging.ts"),
     Path("lib/yfeistai/service-auth.ts"),
     Path("lib/yfeistai/service-boundary.ts"),

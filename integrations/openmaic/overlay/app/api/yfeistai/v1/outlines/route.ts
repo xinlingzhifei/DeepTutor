@@ -90,6 +90,7 @@ const postOutline = createOutlinePostHandler({
       );
       return result.text;
     };
+    const researchContext = await resolveResearchContext(request);
     const generated = await runOutlineRouteAdapter({
       callProvider: aiCall,
       generate: (trackedProviderCall) =>
@@ -103,7 +104,7 @@ const postOutline = createOutlinePostHandler({
               request.teachingBrief.mediaPolicy.allowGeneration,
             videoGenerationEnabled:
               request.teachingBrief.mediaPolicy.allowGeneration,
-            researchContext: await resolveResearchContext(request),
+            researchContext,
           },
         ),
     });

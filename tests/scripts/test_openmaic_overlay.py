@@ -254,6 +254,19 @@ def test_outline_contract_hash_matches_the_frozen_json_schema() -> None:
     verifier.verify_outline_contract_hash(source)
 
 
+def test_outline_route_resolves_research_before_sync_generation_callback() -> None:
+    source = (
+        INTEGRATION_ROOT / "overlay" / "app" / "api" / "yfeistai" / "v1" / "outlines" / "route.ts"
+    ).read_text(encoding="utf-8")
+
+    resolved = "const researchContext = await resolveResearchContext(request);"
+    adapter = "const generated = await runOutlineRouteAdapter({"
+    assert resolved in source
+    assert source.index(resolved) < source.index(adapter)
+    assert "researchContext: await resolveResearchContext(request)" not in source
+    assert "researchContext," in source[source.index(adapter) :]
+
+
 def test_outline_contract_hash_verifier_rejects_a_handwritten_mismatch() -> None:
     verifier = _load_verifier()
     source = (
