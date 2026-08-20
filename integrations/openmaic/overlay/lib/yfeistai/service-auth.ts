@@ -17,6 +17,8 @@ export interface ServiceRequestParts {
   body: string | Uint8Array;
 }
 
+type ServiceRequestIdentityParts = Omit<ServiceRequestParts, "body">;
+
 export interface ServiceRequestToSign extends ServiceRequestParts {
   secret: string;
 }
@@ -93,7 +95,7 @@ function requiresIdempotencyKey(method: string): boolean {
   return !SAFE_METHODS.has(method);
 }
 
-function normalizeRequestParts(input: ServiceRequestParts) {
+function normalizeRequestParts(input: ServiceRequestIdentityParts) {
   const method = normalizeMethod(input.method);
   const path = requireCanonicalLine("path", input.path);
   if (!path.startsWith("/")) {

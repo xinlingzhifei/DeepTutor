@@ -245,6 +245,22 @@ def test_service_auth_verifier_requires_canonical_field_order() -> None:
         verifier.verify_service_auth_source(reordered)
 
 
+def test_service_auth_normalizes_only_fields_shared_by_body_and_digest_requests() -> None:
+    source = (
+        INTEGRATION_ROOT / "overlay" / "lib" / "yfeistai" / "service-auth.ts"
+    ).read_text(encoding="utf-8")
+    compact_source = "".join(source.split())
+
+    assert (
+        'typeServiceRequestIdentityParts=Omit<ServiceRequestParts,"body">;'
+        in compact_source
+    )
+    assert (
+        "functionnormalizeRequestParts(input:ServiceRequestIdentityParts)"
+        in compact_source
+    )
+
+
 def test_outline_contract_hash_matches_the_frozen_json_schema() -> None:
     verifier = _load_verifier()
     source = (
