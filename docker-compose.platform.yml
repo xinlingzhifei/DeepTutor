@@ -1,7 +1,7 @@
 x-images:
-  deeptutor: &deeptutor-image "ghcr.io/xinlingzhifei/deeptutor:first-release@sha256:0000000000000000000000000000000000000000000000000000000000000000"
-  openmaic: &openmaic-image "ghcr.io/xinlingzhifei/openmaic:0.3.1-0cf2a330@sha256:0000000000000000000000000000000000000000000000000000000000000000"
-  openmaic-render: &openmaic-render-image "ghcr.io/xinlingzhifei/openmaic-render:0.3.1-0cf2a330@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  deeptutor: &deeptutor-image "ghcr.io/xinlingzhifei/deeptutor:first-release@sha256:39e0801168f001d51e57c2feb61a438318cf19a5d80635d4a556df02ceb20196"
+  openmaic: &openmaic-image "ghcr.io/xinlingzhifei/openmaic:0.3.1-0cf2a330@sha256:a5014a390c7bdbb6cf858bb0eee6451987e74a8c44b523ce1677a76203ceb178"
+  openmaic-render: &openmaic-render-image "ghcr.io/xinlingzhifei/openmaic-render:0.3.1-0cf2a330@sha256:c1c6439a9e8ad3b9cb9b40a8ff9586ba2468d32294ba6fe38e8625a5ea8e1b10"
   nginx: &nginx-image "nginx:1.29.8-alpine3.23@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de"
   postgres: &postgres-image "postgres:16.14-alpine3.24@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777"
   minio: &minio-image "minio/minio:RELEASE.2025-04-22T22-12-26Z@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e"

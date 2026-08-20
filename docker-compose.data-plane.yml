@@ -1,6 +1,6 @@
 x-images:
-  openmaic: &openmaic-image "ghcr.io/xinlingzhifei/openmaic:0.3.1-0cf2a330@sha256:0000000000000000000000000000000000000000000000000000000000000000"
-  openmaic-render: &openmaic-render-image "ghcr.io/xinlingzhifei/openmaic-render:0.3.1-0cf2a330@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+  openmaic: &openmaic-image "ghcr.io/xinlingzhifei/openmaic:0.3.1-0cf2a330@sha256:a5014a390c7bdbb6cf858bb0eee6451987e74a8c44b523ce1677a76203ceb178"
+  openmaic-render: &openmaic-render-image "ghcr.io/xinlingzhifei/openmaic-render:0.3.1-0cf2a330@sha256:c1c6439a9e8ad3b9cb9b40a8ff9586ba2468d32294ba6fe38e8625a5ea8e1b10"
 
 services:
   openmaic:
