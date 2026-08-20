@@ -1,8 +1,8 @@
 {
   "images": {
     "deeptutor": {
-      "digest": "sha256:39e0801168f001d51e57c2feb61a438318cf19a5d80635d4a556df02ceb20196",
-      "reference": "ghcr.io/xinlingzhifei/deeptutor:first-release@sha256:39e0801168f001d51e57c2feb61a438318cf19a5d80635d4a556df02ceb20196",
+      "digest": "sha256:fe0f0d43030281f650fe6a531d6f4812343f79ab24ee5a6073a8a7ac3bd96412",
+      "reference": "ghcr.io/xinlingzhifei/deeptutor:first-release@sha256:fe0f0d43030281f650fe6a531d6f4812343f79ab24ee5a6073a8a7ac3bd96412",
       "repository": "ghcr.io/xinlingzhifei/deeptutor",
       "tag": "first-release"
     },
@@ -25,8 +25,8 @@
       "tag": "1.29.8-alpine3.23"
     },
     "openmaic": {
-      "digest": "sha256:a5014a390c7bdbb6cf858bb0eee6451987e74a8c44b523ce1677a76203ceb178",
-      "reference": "ghcr.io/xinlingzhifei/openmaic:0.3.1-0cf2a330@sha256:a5014a390c7bdbb6cf858bb0eee6451987e74a8c44b523ce1677a76203ceb178",
+      "digest": "sha256:e9602009064587d6e84bc2c4a77c1458da7d0d8b26c6c1e2e1a337accd24c19f",
+      "reference": "ghcr.io/xinlingzhifei/openmaic:0.3.1-0cf2a330@sha256:e9602009064587d6e84bc2c4a77c1458da7d0d8b26c6c1e2e1a337accd24c19f",
       "repository": "ghcr.io/xinlingzhifei/openmaic",
       "source": {
         "dockerfile": "integrations/openmaic/Dockerfile",
@@ -36,8 +36,8 @@
       "tag": "0.3.1-0cf2a330"
     },
     "openmaic_render": {
-      "digest": "sha256:c1c6439a9e8ad3b9cb9b40a8ff9586ba2468d32294ba6fe38e8625a5ea8e1b10",
-      "reference": "ghcr.io/xinlingzhifei/openmaic-render:0.3.1-0cf2a330@sha256:c1c6439a9e8ad3b9cb9b40a8ff9586ba2468d32294ba6fe38e8625a5ea8e1b10",
+      "digest": "sha256:45ca26231728074d383a4ad00b46b99ee33facc7a823063b40ead339e304aa59",
+      "reference": "ghcr.io/xinlingzhifei/openmaic-render:0.3.1-0cf2a330@sha256:45ca26231728074d383a4ad00b46b99ee33facc7a823063b40ead339e304aa59",
       "repository": "ghcr.io/xinlingzhifei/openmaic-render",
       "source": {
         "dockerfile": "render-service/Dockerfile",
