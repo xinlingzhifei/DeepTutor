@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
@@ -73,19 +74,32 @@ def _wait_for_host_database(async_url: str, *, timeout_seconds: float = 30.0) ->
         finally:
             await engine.dispose()
 
-    deadline = time.monotonic() + timeout_seconds
-    last_error: Exception | None = None
-    while time.monotonic() < deadline:
-        try:
-            asyncio.run(asyncio.wait_for(probe(), timeout=5.0))
-            return
-        except Exception as exc:
-            last_error = exc
-            time.sleep(0.25)
-    raise RuntimeError("published PostgreSQL port did not become ready") from last_error
+    errors: list[BaseException] = []
+
+    def wait() -> None:
+        deadline = time.monotonic() + timeout_seconds
+        last_error: Exception | None = None
+        while time.monotonic() < deadline:
+            try:
+                asyncio.run(asyncio.wait_for(probe(), timeout=5.0))
+                return
+            except Exception as exc:
+                last_error = exc
+                time.sleep(0.25)
+        errors.append(RuntimeError("published PostgreSQL port did not become ready"))
+        if last_error is not None:
+            errors[-1].__cause__ = last_error
+
+    thread = threading.Thread(target=wait, name="postgres-host-readiness")
+    thread.start()
+    thread.join(timeout_seconds + 6)
+    if thread.is_alive():
+        raise RuntimeError("published PostgreSQL port readiness probe did not stop")
+    if errors:
+        raise errors[0]
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="module")
 def generation_database(tmp_path_factory) -> GenerationDatabase:
     password = "GENERATION_PASSWORD_SENTINEL_7d3c1"
     postgres = PostgresContainer(

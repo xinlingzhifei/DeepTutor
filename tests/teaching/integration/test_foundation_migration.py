@@ -82,7 +82,6 @@ def installed_migration(tmp_path_factory) -> InstalledMigration:
             "pip",
             "wheel",
             "--no-deps",
-            "--no-build-isolation",
             "--wheel-dir",
             str(full_wheelhouse),
             str(source_root),
@@ -106,7 +105,6 @@ def installed_migration(tmp_path_factory) -> InstalledMigration:
             "pip",
             "wheel",
             "--no-deps",
-            "--no-build-isolation",
             "--wheel-dir",
             str(cli_wheelhouse),
             str(source_root / "packaging" / "deeptutor-cli"),
@@ -193,6 +191,42 @@ def migration_database(tmp_path_factory):
             password=password,
             environment=environment,
         )
+
+
+@pytest.fixture(autouse=True)
+def isolate_migration_database(request):
+    if "migration_database" not in request.fixturenames:
+        yield
+        return
+
+    database = request.getfixturevalue("migration_database")
+
+    async def reset() -> None:
+        engine = create_async_engine(database.url)
+        try:
+            async with engine.begin() as connection:
+                schemas = (
+                    await connection.execute(
+                        text(
+                            """
+                            SELECT schema_name
+                            FROM information_schema.schemata
+                            WHERE schema_name IN ('platform', 'tenant')
+                               OR schema_name LIKE 'tenant\\_%' ESCAPE '\\'
+                            """
+                        )
+                    )
+                ).scalars()
+                for schema_name in schemas:
+                    await connection.execute(DropSchema(schema_name, cascade=True, if_exists=True))
+        finally:
+            await engine.dispose()
+
+    asyncio.run(reset())
+    try:
+        yield
+    finally:
+        asyncio.run(reset())
 
 
 def _run_alembic(
@@ -466,6 +500,7 @@ def test_migration_runs_from_outside_repository(
         "classroom_review_policies",
         "classroom_review_requests",
         "classroom_versions",
+        "classroom_ticket_consumptions",
         "class_learning_states",
         "classes",
         "course_generation_policies",
@@ -621,6 +656,7 @@ def test_packaged_entrypoint_runs_platform_and_tenant_scopes(
         "classroom_review_policies",
         "classroom_review_requests",
         "classroom_versions",
+        "classroom_ticket_consumptions",
         "class_learning_states",
         "classes",
         "course_generation_policies",
@@ -861,15 +897,30 @@ def test_foundation_migration_is_isolated_and_repeatable(migration_database):
         "classroom_review_policies",
         "classroom_review_requests",
         "classroom_versions",
+        "classroom_ticket_consumptions",
         "class_learning_states",
         "classes",
+        "course_generation_policies",
         "courses",
         "enrollments",
         "generation_jobs",
+        "learning_event_quarantine",
+        "learning_events",
+        "learning_progress",
+        "learning_projection_queue",
+        "learning_sessions",
+        "mastery_evidence",
+        "mastery_levels",
         "publications",
+        "quiz_attempts",
         "quota_ledger",
         "source_snapshots",
         "source_uploads",
+        "student_classroom_assets",
+        "student_classroom_copies",
+        "student_generation_approvals",
+        "student_generation_requests",
+        "student_safety_assessments",
         "teaching_briefs",
         "tenant_source_bindings",
     }
@@ -891,15 +942,30 @@ def test_foundation_migration_is_isolated_and_repeatable(migration_database):
         "classroom_review_policies",
         "classroom_review_requests",
         "classroom_versions",
+        "classroom_ticket_consumptions",
         "class_learning_states",
         "classes",
+        "course_generation_policies",
         "courses",
         "enrollments",
         "generation_jobs",
+        "learning_event_quarantine",
+        "learning_events",
+        "learning_progress",
+        "learning_projection_queue",
+        "learning_sessions",
+        "mastery_evidence",
+        "mastery_levels",
         "publications",
+        "quiz_attempts",
         "quota_ledger",
         "source_snapshots",
         "source_uploads",
+        "student_classroom_assets",
+        "student_classroom_copies",
+        "student_generation_approvals",
+        "student_generation_requests",
+        "student_safety_assessments",
         "teaching_briefs",
         "tenant_source_bindings",
     }
@@ -3486,6 +3552,16 @@ def test_classroom_lifecycle_downgrade_blocks_writer_started_after_guard(
             f"tenant_schema={schema_name}",
         ),
     )
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(
+            migration_database,
+            "scope=tenant",
+            f"tenant_schema={schema_name}",
+            action="downgrade",
+            revision="20260802_0008",
+        ),
+    )
 
     async def race_downgrade() -> tuple[
         subprocess.CompletedProcess[str],
@@ -3522,7 +3598,7 @@ def test_classroom_lifecycle_downgrade_blocks_writer_started_after_guard(
                     {
                         "tenant_id": tenant_id,
                         "schema_name": schema_name,
-                        "revision": HEAD_REVISION,
+                        "revision": "20260802_0008",
                     },
                 )
 
@@ -4325,6 +4401,7 @@ def test_stale_provisioning_claims_stop_at_max_attempts_without_deactivating_upg
         TenantProvisioningJob,
         TenantSchemaState,
     )
+    from deeptutor.teaching.provisioning_worker import TENANT_SCHEMA_REVISION
     from deeptutor.teaching.repositories.provisioning import (
         SqlAlchemyProvisioningRepository,
     )
@@ -4377,7 +4454,9 @@ def test_stale_provisioning_claims_stop_at_max_attempts_without_deactivating_upg
                                 tenant_id=tenant_id,
                                 operation=operation,
                                 target_revision=(
-                                    "20260803_0009" if operation == "upgrade_schema" else None
+                                    TENANT_SCHEMA_REVISION
+                                    if operation == "upgrade_schema"
+                                    else None
                                 ),
                                 status="running",
                                 attempt_count=4,
