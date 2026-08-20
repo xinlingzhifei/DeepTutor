@@ -169,7 +169,7 @@ export function verifyServiceRequest(
 ): ServiceAuthResult {
   let normalized;
   try {
-    normalized = normalizeRequestParts({ ...signed, body: options.body });
+    normalized = normalizeRequestParts(signed);
     requireCanonicalLine("secret", options.secret);
     normalizeTimestamp(options.nowSeconds);
   } catch (error) {
@@ -206,7 +206,7 @@ export function verifyServiceRequestDigest(
 ): ServiceAuthResult {
   let normalized;
   try {
-    normalized = normalizeRequestParts({ ...signed, body: "" });
+    normalized = normalizeRequestParts(signed);
     requireCanonicalLine("secret", options.secret);
     normalizeTimestamp(options.nowSeconds);
     if (!SHA256_HEX.test(options.bodySha256)) {

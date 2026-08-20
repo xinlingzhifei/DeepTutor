@@ -259,6 +259,8 @@ def test_service_auth_normalizes_only_fields_shared_by_body_and_digest_requests(
         "functionnormalizeRequestParts(input:ServiceRequestIdentityParts)"
         in compact_source
     )
+    assert compact_source.count("normalizeRequestParts(signed)") == 2
+    assert "normalizeRequestParts({...signed,body:" not in compact_source
 
 
 def test_outline_contract_hash_matches_the_frozen_json_schema() -> None:
