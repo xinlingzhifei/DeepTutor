@@ -30,6 +30,7 @@ from deeptutor.teaching.openmaic.auth import (
 )
 from deeptutor.teaching.openmaic.client import OpenMAICClient, OpenMAICClientFactory
 from deeptutor.teaching.openmaic.data_planes import DataPlaneSelection, DataPlaneUnavailable
+from deeptutor.teaching.provisioning_worker import build_provisioning_worker
 from deeptutor.teaching.repositories.data_planes import SqlAlchemyDataPlaneRepository
 from deeptutor.teaching.repositories.jobs import (
     CancellationRequest,
@@ -46,6 +47,7 @@ PROCESS_NAMES = (
     "export-worker",
     "reaper",
     "learning-projector",
+    "tenant-provisioner",
 )
 _IDLE_SECONDS = 0.5
 
@@ -422,6 +424,18 @@ async def _run_reaper(*, once: bool) -> bool:
     return await _run_loop(reaper.run_once, once=once)
 
 
+async def _run_tenant_provisioner(
+    settings: PlatformSettings,
+    *,
+    once: bool,
+) -> bool:
+    worker = build_provisioning_worker(
+        settings=settings,
+        worker_id=f"{socket.gethostname()}-tenant-provisioner-{os.getpid()}",
+    )
+    return await _run_loop(worker.run_once, once=once)
+
+
 async def _run_worker(
     settings: PlatformSettings,
     *,
@@ -526,6 +540,8 @@ async def run_process(
         return await _run_reaper(once=once)
     if process_name == "learning-projector":
         return await _run_learning_projector(resolved, once=once)
+    if process_name == "tenant-provisioner":
+        return await _run_tenant_provisioner(resolved, once=once)
     return await _run_worker(
         resolved,
         job_kind="generation" if process_name == "worker" else "export",

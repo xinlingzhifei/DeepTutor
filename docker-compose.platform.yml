@@ -184,9 +184,13 @@ services:
     healthcheck:
       disable: true
     environment:
+      YFEISTAI_PLATFORM_ADMIN_PASSWORD_FILE: /run/secrets/platform_database_password
+      YFEISTAI_PLATFORM_APP_PASSWORD_FILE: /run/secrets/platform_database_app_password
       YFEISTAI_PLATFORM_MIGRATION_USER: yfeistai_migrator
       YFEISTAI_PLATFORM_MIGRATION_PASSWORD_FILE: /run/secrets/platform_database_migration_password
     secrets:
+      - platform_database_password
+      - platform_database_app_password
       - platform_database_migration_password
     volumes:
       - ./data:/app/data
@@ -216,6 +220,7 @@ services:
       MINIO_ROOT_USER_FILE: /run/secrets/minio_bootstrap_access_key
       MINIO_ROOT_PASSWORD_FILE: /run/secrets/minio_bootstrap_secret_key
     secrets:
+      - platform_database_app_password
       - platform_database_migration_password
       - minio_bootstrap_access_key
       - minio_bootstrap_secret_key

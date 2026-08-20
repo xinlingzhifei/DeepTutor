@@ -153,7 +153,9 @@ class TenantStorageCredentialResolver:
                 "tenant storage credential is not active for the current tenant"
             )
         secret_parts = _safe_secret_ref(record.secret_ref)
-        if secret_parts[0] != tenant_id:
+        from deeptutor.teaching.minio_tenant_storage import tenant_secret_ref
+
+        if secret_parts[0] not in {tenant_id, tenant_secret_ref(tenant_id)}:
             raise StorageCredentialError(
                 "tenant storage secret reference is not bound to the current tenant"
             )

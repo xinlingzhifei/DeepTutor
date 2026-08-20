@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 import hashlib
 import json
+import os
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -98,6 +99,8 @@ class MinioHarness:
     credentials_root: Path
     records: dict[str, TenantStorageCredentialRecord]
     raw_clients: dict[str, object]
+    admin_access: str = field(repr=False)
+    admin_secret: str = field(repr=False)
     tenant_credentials: dict[str, tuple[str, str]] = field(repr=False)
 
 
@@ -261,8 +264,42 @@ def minio_harness(tmp_path_factory) -> MinioHarness:
                     credentials_root=credentials_root,
                     records=records,
                     raw_clients=raw_clients,
+                    admin_access=admin_access,
+                    admin_secret=admin_secret,
                     tenant_credentials=tenant_credentials,
                 )
+
+
+@pytest.fixture
+def runtime_minio_harness(
+    request: pytest.FixtureRequest,
+    tmp_path: Path,
+) -> MinioHarness:
+    endpoint = os.environ.get("YFEISTAI_TEST_MINIO_ENDPOINT")
+    if endpoint is None:
+        return request.getfixturevalue("minio_harness")
+    admin_access = os.environ["YFEISTAI_TEST_MINIO_ACCESS_KEY"]
+    admin_secret = os.environ["YFEISTAI_TEST_MINIO_SECRET_KEY"]
+    client = _s3_client(endpoint, admin_access, admin_secret)
+    try:
+        client.head_bucket(Bucket=_BUCKET)
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] not in {
+            "404",
+            "NoSuchBucket",
+            "NotFound",
+        }:
+            raise
+        client.create_bucket(Bucket=_BUCKET)
+    return MinioHarness(
+        endpoint=endpoint,
+        credentials_root=tmp_path / "external-tenant-credentials",
+        records={},
+        raw_clients={},
+        admin_access=admin_access,
+        admin_secret=admin_secret,
+        tenant_credentials={},
+    )
 
 
 def _assert_access_denied(action) -> None:
@@ -801,3 +838,127 @@ async def test_real_minio_hides_and_preserves_legacy_formal_object(
         assert response["Body"].read() == legacy_payload
     finally:
         response["Body"].close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_minio_admin_provisions_isolates_and_rotates_credentials(
+    runtime_minio_harness: MinioHarness,
+    tmp_path: Path,
+) -> None:
+    from deeptutor.teaching.minio_tenant_storage import (
+        RuntimeMinioTenantStorageAdmin,
+        TenantSecretStore,
+        provision_tenant_storage,
+    )
+
+    access_file = tmp_path / "minio-root-access"
+    secret_file = tmp_path / "minio-root-secret"
+    access_file.write_text(runtime_minio_harness.admin_access, encoding="utf-8")
+    secret_file.write_text(runtime_minio_harness.admin_secret, encoding="utf-8")
+    (tmp_path / "minio_bootstrap_access_key").write_text(
+        runtime_minio_harness.admin_access,
+        encoding="utf-8",
+    )
+    (tmp_path / "minio_bootstrap_secret_key").write_text(
+        runtime_minio_harness.admin_secret,
+        encoding="utf-8",
+    )
+    credential_root = tmp_path / "runtime-tenant-credentials"
+    settings = PlatformSettings(
+        enabled=True,
+        database_url=SecretStr("postgresql+asyncpg://user:pass@db/platform"),
+        object_store_mode="s3",
+        object_store_endpoint=runtime_minio_harness.endpoint,
+        object_store_bucket=_BUCKET,
+        object_store_region="us-east-1",
+        object_store_tenant_credentials_dir=credential_root,
+    )
+    admin = RuntimeMinioTenantStorageAdmin(
+        settings=settings,
+        bootstrap_access_key_file=access_file,
+        bootstrap_secret_key_file=secret_file,
+    )
+    store = TenantSecretStore(credential_root)
+    published = []
+
+    class Publisher:
+        async def publish(self, result) -> None:
+            published.append(result)
+
+    first = await provision_tenant_storage(
+        settings=settings,
+        tenant_id="tenant-runtime",
+        admin=admin,
+        secret_store=store,
+        publisher=Publisher(),
+    )
+    first_pair = store.load(first.secret_ref, tenant_id="tenant-runtime")
+    first_client = _s3_client(
+        runtime_minio_harness.endpoint,
+        first_pair.access_key,
+        first_pair.secret_key,
+    )
+    own_key = "tenants/tenant-runtime/provisioning/own.txt"
+    denied_key = "tenants/tenant-b/provisioning/denied.txt"
+    first_client.put_object(Bucket=_BUCKET, Key=own_key, Body=b"own")
+    _assert_access_denied(
+        lambda: first_client.put_object(
+            Bucket=_BUCKET,
+            Key=denied_key,
+            Body=b"denied",
+        )
+    )
+    _assert_access_denied(
+        lambda: first_client.list_objects_v2(
+            Bucket=_BUCKET,
+            Prefix="tenants/tenant-b/",
+        )
+    )
+
+    rotated = await provision_tenant_storage(
+        settings=settings,
+        tenant_id="tenant-runtime",
+        admin=admin,
+        secret_store=store,
+        publisher=Publisher(),
+        rotate=True,
+    )
+    rotated_pair = store.load(rotated.secret_ref, tenant_id="tenant-runtime")
+    rotated_client = _s3_client(
+        runtime_minio_harness.endpoint,
+        rotated_pair.access_key,
+        rotated_pair.secret_key,
+    )
+    rotated_client.put_object(
+        Bucket=_BUCKET,
+        Key="tenants/tenant-runtime/provisioning/rotated.txt",
+        Body=b"rotated",
+    )
+    with pytest.raises(ClientError) as revoked:
+        first_client.list_objects_v2(Bucket=_BUCKET, Prefix="tenants/tenant-runtime/")
+    assert revoked.value.response["Error"]["Code"] in {
+        "AccessDenied",
+        "InvalidAccessKeyId",
+    }
+    assert [result.secret_ref for result in published] == [
+        first.secret_ref,
+        rotated.secret_ref,
+    ]
+
+    from scripts.platform_preflight import (
+        _ActiveTenant,
+        _inspect_object_store_runtime,
+    )
+
+    preflight_errors = await _inspect_object_store_runtime(
+        settings,
+        tmp_path,
+        (
+            _ActiveTenant(
+                tenant_id="tenant-runtime",
+                schema_name=tenant_schema_name("tenant-runtime"),
+                secret_ref=rotated.secret_ref,
+            ),
+        ),
+    )
+    assert preflight_errors == ()

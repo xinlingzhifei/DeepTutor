@@ -192,6 +192,36 @@ def test_only_provisioner_combines_migration_storage_bootstrap_and_secret_write(
         assert tenant_secret_directory not in _writable_volume_targets(service), name
 
 
+def test_database_bootstrap_secrets_are_role_scoped() -> None:
+    services = _platform_compose()["services"]
+    migration = services["teaching-migrate"]
+
+    assert _service_secret_sources(migration) == {
+        "platform_database_password",
+        "platform_database_app_password",
+        "platform_database_migration_password",
+    }
+    assert migration["environment"] == {
+        "YFEISTAI_PLATFORM_ADMIN_PASSWORD_FILE": ("/run/secrets/platform_database_password"),
+        "YFEISTAI_PLATFORM_APP_PASSWORD_FILE": ("/run/secrets/platform_database_app_password"),
+        "YFEISTAI_PLATFORM_MIGRATION_USER": "yfeistai_migrator",
+        "YFEISTAI_PLATFORM_MIGRATION_PASSWORD_FILE": (
+            "/run/secrets/platform_database_migration_password"
+        ),
+    }
+    assert "platform_database_password" not in _service_secret_sources(services["deeptutor"])
+    for name in (
+        "teaching-dispatcher",
+        "teaching-worker",
+        "teaching-export-worker",
+        "teaching-reaper",
+        "learning-projector",
+    ):
+        assert _service_secret_sources(services[name]) == {"platform_database_app_password"} | (
+            {"openmaic_service_secret"} if "worker" in name else set()
+        )
+
+
 def test_data_mounts_mask_host_secret_tree_from_runtime_services() -> None:
     compose = _platform_compose()
     services = compose["services"]

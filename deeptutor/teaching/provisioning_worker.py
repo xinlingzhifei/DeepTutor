@@ -50,11 +50,23 @@ FAILURE_CLASSIFICATIONS: Mapping[tuple[str, str], bool] = MappingProxyType(
         ("storage", "admin_temporarily_unavailable"): True,
         ("storage", "admin_unavailable"): False,
         ("storage", "admin_result_mode"): False,
+        ("storage", "bootstrap_secret_invalid"): False,
+        ("storage", "bootstrap_secret_unavailable"): False,
+        ("storage", "credential_root_unavailable"): False,
+        ("storage", "cross_prefix_access_allowed"): False,
+        ("storage", "cross_prefix_probe_inconclusive"): False,
+        ("storage", "endpoint_invalid"): False,
         ("storage", "invalid_credential_metadata"): False,
         ("storage", "invalid_local_credential"): False,
         ("storage", "invalid_policy"): False,
         ("storage", "local_prefix_unsafe"): False,
         ("storage", "local_unavailable"): True,
+        ("storage", "minio_admin_sdk_unavailable"): False,
+        ("storage", "own_prefix_probe_failed"): False,
+        ("storage", "probe_unavailable"): True,
+        ("storage", "service_account_create_failed"): True,
+        ("storage", "service_account_revoke_failed"): True,
+        ("storage", "tenant_binding_invalid"): False,
         ("policy", "invalid_default"): False,
         ("infrastructure", "temporarily_unavailable"): True,
         ("worker", "unexpected_error"): False,
@@ -135,6 +147,10 @@ class StorageProvisioningResult:
                     retryable=False,
                 )
             return
+        from deeptutor.teaching.minio_tenant_storage import (
+            secret_ref_is_bound_to_tenant,
+        )
+
         fingerprint = self.access_key_fingerprint
         secret_ref = self.secret_ref
         if (
@@ -147,7 +163,7 @@ class StorageProvisioningResult:
             or "\x00" in secret_ref
             or PureWindowsPath(secret_ref).drive
             or any(part in {"", ".", ".."} for part in secret_ref.split("/"))
-            or secret_ref != f"{tenant_id}/object-store"
+            or not secret_ref_is_bound_to_tenant(secret_ref, tenant_id)
             or fingerprint is None
             or len(fingerprint) != 64
             or any(character not in "0123456789abcdef" for character in fingerprint)
@@ -675,6 +691,13 @@ def build_provisioning_worker(
     from deeptutor.teaching.repositories.provisioning import (
         SqlAlchemyProvisioningRepository,
     )
+
+    if s3_admin is None and runtime_settings.object_store_mode == "s3":
+        from deeptutor.teaching.minio_tenant_storage import (
+            RuntimeMinioTenantStorageAdmin,
+        )
+
+        s3_admin = RuntimeMinioTenantStorageAdmin.from_settings(runtime_settings)
 
     repository = SqlAlchemyProvisioningRepository()
     return ProvisioningWorker(
