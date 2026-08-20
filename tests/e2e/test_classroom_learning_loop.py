@@ -25,12 +25,11 @@ from deeptutor.teaching.tickets import (
     TicketReplay,
     TicketScopeError,
 )
+from tests.generation_database_plugin import generation_database as generation_database
 from tests.teaching.integration.test_learning_projector import (
     ProjectorDatabase,
     projector_database,
 )
-
-pytest_plugins = ("tests.teaching.integration.conftest",)
 
 
 class _Clock:

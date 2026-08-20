@@ -22,6 +22,7 @@ def test_process_module_exposes_exact_lifecycle_commands() -> None:
         "export-worker",
         "reaper",
         "learning-projector",
+        "tenant-provisioner",
     )
 
 
@@ -35,7 +36,14 @@ def test_process_module_help_does_not_touch_external_services() -> None:
     )
 
     assert completed.returncode == 0, completed.stderr
-    for name in ("dispatcher", "worker", "export-worker", "reaper", "learning-projector"):
+    for name in (
+        "dispatcher",
+        "worker",
+        "export-worker",
+        "reaper",
+        "learning-projector",
+        "tenant-provisioner",
+    ):
         assert name in completed.stdout
 
 
@@ -60,7 +68,14 @@ def test_process_module_lazy_loads_learning_projector_dependencies() -> None:
 
 @pytest.mark.parametrize(
     "process_name",
-    ("dispatcher", "worker", "export-worker", "reaper", "learning-projector"),
+    (
+        "dispatcher",
+        "worker",
+        "export-worker",
+        "reaper",
+        "learning-projector",
+        "tenant-provisioner",
+    ),
 )
 def test_disabled_platform_processes_return_without_external_work(process_name: str) -> None:
     from deeptutor.teaching.processes import run_process

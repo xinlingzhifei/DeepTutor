@@ -52,9 +52,8 @@ from deeptutor.teaching.services.student_generation import (
 )
 from deeptutor.teaching.source_snapshots import SourceSnapshotBuilder
 from deeptutor.teaching.tenant_context import TenantContext, require_tenant
+from tests.generation_database_plugin import generation_database as generation_database
 from tests.teaching_contract_fixtures import valid_classroom_document
-
-pytest_plugins = ("tests.teaching.integration.conftest",)
 
 
 class _UnusedSourceRepository:

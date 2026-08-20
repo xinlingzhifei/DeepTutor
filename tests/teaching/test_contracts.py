@@ -2278,7 +2278,7 @@ def test_job_error_category_is_fixed(
         getattr(contracts, model_name).model_validate(payload)
 
 
-def test_all_seven_committed_schemas_match_models() -> None:
+def test_all_eight_committed_schemas_match_models() -> None:
     from scripts.verify_classroom_contracts import (
         CONTRACT_SCHEMA_FILENAMES,
         verify_contract_schemas,
@@ -2292,6 +2292,7 @@ def test_all_seven_committed_schemas_match_models() -> None:
         "generation-job.schema.json",
         "export-request.schema.json",
         "export-job.schema.json",
+        "learning-event.schema.json",
     }
     assert verify_contract_schemas() == []
 

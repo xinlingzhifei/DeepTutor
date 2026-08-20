@@ -29,9 +29,8 @@ from deeptutor.teaching.repositories.jobs import (
 )
 from deeptutor.teaching.scheduler import FairScheduler
 from deeptutor.teaching.schema_names import tenant_schema_name
+from tests.generation_database_plugin import generation_database as generation_database
 from tests.teaching_contract_fixtures import valid_classroom_document
-
-pytest_plugins = ("tests.teaching.integration.conftest",)
 
 
 def _document_payload(media_body: bytes) -> tuple[str, str, str]:
