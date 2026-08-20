@@ -267,6 +267,23 @@ def test_outline_route_resolves_research_before_sync_generation_callback() -> No
     assert "researchContext," in source[source.index(adapter) :]
 
 
+def test_classroom_route_types_json_cloned_actions_at_serialization_boundary() -> None:
+    source = (
+        INTEGRATION_ROOT
+        / "overlay"
+        / "app"
+        / "api"
+        / "yfeistai"
+        / "v1"
+        / "classrooms"
+        / "route.ts"
+    ).read_text(encoding="utf-8")
+
+    compact_source = "".join(source.split())
+    assert "functionportableClone<T>(value:unknown):T" in compact_source
+    assert "portableClone<Array<Record<string,JsonValue>>>(actions" in compact_source
+
+
 def test_outline_contract_hash_verifier_rejects_a_handwritten_mismatch() -> None:
     verifier = _load_verifier()
     source = (

@@ -17,7 +17,7 @@ import {
 import { readServiceSecret } from "../../../../../lib/yfeistai/service-auth";
 import { runSceneRouteAdapter } from "../../../../../lib/yfeistai/generation-adapter";
 
-function portableClone<T>(value: T): T {
+function portableClone<T>(value: unknown): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
@@ -184,9 +184,9 @@ const postClassroom = createClassroomPostHandler({
       context.sceneType,
       generated,
     );
-    const portableActions = portableClone(actions) as Array<
-      Record<string, JsonValue>
-    >;
+    const portableActions = portableClone<Array<Record<string, JsonValue>>>(
+      actions,
+    );
     const portableRoot = {
       content,
       actions: portableActions,
