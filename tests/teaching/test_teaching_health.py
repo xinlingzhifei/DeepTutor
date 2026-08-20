@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 from fastapi import FastAPI
 from fastapi.routing import APIRoute
+from fastapi.testclient import TestClient
 
 from deeptutor.api.routers.auth import require_platform_admin
 from deeptutor.teaching.health import (
@@ -72,18 +73,20 @@ def test_health_includes_registered_shared_and_dedicated_data_planes() -> None:
 
 def test_teaching_health_routes_register_only_for_enabled_platform() -> None:
     from deeptutor.api.main import _register_teaching_health_routes
+    from deeptutor.api.routers import teaching_health
 
     disabled = FastAPI()
     assert not _register_teaching_health_routes(disabled, enabled=False)
-    assert "/api/v1/system/teaching-health" not in {route.path for route in disabled.routes}
-    assert "/internal/metrics" not in {route.path for route in disabled.routes}
+    assert "/api/v1/system/teaching-health" not in disabled.openapi()["paths"]
+    assert TestClient(disabled).get("/internal/metrics").status_code == 404
 
     enabled = FastAPI()
     assert _register_teaching_health_routes(enabled, enabled=True)
-    paths = {route.path for route in enabled.routes}
-    assert "/api/v1/system/teaching-health" in paths
-    assert "/internal/metrics" in paths
-    routes = {route.path: route for route in enabled.routes if isinstance(route, APIRoute)}
+    assert "/api/v1/system/teaching-health" in enabled.openapi()["paths"]
+    assert TestClient(enabled).get("/internal/metrics").status_code == 200
+    routes = {
+        route.path: route for route in teaching_health.router.routes if isinstance(route, APIRoute)
+    }
     health_dependencies = {
         dependency.call
         for dependency in routes["/api/v1/system/teaching-health"].dependant.dependencies
