@@ -42,6 +42,7 @@ export default defineConfig({
     {
       name: "teaching-flow",
       testMatch: [
+        "**/e2e/classroom-first-release.spec.ts",
         "**/e2e/teacher-classroom-flow.spec.ts",
         "**/e2e/content-operations-flow.spec.ts",
         "**/e2e/student-classroom-flow.spec.ts",
