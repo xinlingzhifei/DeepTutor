@@ -519,6 +519,22 @@ def _register_classroom_learning_routes(
     return True
 
 
+def _register_teaching_health_routes(
+    application: FastAPI,
+    *,
+    enabled: bool,
+) -> bool:
+    if not enabled:
+        return False
+    from deeptutor.api.routers import teaching_health
+
+    application.include_router(
+        teaching_health.router,
+        tags=["teaching-health"],
+    )
+    return True
+
+
 _register_classroom_job_routes(
     app,
     enabled=load_platform_settings().enabled,
@@ -558,6 +574,10 @@ _register_classroom_learning_routes(
     app,
     enabled=load_platform_settings().enabled,
     dependencies=_auth,
+)
+_register_teaching_health_routes(
+    app,
+    enabled=load_platform_settings().enabled,
 )
 
 app.include_router(

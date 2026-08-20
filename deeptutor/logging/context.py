@@ -15,6 +15,10 @@ LOG_CONTEXT_FIELDS = (
     "capability",
     "stage",
     "sink",
+    "tenant_id",
+    "job_id",
+    "route_id",
+    "error_code",
 )
 
 _context: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar(
