@@ -101,6 +101,7 @@ services:
         target: gateway_private_key.pem
     networks:
       - platform-internal
+      - platform-edge
     depends_on:
       deeptutor:
         condition: service_healthy
@@ -319,6 +320,8 @@ networks:
   platform-internal:
     driver: bridge
     internal: true
+  platform-edge:
+    driver: bridge
   shared-provider-egress:
     driver: bridge
   platform-service-egress:

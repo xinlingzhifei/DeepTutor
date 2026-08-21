@@ -120,6 +120,21 @@ def test_platform_merge_exposes_only_gateway_ports() -> None:
     assert published == {"80", "443"}
 
 
+def test_gateway_publishes_through_a_non_internal_edge_network() -> None:
+    compose = _platform_compose()
+    services = compose["services"]
+
+    assert compose["networks"]["platform-edge"].get("internal", False) is False
+    assert set(services["gateway"]["networks"]) == {
+        "platform-edge",
+        "platform-internal",
+    }
+    for name, service in services.items():
+        if name == "gateway":
+            continue
+        assert "platform-edge" not in service.get("networks", []), name
+
+
 def test_api_waits_for_migration_and_storage_on_the_private_network() -> None:
     compose = _platform_compose()
     dependencies = compose["services"]["deeptutor"]["depends_on"]
