@@ -151,6 +151,8 @@ export function apiPayload(
       return { is_first_user: false };
     case "/api/v1/sessions":
       return { sessions: [] };
+    case "/api/v1/dashboard/suggestions":
+      return { suggestions: [], stale: false };
     case "/api/v1/settings/chat-attachments":
       return {
         effective: {
@@ -201,6 +203,24 @@ export function apiPayload(
           },
         ],
       };
+    case "/api/v1/settings/providers/openai-codex/oauth/status":
+      return {
+        connection: "disconnected",
+        operation_id: null,
+        operation_state: null,
+        authorize_url: null,
+        expires_in: null,
+        callback_port: null,
+        callback_forward_port: null,
+        redirect_uri: null,
+        model_count: 0,
+        catalog_source: null,
+        catalog_fetched_at: null,
+        active_model: null,
+        models: [],
+        activated: false,
+        error_code: null,
+      };
     case "/api/v1/subagents/settings":
       return { consult_budget: 3, backends: {} };
     case "/api/v1/settings":
@@ -232,6 +252,8 @@ export function apiPayload(
       };
     case "/api/v1/learning/progress/baseline-path/map":
       return masteryMapPayload();
+    case "/api/v1/learning/progress/baseline-path/events":
+      return { book_id: "baseline-path", events: [] };
     default:
       return undefined;
   }

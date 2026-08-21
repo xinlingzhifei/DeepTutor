@@ -4,11 +4,11 @@
   "private": true,
   "scripts": {
     "predev": "node ./scripts/sync-openmaic-importer.mjs",
-    "dev": "node --max-old-space-size=4096 ./node_modules/next/dist/bin/next dev",
+    "dev": "node ./scripts/dev.mjs",
     "predev:turbo": "node ./scripts/sync-openmaic-importer.mjs",
-    "dev:turbo": "node --max-old-space-size=6144 ./node_modules/next/dist/bin/next dev --turbopack",
+    "dev:turbo": "node ./scripts/dev.mjs --turbopack",
     "prebuild": "node ./scripts/sync-openmaic-importer.mjs",
-    "build": "next build",
+    "build": "node ./scripts/build.mjs",
     "start": "next start",
     "lint": "eslint .",
     "test:node": "node ./scripts/run-node-tests.mjs",
@@ -20,7 +20,8 @@
     "i18n:check": "npm run i18n:parity && npm run i18n:audit",
     "audit": "playwright test --project=ui-audit",
     "audit:ui": "playwright test --ui --project=ui-audit",
-    "audit:report": "playwright show-report"
+    "audit:report": "playwright show-report",
+    "build:brand-icons": "tsx ./scripts/build-brand-icons.mts"
   },
   "dependencies": {
     "@openmaic/dsl": "0.4.0",
@@ -65,6 +66,7 @@
     "eslint": "^9",
     "eslint-config-next": "16.2.3",
     "postcss": "^8",
+    "simple-icons": "^16.27.1",
     "tailwindcss": "4.2.1",
     "typescript": "^5"
   }

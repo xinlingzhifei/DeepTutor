@@ -14,6 +14,9 @@ today:
 * ``lightrag-server``     — retrieval offloaded to an external, standalone
                             LightRAG server the user runs. No local index: each
                             KB is a connection pointer queried over HTTP.
+* ``ima``                 — retrieval offloaded to a Tencent IMA knowledge base
+                            the user curates in IMA. No local index: each KB is
+                            a connection pointer queried over IMA's OpenAPI.
 
 A KB is bound to one provider at creation time; later adds and retrieval always
 go through that same pipeline (enforced upstream in the knowledge router).
@@ -29,6 +32,7 @@ PAGEINDEX_PROVIDER = "pageindex"
 GRAPHRAG_PROVIDER = "graphrag"
 LIGHTRAG_PROVIDER = "lightrag"
 LIGHTRAG_SERVER_PROVIDER = "lightrag-server"
+IMA_PROVIDER = "ima"
 
 # Providers the factory can instantiate. Unknown / legacy strings fall back to
 # the default with a re-index hint upstream.
@@ -39,6 +43,7 @@ KNOWN_PROVIDERS = frozenset(
         GRAPHRAG_PROVIDER,
         LIGHTRAG_PROVIDER,
         LIGHTRAG_SERVER_PROVIDER,
+        IMA_PROVIDER,
     }
 )
 
@@ -80,6 +85,7 @@ def version_matches_provider(entry: dict[str, Any], provider: Optional[str]) -> 
             GRAPHRAG_PROVIDER,
             LIGHTRAG_PROVIDER,
             LIGHTRAG_SERVER_PROVIDER,
+            IMA_PROVIDER,
         }
 
     return entry_provider == resolved or signature == resolved
@@ -140,6 +146,13 @@ def _build_pipeline(provider: str, kb_base_dir: Optional[str], **kwargs: Any):
             kwargs.setdefault("kb_base_dir", kb_base_dir)
         return LightRagServerPipeline(**kwargs)
 
+    if provider == IMA_PROVIDER:
+        from .pipelines.ima.pipeline import ImaPipeline
+
+        if kb_base_dir is not None:
+            kwargs.setdefault("kb_base_dir", kb_base_dir)
+        return ImaPipeline(**kwargs)
+
     from .pipelines.llamaindex.pipeline import LlamaIndexPipeline
 
     if kb_base_dir is not None:
@@ -174,6 +187,13 @@ def list_pipelines() -> List[Dict[str, Any]]:
         pageindex_ready = is_pageindex_configured()
     except Exception:
         pageindex_ready = False
+
+    try:
+        from .pipelines.ima.config import is_ima_configured
+
+        ima_ready = is_ima_configured()
+    except Exception:
+        ima_ready = False
 
     try:
         from .pipelines.graphrag import config as graphrag_config
@@ -245,6 +265,21 @@ def list_pipelines() -> List[Dict[str, Any]]:
             "modes": lightrag_server_modes,
             "default_mode": lightrag_server_default_mode,
         },
+        {
+            "id": IMA_PROVIDER,
+            "name": "Tencent IMA",
+            "description": (
+                "Retrieval offloaded to a knowledge base you keep in Tencent IMA. "
+                "No local index and no copy — connect a KB to its IMA library and "
+                "query it over IMA's OpenAPI. Documents are added in IMA itself. "
+                "Requires an IMA Client ID and API key."
+            ),
+            # A thin HTTPS client with no install; readiness is only about the
+            # account credentials. The library id stays per-KB, set at connect
+            # time, and a KB may pin its own credentials to reach another account.
+            "configured": ima_ready,
+            "requires_api_key": True,
+        },
     ]
 
 
@@ -254,6 +289,7 @@ __all__ = [
     "GRAPHRAG_PROVIDER",
     "LIGHTRAG_PROVIDER",
     "LIGHTRAG_SERVER_PROVIDER",
+    "IMA_PROVIDER",
     "KNOWN_PROVIDERS",
     "get_pipeline",
     "has_ready_provider_index",

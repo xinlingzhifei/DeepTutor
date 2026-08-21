@@ -9,13 +9,22 @@ from __future__ import annotations
 
 _LANGUAGE_LABELS: dict[str, str] = {
     "zh": "中文（简体）",
+    "zh-cn": "中文（简体）",
+    "zh-tw": "繁體中文",
     "en": "English",
+    "ja": "日本語",
+    "ko": "한국어",
+    "es": "Español",
+    "fr": "Français",
+    "de": "Deutsch",
+    "ru": "Русский",
+    "pt": "Português",
+    "it": "Italiano",
 }
 
 
 def normalize_language(language: str | None) -> str:
-    normalized = (language or "zh").strip().lower()
-    return "en" if normalized.startswith("en") else "zh"
+    return (language or "zh").strip().lower() or "zh"
 
 
 def language_label(language: str | None) -> str:
@@ -23,7 +32,7 @@ def language_label(language: str | None) -> str:
     if code in _LANGUAGE_LABELS:
         return _LANGUAGE_LABELS[code]
     base = code.split("-", 1)[0]
-    return _LANGUAGE_LABELS.get(base, "中文（简体）")
+    return _LANGUAGE_LABELS.get(base, language or "中文（简体）")
 
 
 def language_directive(language: str | None) -> str:

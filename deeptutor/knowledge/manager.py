@@ -20,6 +20,7 @@ from typing import Any
 import uuid
 
 from deeptutor.knowledge.kb_types import (
+    IMA_KB_TYPE,
     LIGHTRAG_SERVER_KB_TYPE,
     LINKED_KB_TYPE,
     OBSIDIAN_KB_TYPE,
@@ -31,6 +32,7 @@ from deeptutor.knowledge.manifest import iter_kb_documents
 from deeptutor.services.file_io import atomic_write_json
 from deeptutor.services.rag.factory import (
     DEFAULT_PROVIDER,
+    IMA_PROVIDER,
     KNOWN_PROVIDERS,
     LIGHTRAG_SERVER_PROVIDER,
     has_ready_provider_index,
@@ -1003,6 +1005,65 @@ class KnowledgeBaseManager:
             entry["search_mode"] = search_mode
         return self._register_new_entry(name, entry)
 
+    def register_ima_kb(
+        self,
+        name: str,
+        client_id: str,
+        api_key: str,
+        knowledge_base_id: str,
+        *,
+        description: str = "",
+    ) -> dict:
+        """Register a pointer to a Tencent IMA knowledge base as a connected KB.
+
+        Like the other connected types this creates no folder under ``base_dir``
+        and runs no index pipeline: it records a ``type: ima`` entry whose
+        library id the ``ima`` provider queries over IMA's OpenAPI. IMA owns
+        indexing entirely.
+
+        Credentials are optional here: leave them empty and the KB retrieves
+        with the account-level pair from the engine settings, so rotating that
+        key updates every such KB at once. Passing a pair pins this KB to it —
+        the way to reach a second IMA account. Callers should validate the
+        binding with the probe helper first; this only guards basic invariants.
+        Raises ``ValueError`` on a missing field, a half-filled credential pair,
+        or a name clash.
+        """
+        name = (name or "").strip()
+        client_id = (client_id or "").strip()
+        api_key = (api_key or "").strip()
+        knowledge_base_id = (knowledge_base_id or "").strip()
+        if not name:
+            raise ValueError("Knowledge base name is required.")
+        if bool(client_id) != bool(api_key):
+            raise ValueError("IMA Client ID and API Key must be given together.")
+        if not knowledge_base_id:
+            raise ValueError("IMA knowledge base ID is required.")
+
+        self.config = self._load_config()
+        knowledge_bases = self.config.setdefault("knowledge_bases", {})
+        if name in knowledge_bases:
+            raise ValueError(f"A knowledge base named '{name}' already exists.")
+
+        now = datetime.now().isoformat()
+        entry: dict[str, Any] = {
+            "path": name,
+            "type": IMA_KB_TYPE,
+            "rag_provider": IMA_PROVIDER,
+            # Written only when this KB overrides the account credentials;
+            # absent means "resolve them from the engine settings".
+            **({"client_id": client_id, "api_key": api_key} if client_id else {}),
+            "knowledge_base_id": knowledge_base_id,
+            "description": description or f"Tencent IMA: {name}",
+            "status": "ready",
+            "needs_reindex": False,
+            "created_at": now,
+            "updated_at": now,
+        }
+        knowledge_bases[name] = entry
+        self._save_config()
+        return entry
+
     def get_knowledge_base_path(self, name: str | None = None) -> Path:
         """Get path to a knowledge base.
 
@@ -1075,27 +1136,33 @@ class KnowledgeBaseManager:
         except Exception as e:
             logger.warning(f"Failed to save default to centralized config: {e}")
 
-    def get_default(self) -> str | None:
+    def get_default(self, *, available_names: list[str] | None = None) -> str | None:
         """
         Get default knowledge base name.
 
         Priority:
         1. Canonical KB config service (`data/knowledge_bases/kb_config.json`)
         2. First knowledge base in the list (auto-fallback)
+
+        Args:
+            available_names: An already-reconciled knowledge-base list. Passing
+                this avoids rescanning every index when the caller just listed
+                the available knowledge bases.
         """
+        kb_list = available_names if available_names is not None else self.list_knowledge_bases()
+
         # Try centralized config first
         try:
             from deeptutor.services.config import get_kb_config_service
 
             kb_config_service = get_kb_config_service()
             default_kb = kb_config_service.get_default_kb()
-            if default_kb and default_kb in self.list_knowledge_bases():
+            if default_kb and default_kb in kb_list:
                 return default_kb
         except Exception:
             pass
 
         # Fallback to first knowledge base in sorted list
-        kb_list = self.list_knowledge_bases()
         if kb_list:
             return kb_list[0]
 
@@ -1149,6 +1216,10 @@ class KnowledgeBaseManager:
                 # LightRAG server pointer (the URL is safe to surface; the API
                 # key deliberately is not).
                 "server_url": kb_config.get("server_url"),
+                # IMA pointer. The library id identifies which IMA knowledge
+                # base this KB reads; the client id and API key are credentials
+                # and are deliberately absent from this allowlist.
+                "knowledge_base_id": kb_config.get("knowledge_base_id"),
                 # Subagent connection fields (None for non-subagent KBs).
                 "agent_kind": kb_config.get("agent_kind"),
                 "cwd": kb_config.get("cwd"),
@@ -1161,7 +1232,13 @@ class KnowledgeBaseManager:
 
         return {}
 
-    def get_info(self, name: str | None = None) -> dict:
+    def get_info(
+        self,
+        name: str | None = None,
+        *,
+        refresh_config: bool = True,
+        default_name: str | None = None,
+    ) -> dict:
         """Get detailed information about a knowledge base.
 
         This method:
@@ -1169,11 +1246,24 @@ class KnowledgeBaseManager:
         2. Reads all config from kb_config.json (authoritative source)
         3. Falls back to metadata.json for legacy KBs
         4. Collects statistics about files and RAG status
+
+        Args:
+            name: Knowledge-base name, or the configured default when omitted.
+            refresh_config: Reload and reconcile the complete configuration.
+                Bulk callers that just invoked :meth:`list_knowledge_bases`
+                can reuse that snapshot by passing ``False``.
+            default_name: A pre-resolved default name for bulk callers. This
+                avoids rescanning the knowledge-base list for every item.
         """
         # Reload config to get latest status
-        self.config = self._load_config()
+        if refresh_config:
+            self.config = self._load_config()
 
-        kb_name = name or self.get_default()
+        resolved_default = default_name
+        if resolved_default is None:
+            resolved_default = self.get_default()
+
+        kb_name = name or resolved_default
         if kb_name is None:
             raise ValueError("No knowledge base name provided and no default set")
 
@@ -1206,7 +1296,9 @@ class KnowledgeBaseManager:
             index_versions = inspect_kb_versions(kb_dir, rag_provider)
             has_ready_provider = any(bool(version.get("ready")) for version in index_versions)
         provider_error_summary = (
-            provider_failure_summary(kb_dir, rag_provider) if dir_exists else ""
+            provider_failure_summary(kb_dir, rag_provider, versions=index_versions)
+            if dir_exists
+            else ""
         )
 
         # For old KBs without status field, determine status from rag_storage
@@ -1282,6 +1374,9 @@ class KnowledgeBaseManager:
         # the backend, so it is deliberately not surfaced here.
         if kb_config.get("server_url"):
             metadata["server_url"] = kb_config.get("server_url")
+        # Same split for IMA: the library id is shown, the credentials are not.
+        if kb_config.get("knowledge_base_id"):
+            metadata["knowledge_base_id"] = kb_config.get("knowledge_base_id")
 
         metadata.update(self._embedding_fields(kb_config))
 
@@ -1291,7 +1386,7 @@ class KnowledgeBaseManager:
         info = {
             "name": kb_name,
             "path": str(kb_dir),
-            "is_default": kb_name == self.get_default(),
+            "is_default": kb_name == resolved_default,
             "metadata": metadata,
             "status": status,
             "progress": progress,
@@ -1345,11 +1440,18 @@ class KnowledgeBaseManager:
                 if (kb_probe_dir and active_signature)
                 else None
             )
-            active_match = (
-                inspect_provider_version(matched_entry, rag_provider).ready
-                if matched_entry
-                else False
-            )
+            active_match = False
+            if matched_entry:
+                # Reuse the probe results already computed for ``index_versions``
+                # instead of probing the matched storage a second time — probing
+                # parses provider-owned files (e.g. the multi-MB LlamaIndex
+                # docstore.json) and is the dominant cost of kb list / the
+                # knowledge API (see issue #859).
+                matched_path = matched_entry.get("storage_path")
+                active_match = any(
+                    entry.get("storage_path") == matched_path and entry.get("ready")
+                    for entry in index_versions
+                )
         else:
             active_match = rag_initialized
 

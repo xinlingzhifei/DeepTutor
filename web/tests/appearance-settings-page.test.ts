@@ -18,13 +18,17 @@ function readAppearancePage() {
   return fs.readFileSync(appearancePagePath, "utf8");
 }
 
-test("appearance settings exposes Chinese first and describes unified language behavior", () => {
+test("appearance settings exposes Chinese first for separate interface and response languages", () => {
   const source = readAppearancePage();
 
   assert.match(source, /\(\["zh", "en"\] as const\)/);
   assert.match(
     source,
-    /Controls the interface, system messages, and AI response language\./,
+    /Controls navigation, settings, and status text only\./,
+  );
+  assert.match(
+    source,
+    /Sets the default language for chat and capability responses\./,
   );
 });
 

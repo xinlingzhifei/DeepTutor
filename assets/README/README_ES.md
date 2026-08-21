@@ -17,6 +17,7 @@
 <p align="center">
   <a href="../../README.md"><img alt="English" height="40" src="https://img.shields.io/badge/English-CDCFD4"></a>&nbsp;
   <a href="README_CN.md"><img alt="简体中文" height="40" src="https://img.shields.io/badge/简体中文-CDCFD4"></a>&nbsp;
+  <a href="README_TW.md"><img alt="繁體中文" height="40" src="https://img.shields.io/badge/繁體中文-CDCFD4"></a>&nbsp;
   <a href="README_JA.md"><img alt="日本語" height="40" src="https://img.shields.io/badge/日本語-CDCFD4"></a>&nbsp;
   <a href="README_ES.md"><img alt="Español" height="40" src="https://img.shields.io/badge/Español-BCDCF7"></a>&nbsp;
   <a href="README_FR.md"><img alt="Français" height="40" src="https://img.shields.io/badge/Français-CDCFD4"></a>&nbsp;
@@ -63,7 +64,7 @@ yFeiSTAI es un espacio de trabajo de aprendizaje nativo de agentes que conecta t
 - **Contexto de aprendizaje conectado** — Bases de conocimiento, libros, borradores de Co-Writer, cuadernos, bancos de preguntas, personas y Memory están disponibles en todos los flujos de trabajo en lugar de vivir en herramientas aisladas.
 - **Subagentes y Partners** — consulta una CLI de codificación en vivo (Claude Code, Codex, Gemini, Kimi, opencode o MiMo) o un Partner desde cualquier turno (o importa sus conversaciones pasadas), y ejecuta compañeros IM persistentes con el mismo cerebro.
 - **Conocimiento multi-motor** — bibliotecas RAG con versiones: LlamaIndex, PageIndex, GraphRAG, LightRAG o un vault Obsidian vinculado, con análisis de documentos conectable.
-- **Herramientas y habilidades extensibles** — herramientas integradas, servidores MCP, modelos de generación de imagen / video / voz, y skills de la comunidad instalables desde EduHub.
+- **Herramientas y habilidades extensibles** — herramientas integradas, servidores MCP, aplicaciones CLI, modelos de generación de imagen / video / voz, y skills de la comunidad instalables desde EduHub.
 - **Memoria inspectable** — trazas L1, resúmenes de superficie L2 y síntesis L3 hacen visible y editable la personalización, con un Memory Graph que traza cada afirmación hasta su evidencia.
 
 ---
@@ -109,10 +110,10 @@ python -m pip install -e .
 ( cd web && npm ci --legacy-peer-deps )
 
 deeptutor init
-deeptutor start
+deeptutor start --dev
 ```
 
-Las instalaciones desde fuente ejecutan Next.js en modo de desarrollo contra el directorio `web/` local; todo lo demás (diseño de configuración, puertos, detener con `Ctrl+C`) coincide con la Opción 1.
+`deeptutor start` compila el frontend `web/` local para producción una vez y lo reutiliza; `--dev` ejecuta Next.js con HMR (recarga en caliente de módulos). El diseño de configuración, los puertos y `Ctrl+C` coinciden con la Opción 1.
 
 <details>
 <summary><b>Entorno Conda</b> (en lugar de <code>venv</code>)</summary>
@@ -143,11 +144,11 @@ pip install -e ".[math-animator]"   # complemento Manim; requiere LaTeX/ffmpeg/l
 
 **Cambiar dependencias del frontend:** ejecuta `npm install --legacy-peer-deps` para actualizar `web/package-lock.json`, luego confirma tanto `web/package.json` como `web/package-lock.json`.
 
-**Servidor de desarrollo atascado:** si `deeptutor start` informa de un frontend existente que no responde, detén el PID que imprime. Si no hay ningún proceso Next.js en ejecución, los archivos de bloqueo están obsoletos — elimínalos y vuelve a intentarlo:
+**Servidor de desarrollo atascado:** si `deeptutor start --dev` informa de un frontend existente que no responde, detén el PID que imprime. Si no hay ningún proceso Next.js en ejecución, los archivos de bloqueo están obsoletos — elimínalos y vuelve a intentarlo:
 
 ```bash
 rm -f web/.next/dev/lock web/.next/lock
-deeptutor start
+deeptutor start --dev
 ```
 
 </details>
@@ -298,7 +299,7 @@ Todo bajo `data/user/settings/` es JSON/YAML plano. La página **Settings** en e
 | `system.json` | Puertos de backend/frontend, base de API pública, CORS, verificación SSL, directorio de adjuntos y límites de subida/extracción |
 | `auth.json` | Interruptor de autenticación opcional, nombre de usuario, hash de contraseña, configuración de token/cookie |
 | `integrations.json` | Configuración opcional de PocketBase e integraciones sidecar |
-| `interface.json` | Preferencias de idioma / tema / barra lateral de UI |
+| `interface.json` | Idioma de UI y de salida del modelo / tema / preferencias de barra lateral |
 | `main.yaml` | Valores predeterminados de comportamiento de runtime e inyección de rutas |
 | `agents.yaml` | Configuración de temperatura y tokens de capacidades/herramientas |
 
@@ -420,7 +421,7 @@ Book convierte las fuentes seleccionadas en un **libro vivo** interactivo — no
 <img src="../../assets/figs/web-1.4.6+/book/03-book-demo%20interactive%20module.png" alt="Bloque de widget interactivo en Book" width="31%">
 </p>
 
-Cada capítulo se compila en bloques tipados — texto, callouts, quizzes, tarjetas flash, líneas de tiempo, código, figuras, HTML interactivo, animaciones, gráficos de conceptos, profundizaciones y notas de usuario — y cada página tiene su propio Page Chat. Los bloques son editables: inserta, mueve, regenera o cambia el tipo de un bloque sin reescribir el capítulo. Los comandos de mantenimiento como `deeptutor book health` y `deeptutor book refresh-fingerprints` ayudan a detectar cuándo el conocimiento fuente ha divergido de las páginas compiladas.
+Cada capítulo se compila en bloques tipados — texto, callouts, quizzes, tarjetas flash, líneas de tiempo, código, figuras, HTML interactivo, animaciones, gráficos de conceptos, profundizaciones y notas de usuario — y cada página tiene su propio Page Chat. Los bloques son editables: inserta, mueve, regenera, reescribe un cuerpo o cambia el tipo sin rehacer el capítulo. Las páginas visitadas, los marcadores y los intentos de quiz se acumulan en una puntuación de finalización y los capítulos débiles; cualquier libro se exporta a Markdown. Una compilación larga se pausa y se reanuda; `deeptutor book health` y `refresh-fingerprints` señalan cuándo el conocimiento fuente ha divergido.
 
 </details>
 
@@ -431,13 +432,13 @@ Cada capítulo se compila en bloques tipados — texto, callouts, quizzes, tarje
 <img src="../../assets/figs/web-1.4.6+/knowledge/00-overview.png" alt="Centro de Conocimiento yFeiSTAI" width="900">
 </div>
 
-Las bases de conocimiento son las colecciones de documentos detrás del RAG — fundamentan los turnos de Chat, las ediciones de Co-Writer, la generación de Book y las conversaciones de Partner. Lo que las distingue es la **elección de motores de recuperación**: **LlamaIndex** (el predeterminado, vector local + BM25), **PageIndex** (hospedado, recuperación por razonamiento con citas a nivel de página), **GraphRAG** y **LightRAG** (recuperación por grafo de conocimiento), **LightRAG Server** (recuperación delegada a una instancia externa de LightRAG a la que te conectas por HTTP), o un vault **Obsidian** vinculado que el tutor lee y escribe en el lugar. Cada KB está vinculada a un motor.
+Las bases de conocimiento son las colecciones de documentos detrás del RAG — fundamentan los turnos de Chat, las ediciones de Co-Writer, la generación de Book y las conversaciones de Partner. Lo que las distingue es la **elección de motores de recuperación**: **LlamaIndex** (el predeterminado, vector local + BM25), **PageIndex** (hospedado, recuperación por razonamiento con citas a nivel de página), **GraphRAG** y **LightRAG** (recuperación por grafo de conocimiento), **LightRAG Server** (recuperación delegada a una instancia externa de LightRAG a la que te conectas por HTTP), **Tencent IMA** (una biblioteca que curas en IMA, consultada a través de su OpenAPI), o un vault **Obsidian** vinculado que el tutor lee y escribe en el lugar. Cada KB está vinculada a un motor.
 
 <div align="center">
 <img src="../../assets/figs/web-1.4.6+/knowledge/01-create%20knowledge%20base.png" alt="Crear una base de conocimiento" width="900">
 </div>
 
-Al crear una KB, puedes **crear nueva** (subir documentos y construir un índice nuevo) o **vincular existente** (reutilizar un índice construido en otro lugar, leer en el lugar sin re-indexar). La re-indexación escribe un nuevo directorio `version-N` plano y conserva los anteriores, de modo que un índice funcional nunca se destruye a mitad de la reconstrucción. Un solo documento puede eliminarse incluso de una base en estado de **error** — descartando un archivo que no se pudo analizar sin necesidad de borrar y reconstruir todo. El análisis de documentos — Text-only, MinerU, Docling, markitdown o PyMuPDF4LLM — se elige en **Settings → Knowledge Base**, con descargas de modelos locales desactivadas por defecto. La CLI refleja el ciclo de vida con `deeptutor kb list`, `info`, `create`, `add`, `search`, `set-default` y `delete`.
+Al crear una KB, puedes **crear nueva** (subir documentos y construir un índice nuevo) o **vincular existente** (reutilizar un índice construido en otro lugar, leer en el lugar sin re-indexar). La re-indexación escribe un nuevo directorio `version-N` plano y conserva los anteriores, de modo que un índice funcional nunca se destruye a mitad de la reconstrucción. Un solo documento puede eliminarse incluso de una base en estado de **error** — descartando un archivo que no se pudo analizar sin necesidad de borrar y reconstruir todo. El análisis de documentos — Text-only, MinerU, Docling, markitdown, PyMuPDF4LLM o LiteParse — se elige en **Settings → Knowledge Base**, con descargas de modelos locales desactivadas por defecto. Docling también puede ejecutarse en modo **remoto** contra un servidor Docling Serve (sin necesidad de instalación local ni modelos), configurado a través de **Settings → Document Parsing** (`mode=remote`, una URL base de servidor y una clave API opcional) o las variables de entorno `DOCLING_MODE` / `DOCLING_API_BASE_URL` / `DOCLING_API_TOKEN`. La CLI refleja el ciclo de vida con `deeptutor kb list`, `info`, `create`, `add`, `search`, `set-default` y `delete`.
 
 </details>
 
@@ -448,7 +449,7 @@ Al crear una KB, puedes **crear nueva** (subir documentos y construir un índice
 <img src="../../assets/figs/web-1.4.6+/learning-space/00-overview.png" alt="Hub del Espacio de Aprendizaje yFeiSTAI" width="900">
 </div>
 
-El Espacio de Aprendizaje es la capa de biblioteca y personalización — donde viven las cosas que persisten. **Conversaciones y Materiales** guarda tu historial de chat, cuadernos y un banco de preguntas (cada pregunta guardada conserva tu respuesta, la respuesta de referencia y una explicación). **Personalización** guarda rutas de dominio, personas (preajustes de comportamiento como *compañero*, *asistente de investigación*, *profesor*) y skills (guías `SKILL.md` que el modelo lee bajo demanda). Todo aquí se puede reutilizar desde Chat, Partners, Co-Writer y Book.
+El Espacio de Aprendizaje es la capa de biblioteca y personalización — donde viven las cosas que persisten. **Conversaciones y Materiales** guarda tu historial de chat, cuadernos y un banco de preguntas (cada pregunta guardada conserva tu respuesta, la respuesta de referencia y una explicación). **Personalización** guarda rutas de dominio, personas (preajustes de comportamiento como *compañero*, *asistente de investigación*, *profesor*), skills (guías `SKILL.md` que el modelo lee bajo demanda), **Servicios MCP** — una tienda curada de servidores MCP alojados que instalas para ti mismo con un clic, además de cualquier servidor remoto que configures por URL — y **Aplicaciones CLI**, herramientas de línea de comandos del catálogo [CLI-Anything](https://github.com/HKUDS/CLI-Anything) que el agente de chat invoca directamente, con la guía de uso propia de cada aplicación cargada bajo demanda. Todo aquí se puede reutilizar desde Chat, Partners, Co-Writer y Book.
 
 <div align="center">
 <img src="../../assets/figs/web-1.4.6+/learning-space/07-%20download%20skills%20from%20eduhub.png" alt="Importar skills desde EduHub" width="900">
@@ -482,7 +483,7 @@ El Memory Graph muestra toda la pirámide — síntesis L3 en el centro, L2 en e
 <img src="../../assets/figs/web-1.4.6+/settings/00-setting%20overview.png" alt="Hub de configuración yFeiSTAI" width="900">
 </div>
 
-Settings es el panel de control operativo, con una tira de estado en vivo (Backend, LLM, Embedding, Search) y una tarjeta por área: **Apariencia** (tema, idioma de UI, estilo de bloques de código), **Red** (base de API, puertos, CORS), **Modelos** (LLM, Embedding, Search, Text-to-Speech, Speech-to-Text, Image Generation, Video Generation), **Knowledge Base** (motor de análisis de documentos), **Chat** (herramientas, servidores MCP, parámetros por capacidad, límites de adjuntos), **Partners & Agents** (los subagentes que puedes consultar desde un turno), y **Memory** (los presupuestos del consolidador).
+Settings es el panel de control operativo, con una tira de estado en vivo (estado del backend y memoria residente en todo el árbol de procesos) y una tarjeta por área: **Apariencia** (tema, idioma de UI y de salida del modelo, estilo de bloques de código), **Red** (base de API, puertos, CORS), **Modelos** (LLM, Embedding, Search, Text-to-Speech, Speech-to-Text, Image Generation, Video Generation), **Knowledge Base** (motor de análisis de documentos), **Chat** (herramientas, parámetros por capacidad, límites de adjuntos), **Partners & Agents** (los subagentes que puedes consultar desde un turno), y **Memory** (los presupuestos del consolidador).
 
 <div align="center">
 <img src="../../assets/figs/web-1.4.6+/settings/01-appearance%20settings.png" alt="Configuración de apariencia de yFeiSTAI y temas" width="900">
@@ -490,7 +491,27 @@ Settings es el panel de control operativo, con una tira de estado en vivo (Backe
 
 La mayoría de las secciones usan un flujo de borrador y aplicación, de modo que puedes probar un proveedor antes de confirmarlo. Cuatro temas se incluyen por defecto — Default, Cream, Dark y Glass. Los archivos `.env` de la raíz del proyecto se ignoran intencionalmente; la configuración de runtime vive bajo `data/user/settings/*.json` a menos que `DEEPTUTOR_HOME` o `deeptutor start --home` apunten la app en otro lugar.
 
-**OpenAI Codex OAuth (experimental).** Elegir **OpenAI Codex** bajo Models → LLM reemplaza los campos de clave API por un inicio de sesión en el navegador que se ejecuta contra tu propio plan de ChatGPT, de modo que no se necesita `OPENAI_API_KEY`. Los tokens viven solo en `<user-root>/private/openai-codex/` y yFeiSTAI nunca lee ni modifica tu inicio de sesión de la CLI `~/.codex`. La lista de modelos proviene del catálogo en vivo de esa cuenta; iniciar sesión publica el perfil, pero este solo se convierte en el modelo activo cuando todavía no hay ningún LLM configurado, de modo que nunca redirige un despliegue a tus espaldas. Como un token autoriza el plan de una sola persona, el perfil no se puede compartir a través de permisos de usuario — cada cuenta inicia sesión por sí misma, y el navegador debe poder alcanzar la máquina que ejecuta el backend (en un servidor remoto, ejecuta `deeptutor provider login openai-codex` allí en su lugar). Los errores de cuota y las fallas del catálogo se reportan tal cual y nunca recurren a un proveedor de pago. Esta ruta de compatibilidad es experimental: la interfaz upstream puede cambiar.
+**OpenAI Codex OAuth (experimental).** Elegir **OpenAI Codex** bajo Models → LLM reemplaza los campos de clave API por un inicio de sesión en el navegador que se ejecuta contra tu propio plan de ChatGPT, de modo que no se necesita `OPENAI_API_KEY`. Los tokens viven solo en `data/system/user-secrets/<owner>/private/openai-codex/` — en el despliegue multi-contenedor con Compose, fuera de cualquier árbol al que el sandbox de ejecución pueda acceder — y yFeiSTAI nunca lee ni modifica tu inicio de sesión de la CLI `~/.codex`. La lista de modelos proviene del catálogo en vivo de esa cuenta; iniciar sesión publica el perfil, pero este solo se convierte en el modelo activo cuando todavía no hay ningún LLM configurado, de modo que nunca redirige un despliegue a tus espaldas. Como un token autoriza el plan de una sola persona, el perfil no se puede compartir a través de permisos de usuario — cada cuenta inicia sesión por sí misma, incluidos los usuarios comunes: su tarjeta se encuentra bajo Models → LLM, y los modelos, el catálogo y el cierre de sesión resultantes permanecen privados para esa cuenta, y el navegador debe poder alcanzar la máquina que ejecuta el backend (en un servidor remoto, ejecuta `deeptutor provider login openai-codex` allí en su lugar). Los errores de cuota y las fallas del catálogo se reportan tal cual y nunca recurren a un proveedor de pago. Esta ruta de compatibilidad es experimental: la interfaz upstream puede cambiar.
+
+Los despliegues locales predeterminados de Docker y Podman usan redes de loopback separadas y necesitan un puente temporal durante el inicio de sesión. Sigue la [guía del puente temporal local de OAuth de Codex](../../CONTAINERIZATION.md#temporary-local-codex-oauth-bridge) para conocer los comandos exactos de Docker, Compose, Podman y desmontaje.
+
+Para un despliegue remoto, el `localhost` del navegador y el `localhost` del servidor son máquinas diferentes, de modo que un proxy inverso ordinario por sí solo no puede llevar la devolución de llamada localhost del navegador hasta el servidor. Usa un túnel SSH como puente de devolución de llamada. El túnel llega hasta el puerto Web ya publicado; Next.js reescribe únicamente la ruta exacta de devolución de llamada hacia el broker público de devolución de llamada, y el broker valida `state` antes de enrutar hacia la operación OAuth original. El listener de devolución de llamada permanece en el loopback del backend, los puertos `1455` y `1457` no se publican, y esta ruta admite la red bridge predeterminada de Docker.
+
+```bash
+ssh -N -L 1455:127.0.0.1:3782 <ssh-user>@<server-host>
+```
+
+Si yFeiSTAI reporta el puerto de devolución de llamada de reserva `1457`, usa:
+
+```bash
+ssh -N -L 1457:127.0.0.1:3782 <ssh-user>@<server-host>
+```
+
+Ejecuta solo el comando que coincide con el puerto de devolución de llamada real; nunca ejecutes ambos. `3782` es solo el puerto Web de ejemplo: es el puerto de frontend/contenedor configurado, reportado como `callback_forward_port`. Ese valor no garantiza que el mismo puerto esté escuchando en el `127.0.0.1` del host SSH. Si Docker o Podman publican un puerto de host diferente, o un proxy inverso escucha en un puerto distinto, reemplaza solo el puerto de destino del lado derecho (`3782` arriba) por el puerto Web que realmente escucha en el `127.0.0.1` del host SSH; conserva el puerto de devolución de llamada del lado izquierdo como `1455` o `1457`. `<server-host>` es el host SSH cuyo loopback posee ese puerto en escucha. Si la URL del navegador nombra un proxy inverso o balanceador de carga, reemplázala por el host frontend SSH correcto.
+
+La CLI imprime el comando del túnel y luego intenta abrir el navegador de inmediato. En un despliegue remoto, mantén abierta la página de autorización sin completarla, establece el túnel impreso en otra terminal, y solo entonces continúa la autorización.
+
+La detección de topología remota tiene un límite de localhost. Si Web mismo se alcanza a través de un forward de localhost de SSH o del IDE, el navegador no puede saber que el servidor es remoto. Para la operación Web actual, deja su página de autorización sin terminar, lee `redirect_uri` en la URL de autorización de esa operación para identificar el puerto de devolución de llamada `1455` o `1457`, y crea el segundo túnel desde ese puerto local hasta el puerto Web real. Alternativamente, cancela esa operación Web e inicia una nueva con la CLI; la salida de la CLI pertenece a la nueva operación y no debe usarse para la operación Web existente. Los errores de cuota y las fallas de catálogo se reportan tal cual y nunca recurren a un proveedor de pago. Esta ruta de compatibilidad es experimental: la interfaz upstream puede cambiar.
 
 </details>
 
@@ -504,12 +525,13 @@ data/
 ├── user/                    # Espacio de trabajo del administrador + configuración global
 ├── users/<uid>/             # Alcance por usuario: historial de chat, memoria, cuadernos, KBs
 ├── partners/<id>/workspace/ # Alcance del partner (usuario sintético)
-└── system/                  # auth/users.json · grants/<uid>.json · audit/usage.jsonl
+├── cli-apps/                # Aplicaciones CLI instaladas, montadas de solo lectura en el sandbox
+└── system/                  # auth · grants · audit · user-secrets/<owner> (tokens OAuth)
 ```
 
 El **primer usuario registrado se convierte en administrador** y es dueño de catálogos de modelos, credenciales de proveedor, bases de conocimiento compartidas, skills y permisos por usuario. Todos los demás obtienen un espacio de trabajo aislado y una página de Settings redactada — los modelos, KBs y skills asignados por el administrador aparecen como opciones con alcance de solo lectura, nunca como claves API en bruto.
 
-**Activarlo:** activa la autenticación en `data/user/settings/auth.json`, reinicia `deeptutor start`, registra al primer administrador en `/register`, luego agrega usuarios desde `/admin/users` y asigna modelos, KBs, skills, Partners, política de herramientas/MCP y acceso de ejecución de código a través de permisos.
+**Activarlo:** activa la autenticación en `data/user/settings/auth.json`, reinicia `deeptutor start`, registra al primer administrador en `/register`, luego agrega usuarios desde `/admin/users` y asigna modelos, KBs, skills, Partners, política de herramientas/MCP/CLI-apps y acceso de ejecución de código a través de permisos.
 
 > PocketBase sigue siendo una integración monousuario — mantén `integrations.pocketbase_url` en blanco para despliegues multi-usuario a menos que hayas conectado un almacén de usuarios externo.
 
@@ -562,7 +584,7 @@ El repo incluye un [`SKILL.md`](../../SKILL.md) raíz — un documento de traspa
 | Comando | Descripción |
 |:---|:---|
 | `deeptutor init` | Crear o actualizar `data/user/settings` para el espacio de trabajo actual |
-| `deeptutor start [--home PATH]` | Lanzar backend + frontend juntos |
+| `deeptutor start [--home PATH] [--dev]` | Lanzar backend + frontend juntos |
 | `deeptutor serve [--port PORT]` | Iniciar solo el backend FastAPI |
 | `deeptutor run <capability> <message>` | Ejecutar un turno de capacidad único (`chat`, `deep_solve`, `deep_question`, `deep_research`, `visualize`, `math_animator`, `mastery_path`); agrega `--format json` para salida NDJSON |
 | `deeptutor chat` | REPL interactivo con controles de capacidad, herramienta, KB, notebook e historial |
@@ -575,7 +597,7 @@ El repo incluye un [`SKILL.md`](../../SKILL.md) raíz — un documento de traspa
 | `deeptutor book list/health/refresh-fingerprints` | Inspeccionar libros y actualizar huellas dactilares de fuentes |
 | `deeptutor plugin list/info` | Inspeccionar herramientas y capacidades registradas |
 | `deeptutor config show` | Imprimir resumen de configuración |
-| `deeptutor provider login <provider>` | Autenticación del proveedor (`openai-codex` OAuth login; `github-copilot` valida una sesión de autenticación Copilot existente) |
+| `deeptutor provider login <provider>` | Autenticación del proveedor (`openai-codex` OAuth login; `github-copilot` valida una sesión de autenticación Copilot existente; `codebuddy` valida la autenticación del SDK de CodeBuddy e inicia el login cuando es necesario) |
 
 </details>
 
@@ -650,6 +672,22 @@ Agrega más registros en `settings/skill_hubs.json`: una entrada `type: "clawhub
 
 </details>
 
+## 🤝 Socios de Código Abierto
+
+<p align="center">
+  <a href="https://github.com/VectifyAI/PageIndex" target="_blank">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="../../assets/figs/partners/pageindex-mark-dark.svg">
+      <source media="(prefers-color-scheme: light)" srcset="../../assets/figs/partners/pageindex-mark.svg">
+      <img src="../../assets/figs/partners/pageindex-mark.svg" alt="PageIndex" height="38">
+    </picture>
+  </a>
+</p>
+
+<p align="center">
+  Usando el código: <b><code>DEEPTUTOR20</code></b> — ¡obtén $20 de descuento en tu primera <a href="https://developer.pageindex.ai/">suscripción a PageIndex</a>!
+</p>
+
 ## 🌐 Comunidad
 
 ### 📮 Contacto
@@ -684,18 +722,6 @@ Esperamos que yFeiSTAI se convierta en un regalo para la comunidad. 🎁
 
 <a href="https://github.com/HKUDS/DeepTutor/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=HKUDS/DeepTutor&max=999" alt="Contribuidores" />
-</a>
-
-</div>
-
-<div align="center">
-
-<a href="https://www.star-history.com/#HKUDS/DeepTutor&type=timeline&legend=top-left">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=HKUDS/DeepTutor&type=timeline&theme=dark&legend=top-left" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=HKUDS/DeepTutor&type=timeline&legend=top-left" />
-    <img alt="Gráfico de historial de estrellas" src="https://api.star-history.com/svg?repos=HKUDS/DeepTutor&type=timeline&legend=top-left" />
-  </picture>
 </a>
 
 </div>

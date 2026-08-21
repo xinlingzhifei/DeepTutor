@@ -20,16 +20,17 @@ Usage:
             ...
 """
 
+from importlib import import_module
+
 __all__ = ["BaseAgent", "ChatAgent", "SessionManager"]
 
 
 def __getattr__(name: str):
     if name == "BaseAgent":
-        from .base_agent import BaseAgent
-
-        return BaseAgent
-    if name in {"ChatAgent", "SessionManager"}:
-        from .chat import ChatAgent, SessionManager
-
-        return {"ChatAgent": ChatAgent, "SessionManager": SessionManager}[name]
-    raise AttributeError(name)
+        value = import_module(f"{__name__}.base_agent").BaseAgent
+    elif name in {"ChatAgent", "SessionManager"}:
+        value = getattr(import_module(f"{__name__}.chat"), name)
+    else:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    globals()[name] = value
+    return value

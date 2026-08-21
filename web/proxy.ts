@@ -1,20 +1,26 @@
 import { NextRequest, NextResponse } from "next/server";
 import { parseAuthEnabled } from "./lib/api";
 import {
+  CODEX_CALLBACK_API_PATH,
   COOKIE_NAME,
   LOGIN_PATH,
   classifyToken,
   isAuthExempt,
   isBackendPath,
+  isCodexCallbackPath,
 } from "./lib/proxy-policy";
 
 // Backend base URL for `/api/*` and `/ws/*` rewrites. The container entrypoint
 // exports `DEEPTUTOR_API_BASE_URL` from `data/user/settings/system.json`
 // (preferring `next_public_api_base`, then `next_public_api_base_external`,
-// then `http://localhost:${BACKEND_PORT}`). In dev (`deeptutor start`) it
-// defaults to `http://localhost:8001`.
+// then `http://127.0.0.1:${BACKEND_PORT}`). This last-resort default applies
+// only when nothing exported the variable at all.
+//
+// The loopback is spelled as the IPv4 literal, not `localhost`: on a dual-stack
+// host that name resolves to ::1 first, while uvicorn binds 0.0.0.0 (IPv4
+// only), so every rewrite would fail to connect.
 const API_BASE_URL =
-  process.env.DEEPTUTOR_API_BASE_URL ?? "http://localhost:8001";
+  process.env.DEEPTUTOR_API_BASE_URL ?? "http://127.0.0.1:8001";
 
 const AUTH_ENABLED = parseAuthEnabled(process.env.DEEPTUTOR_AUTH_ENABLED);
 
@@ -35,6 +41,12 @@ function redirectToLogin(
 
 export function proxy(req: NextRequest): NextResponse {
   const { pathname, search } = req.nextUrl;
+
+  if (isCodexCallbackPath(pathname)) {
+    return NextResponse.rewrite(
+      new URL(CODEX_CALLBACK_API_PATH + search, API_BASE_URL),
+    );
+  }
 
   // 1. Bridge the origin gap: forward backend-relative paths to the API server.
   //    This keeps the URL knowledge in one place (the entrypoint + system.json)
@@ -62,8 +74,13 @@ export function proxy(req: NextRequest): NextResponse {
 export const config = {
   // Run on every request except Next.js internals and the favicon. The /api/*
   // and /ws/* paths are explicitly handled above (rewritten to the backend);
+  // large knowledge create/upload requests are handled by dedicated App Router
+  // endpoints that stream directly to FastAPI. Excluding them here is crucial:
+  // merely entering Proxy makes Next clone and cap the multipart body.
   // the browser's /_next/image optimizer requests are excluded here, while the
   // optimizer's loopback fetch for the source image (e.g. /logo.png) is let
   // through the auth gate by isAuthExempt.
-  matcher: ["/((?!_next/static|_next/image|favicon.ico).*)"],
+  matcher: [
+    "/((?!_next/static|_next/image|favicon.ico|api/v1/knowledge/(?:create|[^/]+/upload)(?:/|$)).*)",
+  ],
 };

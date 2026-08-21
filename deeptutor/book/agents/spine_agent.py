@@ -33,7 +33,9 @@ class SpineAgent(BaseAgent):
         base_url: str | None = None,
         api_version: str | None = None,
         language: str = "zh",
-        binding: str = "openai",
+        # Let BaseAgent use the configured provider instead of forcing the
+        # OpenAI wire format for every deployment.
+        binding: str | None = None,
     ) -> None:
         super().__init__(
             module_name="book",
