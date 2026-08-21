@@ -28,6 +28,28 @@ class FakeRuntime:
         return self.results.get(name)
 
 
+def test_verifier_requires_the_exact_first_release_acceptance_matrix() -> None:
+    module = _load_verifier()
+
+    expected = (
+        "teacher_flow",
+        "student_micro_flow",
+        "student_full_flow",
+        "content_operations_flow",
+        "classroom_exports",
+        "tenant_isolation",
+        "learning_event_idempotency",
+        "openmaic_shared_plane",
+        "openmaic_dedicated_plane",
+        "tailwind4_visual_matrix",
+        "backup_restore",
+        "gateway_only_public",
+    )
+
+    assert module.REQUIRED_ACCEPTANCE_EVIDENCE == expected
+    assert set(expected) <= set(module.REQUIRED_LAYERS)
+
+
 def test_verifier_fails_when_any_business_flow_is_missing() -> None:
     module = _load_verifier()
     runtime = FakeRuntime()

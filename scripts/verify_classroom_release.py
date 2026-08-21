@@ -15,24 +15,31 @@ DEFAULT_EVIDENCE_PATH = (
     PROJECT_ROOT / "data" / "user" / "release-evidence" / "classroom-first-release.json"
 )
 
-REQUIRED_LAYERS = (
+REQUIRED_OPERATIONAL_LAYERS = (
     "source_head",
     "image_digests",
     "database_revisions",
     "running_containers",
     "service_health",
-    "public_routes",
+    "capacity_profile",
+)
+
+REQUIRED_ACCEPTANCE_EVIDENCE = (
     "teacher_flow",
     "student_micro_flow",
     "student_full_flow",
     "content_operations_flow",
-    "learning_loop",
-    "export_formats",
+    "classroom_exports",
     "tenant_isolation",
-    "dedicated_data_plane",
+    "learning_event_idempotency",
+    "openmaic_shared_plane",
+    "openmaic_dedicated_plane",
+    "tailwind4_visual_matrix",
     "backup_restore",
-    "capacity_profile",
+    "gateway_only_public",
 )
+
+REQUIRED_LAYERS = REQUIRED_OPERATIONAL_LAYERS + REQUIRED_ACCEPTANCE_EVIDENCE
 
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 
