@@ -24,6 +24,7 @@ REQUIRED_PLATFORM_SERVICES = {
     "tenant-provisioner",
     "openmaic",
     "openmaic-render",
+    "shared-data-plane-bootstrap",
     "teaching-dispatcher",
     "teaching-worker",
     "teaching-export-worker",
@@ -144,6 +145,30 @@ def test_api_waits_for_migration_and_storage_on_the_private_network() -> None:
     assert compose["networks"]["platform-internal"]["internal"] is True
     for name in REQUIRED_PLATFORM_SERVICES | {"deeptutor"}:
         assert "platform-internal" in compose["services"][name]["networks"], name
+
+
+def test_runtime_waits_for_verified_shared_data_plane_registration() -> None:
+    compose = _platform_compose()
+    services = compose["services"]
+    bootstrap = services["shared-data-plane-bootstrap"]
+
+    assert bootstrap["command"] == ["scripts/bootstrap_shared_data_plane.py"]
+    assert bootstrap["depends_on"]["teaching-migrate"]["condition"] == (
+        "service_completed_successfully"
+    )
+    assert bootstrap["depends_on"]["openmaic"]["condition"] == "service_healthy"
+    for name in {
+        "deeptutor",
+        "learning-projector",
+        "teaching-dispatcher",
+        "teaching-export-worker",
+        "teaching-reaper",
+        "teaching-worker",
+        "tenant-provisioner",
+    }:
+        assert services[name]["depends_on"]["shared-data-plane-bootstrap"]["condition"] == (
+            "service_completed_successfully"
+        )
 
 
 def test_only_openmaic_can_reach_the_shared_provider_egress() -> None:

@@ -36,6 +36,8 @@ x-teaching-process: &teaching-process
       condition: service_completed_successfully
     minio-bootstrap:
       condition: service_completed_successfully
+    shared-data-plane-bootstrap:
+      condition: service_completed_successfully
 
 services:
   pocketbase:
@@ -59,6 +61,8 @@ services:
       teaching-migrate:
         condition: service_completed_successfully
       minio-bootstrap:
+        condition: service_completed_successfully
+      shared-data-plane-bootstrap:
         condition: service_completed_successfully
     networks: !override
       - platform-internal
@@ -261,6 +265,35 @@ services:
       interval: 15s
       timeout: 5s
       retries: 12
+
+  shared-data-plane-bootstrap:
+    image: *deeptutor-image
+    restart: "no"
+    user: "1000:1000"
+    entrypoint:
+      - python
+    command:
+      - scripts/bootstrap_shared_data_plane.py
+    healthcheck:
+      disable: true
+    secrets:
+      - platform_database_app_password
+      - openmaic_service_secret
+    volumes:
+      - ./data:/app/data
+      - type: volume
+        source: platform-secret-mask
+        target: /app/data/system/secrets
+        read_only: true
+        volume:
+          nocopy: true
+    networks:
+      - platform-internal
+    depends_on:
+      teaching-migrate:
+        condition: service_completed_successfully
+      openmaic:
+        condition: service_healthy
 
   openmaic-render:
     image: *openmaic-render-image
