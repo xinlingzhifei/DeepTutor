@@ -35,6 +35,17 @@ def _migration_script():
     return module
 
 
+@cache
+def _preflight_script():
+    path = ROOT / "scripts" / "platform_preflight.py"
+    spec = importlib.util.spec_from_file_location("platform_preflight_role_test", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 @pytest.mark.asyncio
 async def test_database_roles_authenticate_with_least_privilege(
     request: pytest.FixtureRequest,
@@ -104,7 +115,8 @@ async def test_preflight_requires_current_platform_and_tenant_migrations(
     from deeptutor.services.config import PlatformSettings
     from deeptutor.teaching.provisioning_worker import TENANT_SCHEMA_REVISION
     from deeptutor.teaching.schema_names import tenant_schema_name
-    from scripts.platform_preflight import _inspect_database_runtime
+
+    inspect_database_runtime = _preflight_script()._inspect_database_runtime
 
     database_url = _database_url(request)
     settings_dir = tmp_path / "data" / "user" / "settings"
@@ -215,7 +227,7 @@ async def test_preflight_requires_current_platform_and_tenant_migrations(
     finally:
         await engine.dispose()
 
-    inspection = await _inspect_database_runtime(
+    inspection = await inspect_database_runtime(
         PlatformSettings(
             enabled=True,
             database_url=SecretStr(database_url),
@@ -238,7 +250,7 @@ async def test_preflight_requires_current_platform_and_tenant_migrations(
     finally:
         await engine.dispose()
 
-    inspection = await _inspect_database_runtime(
+    inspection = await inspect_database_runtime(
         PlatformSettings(
             enabled=True,
             database_url=SecretStr(database_url),

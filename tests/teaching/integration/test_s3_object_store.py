@@ -5,9 +5,11 @@ from collections.abc import AsyncIterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
+import sys
 from urllib.parse import parse_qs, urlparse
 
 import boto3
@@ -945,16 +947,18 @@ async def test_runtime_minio_admin_provisions_isolates_and_rotates_credentials(
         rotated.secret_ref,
     ]
 
-    from scripts.platform_preflight import (
-        _ActiveTenant,
-        _inspect_object_store_runtime,
-    )
+    preflight_path = Path(__file__).resolve().parents[3] / "scripts" / "platform_preflight.py"
+    spec = importlib.util.spec_from_file_location("platform_preflight_s3_test", preflight_path)
+    assert spec is not None and spec.loader is not None
+    preflight = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = preflight
+    spec.loader.exec_module(preflight)
 
-    preflight_errors = await _inspect_object_store_runtime(
+    preflight_errors = await preflight._inspect_object_store_runtime(
         settings,
         tmp_path,
         (
-            _ActiveTenant(
+            preflight._ActiveTenant(
                 tenant_id="tenant-runtime",
                 schema_name=tenant_schema_name("tenant-runtime"),
                 secret_ref=rotated.secret_ref,

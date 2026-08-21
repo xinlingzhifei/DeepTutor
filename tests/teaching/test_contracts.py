@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 import copy
+from functools import cache
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
+import sys
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
@@ -18,6 +21,17 @@ OUTLINE_BUNDLE_CONTRACT_SHA256 = (
 )
 GENERATED_AT = "2026-07-30T08:00:00Z"
 CONTRACT_SCHEMA_DIR = Path(__file__).resolve().parents[2] / "contracts" / "classroom"
+
+
+@cache
+def _contract_verifier():
+    path = Path(__file__).resolve().parents[2] / "scripts" / "verify_classroom_contracts.py"
+    spec = importlib.util.spec_from_file_location("classroom_contract_verifier_test", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def committed_schema(filename: str) -> dict[str, object]:
@@ -2279,12 +2293,9 @@ def test_job_error_category_is_fixed(
 
 
 def test_all_eight_committed_schemas_match_models() -> None:
-    from scripts.verify_classroom_contracts import (
-        CONTRACT_SCHEMA_FILENAMES,
-        verify_contract_schemas,
-    )
+    verifier = _contract_verifier()
 
-    assert set(CONTRACT_SCHEMA_FILENAMES) == {
+    assert set(verifier.CONTRACT_SCHEMA_FILENAMES) == {
         "teaching-brief.schema.json",
         "generation-request.schema.json",
         "outline-bundle.schema.json",
@@ -2294,23 +2305,20 @@ def test_all_eight_committed_schemas_match_models() -> None:
         "export-job.schema.json",
         "learning-event.schema.json",
     }
-    assert verify_contract_schemas() == []
+    assert verifier.verify_contract_schemas() == []
 
 
 def test_schema_verifier_reports_missing_and_drifted_files(tmp_path: Path) -> None:
-    from scripts.verify_classroom_contracts import (
-        generated_contract_schemas,
-        verify_contract_schemas,
-    )
+    verifier = _contract_verifier()
 
-    generated = generated_contract_schemas()
+    generated = verifier.generated_contract_schemas()
     for filename, schema in generated.items():
         (tmp_path / filename).write_text(
             json.dumps(schema, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
 
-    assert verify_contract_schemas(tmp_path) == []
+    assert verifier.verify_contract_schemas(tmp_path) == []
 
     modified_dir = tmp_path / "modified"
     modified_dir.mkdir()
@@ -2329,7 +2337,7 @@ def test_schema_verifier_reports_missing_and_drifted_files(tmp_path: Path) -> No
         encoding="utf-8",
     )
 
-    errors = verify_contract_schemas(modified_dir)
+    errors = verifier.verify_contract_schemas(modified_dir)
     assert errors == [
         "export-job.schema.json: missing",
         "generation-request.schema.json: schema drift",
@@ -2341,18 +2349,15 @@ def test_schema_verifier_rejects_stray_files(
     tmp_path: Path,
     stray_filename: str,
 ) -> None:
-    from scripts.verify_classroom_contracts import (
-        generated_contract_schemas,
-        verify_contract_schemas,
-    )
+    verifier = _contract_verifier()
 
-    for filename, schema in generated_contract_schemas().items():
+    for filename, schema in verifier.generated_contract_schemas().items():
         (tmp_path / filename).write_text(
             json.dumps(schema, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
     (tmp_path / stray_filename).write_text("{}\n", encoding="utf-8")
 
-    assert verify_contract_schemas(tmp_path) == [
+    assert verifier.verify_contract_schemas(tmp_path) == [
         f"{stray_filename}: unexpected",
     ]
