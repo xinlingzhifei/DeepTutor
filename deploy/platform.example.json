@@ -7,6 +7,7 @@
   "database_password_file": "/run/secrets/platform_database_app_password",
   "object_store_mode": "s3",
   "object_store_endpoint": "http://minio:9000",
+  "object_store_namespace_id": "yfeistai-primary-minio",
   "object_store_bucket": "yfeistai-classrooms",
   "object_store_region": "us-east-1",
   "object_store_tenant_credentials_dir": "/run/yfeistai/tenant-secrets",

@@ -39,6 +39,7 @@ class PlatformSettings(BaseModel):
     database_password_file: Path | None = None
     object_store_mode: Literal["local", "s3"] = "local"
     object_store_endpoint: str | None = None
+    object_store_namespace_id: str | None = None
     object_store_bucket: str = "yfeistai-classrooms"
     object_store_region: str = "us-east-1"
     object_store_tenant_credentials_dir: Path | None = None
@@ -54,6 +55,7 @@ class PlatformSettings(BaseModel):
             raise ValueError(
                 "platform database_url or database_password_file is required when enabled"
             )
+        namespace_id = self.object_store_namespace_id
         if self.enabled and self.object_store_mode == "s3":
             endpoint = self.object_store_endpoint
             bucket = self.object_store_bucket
@@ -61,12 +63,15 @@ class PlatformSettings(BaseModel):
             if (
                 endpoint is None
                 or not endpoint.strip()
+                or namespace_id is None
+                or not namespace_id
                 or not bucket.strip()
                 or credentials_dir is None
                 or not credentials_dir.is_absolute()
             ):
                 raise ValueError(
-                    "S3 endpoint, bucket, and absolute tenant credentials directory are required"
+                    "S3 endpoint, stable namespace ID, bucket, and absolute tenant credentials "
+                    "directory are required"
                 )
         for origin in self.object_store_public_download_origins:
             parsed = urlsplit(origin)
@@ -80,6 +85,14 @@ class PlatformSettings(BaseModel):
                 or parsed.fragment
             ):
                 raise ValueError("object store public download origins must be HTTPS origins")
+        if namespace_id is not None and (
+            not namespace_id
+            or len(namespace_id) > 128
+            or not namespace_id.isascii()
+            or not namespace_id[0].isalnum()
+            or any(not (character.isalnum() or character in "._:-") for character in namespace_id)
+        ):
+            raise ValueError("object_store_namespace_id is invalid")
         if (
             self.classroom_ticket_secret_file is not None
             and not self.classroom_ticket_secret_file.is_absolute()
@@ -153,7 +166,10 @@ def _safe_validation_error_message(error: ValidationError) -> str:
         if "database_url or database_password_file" in message:
             issues.append("database_url or database_password_file")
         elif "S3 endpoint" in message:
-            issues.append("S3 endpoint, bucket, and absolute tenant credentials directory")
+            issues.append(
+                "S3 endpoint, stable namespace ID, bucket, and absolute tenant credentials "
+                "directory"
+            )
         elif "classroom_ticket_secret_file" in message:
             issues.append("classroom_ticket_secret_file")
         else:

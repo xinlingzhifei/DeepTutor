@@ -415,6 +415,7 @@ def test_s3_default_admin_boundary_fails_closed_without_credential_metadata(
         database_url="postgresql+asyncpg://user:password@db/test",
         object_store_mode="s3",
         object_store_endpoint="http://minio:9000",
+        object_store_namespace_id="test-minio-primary",
         object_store_tenant_credentials_dir=tmp_path,
     )
     provisioner = build_storage_provisioner(settings)
@@ -634,6 +635,7 @@ def test_injected_s3_admin_must_execute_and_return_verified_tenant_binding(
         database_url="postgresql+asyncpg://user:password@db/test",
         object_store_mode="s3",
         object_store_endpoint="http://minio:9000",
+        object_store_namespace_id="test-minio-primary",
         object_store_tenant_credentials_dir=tmp_path,
     )
     provisioner = build_storage_provisioner(

@@ -147,6 +147,27 @@ def test_api_waits_for_migration_and_storage_on_the_private_network() -> None:
         assert "platform-internal" in compose["services"][name]["networks"], name
 
 
+def test_minio_bootstrap_enables_and_verifies_bucket_versioning() -> None:
+    compose = yaml.load(
+        (ROOT / "docker-compose.platform.yml").read_text(encoding="utf-8"),
+        Loader=yaml.BaseLoader,
+    )
+    command = compose["services"]["minio-bootstrap"]["command"]
+    assert isinstance(command, list) and len(command) == 1
+    script = command[0]
+
+    bucket = 'bucket="platform/${YFEISTAI_OBJECT_STORE_BUCKET:-yfeistai-classrooms}"'
+    create = 'mc mb --ignore-existing "$$bucket"'
+    enable = 'mc version enable "$$bucket"'
+    verify = 'mc version info "$$bucket" | grep -F "versioning is enabled"'
+
+    assert bucket in script
+    assert create in script
+    assert enable in script
+    assert verify in script
+    assert script.index(create) < script.index(enable) < script.index(verify)
+
+
 def test_runtime_waits_for_verified_shared_data_plane_registration() -> None:
     compose = _platform_compose()
     services = compose["services"]
@@ -351,6 +372,7 @@ def test_openmaic_images_and_worker_pools_are_separate_and_pinned() -> None:
     assert services["teaching-worker"]["command"][-1] == "worker"
     assert services["teaching-export-worker"]["command"][-1] == "export-worker"
     settings = json.loads((ROOT / "deploy" / "platform.example.json").read_text(encoding="utf-8"))
+    assert settings["object_store_namespace_id"] == "yfeistai-primary-minio"
     assert settings["shared_generation_limit"] == 20
     assert settings["default_tenant_generation_limit"] == 2
 

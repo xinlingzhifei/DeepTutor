@@ -341,6 +341,9 @@ def test_invalid_setting_is_rejected_without_exposing_raw_input(
         ),
         ({"object_store_endpoint": " \t "}, "S3 endpoint"),
         ({"object_store_bucket": " \t "}, "bucket"),
+        ({"object_store_namespace_id": None}, "stable namespace ID"),
+        ({"object_store_namespace_id": ""}, "stable namespace ID"),
+        ({"object_store_namespace_id": "同一存储"}, "invalid platform settings: model"),
     ],
 )
 def test_enabled_s3_rejects_unusable_storage_settings_without_exposing_input(
@@ -356,6 +359,7 @@ def test_enabled_s3_rejects_unusable_storage_settings_without_exposing_input(
             "database_url": "postgresql+asyncpg://db/yfeistai",
             "object_store_mode": "s3",
             "object_store_endpoint": "http://minio:9000",
+            "object_store_namespace_id": "yfeistai-primary-minio",
             "object_store_bucket": "yfeistai-classrooms",
             "object_store_tenant_credentials_dir": str(tmp_path / "tenant-secrets"),
             "openmaic_service_secret_file": sentinel,
@@ -368,6 +372,23 @@ def test_enabled_s3_rejects_unusable_storage_settings_without_exposing_input(
     _assert_error_does_not_expose(exc_info.value, sentinel)
 
 
+def test_enabled_s3_requires_stable_namespace_id(tmp_path: Path) -> None:
+    settings = _write_settings(
+        tmp_path,
+        {
+            "enabled": True,
+            "database_url": "postgresql+asyncpg://db/yfeistai",
+            "object_store_mode": "s3",
+            "object_store_endpoint": "http://minio:9000",
+            "object_store_bucket": "yfeistai-classrooms",
+            "object_store_tenant_credentials_dir": str(tmp_path / "tenant-secrets"),
+        },
+    )
+
+    with pytest.raises(ValueError, match="stable namespace ID"):
+        load_platform_settings(settings)
+
+
 def test_enabled_s3_accepts_tenant_credentials_root(tmp_path: Path) -> None:
     credentials_dir = tmp_path / "tenant-secrets"
     settings = _write_settings(
@@ -377,12 +398,14 @@ def test_enabled_s3_accepts_tenant_credentials_root(tmp_path: Path) -> None:
             "database_url": "postgresql+asyncpg://db/yfeistai",
             "object_store_mode": "s3",
             "object_store_endpoint": "http://minio:9000",
+            "object_store_namespace_id": "yfeistai-primary-minio",
             "object_store_tenant_credentials_dir": str(credentials_dir),
         },
     )
     loaded = load_platform_settings(settings)
 
     assert loaded.object_store_endpoint == "http://minio:9000"
+    assert loaded.object_store_namespace_id == "yfeistai-primary-minio"
     assert loaded.object_store_tenant_credentials_dir == credentials_dir
 
 

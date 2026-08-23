@@ -37,6 +37,7 @@ def _settings(tmp_path: Path) -> PlatformSettings:
         database_url=SecretStr("postgresql+asyncpg://user:pass@db/platform"),
         object_store_mode="s3",
         object_store_endpoint="http://minio:9000",
+        object_store_namespace_id="test-minio-primary",
         object_store_bucket="classrooms",
         object_store_region="us-east-1",
         object_store_tenant_credentials_dir=tmp_path,

@@ -248,6 +248,7 @@ def test_runtime_preflight_fails_closed_for_every_required_dependency(
         database_url=SecretStr("postgresql+asyncpg://app:pass@db/platform"),
         object_store_mode="s3",
         object_store_endpoint="http://minio:9000",
+        object_store_namespace_id="test-minio-primary",
         object_store_bucket="classrooms",
         object_store_tenant_credentials_dir=tmp_path / "tenant-secrets",
     )

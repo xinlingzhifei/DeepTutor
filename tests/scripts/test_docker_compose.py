@@ -89,6 +89,7 @@ def test_render_docker_env_adds_only_non_sensitive_platform_values(
                 "database_password_file": "/run/secrets/platform_database_password",
                 "object_store_mode": "s3",
                 "object_store_endpoint": "http://minio:9000",
+                "object_store_namespace_id": "test-minio-primary",
                 "object_store_bucket": "yfeistai-classrooms",
                 "object_store_region": "us-east-1",
                 "shared_generation_limit": 20,
@@ -627,6 +628,27 @@ def test_production_dockerfile_can_use_ephemeral_signed_debian_sources() -> None
     )
 
     assert content.count(f"RUN {mount} \\") == 2
+
+
+def test_production_dockerfile_installs_postgresql_16_backup_clients() -> None:
+    root = Path(__file__).resolve().parents[2]
+    content = (root / "Dockerfile").read_text(encoding="utf-8")
+    production = content.split("FROM python:3.11-slim AS production", 1)[1].split(
+        "FROM production AS development", 1
+    )[0]
+    mount = (
+        "RUN --mount=type=secret,id=debian_sources,"
+        "target=/etc/apt/sources.list.d/debian.sources,required=false \\\n"
+    )
+
+    assert mount in production
+    assert "https://www.postgresql.org/media/keys/ACCC4CF8.asc" in production
+    assert "https://apt.postgresql.org/pub/repos/apt" in production
+    assert "Suites: $${VERSION_CODENAME}-pgdg" in production
+    assert "Signed-By: /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc" in production
+    assert "    postgresql-client-16 \\\n" in production
+    assert "pg_dump --version | grep -E '[(]PostgreSQL[)] 16[.]'" in production
+    assert "pg_restore --version | grep -E '[(]PostgreSQL[)] 16[.]'" in production
 
 
 def test_production_dockerfile_installs_rust_from_the_signed_debian_source() -> None:

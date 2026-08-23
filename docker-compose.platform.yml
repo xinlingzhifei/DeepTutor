@@ -168,7 +168,10 @@ services:
     command:
       - |
         mc alias set platform http://minio:9000 "$$(cat /run/secrets/minio_bootstrap_access_key)" "$$(cat /run/secrets/minio_bootstrap_secret_key)"
-        mc mb --ignore-existing "platform/${YFEISTAI_OBJECT_STORE_BUCKET:-yfeistai-classrooms}"
+        bucket="platform/${YFEISTAI_OBJECT_STORE_BUCKET:-yfeistai-classrooms}"
+        mc mb --ignore-existing "$$bucket"
+        mc version enable "$$bucket"
+        mc version info "$$bucket" | grep -F "versioning is enabled"
     secrets:
       - minio_bootstrap_access_key
       - minio_bootstrap_secret_key

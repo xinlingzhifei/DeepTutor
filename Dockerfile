@@ -143,6 +143,23 @@ RUN --mount=type=secret,id=debian_sources,target=/etc/apt/sources.list.d/debian.
     libsm6 \
     libxext6 \
     libxrender1 \
+    && install -d -m 0755 /usr/share/postgresql-common/pgdg \
+    && curl --fail --show-error --silent \
+        -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+        https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+    && . /etc/os-release \
+    && printf '%s\n' \
+        'Types: deb' \
+        'URIs: https://apt.postgresql.org/pub/repos/apt' \
+        "Suites: $${VERSION_CODENAME}-pgdg" \
+        "Architectures: $$(dpkg --print-architecture)" \
+        'Components: main' \
+        'Signed-By: /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc' \
+        > /etc/apt/sources.list.d/pgdg.sources \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    postgresql-client-16 \
+    && pg_dump --version | grep -E '[(]PostgreSQL[)] 16[.]' \
+    && pg_restore --version | grep -E '[(]PostgreSQL[)] 16[.]' \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy Node.js from node-runtime stage (platform-matched binary)

@@ -440,12 +440,20 @@ git commit -m "feat(teaching): observe classroom runtime health"
 
 **Files:**
 
+- Modify: `Dockerfile`
+- Modify: `docker-compose.platform.yml`
+- Modify: `deeptutor/services/config/platform_settings.py`
+- Modify: `deploy/platform.example.json`
 - Create: `scripts/backup_teaching.py`
 - Create: `scripts/restore_teaching_validation.py`
 - Create: `scripts/register_data_plane.py`
 - Create: `tests/scripts/test_teaching_backup_manifest.py`
 - Create: `tests/integration/test_teaching_restore.py`
 - Create: `tests/integration/test_dedicated_data_plane.py`
+- Modify: `tests/scripts/test_docker_compose.py`
+- Modify: `tests/scripts/test_platform_compose.py`
+- Modify: `tests/services/config/test_platform_settings.py`
+- Modify: existing S3 `PlatformSettings` fixtures to supply the stable test namespace ID
 
 - [ ] Step 1: 写备份清单和无共享回退失败测试
 
@@ -481,7 +489,7 @@ Expected: FAIL。
 
 - [ ] Step 4: 实现非破坏性恢复验证
 
-恢复脚本只恢复到新数据库和新对象前缀，例如 `restore-validation/<run-id>/`，验证版本、来源快照、媒体、事件、配额和审计关联后输出报告，不覆盖当前环境。
+备份清单以受摘要保护的稳定对象存储 namespace ID + bucket 绑定源命名空间；该 ID 由运维显式配置且不得随 endpoint/CNAME/代理入口变化。恢复脚本只恢复到新数据库和与源身份不同的专属新对象桶；目标桶必须为空且已启用版本化，并按运行时可直接读取的 canonical `tenants/<tenant-id>/...` key 恢复。脚本验证目标 ETag/VersionId、来源快照、媒体、事件、配额、审计关联和 `yfeistai_app` 权限后输出报告，不覆盖当前环境。仅使用同桶 `restore-validation/<run-id>/` 前缀不满足本合同，因为数据库中的 canonical object key 会与物理对象 key 脱节。
 
 - [ ] Step 5: 实现独立数据面登记
 
