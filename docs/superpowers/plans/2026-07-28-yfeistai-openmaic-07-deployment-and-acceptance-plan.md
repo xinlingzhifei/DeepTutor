@@ -455,7 +455,7 @@ git commit -m "feat(teaching): observe classroom runtime health"
 - Modify: `tests/services/config/test_platform_settings.py`
 - Modify: existing S3 `PlatformSettings` fixtures to supply the stable test namespace ID
 
-- [ ] Step 1: 写备份清单和无共享回退失败测试
+- [x] Step 1: 写备份清单和无共享回退失败测试
 
 ```python
 def test_backup_manifest_binds_database_and_objects(manifest):
@@ -473,7 +473,7 @@ async def test_private_tenant_never_uses_shared_provider(harness):
     assert harness.shared_plane.requests_for("tenant-private") == 0
 ```
 
-- [ ] Step 2: 运行并确认失败
+- [x] Step 2: 运行并确认失败
 
 Run:
 
@@ -483,19 +483,19 @@ python -m pytest tests/scripts/test_teaching_backup_manifest.py tests/integratio
 
 Expected: FAIL。
 
-- [ ] Step 3: 实现一致性备份
+- [x] Step 3: 实现一致性备份
 
 备份脚本创建 PostgreSQL 一致性 dump、对象清单、Schema revisions、课堂版本计数、事件计数和 SHA-256 清单。输出目录由调用者显式提供；脚本不清理旧备份。
 
-- [ ] Step 4: 实现非破坏性恢复验证
+- [x] Step 4: 实现非破坏性恢复验证
 
 备份清单以受摘要保护的稳定对象存储 namespace ID + bucket 绑定源命名空间；该 ID 由运维显式配置且不得随 endpoint/CNAME/代理入口变化。恢复脚本只恢复到新数据库和与源身份不同的专属新对象桶；目标桶必须为空且已启用版本化，并按运行时可直接读取的 canonical `tenants/<tenant-id>/...` key 恢复。脚本验证目标 ETag/VersionId、来源快照、媒体、事件、配额、审计关联和 `yfeistai_app` 权限后输出报告，不覆盖当前环境。仅使用同桶 `restore-validation/<run-id>/` 前缀不满足本合同，因为数据库中的 canonical object key 会与物理对象 key 脱节。
 
-- [ ] Step 5: 实现独立数据面登记
+- [x] Step 5: 实现独立数据面登记
 
 `register_data_plane.py` 校验健康、契约、Secret 引用和目标租户后写入平台控制 Schema。密钥仍留在 Secret 文件；共享池无法读取独立数据面 Provider。
 
-- [ ] Step 6: 运行演练
+- [x] Step 6: 运行演练
 
 Run:
 
@@ -505,7 +505,7 @@ python -m pytest tests/scripts/test_teaching_backup_manifest.py tests/integratio
 
 Expected: PASS。
 
-- [ ] Step 7: 提交
+- [x] Step 7: 提交
 
 ```powershell
 git add scripts/backup_teaching.py scripts/restore_teaching_validation.py scripts/register_data_plane.py tests/scripts/test_teaching_backup_manifest.py tests/integration/test_teaching_restore.py tests/integration/test_dedicated_data_plane.py
@@ -521,7 +521,7 @@ git commit -m "feat(deploy): verify backup and dedicated data planes"
 - Create: `tests/load/test_scheduler_capacity.py`
 - Create: `tests/load/test_learning_event_capacity.py`
 
-- [ ] Step 1: 写容量断言
+- [x] Step 1: 写容量断言
 
 ```python
 def test_first_release_profile():
@@ -534,7 +534,7 @@ def test_first_release_profile():
     assert profile.default_tenant_slots == 2
 ```
 
-- [ ] Step 2: 实现模拟 Provider 压测
+- [x] Step 2: 实现模拟 Provider 压测
 
 `scripts/load_classroom.py --profile first-release` 使用可控延迟和错误率的模拟 OpenMAIC Provider，验证：
 
@@ -550,7 +550,7 @@ job submission visible within 2 seconds
 mastery projection visible within 60 seconds
 ```
 
-- [ ] Step 3: 实现安全测试
+- [x] Step 3: 实现安全测试
 
 覆盖：
 
@@ -566,7 +566,7 @@ provider secret exposure in APIs and logs
 public OpenMAIC route probing
 ```
 
-- [ ] Step 4: 运行门禁
+- [x] Step 4: 运行门禁
 
 Run:
 
@@ -577,7 +577,7 @@ python scripts/load_classroom.py --profile first-release
 
 Expected: PASS；压测报告保存原始样本、p50/p95/p99、错误率和资源占用。
 
-- [ ] Step 5: 提交
+- [x] Step 5: 提交
 
 ```powershell
 git add scripts/load_classroom.py tests/security/test_classroom_security.py tests/load/test_scheduler_capacity.py tests/load/test_learning_event_capacity.py
@@ -592,7 +592,7 @@ git commit -m "test(teaching): gate security and first-release capacity"
 - Create: `tests/scripts/test_verify_classroom_release.py`
 - Create: `web/tests/e2e/classroom-first-release.spec.ts`
 
-- [ ] Step 1: 写验证器失败条件
+- [x] Step 1: 写验证器失败条件
 
 ```python
 def test_verifier_fails_when_any_business_flow_is_missing(fake_runtime):
@@ -603,7 +603,7 @@ def test_verifier_fails_when_any_business_flow_is_missing(fake_runtime):
     assert "content_operations_flow" in result.missing
 ```
 
-- [ ] Step 2: 运行并确认失败
+- [x] Step 2: 运行并确认失败
 
 Run:
 
@@ -613,7 +613,7 @@ python -m pytest tests/scripts/test_verify_classroom_release.py -q
 
 Expected: FAIL。
 
-- [ ] Step 3: 实现发布验证器
+- [x] Step 3: 实现发布验证器
 
 验证器报告以下层次，不能混为一个“部署成功”：
 
@@ -636,7 +636,7 @@ backup_restore
 capacity_profile
 ```
 
-- [ ] Step 4: 实现统一浏览器验收
+- [x] Step 4: 实现统一浏览器验收
 
 同一套环境依次执行教师、学生微课堂、学生完整课堂、教研批量、审核、发布、播放、课堂 ZIP/PPTX/离线 HTML/MP4 导出、事件回传和报表。切换两个租户证明导航、列表、文件、导出和事件不串租户。
 
