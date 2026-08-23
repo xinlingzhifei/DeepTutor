@@ -16,3 +16,16 @@ test("managed Next descendants do not inherit the Playwright runner heap limit",
     /NODE_OPTIONS:\s*`--max-old-space-size=\$\{MANAGED_HEAP_LIMIT_MB\}`/,
   );
 });
+
+test("managed Next has enough heap for the complete route warm-up", () => {
+  for (const sourcePath of [
+    "tests/e2e/support/managed-web-server.ts",
+    "tests/e2e/support/managed-next-server.mjs",
+  ]) {
+    assert.match(
+      readFileSync(sourcePath, "utf8"),
+      /const MANAGED_HEAP_LIMIT_MB = 4096;/,
+      `${sourcePath} must match the reviewed development heap ceiling`,
+    );
+  }
+});

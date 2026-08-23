@@ -16,7 +16,7 @@ const LOCAL_WEB_PORT = process.env.PW_WEB_PORT || "3000";
 const LOCAL_WEB_BASE_URL = `http://127.0.0.1:${LOCAL_WEB_PORT}`;
 const LOCAL_SERVER_URL = `http://127.0.0.1:${LOCAL_WEB_PORT}/login`;
 const WARMUP_TIMEOUT_MS = 6 * 60 * 1000;
-const MANAGED_HEAP_LIMIT_MB = 3072;
+const MANAGED_HEAP_LIMIT_MB = 4096;
 const BASELINE_ROUTES = [
   "/login",
   "/home",

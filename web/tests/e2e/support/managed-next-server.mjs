@@ -9,7 +9,7 @@ const WEB_ROOT = path.resolve(
 );
 const port = Number(process.argv[2]);
 const hostname = "127.0.0.1";
-const MANAGED_HEAP_LIMIT_MB = 3072;
+const MANAGED_HEAP_LIMIT_MB = 4096;
 const nextBin = path.join(
   WEB_ROOT,
   "node_modules",
