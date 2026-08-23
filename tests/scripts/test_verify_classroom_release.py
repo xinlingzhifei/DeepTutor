@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -14,6 +15,58 @@ def _load_verifier():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _candidate(source_head: str) -> dict[str, object]:
+    return {
+        "sourceHead": source_head,
+        "imageDigests": {
+            "deeptutor": "sha256:" + "1" * 64,
+            "openmaic": "sha256:" + "2" * 64,
+            "openmaic_render": "sha256:" + "3" * 64,
+        },
+    }
+
+
+def _write_complete_bundle(
+    tmp_path: Path,
+    module,
+    *,
+    source_head: str,
+) -> tuple[Path, dict[str, object], dict[str, object]]:
+    candidate = _candidate(source_head)
+    evidence: dict[str, object] = {}
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    for name in module.REQUIRED_LAYERS:
+        artifact_path = artifacts / f"{name}.json"
+        artifact_body = json.dumps(
+            {
+                "schemaVersion": 1,
+                "candidate": candidate,
+                "evidence": name,
+            },
+            sort_keys=True,
+        ).encode()
+        artifact_path.write_bytes(artifact_body)
+        evidence[name] = {
+            "status": "pass",
+            "detail": f"{name} verified",
+            "artifact": artifact_path.relative_to(tmp_path).as_posix(),
+            "artifactSha256": hashlib.sha256(artifact_body).hexdigest(),
+        }
+    manifest = tmp_path / "release-evidence.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schemaVersion": 2,
+                "candidate": candidate,
+                "evidence": evidence,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return manifest, evidence, candidate
 
 
 class FakeRuntime:
@@ -122,24 +175,10 @@ def test_all_required_layers_produce_a_ready_report() -> None:
 
 def test_file_runtime_requires_the_same_candidate_head(tmp_path: Path) -> None:
     module = _load_verifier()
-    evidence = {
-        name: {
-            "status": "pass",
-            "detail": f"{name} verified",
-            "artifact": f"evidence/{name}.json",
-        }
-        for name in module.REQUIRED_LAYERS
-    }
-    manifest = tmp_path / "release-evidence.json"
-    manifest.write_text(
-        json.dumps(
-            {
-                "schemaVersion": 1,
-                "candidate": {"sourceHead": "a" * 40},
-                "evidence": evidence,
-            }
-        ),
-        encoding="utf-8",
+    manifest, _, _ = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
     )
 
     result = module.verify(module.FileReleaseRuntime(manifest, expected_source_head="b" * 40))
@@ -151,22 +190,18 @@ def test_file_runtime_requires_the_same_candidate_head(tmp_path: Path) -> None:
 
 def test_file_runtime_rejects_unproven_or_malformed_passes(tmp_path: Path) -> None:
     module = _load_verifier()
-    evidence = {
-        name: {
-            "status": "pass",
-            "detail": "verified",
-            "artifact": f"evidence/{name}.json",
-        }
-        for name in module.REQUIRED_LAYERS
-    }
+    manifest, evidence, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="c" * 40,
+    )
     evidence["teacher_flow"] = {"status": "pass", "detail": "", "artifact": ""}
     evidence["student_full_flow"] = {"status": "unknown", "detail": "not run"}
-    manifest = tmp_path / "release-evidence.json"
     manifest.write_text(
         json.dumps(
             {
-                "schemaVersion": 1,
-                "candidate": {"sourceHead": "c" * 40},
+                "schemaVersion": 2,
+                "candidate": candidate,
                 "evidence": evidence,
             }
         ),
@@ -178,6 +213,94 @@ def test_file_runtime_rejects_unproven_or_malformed_passes(tmp_path: Path) -> No
     assert result.ok is False
     assert result.layers["teacher_flow"].status == "fail"
     assert result.layers["student_full_flow"].status == "fail"
+
+
+def test_file_runtime_rejects_missing_or_tampered_artifacts(tmp_path: Path) -> None:
+    module = _load_verifier()
+    manifest, evidence, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="e" * 40,
+    )
+    teacher = evidence["teacher_flow"]
+    assert isinstance(teacher, dict)
+    teacher["artifact"] = "artifacts/missing.json"
+    student = evidence["student_micro_flow"]
+    assert isinstance(student, dict)
+    student_path = tmp_path / str(student["artifact"])
+    student_path.write_bytes(student_path.read_bytes() + b"\n")
+    manifest.write_text(
+        json.dumps({"schemaVersion": 2, "candidate": candidate, "evidence": evidence}),
+        encoding="utf-8",
+    )
+
+    result = module.verify(module.FileReleaseRuntime(manifest, expected_source_head="e" * 40))
+
+    assert result.layers["teacher_flow"].status == "fail"
+    assert "does not exist" in result.layers["teacher_flow"].detail
+    assert result.layers["student_micro_flow"].status == "fail"
+    assert "digest" in result.layers["student_micro_flow"].detail
+
+
+def test_file_runtime_rejects_artifact_from_another_candidate(tmp_path: Path) -> None:
+    module = _load_verifier()
+    manifest, evidence, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="f" * 40,
+    )
+    entry = evidence["student_full_flow"]
+    assert isinstance(entry, dict)
+    artifact_path = tmp_path / str(entry["artifact"])
+    artifact_body = json.dumps(
+        {
+            "schemaVersion": 1,
+            "candidate": _candidate("0" * 40),
+            "evidence": "student_full_flow",
+        },
+        sort_keys=True,
+    ).encode()
+    artifact_path.write_bytes(artifact_body)
+    entry["artifactSha256"] = hashlib.sha256(artifact_body).hexdigest()
+    manifest.write_text(
+        json.dumps({"schemaVersion": 2, "candidate": candidate, "evidence": evidence}),
+        encoding="utf-8",
+    )
+
+    result = module.verify(module.FileReleaseRuntime(manifest, expected_source_head="f" * 40))
+
+    assert result.layers["student_full_flow"].status == "fail"
+    assert "candidate" in result.layers["student_full_flow"].detail
+
+
+def test_file_runtime_rejects_zero_candidate_image_digest(tmp_path: Path) -> None:
+    module = _load_verifier()
+    manifest, evidence, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="1" * 40,
+    )
+    image_digests = candidate["imageDigests"]
+    assert isinstance(image_digests, dict)
+    image_digests["openmaic"] = "sha256:" + "0" * 64
+    for name, raw in evidence.items():
+        assert isinstance(raw, dict)
+        artifact_path = tmp_path / str(raw["artifact"])
+        artifact_body = json.dumps(
+            {"schemaVersion": 1, "candidate": candidate, "evidence": name},
+            sort_keys=True,
+        ).encode()
+        artifact_path.write_bytes(artifact_body)
+        raw["artifactSha256"] = hashlib.sha256(artifact_body).hexdigest()
+    manifest.write_text(
+        json.dumps({"schemaVersion": 2, "candidate": candidate, "evidence": evidence}),
+        encoding="utf-8",
+    )
+
+    result = module.verify(module.FileReleaseRuntime(manifest, expected_source_head="1" * 40))
+
+    assert result.layers["image_digests"].status == "fail"
+    assert "candidate image digests" in result.layers["image_digests"].detail
 
 
 def test_missing_evidence_manifest_fails_closed(tmp_path: Path) -> None:

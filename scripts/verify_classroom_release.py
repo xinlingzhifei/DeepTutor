@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -41,7 +42,13 @@ REQUIRED_ACCEPTANCE_EVIDENCE = (
 
 REQUIRED_LAYERS = REQUIRED_OPERATIONAL_LAYERS + REQUIRED_ACCEPTANCE_EVIDENCE
 
+EVIDENCE_SCHEMA_VERSION = 2
+ARTIFACT_SCHEMA_VERSION = 1
+CUSTOM_IMAGE_NAMES = ("deeptutor", "openmaic", "openmaic_render")
+
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
+_DIGEST = re.compile(r"^sha256:([0-9a-f]{64})$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +56,7 @@ class LayerEvidence:
     status: str
     detail: str
     artifact: str | None = None
+    artifact_sha256: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +86,8 @@ class FileReleaseRuntime:
         self._expected_source_head = expected_source_head
         self._loaded = False
         self._candidate_head = ""
+        self._candidate: dict[str, object] = {}
+        self._candidate_is_valid = False
         self._evidence: dict[str, object] = {}
 
     def _load(self) -> None:
@@ -88,7 +98,10 @@ class FileReleaseRuntime:
             document = json.loads(self._path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError):
             return
-        if not isinstance(document, dict) or document.get("schemaVersion") != 1:
+        if (
+            not isinstance(document, dict)
+            or document.get("schemaVersion") != EVIDENCE_SCHEMA_VERSION
+        ):
             return
         candidate = document.get("candidate")
         evidence = document.get("evidence")
@@ -97,25 +110,89 @@ class FileReleaseRuntime:
         source_head = candidate.get("sourceHead")
         if isinstance(source_head, str) and _COMMIT.fullmatch(source_head):
             self._candidate_head = source_head
+        image_digests = candidate.get("imageDigests")
+        self._candidate_is_valid = self._candidate_head != "" and self._valid_image_digests(
+            image_digests
+        )
+        self._candidate = candidate
         self._evidence = evidence
 
     @staticmethod
-    def _parse(raw: object) -> LayerEvidence:
+    def _valid_image_digests(raw: object) -> bool:
+        if not isinstance(raw, dict) or set(raw) != set(CUSTOM_IMAGE_NAMES):
+            return False
+        for name in CUSTOM_IMAGE_NAMES:
+            digest = raw.get(name)
+            match = _DIGEST.fullmatch(digest) if isinstance(digest, str) else None
+            if match is None or match.group(1) == "0" * 64:
+                return False
+        return True
+
+    def _artifact_path(self, reference: str) -> Path | None:
+        relative = Path(reference)
+        if relative.is_absolute():
+            return None
+        root = self._path.parent.resolve()
+        resolved = (root / relative).resolve()
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            return None
+        return resolved
+
+    def _parse(self, name: str, raw: object) -> LayerEvidence:
         if not isinstance(raw, dict):
             return LayerEvidence("fail", "evidence entry is invalid")
         status = raw.get("status")
         detail = raw.get("detail")
         artifact = raw.get("artifact")
+        artifact_sha256 = raw.get("artifactSha256")
         if status not in {"pass", "fail"}:
             return LayerEvidence("fail", "evidence status is invalid")
         if not isinstance(detail, str) or not detail.strip():
             return LayerEvidence("fail", "evidence detail is missing")
-        if status == "pass" and (not isinstance(artifact, str) or not artifact.strip()):
+        if status != "pass":
+            return LayerEvidence(
+                status=status,
+                detail=detail.strip(),
+                artifact=(
+                    artifact.strip() if isinstance(artifact, str) and artifact.strip() else None
+                ),
+            )
+        if not isinstance(artifact, str) or not artifact.strip():
             return LayerEvidence("fail", "passing evidence artifact is missing")
+        if not isinstance(artifact_sha256, str) or not _SHA256.fullmatch(artifact_sha256):
+            return LayerEvidence("fail", "passing evidence artifact digest is invalid")
+        if not self._candidate_is_valid:
+            return LayerEvidence("fail", "evidence candidate image digests are invalid")
+        artifact_reference = artifact.strip()
+        artifact_path = self._artifact_path(artifact_reference)
+        if artifact_path is None:
+            return LayerEvidence("fail", "evidence artifact is outside the evidence bundle")
+        try:
+            artifact_body = artifact_path.read_bytes()
+        except OSError:
+            return LayerEvidence("fail", "evidence artifact does not exist")
+        actual_sha256 = hashlib.sha256(artifact_body).hexdigest()
+        if actual_sha256 != artifact_sha256:
+            return LayerEvidence("fail", "evidence artifact digest does not match")
+        try:
+            artifact_document = json.loads(artifact_body)
+        except (UnicodeError, json.JSONDecodeError):
+            return LayerEvidence("fail", "evidence artifact is not valid JSON")
+        if (
+            not isinstance(artifact_document, dict)
+            or artifact_document.get("schemaVersion") != ARTIFACT_SCHEMA_VERSION
+            or artifact_document.get("evidence") != name
+        ):
+            return LayerEvidence("fail", "evidence artifact envelope is invalid")
+        if artifact_document.get("candidate") != self._candidate:
+            return LayerEvidence("fail", "evidence artifact candidate does not match")
         return LayerEvidence(
             status=status,
             detail=detail.strip(),
-            artifact=artifact.strip() if isinstance(artifact, str) and artifact.strip() else None,
+            artifact=artifact_reference,
+            artifact_sha256=artifact_sha256,
         )
 
     def result(self, name: str) -> LayerEvidence | None:
@@ -123,7 +200,7 @@ class FileReleaseRuntime:
         raw = self._evidence.get(name)
         if raw is None:
             return None
-        parsed = self._parse(raw)
+        parsed = self._parse(name, raw)
         if name == "source_head" and (
             not _COMMIT.fullmatch(self._expected_source_head)
             or self._candidate_head != self._expected_source_head
@@ -132,6 +209,7 @@ class FileReleaseRuntime:
                 "fail",
                 "evidence candidate source head does not match the checked-out candidate",
                 parsed.artifact,
+                parsed.artifact_sha256,
             )
         return parsed
 
@@ -152,10 +230,12 @@ def verify(runtime: ReleaseRuntime) -> ReleaseVerification:
         status = getattr(raw, "status", "fail")
         detail = getattr(raw, "detail", "evidence result is invalid")
         artifact = getattr(raw, "artifact", None)
+        artifact_sha256 = getattr(raw, "artifact_sha256", None)
         evidence = LayerEvidence(
             status=status if isinstance(status, str) else "fail",
             detail=detail if isinstance(detail, str) else "evidence result is invalid",
             artifact=artifact if isinstance(artifact, str) else None,
+            artifact_sha256=(artifact_sha256 if isinstance(artifact_sha256, str) else None),
         )
         layers[name] = evidence
         if evidence.status != "pass":
@@ -178,6 +258,7 @@ def report_payload(result: ReleaseVerification) -> dict[str, object]:
                 "status": evidence.status,
                 "detail": evidence.detail,
                 "artifact": evidence.artifact,
+                "artifactSha256": evidence.artifact_sha256,
             }
             for name, evidence in result.layers.items()
         },
