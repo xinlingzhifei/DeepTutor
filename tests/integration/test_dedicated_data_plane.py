@@ -6,10 +6,14 @@ from dataclasses import dataclass
 import importlib.util
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
+import httpx
+from pydantic import SecretStr
 import pytest
 
 from deeptutor.teaching.models import AuditLog, DataPlaneRoute, ProviderProfile, Tenant
+from deeptutor.teaching.openmaic.client import OpenMAICRequestFailed
 from deeptutor.teaching.openmaic.data_planes import (
     DataPlaneResolution,
     DataPlaneRouteRecord,
@@ -43,8 +47,12 @@ class RegistrationHarness:
 
     def __post_init__(self) -> None:
         self.registered: list[DedicatedDataPlaneRegistration] = []
+        self.tenant_calls: list[str] = []
         self.health_calls: list[DedicatedDataPlaneRegistration] = []
         self.secret_calls: list[tuple[str, str, str]] = []
+
+    async def verify_tenant(self, tenant_id: str) -> None:
+        self.tenant_calls.append(tenant_id)
 
     async def verify_health(
         self,
@@ -94,12 +102,14 @@ def test_registration_verifies_health_contract_and_secret_before_persisting() ->
     asyncio.run(
         register_dedicated_data_plane(
             registration,
+            verify_tenant=harness.verify_tenant,
             verify_health=harness.verify_health,
             verify_secret=harness.verify_secret,
             persist=harness.register,
         )
     )
 
+    assert harness.tenant_calls == ["tenant-private"]
     assert harness.secret_calls == [
         (
             "tenant-private",
@@ -149,6 +159,7 @@ def test_registration_fails_closed_before_persisting_on_contract_mismatch(
         asyncio.run(
             register_dedicated_data_plane(
                 _registration(),
+                verify_tenant=harness.verify_tenant,
                 verify_health=harness.verify_health,
                 verify_secret=harness.verify_secret,
                 persist=harness.register,
@@ -226,7 +237,7 @@ def test_registration_secret_check_uses_exact_tenant_file_without_exposing_value
     assert "PROVIDER_SECRET_SENTINEL" not in repr(_registration())
 
 
-def test_default_registration_persists_exact_dedicated_binding_in_one_transaction(
+def test_explicit_writer_persists_exact_dedicated_binding_in_one_transaction(
     monkeypatch,
 ) -> None:
     tenant = Tenant(
@@ -263,16 +274,14 @@ def test_default_registration_persists_exact_dedicated_binding_in_one_transactio
     async def fake_platform_session():
         yield session
 
-    monkeypatch.setattr(_REGISTER, "platform_session", fake_platform_session)
-    harness = RegistrationHarness(_healthy())
-
-    asyncio.run(
-        register_dedicated_data_plane(
-            _registration(),
-            verify_health=harness.verify_health,
-            verify_secret=harness.verify_secret,
-        )
+    monkeypatch.setattr(
+        _REGISTER,
+        "async_sessionmaker",
+        lambda _engine, *, expire_on_commit: fake_platform_session,
     )
+    writer = _REGISTER.SqlAlchemyDedicatedDataPlaneWriter(object())
+
+    asyncio.run(writer.persist(_registration()))
 
     assert session.transactions == 1
     assert session.flushes == 1
@@ -294,3 +303,314 @@ def test_default_registration_persists_exact_dedicated_binding_in_one_transactio
     )
     assert route.provider_profile_id == profile.id
     assert audit.action == "teaching.data_plane.registered"
+
+
+def test_explicit_writer_is_exactly_idempotent_without_duplicate_audit(
+    monkeypatch,
+) -> None:
+    registration = _registration()
+    tenant = Tenant(
+        id=registration.tenant_id,
+        name="Private Tenant",
+        status="active",
+        data_plane_mode="dedicated",
+    )
+    route = DataPlaneRoute(
+        id=registration.route_id,
+        tenant_id=registration.tenant_id,
+        owner_key=registration.tenant_id,
+        mode="dedicated",
+        base_url=registration.base_url,
+        worker_pool=registration.worker_pool,
+        queue_name=registration.queue_name,
+        provider_profile_id=registration.provider_profile_id,
+        status="active",
+        health_status="unknown",
+    )
+    profile = ProviderProfile(
+        id=registration.provider_profile_id,
+        scope="dedicated",
+        tenant_id=registration.tenant_id,
+        owner_key=registration.tenant_id,
+        provider_type=registration.provider_type,
+        model_name=registration.model_name,
+        api_base_url=registration.provider_api_base_url,
+        secret_ref=registration.secret_ref,
+        status="active",
+    )
+
+    class Session:
+        def __init__(self) -> None:
+            self.scalar_results = [tenant, route, profile]
+            self.added: list[object] = []
+            self.transactions = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc_info) -> None:
+            return None
+
+        @asynccontextmanager
+        async def begin(self):
+            self.transactions += 1
+            yield
+
+        async def scalar(self, _statement):
+            return self.scalar_results.pop(0)
+
+        def add(self, value: object) -> None:
+            self.added.append(value)
+
+    session = Session()
+    monkeypatch.setattr(
+        _REGISTER,
+        "async_sessionmaker",
+        lambda _engine, *, expire_on_commit: lambda: session,
+    )
+
+    writer = _REGISTER.SqlAlchemyDedicatedDataPlaneWriter(object())
+    asyncio.run(writer.persist(registration))
+
+    assert session.transactions == 1
+    assert session.added == []
+    assert route.health_status == "healthy"
+    assert route.health_checked_at is not None
+
+
+def test_explicit_writer_rolls_back_conflicting_registration(monkeypatch) -> None:
+    registration = _registration()
+    tenant = Tenant(
+        id=registration.tenant_id,
+        name="Private Tenant",
+        status="active",
+        data_plane_mode="shared",
+    )
+    conflicting_route = DataPlaneRoute(
+        id=registration.route_id,
+        tenant_id=registration.tenant_id,
+        owner_key=registration.tenant_id,
+        mode="dedicated",
+        base_url="https://different.internal",
+        worker_pool=registration.worker_pool,
+        queue_name=registration.queue_name,
+        provider_profile_id=registration.provider_profile_id,
+        status="active",
+        health_status="unknown",
+    )
+
+    class Session:
+        def __init__(self) -> None:
+            self.scalar_results = [tenant, conflicting_route, None]
+            self.added: list[object] = []
+            self.transactions = 0
+            self.rollbacks = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc_info) -> None:
+            return None
+
+        @asynccontextmanager
+        async def begin(self):
+            self.transactions += 1
+            try:
+                yield
+            except BaseException:
+                self.rollbacks += 1
+                raise
+
+        async def scalar(self, _statement):
+            return self.scalar_results.pop(0)
+
+        def add(self, value: object) -> None:
+            self.added.append(value)
+
+    session = Session()
+    monkeypatch.setattr(
+        _REGISTER,
+        "async_sessionmaker",
+        lambda _engine, *, expire_on_commit: lambda: session,
+    )
+    writer = _REGISTER.SqlAlchemyDedicatedDataPlaneWriter(object())
+
+    with pytest.raises(ValueError, match="conflicts"):
+        asyncio.run(writer.persist(registration))
+
+    assert session.transactions == 1
+    assert session.rollbacks == 1
+    assert session.added == []
+    assert tenant.data_plane_mode == "shared"
+
+
+def _operator_arguments(
+    *,
+    config: Path,
+    provider_secrets_root: Path,
+    service_secret_file: Path,
+) -> list[str]:
+    return [
+        "--config",
+        str(config),
+        "--provider-secrets-root",
+        str(provider_secrets_root),
+        "--service-secret-file",
+        str(service_secret_file),
+        "--tenant-id",
+        "tenant-private",
+        "--route-id",
+        "dedicated-tenant-private",
+        "--base-url",
+        "https://openmaic.tenant-private.internal",
+        "--worker-pool",
+        "generation-tenant-private",
+        "--queue-name",
+        "openmaic.tenant-private",
+        "--provider-profile-id",
+        "provider-tenant-private",
+        "--provider-type",
+        "openai-compatible",
+        "--model-name",
+        "private-model",
+        "--provider-api-base-url",
+        "https://provider.internal/v1",
+    ]
+
+
+@pytest.mark.parametrize("health_status", [200, 503])
+def test_operator_cli_uses_explicit_inputs_signs_health_and_closes_resources(
+    monkeypatch,
+    tmp_path,
+    capsys,
+    health_status: int,
+) -> None:
+    config = tmp_path / "platform.json"
+    config.write_text("{}", encoding="utf-8")
+    provider_secrets_root = tmp_path / "provider-secrets"
+    provider_secret = (
+        provider_secrets_root
+        / "tenants"
+        / "tenant-private"
+        / "providers"
+        / "provider-tenant-private"
+    )
+    provider_secret.parent.mkdir(parents=True)
+    provider_secret.write_text("PROVIDER_SECRET_SENTINEL", encoding="utf-8")
+    service_secret_file = tmp_path / "openmaic_service_secret"
+    service_secret_file.write_text("SERVICE_SECRET_SENTINEL_0123456789", encoding="utf-8")
+    arguments = _operator_arguments(
+        config=config,
+        provider_secrets_root=provider_secrets_root,
+        service_secret_file=service_secret_file,
+    )
+    events: list[str] = []
+    loaded_configs: list[Path] = []
+
+    def load_settings(path: Path):
+        loaded_configs.append(path)
+        return SimpleNamespace(
+            enabled=True,
+            database_url=SecretStr("postgresql+asyncpg://operator@db/platform"),
+        )
+
+    class Engine:
+        disposed = False
+
+        async def dispose(self) -> None:
+            events.append("dispose-engine")
+            self.disposed = True
+
+    engine = Engine()
+    monkeypatch.setattr(_REGISTER, "load_platform_settings", load_settings)
+    monkeypatch.setattr(_REGISTER, "create_async_engine", lambda *_args, **_kwargs: engine)
+
+    class Writer:
+        def __init__(self, received_engine) -> None:
+            assert received_engine is engine
+
+        async def require_active_tenant(self, tenant_id: str) -> None:
+            events.append(f"active:{tenant_id}")
+
+        async def persist(self, registration: DedicatedDataPlaneRegistration) -> None:
+            events.append(f"persist:{registration.secret_ref}")
+
+    monkeypatch.setattr(_REGISTER, "SqlAlchemyDedicatedDataPlaneWriter", Writer)
+    original_provider_check = _REGISTER.provider_secret_reference_exists
+
+    def provider_check(*args) -> bool:
+        events.append("provider-secret")
+        return original_provider_check(*args)
+
+    monkeypatch.setattr(_REGISTER, "provider_secret_reference_exists", provider_check)
+    original_read_service_secret = _REGISTER.read_service_secret
+
+    def read_secret(path: Path):
+        events.append("service-secret")
+        return original_read_service_secret(path)
+
+    monkeypatch.setattr(_REGISTER, "read_service_secret", read_secret)
+    created_clients: list[httpx.AsyncClient] = []
+    real_async_client = httpx.AsyncClient
+
+    def handle_health(request: httpx.Request) -> httpx.Response:
+        events.append("signed-health")
+        assert request.url.path == "/api/yfeistai/v1/health"
+        assert request.headers["x-yfeistai-tenant-id"] == "tenant-private"
+        assert request.headers["x-yfeistai-job-id"] == "health"
+        assert len(request.headers["x-yfeistai-signature"]) == 64
+        payload = {
+            "service": "openmaic",
+            "upstreamCommit": "0cf2a330411681190e89f48e20f305345ff99f87",
+            "appVersion": "0.3.1",
+            "contractVersions": ["1.0"],
+            "capabilities": [
+                "outline",
+                "content",
+                "micro",
+                "export",
+                "cancel",
+                "artifact-manifest",
+            ],
+            "exportFormats": ["classroom_zip", "pptx", "offline_html", "mp4"],
+        }
+        return httpx.Response(health_status, json=payload, request=request)
+
+    def async_client_factory(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(handle_health)
+        client = real_async_client(*args, **kwargs)
+        created_clients.append(client)
+        return client
+
+    monkeypatch.setattr(_REGISTER.httpx, "AsyncClient", async_client_factory)
+
+    if health_status == 200:
+        assert _REGISTER.main(arguments) == 0
+    else:
+        with pytest.raises(OpenMAICRequestFailed):
+            _REGISTER.main(arguments)
+
+    assert loaded_configs == [config]
+    assert events[:-1] == [
+        "active:tenant-private",
+        "provider-secret",
+        "service-secret",
+        "signed-health",
+        *(
+            ["persist:tenants/tenant-private/providers/provider-tenant-private"]
+            if health_status == 200
+            else []
+        ),
+    ]
+    assert events[-1] == "dispose-engine"
+    assert engine.disposed
+    assert len(created_clients) == 1 and created_clients[0].is_closed
+    output = capsys.readouterr()
+    rendered_output = output.out + output.err
+    assert "PROVIDER_SECRET_SENTINEL" not in rendered_output
+    assert "SERVICE_SECRET_SENTINEL" not in rendered_output
+
+    parsed = _REGISTER._parser().parse_args(arguments)
+    registration = _REGISTER._registration_from_arguments(parsed)
+    assert registration.secret_ref == ("tenants/tenant-private/providers/provider-tenant-private")
+    assert not hasattr(parsed, "secret_ref")
