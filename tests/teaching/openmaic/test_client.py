@@ -1033,13 +1033,14 @@ def test_stream_artifact_only_reads_the_signed_internal_artifact_path() -> None:
 def test_stream_timeout_only_wraps_internal_reads_and_always_closes() -> None:
     stream = ControlledByteStream()
     unhandled: list[dict[str, object]] = []
+    total_timeout = 0.5
 
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, stream=stream)
 
     client, http = _client(
         handler,
-        timeouts=ClientTimeouts(connect=1.0, read=1.0, total=0.01),
+        timeouts=ClientTimeouts(connect=1.0, read=1.0, total=total_timeout),
     )
 
     async def consume() -> tuple[bytes, bool]:
@@ -1049,7 +1050,7 @@ def test_stream_timeout_only_wraps_internal_reads_and_always_closes() -> None:
         generator = client.stream_artifact("/api/yfeistai/v1/artifacts/job-1/media/file.bin")
         try:
             first = await anext(generator)
-            await asyncio.sleep(0.02)
+            await asyncio.sleep(total_timeout + 0.05)
             consumer_sleep_completed = True
             with pytest.raises(OpenMAICTimeout):
                 await anext(generator)
