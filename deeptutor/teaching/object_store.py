@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
+from functools import partial
 import hashlib
 import hmac
 import json
 import os
 from pathlib import Path, PureWindowsPath
 import tempfile
+from threading import BoundedSemaphore
 from typing import Any, Mapping, Protocol
 import uuid
 
@@ -19,6 +23,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 
 from deeptutor.multi_user.context import get_current_tenant
 from deeptutor.services.config import PlatformSettings
+from deeptutor.services.config.platform_settings import validate_object_store_endpoint
 from deeptutor.teaching.artifacts import (
     ArtifactManifestEntry,
     ArtifactManifestError,
@@ -30,8 +35,10 @@ from deeptutor.teaching.artifacts import (
     temporary_artifact_key,
     tenant_artifact_prefix,
 )
+from deeptutor.teaching.health_logging import redact_health_transport_logs
 from deeptutor.teaching.storage_credentials import (
     ActiveStorageCredentialRepository,
+    ResolvedStorageCredentials,
     SqlAlchemyStorageCredentialRepository,
     StorageCredentialError,
     TenantStorageCredentialResolver,
@@ -46,6 +53,14 @@ _INTERNAL_NAMES = frozenset({_CLAIM_NAME, _COMMIT_NAME})
 _LOCAL_SCRATCH_PREFIX = ".deeptutor-scratch-"
 _LOCAL_SOURCE_RECEIPT_DIRECTORY = ".deeptutor-source-receipts"
 _MAX_SOURCE_RECEIPT_SIZE = 2048
+OBJECT_STORE_HEALTH_CONNECT_TIMEOUT_SECONDS = 0.5
+OBJECT_STORE_HEALTH_READ_TIMEOUT_SECONDS = 0.5
+OBJECT_STORE_HEALTH_THREAD_WORKERS = 4
+_OBJECT_STORE_HEALTH_EXECUTOR = ThreadPoolExecutor(
+    max_workers=OBJECT_STORE_HEALTH_THREAD_WORKERS,
+    thread_name_prefix="teaching-object-health",
+)
+_OBJECT_STORE_HEALTH_SLOTS = BoundedSemaphore(OBJECT_STORE_HEALTH_THREAD_WORKERS)
 
 
 class ObjectStoreError(Exception):
@@ -570,9 +585,7 @@ class _TenantScopedStore:
             "temporary",
             "source",
         }:
-            raise ObjectStoreAccessDenied(
-                "uploads must use a canonical tenant input key"
-            )
+            raise ObjectStoreAccessDenied("uploads must use a canonical tenant input key")
         return validated
 
     def _require_classroom_key(self, key: str) -> str:
@@ -1030,6 +1043,26 @@ def _remove_local_source_receipt(path: Path, expected: bytes) -> None:
 class LocalClassroomArtifactStore(_TenantScopedStore):
     """Filesystem adapter intended only for explicit development/test use."""
 
+    @staticmethod
+    async def health_check_root(root: Path) -> None:
+        """Verify an existing local root is readable without mutating it."""
+
+        def check() -> None:
+            candidate = Path(root)
+            try:
+                if candidate.is_symlink() or not candidate.is_dir():
+                    raise OSError
+                candidate.resolve(strict=True)
+                # Opening the directory iterator exercises the actual read boundary.
+                with os.scandir(candidate) as entries:
+                    next(entries, None)
+            except (OSError, ValueError):
+                raise ObjectStoreConfigurationError(
+                    "local object storage root is unavailable"
+                ) from None
+
+        await asyncio.to_thread(check)
+
     def __init__(self, root: Path, tenant_id: str) -> None:
         super().__init__(tenant_id)
         root = Path(root)
@@ -1068,9 +1101,7 @@ class LocalClassroomArtifactStore(_TenantScopedStore):
             "source",
             "temporary",
         }:
-            raise ObjectStoreAccessDenied(
-                "ownership receipts require a direct upload key"
-            )
+            raise ObjectStoreAccessDenied("ownership receipts require a direct upload key")
         directory = self._root / _LOCAL_SOURCE_RECEIPT_DIRECTORY
         if directory.is_symlink():
             raise ObjectStoreAccessDenied("local source receipt path contains a symlink")
@@ -1228,9 +1259,7 @@ class LocalClassroomArtifactStore(_TenantScopedStore):
         )
         if not receipt_exists:
             if await asyncio.to_thread(self._path_for(safe_key).is_file):
-                raise ObjectStoreConflictError(
-                    "object has no matching ownership receipt"
-                )
+                raise ObjectStoreConflictError("object has no matching ownership receipt")
             return None
         artifact = _stored_artifact(
             safe_key,
@@ -1602,6 +1631,107 @@ async def _get_object_response(client, **arguments):
                 if body is not None:
                     await asyncio.to_thread(body.close)
         raise
+
+
+async def run_s3_health_sync(
+    operation: Callable[..., Any],
+    /,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """Run one health-only operation with globally bounded outstanding work."""
+
+    if not _OBJECT_STORE_HEALTH_SLOTS.acquire(blocking=False):
+        raise ObjectStoreError("S3 health execution capacity is unavailable")
+    slot_owned = True
+    try:
+        with redact_health_transport_logs():
+            context = copy_context()
+
+        def execute() -> Any:
+            try:
+                return context.run(partial(operation, *args, **kwargs))
+            finally:
+                _OBJECT_STORE_HEALTH_SLOTS.release()
+
+        future = asyncio.get_running_loop().run_in_executor(
+            _OBJECT_STORE_HEALTH_EXECUTOR,
+            execute,
+        )
+        slot_owned = False
+    except BaseException:
+        if slot_owned:
+            _OBJECT_STORE_HEALTH_SLOTS.release()
+        raise
+    try:
+        return await asyncio.shield(future)
+    except asyncio.CancelledError:
+        future.add_done_callback(_consume_s3_health_future_exception)
+        raise
+
+
+def _consume_s3_health_future_exception(future: asyncio.Future[Any]) -> None:
+    if future.cancelled():
+        return
+    try:
+        future.exception()
+    except BaseException:
+        pass
+
+
+async def check_s3_object_store_health(
+    *,
+    tenant_id: str,
+    endpoint: str,
+    bucket: str,
+    region: str,
+    credentials: ResolvedStorageCredentials,
+) -> None:
+    """Run one read-only S3 check with a short-lived, tightly bounded client."""
+
+    if credentials.tenant_id != tenant_id or not all(
+        isinstance(value, str) and bool(value.strip())
+        for value in (tenant_id, endpoint, bucket, region)
+    ):
+        raise ObjectStoreConfigurationError("S3 health configuration is unavailable")
+    try:
+        endpoint = validate_object_store_endpoint(endpoint)
+    except ValueError:
+        raise ObjectStoreConfigurationError("S3 health configuration is unavailable") from None
+    prefix = tenant_artifact_prefix(tenant_id)
+
+    def check():
+        health_client = boto3.client(
+            "s3",
+            endpoint_url=endpoint,
+            region_name=region,
+            aws_access_key_id=credentials.access_key,
+            aws_secret_access_key=credentials.secret_key,
+            aws_session_token=None,
+            config=Config(
+                signature_version="s3v4",
+                connect_timeout=OBJECT_STORE_HEALTH_CONNECT_TIMEOUT_SECONDS,
+                read_timeout=OBJECT_STORE_HEALTH_READ_TIMEOUT_SECONDS,
+                retries={"total_max_attempts": 1},
+                proxies={},
+                s3={"addressing_style": "path"},
+            ),
+        )
+        try:
+            return health_client.list_objects_v2(
+                Bucket=bucket,
+                Prefix=prefix,
+                MaxKeys=1,
+            )
+        finally:
+            health_client.close()
+
+    try:
+        response = await run_s3_health_sync(check)
+    except (BotoCoreError, ClientError) as exc:
+        _raise_s3_error(exc)
+    if not isinstance(response, Mapping):
+        raise ObjectStoreError("S3 health listing returned an invalid response")
 
 
 class S3ClassroomArtifactStore(_TenantScopedStore):

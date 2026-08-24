@@ -643,7 +643,18 @@ def test_runtime_heartbeat_schema_names_fit_postgresql_and_match_migration() -> 
 @pytest.mark.asyncio
 async def test_health_route_reads_the_durable_repository() -> None:
     from deeptutor.api.routers.teaching_health import teaching_health
+    from deeptutor.teaching.health_probes import (
+        ACTIVE_PROBE_COMPONENTS,
+        ActiveProbeResult,
+    )
     from deeptutor.teaching.runtime_heartbeat import RuntimeHeartbeatSnapshot
+
+    class HealthyActiveProbes:
+        async def probe(self):
+            return {
+                component: ActiveProbeResult(status="healthy")
+                for component in ACTIVE_PROBE_COMPONENTS
+            }
 
     repository = RecordingRepository()
     repository.snapshots = (
@@ -655,7 +666,7 @@ async def test_health_route_reads_the_durable_repository() -> None:
     service = TeachingHealthService(now=lambda: NOW, stale_after_seconds=90)
     service.set_heartbeat("dispatcher")
 
-    payload = await teaching_health(service, repository)
+    payload = await teaching_health(service, repository, HealthyActiveProbes())
 
     assert payload["components"]["dispatcher"]["status"] == "stale"
     assert "instance_id" not in repr(payload)

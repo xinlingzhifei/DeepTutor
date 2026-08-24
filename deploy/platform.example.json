@@ -14,6 +14,7 @@
   "object_store_public_download_origins": [],
   "classroom_ticket_secret_file": "/run/secrets/classroom_ticket_secret",
   "openmaic_service_secret_file": "/run/secrets/openmaic_service_secret",
+  "openmaic_render_health_url": "http://openmaic-render:9000/health",
   "shared_generation_limit": 20,
   "default_tenant_generation_limit": 2
 }

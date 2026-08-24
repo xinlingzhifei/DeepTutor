@@ -8,10 +8,14 @@ import hmac
 from pathlib import Path, PureWindowsPath
 from typing import Protocol
 
-from sqlalchemy import select
+from sqlalchemy import and_, select
 
 from deeptutor.teaching.database import platform_session
-from deeptutor.teaching.models import Tenant, TenantStorageCredential
+from deeptutor.teaching.models import (
+    Tenant,
+    TenantStorageCredential,
+    TenantStorageState,
+)
 
 _ACCESS_KEY_FILE = "object-store-access-key"
 _SECRET_KEY_FILE = "object-store-secret-key"
@@ -42,9 +46,17 @@ class ResolvedStorageCredentials:
     def __repr__(self) -> str:
         return (
             "ResolvedStorageCredentials("
-            f"tenant_id={self.tenant_id!r}, "
-            "access_key=<redacted>, secret_key=<redacted>)"
+            "tenant_id=<redacted>, access_key=<redacted>, secret_key=<redacted>)"
         )
+
+
+@dataclass(frozen=True, slots=True)
+class StorageHealthInventory:
+    """Aggregate-only active tenant credential inventory for S3 health."""
+
+    active_tenants: int
+    credentials: tuple[TenantStorageCredentialRecord, ...]
+    unavailable_tenants: int
 
 
 class ActiveStorageCredentialRepository(Protocol):
@@ -54,6 +66,45 @@ class ActiveStorageCredentialRepository(Protocol):
         self,
         tenant_id: str,
     ) -> TenantStorageCredentialRecord | None: ...
+
+
+class StorageHealthInventoryRepository(Protocol):
+    async def fetch_health_inventory(self) -> StorageHealthInventory: ...
+
+
+def build_storage_health_inventory_statement():
+    """Read every active tenant and only its active credential metadata."""
+
+    return (
+        select(
+            Tenant.id.label("tenant_id"),
+            TenantStorageCredential.secret_ref,
+            TenantStorageCredential.access_key_fingerprint,
+            TenantStorageCredential.status.label("credential_status"),
+            TenantStorageState.tenant_id.label("storage_state_tenant_id"),
+        )
+        .select_from(Tenant)
+        .outerjoin(
+            TenantStorageCredential,
+            and_(
+                TenantStorageCredential.tenant_id == Tenant.id,
+                TenantStorageCredential.status == "active",
+            ),
+        )
+        .outerjoin(
+            TenantStorageState,
+            and_(
+                TenantStorageState.tenant_id == Tenant.id,
+                TenantStorageState.mode == "s3",
+                TenantStorageState.status == "active",
+                TenantStorageState.credential_secret_ref == TenantStorageCredential.secret_ref,
+                TenantStorageState.credential_fingerprint
+                == TenantStorageCredential.access_key_fingerprint,
+            ),
+        )
+        .where(Tenant.status == "active")
+        .order_by(Tenant.id)
+    )
 
 
 class SqlAlchemyStorageCredentialRepository:
@@ -80,6 +131,34 @@ class SqlAlchemyStorageCredentialRepository:
             secret_ref=model.secret_ref,
             access_key_fingerprint=model.access_key_fingerprint,
             status=model.status,
+        )
+
+    async def fetch_health_inventory(self) -> StorageHealthInventory:
+        async with platform_session() as session:
+            rows = (await session.execute(build_storage_health_inventory_statement())).all()
+        credentials: list[TenantStorageCredentialRecord] = []
+        unavailable_tenants = 0
+        for row in rows:
+            if (
+                row.secret_ref is None
+                or row.access_key_fingerprint is None
+                or row.credential_status != "active"
+                or row.storage_state_tenant_id != row.tenant_id
+            ):
+                unavailable_tenants += 1
+                continue
+            credentials.append(
+                TenantStorageCredentialRecord(
+                    tenant_id=str(row.tenant_id),
+                    secret_ref=str(row.secret_ref),
+                    access_key_fingerprint=str(row.access_key_fingerprint),
+                    status="active",
+                )
+            )
+        return StorageHealthInventory(
+            active_tenants=len(rows),
+            credentials=tuple(credentials),
+            unavailable_tenants=unavailable_tenants,
         )
 
 

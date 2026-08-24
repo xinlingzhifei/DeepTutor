@@ -19,6 +19,7 @@ from deeptutor.teaching.openmaic.data_planes import (
     DataPlaneResolution,
     DataPlaneRouteRecord,
     DataPlaneSelection,
+    DedicatedDataPlaneHealthInventory,
     ProviderProfileRecord,
 )
 
@@ -52,6 +53,64 @@ def _profile_record(profile: ProviderProfile) -> ProviderProfileRecord:
         api_base_url=profile.api_base_url,
         secret_ref=profile.secret_ref,
         status=profile.status,
+    )
+
+
+def build_shared_health_route_statement():
+    """Read an active shared route with its complete active profile binding."""
+
+    return (
+        select(DataPlaneRoute)
+        .join(
+            ProviderProfile,
+            and_(
+                ProviderProfile.id == DataPlaneRoute.provider_profile_id,
+                ProviderProfile.scope == DataPlaneRoute.mode,
+                ProviderProfile.tenant_id.is_(None),
+                ProviderProfile.owner_key == DataPlaneRoute.owner_key,
+            ),
+        )
+        .where(
+            DataPlaneRoute.mode == "shared",
+            DataPlaneRoute.tenant_id.is_(None),
+            DataPlaneRoute.owner_key == "shared",
+            DataPlaneRoute.status == "active",
+            ProviderProfile.status == "active",
+        )
+    )
+
+
+def build_dedicated_health_inventory_statement():
+    """Inventory every active dedicated tenant and its route without provider secrets."""
+
+    return (
+        select(
+            Tenant,
+            DataPlaneRoute,
+            ProviderProfile.id.label("health_profile_id"),
+        )
+        .outerjoin(
+            DataPlaneRoute,
+            and_(
+                DataPlaneRoute.tenant_id == Tenant.id,
+                DataPlaneRoute.mode == "dedicated",
+            ),
+        )
+        .outerjoin(
+            ProviderProfile,
+            and_(
+                ProviderProfile.id == DataPlaneRoute.provider_profile_id,
+                ProviderProfile.scope == DataPlaneRoute.mode,
+                ProviderProfile.tenant_id == Tenant.id,
+                ProviderProfile.owner_key == Tenant.id,
+                ProviderProfile.status == "active",
+            ),
+        )
+        .where(
+            Tenant.status == "active",
+            Tenant.data_plane_mode == "dedicated",
+        )
+        .order_by(Tenant.id)
     )
 
 
@@ -111,6 +170,37 @@ class SqlAlchemyDataPlaneRepository:
                 route=_route_record(route) if route is not None else None,
                 provider_profile=(_profile_record(profile) if profile is not None else None),
             )
+
+    async def resolve_shared_health_route(self) -> DataPlaneRouteRecord | None:
+        async with platform_session() as session:
+            route = await session.scalar(build_shared_health_route_statement())
+        return _route_record(route) if route is not None else None
+
+    async def resolve_dedicated_health_inventory(
+        self,
+    ) -> DedicatedDataPlaneHealthInventory:
+        async with platform_session() as session:
+            rows = (await session.execute(build_dedicated_health_inventory_statement())).all()
+        routes: list[DataPlaneRouteRecord] = []
+        unavailable = 0
+        for tenant, route, health_profile_id in rows:
+            if (
+                route is None
+                or health_profile_id is None
+                or route.status != "active"
+                or route.mode != "dedicated"
+                or route.tenant_id != tenant.id
+                or route.owner_key != tenant.id
+                or route.provider_profile_id != health_profile_id
+            ):
+                unavailable += 1
+                continue
+            routes.append(_route_record(route))
+        return DedicatedDataPlaneHealthInventory(
+            active_tenants=len(rows),
+            routes=tuple(routes),
+            unavailable_tenants=unavailable,
+        )
 
     async def record_decision(self, decision: DataPlaneDecision) -> None:
         async with platform_session() as session:

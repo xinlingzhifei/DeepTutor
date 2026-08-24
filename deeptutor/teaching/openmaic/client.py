@@ -18,6 +18,7 @@ import httpx
 from pydantic import BaseModel, SecretStr
 
 from deeptutor.teaching.contracts import ExportRequest, GenerationRequest, canonical_json_bytes
+from deeptutor.teaching.health_logging import redact_health_transport_logs
 from deeptutor.teaching.openmaic.auth import (
     PrehashedServiceRequest,
     ServiceRequest,
@@ -31,6 +32,7 @@ from deeptutor.teaching.openmaic.data_planes import (
 )
 
 logger = logging.getLogger(__name__)
+
 
 if TYPE_CHECKING:
     from deeptutor.teaching.export_worker import (
@@ -46,6 +48,7 @@ REQUIRED_CAPABILITIES = frozenset(
     {"outline", "content", "micro", "export", "cancel", "artifact-manifest"}
 )
 REQUIRED_EXPORT_FORMATS = frozenset({"classroom_zip", "pptx", "offline_html", "mp4"})
+MAX_HEALTH_RESPONSE_BYTES = 64 * 1024
 _TERMINAL_STATUSES = frozenset({"succeeded", "failed", "canceled"})
 _JOB_STATUSES = {
     "outline": frozenset(
@@ -208,6 +211,64 @@ def _string_tuple(value: object) -> tuple[str, ...]:
     return tuple(value)
 
 
+def parse_openmaic_health(payload: Mapping[str, Any]) -> OpenMAICHealth:
+    """Parse the frozen health DTO without route or credential context."""
+
+    return OpenMAICHealth(
+        service=_required_string(payload.get("service")),
+        upstream_commit=_required_string(payload.get("upstreamCommit")),
+        app_version=_required_string(payload.get("appVersion")),
+        contract_versions=_string_tuple(payload.get("contractVersions")),
+        capabilities=_string_tuple(payload.get("capabilities")),
+        export_formats=_string_tuple(payload.get("exportFormats")),
+    )
+
+
+def assert_compatible_openmaic_health(health: OpenMAICHealth) -> OpenMAICHealth:
+    """Apply the same pinned contract policy to signed and credential-free clients."""
+
+    if (
+        health.service != "openmaic"
+        or health.upstream_commit != EXPECTED_UPSTREAM_COMMIT
+        or health.app_version != EXPECTED_APP_VERSION
+        or SUPPORTED_CONTRACT_VERSION not in health.contract_versions
+        or not REQUIRED_CAPABILITIES.issubset(health.capabilities)
+        or not REQUIRED_EXPORT_FORMATS.issubset(health.export_formats)
+    ):
+        raise IncompatibleOpenMAIC()
+    return health
+
+
+def _validated_base_url(base_url: str) -> str:
+    if (
+        not isinstance(base_url, str)
+        or not base_url
+        or base_url != base_url.strip()
+        or "\\" in base_url
+        or any(
+            character.isspace() or ord(character) < 32 or ord(character) == 127
+            for character in base_url
+        )
+    ):
+        raise ValueError("OpenMAIC base URL is invalid")
+    try:
+        parsed = urlsplit(base_url)
+        parsed.port
+    except ValueError:
+        raise ValueError("OpenMAIC base URL is invalid") from None
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+    ):
+        raise ValueError("OpenMAIC base URL is invalid")
+    return base_url.rstrip("/")
+
+
 class OpenMAICClient:
     """Signed, timeout-bounded client for one resolved tenant data plane."""
 
@@ -226,17 +287,6 @@ class OpenMAICClient:
         jitter: Callable[[], float] | None = None,
         known_job_kinds: Mapping[str, EngineJobKind] | None = None,
     ) -> None:
-        parsed = urlsplit(base_url)
-        if (
-            parsed.scheme not in {"http", "https"}
-            or not parsed.netloc
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.query
-            or parsed.fragment
-            or parsed.path not in {"", "/"}
-        ):
-            raise ValueError("OpenMAIC base URL is invalid")
         if not tenant_id or "\n" in tenant_id or "\r" in tenant_id:
             raise ValueError("tenant_id is invalid")
         if not route_id or "\n" in route_id or "\r" in route_id:
@@ -244,7 +294,7 @@ class OpenMAICClient:
         if not isinstance(service_secret, SecretStr):
             raise TypeError("service_secret must be a SecretStr")
         self._http = http_client
-        self._base_url = base_url.rstrip("/")
+        self._base_url = _validated_base_url(base_url)
         self._tenant_id = tenant_id
         self._route_id = route_id
         self._service_secret = service_secret
@@ -454,28 +504,10 @@ class OpenMAICClient:
             "/api/yfeistai/v1/health",
             job_id="health",
         )
-        payload = self._json_object(response)
-        return OpenMAICHealth(
-            service=_required_string(payload.get("service")),
-            upstream_commit=_required_string(payload.get("upstreamCommit")),
-            app_version=_required_string(payload.get("appVersion")),
-            contract_versions=_string_tuple(payload.get("contractVersions")),
-            capabilities=_string_tuple(payload.get("capabilities")),
-            export_formats=_string_tuple(payload.get("exportFormats")),
-        )
+        return parse_openmaic_health(self._json_object(response))
 
     async def assert_compatible(self) -> OpenMAICHealth:
-        health = await self.health()
-        if (
-            health.service != "openmaic"
-            or health.upstream_commit != EXPECTED_UPSTREAM_COMMIT
-            or health.app_version != EXPECTED_APP_VERSION
-            or SUPPORTED_CONTRACT_VERSION not in health.contract_versions
-            or not REQUIRED_CAPABILITIES.issubset(health.capabilities)
-            or not REQUIRED_EXPORT_FORMATS.issubset(health.export_formats)
-        ):
-            raise IncompatibleOpenMAIC()
-        return health
+        return assert_compatible_openmaic_health(await self.health())
 
     async def _submit(
         self,
@@ -581,9 +613,7 @@ class OpenMAICClient:
         if file not in declaration.files:
             raise ValueError("export input file is outside the declaration")
         file_id = self._validate_job_id(file.file_id)
-        path = (
-            f"/api/yfeistai/v1/export-inputs/{declaration.job_id}/files/{file_id}"
-        )
+        path = f"/api/yfeistai/v1/export-inputs/{declaration.job_id}/files/{file_id}"
         response = await self._request_stream(
             "PUT",
             path,
@@ -619,9 +649,7 @@ class OpenMAICClient:
     ) -> ExportInputCommitReceipt:
         self._validate_staging_declaration(declaration)
         path = f"/api/yfeistai/v1/export-inputs/{declaration.job_id}/commit"
-        body = canonical_json_bytes(
-            {"declarationSha256": declaration.declaration_sha256}
-        )
+        body = canonical_json_bytes({"declarationSha256": declaration.declaration_sha256})
         response = await self._request(
             "POST",
             path,
@@ -631,17 +659,22 @@ class OpenMAICClient:
             content_type="application/json",
         )
         payload = self._json_object(response)
-        if set(payload) != {
-            "schemaVersion",
-            "tenantId",
-            "jobId",
-            "idempotencyKey",
-            "declarationSha256",
-            "classroomDocumentSha256",
-            "mediaManifestSha256",
-            "status",
-            "receiptSha256",
-        } or payload.get("schemaVersion") != 1 or payload.get("status") != "committed":
+        if (
+            set(payload)
+            != {
+                "schemaVersion",
+                "tenantId",
+                "jobId",
+                "idempotencyKey",
+                "declarationSha256",
+                "classroomDocumentSha256",
+                "mediaManifestSha256",
+                "status",
+                "receiptSha256",
+            }
+            or payload.get("schemaVersion") != 1
+            or payload.get("status") != "committed"
+        ):
             raise InvalidOpenMAICResponse()
         from deeptutor.teaching.export_worker import ExportInputCommitReceipt
 
@@ -650,15 +683,9 @@ class OpenMAICClient:
                 tenant_id=_required_string(payload.get("tenantId")),
                 job_id=_required_string(payload.get("jobId")),
                 idempotency_key=_required_string(payload.get("idempotencyKey")),
-                declaration_sha256=_required_string(
-                    payload.get("declarationSha256")
-                ),
-                classroom_document_sha256=_required_string(
-                    payload.get("classroomDocumentSha256")
-                ),
-                media_manifest_sha256=_required_string(
-                    payload.get("mediaManifestSha256")
-                ),
+                declaration_sha256=_required_string(payload.get("declarationSha256")),
+                classroom_document_sha256=_required_string(payload.get("classroomDocumentSha256")),
+                media_manifest_sha256=_required_string(payload.get("mediaManifestSha256")),
                 receipt_sha256=_required_string(payload.get("receiptSha256")),
             )
             receipt.validate(declaration)
@@ -786,6 +813,58 @@ class OpenMAICClient:
                         mapped_error = OpenMAICUnavailable()
         if mapped_error is not None:
             raise mapped_error
+
+
+class OpenMAICContractHealthClient:
+    """Credential-free client for the private, immutable health contract route."""
+
+    def __init__(
+        self,
+        http_client: httpx.AsyncClient,
+        *,
+        base_url: str,
+        timeouts: ClientTimeouts | None = None,
+    ) -> None:
+        self._http = http_client
+        self._base_url = _validated_base_url(base_url)
+        self._timeouts = timeouts or ClientTimeouts()
+
+    async def health(self) -> OpenMAICHealth:
+        try:
+            with redact_health_transport_logs():
+                async with asyncio.timeout(self._timeouts.total):
+                    async with self._http.stream(
+                        "GET",
+                        f"{self._base_url}/api/yfeistai/v1/health",
+                        headers={
+                            "accept": "application/json",
+                            "accept-encoding": "identity",
+                        },
+                        timeout=self._timeouts.httpx_timeout(),
+                        follow_redirects=False,
+                    ) as response:
+                        response.raise_for_status()
+                        payload = bytearray()
+                        async for chunk in response.aiter_bytes():
+                            if len(payload) + len(chunk) > MAX_HEALTH_RESPONSE_BYTES:
+                                raise InvalidOpenMAICResponse()
+                            payload.extend(chunk)
+        except (TimeoutError, httpx.TimeoutException):
+            raise OpenMAICTimeout() from None
+        except httpx.HTTPStatusError as exc:
+            raise OpenMAICRequestFailed(exc.response.status_code) from None
+        except httpx.RequestError:
+            raise OpenMAICUnavailable() from None
+        try:
+            value = json.loads(payload)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise InvalidOpenMAICResponse()
+        if not isinstance(value, dict):
+            raise InvalidOpenMAICResponse()
+        return parse_openmaic_health(value)
+
+    async def assert_compatible(self) -> OpenMAICHealth:
+        return assert_compatible_openmaic_health(await self.health())
 
 
 class ClientRouteBindingRepository(Protocol):

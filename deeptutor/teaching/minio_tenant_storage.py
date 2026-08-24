@@ -14,6 +14,7 @@ from typing import Any, Protocol
 from urllib.parse import urlsplit
 
 from deeptutor.services.config import PlatformSettings
+from deeptutor.services.config.platform_settings import validate_object_store_endpoint
 from deeptutor.teaching.artifacts import tenant_artifact_prefix
 from deeptutor.teaching.provisioning_worker import (
     ProvisioningStepError,
@@ -435,21 +436,15 @@ class RuntimeMinioTenantStorageAdmin:
         )
 
     def _endpoint(self) -> tuple[str, bool]:
-        parsed = urlsplit(self._settings.object_store_endpoint or "")
-        if (
-            parsed.scheme not in {"http", "https"}
-            or not parsed.netloc
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.path not in {"", "/"}
-            or parsed.query
-            or parsed.fragment
-        ):
+        try:
+            endpoint = validate_object_store_endpoint(self._settings.object_store_endpoint or "")
+        except ValueError:
             raise ProvisioningStepError(
                 category="storage",
                 code="endpoint_invalid",
                 retryable=False,
-            )
+            ) from None
+        parsed = urlsplit(endpoint)
         return parsed.netloc, parsed.scheme == "https"
 
     def _clients(self, credentials: TenantCredentialPair | None = None):

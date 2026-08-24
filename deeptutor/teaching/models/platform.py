@@ -300,6 +300,12 @@ class DataPlaneRoute(PlatformBase):
 
 
 class TenantSchemaState(PlatformBase):
+    """Authoritative tenant-migration ledger advanced only after successful migrations.
+
+    Health checks use this ledger as migration evidence. Physical schema changes made
+    out of band are outside that evidence boundary.
+    """
+
     __tablename__ = "tenant_schema_states"
 
     tenant_id: Mapped[str] = mapped_column(

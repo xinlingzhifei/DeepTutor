@@ -19,6 +19,70 @@ from pydantic import (
 from .loader import get_runtime_settings_dir
 
 
+def validate_object_store_endpoint(endpoint: str) -> str:
+    """Return one canonical S3 origin or fail without echoing the value."""
+
+    if (
+        not isinstance(endpoint, str)
+        or not endpoint
+        or endpoint != endpoint.strip()
+        or "\\" in endpoint
+        or any(
+            character.isspace() or ord(character) < 32 or ord(character) == 127
+            for character in endpoint
+        )
+    ):
+        raise ValueError("object store endpoint is invalid")
+    try:
+        parsed = urlsplit(endpoint)
+        parsed.port
+    except ValueError:
+        raise ValueError("object store endpoint is invalid") from None
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("object store endpoint is invalid")
+    return endpoint.rstrip("/")
+
+
+def validate_render_health_url(health_url: str) -> str:
+    """Return one controlled shared-render health URL or fail closed."""
+
+    if (
+        not isinstance(health_url, str)
+        or not health_url
+        or health_url != health_url.strip()
+        or "\\" in health_url
+        or any(
+            character.isspace() or ord(character) < 32 or ord(character) == 127
+            for character in health_url
+        )
+    ):
+        raise ValueError("render health URL is invalid")
+    try:
+        parsed = urlsplit(health_url)
+        parsed.port
+    except ValueError:
+        raise ValueError("render health URL is invalid") from None
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path != "/health"
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("render health URL is invalid")
+    return health_url
+
+
 class PlatformSettings(BaseModel):
     """Typed configuration for the optional multi-tenant platform runtime.
 
@@ -46,6 +110,7 @@ class PlatformSettings(BaseModel):
     object_store_public_download_origins: tuple[str, ...] = ()
     classroom_ticket_secret_file: Path | None = None
     openmaic_service_secret_file: Path | None = None
+    openmaic_render_health_url: str | None = None
     shared_generation_limit: int = 20
     default_tenant_generation_limit: int = 2
 
@@ -73,6 +138,7 @@ class PlatformSettings(BaseModel):
                     "S3 endpoint, stable namespace ID, bucket, and absolute tenant credentials "
                     "directory are required"
                 )
+            validate_object_store_endpoint(endpoint)
         for origin in self.object_store_public_download_origins:
             parsed = urlsplit(origin)
             if (
@@ -85,6 +151,8 @@ class PlatformSettings(BaseModel):
                 or parsed.fragment
             ):
                 raise ValueError("object store public download origins must be HTTPS origins")
+        if self.openmaic_render_health_url is not None:
+            validate_render_health_url(self.openmaic_render_health_url)
         if namespace_id is not None and (
             not namespace_id
             or len(namespace_id) > 128

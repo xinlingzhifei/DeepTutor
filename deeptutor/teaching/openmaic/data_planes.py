@@ -47,6 +47,15 @@ class DataPlaneRouteRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class DedicatedDataPlaneHealthInventory:
+    """Aggregate-only active dedicated-plane inventory for health probing."""
+
+    active_tenants: int
+    routes: tuple[DataPlaneRouteRecord, ...]
+    unavailable_tenants: int
+
+
+@dataclass(frozen=True, slots=True)
 class DataPlaneResolution:
     """Repository result before the selector removes sensitive metadata."""
 

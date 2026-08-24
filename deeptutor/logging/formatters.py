@@ -14,6 +14,9 @@ class ContextFilter(logging.Filter):
     """Attach contextvars and explicit record fields to each LogRecord."""
 
     def filter(self, record: logging.LogRecord) -> bool:
+        if getattr(record, "_teaching_health_redacted", False):
+            record.log_context = {}
+            return True
         context = current_log_context()
         for key in LOG_CONTEXT_FIELDS:
             value = getattr(record, key, None)
@@ -27,12 +30,17 @@ class JsonlFormatter(logging.Formatter):
     """One structured JSON object per line."""
 
     def format(self, record: logging.LogRecord) -> str:
+        context = (
+            {}
+            if getattr(record, "_teaching_health_redacted", False)
+            else getattr(record, "log_context", {}) or {}
+        )
         entry: dict[str, Any] = {
             "timestamp": datetime.fromtimestamp(record.created, timezone.utc).isoformat(),
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),
-            "context": getattr(record, "log_context", {}) or {},
+            "context": context,
         }
         if record.exc_info:
             entry["exception"] = self.formatException(record.exc_info)
@@ -43,7 +51,11 @@ class ConsoleFormatter(logging.Formatter):
     """Small human-readable formatter for local development."""
 
     def format(self, record: logging.LogRecord) -> str:
-        context = getattr(record, "log_context", {}) or {}
+        context = (
+            {}
+            if getattr(record, "_teaching_health_redacted", False)
+            else getattr(record, "log_context", {}) or {}
+        )
         stage = f" @{context['stage']}" if context.get("stage") else ""
         task = f" #{context['task_id']}" if context.get("task_id") else ""
         message = f"{record.levelname:<7} {record.name}{stage}{task} - {record.getMessage()}"

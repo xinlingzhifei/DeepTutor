@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import logging
 import math
 import re
-from typing import Callable, Literal
+from typing import Callable, Literal, Mapping, Protocol
 
 from deeptutor.teaching.runtime_heartbeat import (
     RUNTIME_PROCESS_ROLES,
@@ -17,6 +18,16 @@ from deeptutor.teaching.runtime_heartbeat import (
 HealthStatus = Literal["healthy", "stale", "unhealthy", "unknown"]
 DataPlaneMode = Literal["shared", "dedicated"]
 DataPlaneService = Literal["openmaic", "render"]
+HEARTBEAT_HEALTH_TIMEOUT_SECONDS = 1.0
+
+ACTIVE_HEALTH_COMPONENTS = (
+    "database",
+    "migrations",
+    "object_store",
+    "openmaic_shared",
+    "render_shared",
+    "dedicated_data_planes",
+)
 
 REQUIRED_HEALTH_COMPONENTS = (
     "database",
@@ -29,6 +40,7 @@ REQUIRED_HEALTH_COMPONENTS = (
     "projector",
     "openmaic_shared",
     "render_shared",
+    "dedicated_data_planes",
     "reaper",
 )
 
@@ -65,6 +77,24 @@ class _Signal:
     mode: DataPlaneMode | None = None
 
 
+class ActiveComponentResult(Protocol):
+    status: Literal["healthy", "unhealthy"]
+    reason: str | None
+
+
+_ACTIVE_COMPONENT_METADATA: dict[
+    str,
+    tuple[DataPlaneService | None, DataPlaneMode | None],
+] = {
+    "database": (None, None),
+    "migrations": (None, None),
+    "object_store": (None, None),
+    "openmaic_shared": ("openmaic", "shared"),
+    "render_shared": ("render", "shared"),
+    "dedicated_data_planes": ("openmaic", "dedicated"),
+}
+
+
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -83,11 +113,15 @@ class TeachingHealthService:
         *,
         now: Callable[[], datetime] = _utc_now,
         stale_after_seconds: float = 90,
+        heartbeat_timeout_seconds: float = HEARTBEAT_HEALTH_TIMEOUT_SECONDS,
     ) -> None:
         if not math.isfinite(stale_after_seconds) or stale_after_seconds <= 0:
             raise ValueError("stale_after_seconds must be positive")
+        if not math.isfinite(heartbeat_timeout_seconds) or heartbeat_timeout_seconds <= 0:
+            raise ValueError("heartbeat_timeout_seconds must be positive")
         self._now = now
         self._stale_after_seconds = float(stale_after_seconds)
+        self._heartbeat_timeout_seconds = float(heartbeat_timeout_seconds)
         self._signals: dict[str, _Signal] = {
             component: _Signal(status="unknown", checked_at=None)
             for component in REQUIRED_HEALTH_COMPONENTS
@@ -177,18 +211,21 @@ class TeachingHealthService:
         self,
         *,
         signal_overrides: dict[str, _Signal] | None = None,
+        include_data_planes: bool = True,
+        now: datetime | None = None,
     ) -> TeachingHealthReport:
-        now = self._now()
+        now = self._now() if now is None else now
         signals = dict(self._signals)
         if signal_overrides is not None:
             signals.update(signal_overrides)
         components = {name: self._component(signal, now) for name, signal in signals.items()}
-        components.update(
-            {
-                f"data_plane:{route_id}": self._component(signal, now)
-                for route_id, signal in self._data_planes.items()
-            }
-        )
+        if include_data_planes:
+            components.update(
+                {
+                    f"data_plane:{route_id}": self._component(signal, now)
+                    for route_id, signal in self._data_planes.items()
+                }
+            )
         status = (
             "healthy"
             if components and all(item.status == "healthy" for item in components.values())
@@ -203,14 +240,15 @@ class TeachingHealthService:
     def report(self) -> TeachingHealthReport:
         return self._report()
 
-    async def report_durable(
+    async def _durable_overrides(
         self,
         repository: RuntimeHeartbeatRepository,
-    ) -> TeachingHealthReport:
+    ) -> dict[str, _Signal]:
         try:
-            snapshots = await repository.latest_running_heartbeats(RUNTIME_PROCESS_ROLES)
+            async with asyncio.timeout(self._heartbeat_timeout_seconds):
+                snapshots = await repository.latest_running_heartbeats(RUNTIME_PROCESS_ROLES)
         except Exception:
-            overrides = {
+            return {
                 role: _Signal(
                     status="unknown",
                     checked_at=None,
@@ -218,7 +256,6 @@ class TeachingHealthService:
                 )
                 for role in RUNTIME_PROCESS_ROLES
             }
-            return self._report(signal_overrides=overrides)
 
         latest: dict[str, float] = {}
         for snapshot in snapshots:
@@ -226,7 +263,7 @@ class TeachingHealthService:
             existing = latest.get(snapshot.role)
             if existing is None or age_seconds < existing:
                 latest[snapshot.role] = age_seconds
-        overrides = {
+        return {
             role: (
                 _Signal(
                     status="healthy",
@@ -243,7 +280,44 @@ class TeachingHealthService:
             )
             for role in RUNTIME_PROCESS_ROLES
         }
-        return self._report(signal_overrides=overrides)
+
+    async def report_active(
+        self,
+        repository: RuntimeHeartbeatRepository,
+        active_results: Mapping[str, ActiveComponentResult],
+    ) -> TeachingHealthReport:
+        """Merge request-local active results with only durable role heartbeats."""
+
+        if set(active_results) != set(ACTIVE_HEALTH_COMPONENTS):
+            raise ValueError("active health results must cover every dependency")
+        checked_at = self._now()
+        active_overrides: dict[str, _Signal] = {}
+        for component in ACTIVE_HEALTH_COMPONENTS:
+            result = active_results[component]
+            if result.status not in {"healthy", "unhealthy"}:
+                raise ValueError("active health status is invalid")
+            if result.reason is not None:
+                _safe_token(result.reason, "health reason")
+            service, mode = _ACTIVE_COMPONENT_METADATA[component]
+            active_overrides[component] = _Signal(
+                status=result.status,
+                checked_at=checked_at,
+                reason=result.reason,
+                service=service,
+                mode=mode,
+            )
+        durable_overrides = await self._durable_overrides(repository)
+        return self._report(
+            signal_overrides={**active_overrides, **durable_overrides},
+            include_data_planes=False,
+            now=checked_at,
+        )
+
+    async def report_durable(
+        self,
+        repository: RuntimeHeartbeatRepository,
+    ) -> TeachingHealthReport:
+        return self._report(signal_overrides=await self._durable_overrides(repository))
 
 
 _service = TeachingHealthService()
