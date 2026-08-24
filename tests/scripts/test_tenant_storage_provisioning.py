@@ -404,10 +404,23 @@ def test_tenant_provisioner_is_a_real_process_entrypoint(
     from deeptutor.teaching import processes
 
     calls: list[bool] = []
+    heartbeat_events: list[tuple[str, str, str]] = []
 
     class Worker:
         async def run_once(self) -> bool:
             calls.append(True)
+            return True
+
+    class HeartbeatRepository:
+        async def register(self, role: str, instance_id: str) -> None:
+            heartbeat_events.append(("register", role, instance_id))
+
+        async def heartbeat(self, role: str, instance_id: str) -> bool:
+            heartbeat_events.append(("heartbeat", role, instance_id))
+            return True
+
+        async def mark_stopped(self, role: str, instance_id: str) -> bool:
+            heartbeat_events.append(("stop", role, instance_id))
             return True
 
     monkeypatch.setattr(processes, "build_provisioning_worker", lambda **_kwargs: Worker())
@@ -418,7 +431,13 @@ def test_tenant_provisioner_is_a_real_process_entrypoint(
             "tenant-provisioner",
             once=True,
             settings=_settings(tmp_path),
+            heartbeat_repository=HeartbeatRepository(),
         )
     )
     assert handled is True
     assert calls == [True]
+    assert [event[:2] for event in heartbeat_events] == [
+        ("register", "tenant_provisioner"),
+        ("stop", "tenant_provisioner"),
+    ]
+    assert heartbeat_events[0][2] == heartbeat_events[-1][2]
