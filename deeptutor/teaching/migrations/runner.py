@@ -8,13 +8,21 @@ from pathlib import Path
 import re
 from typing import Literal, NamedTuple
 
-from alembic import command
+from alembic import command, context
 from alembic.config import Config
 from alembic.util import CommandError
 from sqlalchemy import exc as sqlalchemy_exc
+from sqlalchemy import text
+from sqlalchemy.engine import Connection
+from sqlalchemy.sql.elements import TextClause
+
+from deeptutor.services.config import load_platform_settings
 
 _TENANT_SCHEMA_PATTERN = re.compile(r"tenant_[0-9a-f]{16}")
 _SUPPORTED_ACTIONS = frozenset({"upgrade", "downgrade"})
+MIGRATION_LOCK_TIMEOUT_MS = 30_000
+MIGRATION_STATEMENT_TIMEOUT_MS = 900_000
+TEACHING_MIGRATION_HEAD_REVISION = "20260810_0017"
 
 
 class MigrationUnavailableError(CommandError):
@@ -26,9 +34,33 @@ class MigrationUnavailableError(CommandError):
         super().__init__("database migration is temporarily unavailable")
 
 
+def load_migration_database_url() -> str:
+    """Load one fail-closed database URL without exposing its value."""
+
+    try:
+        settings = load_platform_settings()
+    except Exception:
+        raise CommandError("platform database settings are invalid") from None
+    if not settings.enabled:
+        raise CommandError("platform database is disabled")
+    if settings.database_url is None:
+        raise CommandError("platform database URL is unavailable")
+    return settings.database_url.get_secret_value()
+
+
 def is_transient_database_error(exc: Exception) -> bool:
     """Classify database availability failures by exception type."""
 
+    if isinstance(
+        exc,
+        (
+            sqlalchemy_exc.DataError,
+            sqlalchemy_exc.IntegrityError,
+            sqlalchemy_exc.NotSupportedError,
+            sqlalchemy_exc.ProgrammingError,
+        ),
+    ):
+        return False
     return isinstance(
         exc,
         (
@@ -40,10 +72,7 @@ def is_transient_database_error(exc: Exception) -> bool:
             sqlalchemy_exc.TimeoutError,
             TimeoutError,
         ),
-    ) or (
-        isinstance(exc, sqlalchemy_exc.DBAPIError)
-        and exc.connection_invalidated
-    )
+    ) or (isinstance(exc, sqlalchemy_exc.DBAPIError) and exc.connection_invalidated)
 
 
 def translate_migration_runtime_error(exc: Exception) -> CommandError:
@@ -130,13 +159,42 @@ def build_alembic_config(
     return config
 
 
-def run_migration(
+def _run_migrations_in_transaction(
+    connection: Connection,
+    migration_scope: MigrationScope,
+) -> None:
+    """Configure one bounded Alembic transaction on its sync connection."""
+
+    context.configure(
+        connection=connection,
+        version_table="alembic_version",
+        version_table_schema=migration_scope.schema,
+    )
+    with context.begin_transaction():
+        connection.execute(*_migration_timeout_command())
+        context.run_migrations()
+
+
+def _migration_timeout_command() -> tuple[TextClause, dict[str, str]]:
+    return (
+        text(
+            "SELECT set_config('lock_timeout', :lock_timeout, true), "
+            "set_config('statement_timeout', :statement_timeout, true)"
+        ),
+        {
+            "lock_timeout": f"{MIGRATION_LOCK_TIMEOUT_MS}ms",
+            "statement_timeout": f"{MIGRATION_STATEMENT_TIMEOUT_MS}ms",
+        },
+    )
+
+
+def _run_migration_unlocked(
     *,
     action: str,
     scope: str,
     tenant_schema: str | None = None,
 ) -> None:
-    """Run the supported upgrade-to-head or downgrade-to-base operation."""
+    """Run Alembic after the caller has acquired the required session locks."""
 
     config = build_alembic_config(
         action=action,

@@ -537,9 +537,7 @@ def test_migration_runs_from_outside_repository(
         cwd=tmp_path,
     )
     _assert_migration_succeeded(migration_database, tenant_downgrade)
-    assert asyncio.run(_table_names(migration_database.url, tenant_schema)) == {
-        "alembic_version"
-    }
+    assert asyncio.run(_table_names(migration_database.url, tenant_schema)) == {"alembic_version"}
 
 
 def test_wheel_packages_migrations_and_full_app_entrypoint(
@@ -693,9 +691,68 @@ def test_packaged_entrypoint_runs_platform_and_tenant_scopes(
         cwd=tmp_path,
     )
     _assert_migration_succeeded(migration_database, tenant_downgrade)
-    assert asyncio.run(_table_names(migration_database.url, tenant_schema)) == {
-        "alembic_version"
-    }
+    assert asyncio.run(_table_names(migration_database.url, tenant_schema)) == {"alembic_version"}
+
+
+def test_packaged_platform_migration_waits_for_shared_directory_lock(
+    installed_migration,
+    migration_database,
+    tmp_path,
+) -> None:
+    from deeptutor.teaching.tenant_directory_lock import (
+        tenant_directory_session_lock,
+    )
+
+    async def exercise():
+        engine = create_async_engine(migration_database.url)
+        migration_task = None
+        try:
+            async with engine.connect() as lock_connection:
+                async with tenant_directory_session_lock(
+                    lock_connection,
+                    shared=True,
+                ):
+                    migration_task = asyncio.create_task(
+                        asyncio.to_thread(
+                            _run_packaged_migration,
+                            installed_migration,
+                            migration_database,
+                            action="upgrade",
+                            scope="platform",
+                            cwd=tmp_path,
+                        )
+                    )
+                    blocked_lock_observed = False
+                    for _attempt in range(200):
+                        if migration_task.done():
+                            break
+                        async with engine.connect() as observer:
+                            waiting = await observer.scalar(
+                                text(
+                                    "SELECT count(*) FROM pg_locks "
+                                    "WHERE locktype = 'advisory' AND NOT granted "
+                                    "AND database = (SELECT oid FROM pg_database "
+                                    "WHERE datname = current_database())"
+                                )
+                            )
+                        if int(waiting or 0) > 0:
+                            blocked_lock_observed = True
+                            break
+                        await asyncio.sleep(0.05)
+                    finished_while_locked = migration_task.done()
+
+            completed = await asyncio.wait_for(migration_task, timeout=120)
+            return blocked_lock_observed, finished_while_locked, completed
+        finally:
+            if migration_task is not None and not migration_task.done():
+                await asyncio.wait_for(migration_task, timeout=120)
+            await engine.dispose()
+
+    blocked, finished_while_locked, completed = asyncio.run(exercise())
+
+    assert blocked is True
+    assert finished_while_locked is False
+    _assert_migration_succeeded(migration_database, completed)
 
 
 @pytest.mark.parametrize(
@@ -2293,9 +2350,7 @@ def test_source_receipt_migration_refuses_unverifiable_legacy_upload_without_mut
                     ),
                     {
                         "tenant_id": tenant_id,
-                        "object_key": (
-                            f"tenants/{tenant_id}/sources/legacy-upload/source.pdf"
-                        ),
+                        "object_key": (f"tenants/{tenant_id}/sources/legacy-upload/source.pdf"),
                         "sha256": "a" * 64,
                     },
                 )
@@ -3613,9 +3668,7 @@ def test_classroom_lifecycle_downgrade_blocks_writer_started_after_guard(
                 ),
                 {"schema_name": schema_name},
             )
-            blocker_xid = await blocker.scalar(
-                text("SELECT pg_current_xact_id()::text")
-            )
+            blocker_xid = await blocker.scalar(text("SELECT pg_current_xact_id()::text"))
             assert isinstance(blocker_xid, str)
             downgrade_task = asyncio.create_task(
                 asyncio.to_thread(
@@ -3748,16 +3801,12 @@ def test_classroom_lifecycle_downgrade_blocks_writer_started_after_guard(
             async with engine.begin() as connection:
                 await connection.execute(
                     text(
-                        "DELETE FROM platform.tenant_provisioning_jobs "
-                        "WHERE tenant_id = :tenant_id"
+                        "DELETE FROM platform.tenant_provisioning_jobs WHERE tenant_id = :tenant_id"
                     ),
                     {"tenant_id": tenant_id},
                 )
                 await connection.execute(
-                    text(
-                        "DELETE FROM platform.tenant_schema_states "
-                        "WHERE tenant_id = :tenant_id"
-                    ),
+                    text("DELETE FROM platform.tenant_schema_states WHERE tenant_id = :tenant_id"),
                     {"tenant_id": tenant_id},
                 )
                 await connection.execute(
@@ -4153,16 +4202,12 @@ def test_classroom_lifecycle_downgrade_allows_reconstructible_plan02_backfill(
                 await connection.execute(DropSchema(schema_name, cascade=True))
                 await connection.execute(
                     text(
-                        "DELETE FROM platform.tenant_provisioning_jobs "
-                        "WHERE tenant_id = :tenant_id"
+                        "DELETE FROM platform.tenant_provisioning_jobs WHERE tenant_id = :tenant_id"
                     ),
                     {"tenant_id": tenant_id},
                 )
                 await connection.execute(
-                    text(
-                        "DELETE FROM platform.tenant_schema_states "
-                        "WHERE tenant_id = :tenant_id"
-                    ),
+                    text("DELETE FROM platform.tenant_schema_states WHERE tenant_id = :tenant_id"),
                     {"tenant_id": tenant_id},
                 )
                 await connection.execute(
@@ -4343,23 +4388,15 @@ def test_postgres_claims_are_unique_and_stale_same_owner_token_is_fenced(
             policy_result = build_default_policy_result()
             assert await repository.heartbeat(old_claim, lease_seconds=60) is False
             assert await repository.record_schema_ready(old_claim, schema_result) is False
-            assert await repository.record_storage_ready(old_claim, storage_result) is False
             assert (
-                await repository.record_default_policy_ready(
+                await repository.finalize_provisioning(
                     old_claim,
+                    storage_result,
                     policy_result,
                 )
                 is False
             )
             assert await repository.record_schema_ready(reclaimed, schema_result) is True
-            assert await repository.record_storage_ready(reclaimed, storage_result) is True
-            assert (
-                await repository.record_default_policy_ready(
-                    reclaimed,
-                    policy_result,
-                )
-                is True
-            )
             assert (
                 await repository.record_failure(
                     old_claim,
@@ -4370,8 +4407,14 @@ def test_postgres_claims_are_unique_and_stale_same_owner_token_is_fenced(
                 )
                 is False
             )
-            assert await repository.activate(old_claim) is False
-            assert await repository.activate(reclaimed) is True
+            assert (
+                await repository.finalize_provisioning(
+                    reclaimed,
+                    storage_result,
+                    policy_result,
+                )
+                is True
+            )
 
             async with database_module.platform_session() as session:
                 state = await session.get(TenantSchemaState, "worker-stale")
@@ -4568,13 +4611,14 @@ def test_future_tenant_schema_revision_is_not_enqueued_or_claimed(
     asyncio.run(exercise())
 
 
-def test_postgres_activation_requires_all_states_and_s3_credential_binding(
+def test_postgres_finalization_requires_schema_and_atomically_activates_storage_policy(
     migration_database,
     monkeypatch,
 ) -> None:
     from dataclasses import replace
 
     from deeptutor.teaching.models import (
+        Tenant,
         TenantDefaultPolicyState,
         TenantProvisioningJob,
         TenantStorageCredential,
@@ -4616,16 +4660,27 @@ def test_postgres_activation_requires_all_states_and_s3_credential_binding(
             )
             assert claim is not None
             assert claim.tenant_id == "activation-prerequisites"
-            assert await repository.activate(claim) is False
+            local_storage = StorageProvisioningResult.local(claim.tenant_id)
+            policy_result = build_default_policy_result()
+            assert (
+                await repository.finalize_provisioning(
+                    claim,
+                    local_storage,
+                    policy_result,
+                )
+                is False
+            )
+            async with database_module.platform_session() as session:
+                assert await session.get(TenantStorageCredential, claim.tenant_id) is None
+                assert await session.get(TenantStorageState, claim.tenant_id) is None
+                assert await session.get(TenantDefaultPolicyState, claim.tenant_id) is None
 
             schema_result = SchemaProvisioningResult(
                 schema_name=tenant_schema_name(claim.tenant_id),
                 revision=TENANT_SCHEMA_REVISION,
             )
             assert await repository.record_schema_ready(claim, schema_result) is True
-            assert await repository.activate(claim) is False
 
-            local_storage = StorageProvisioningResult.local(claim.tenant_id)
             cross_tenant_storage = replace(
                 local_storage,
                 mode="s3",
@@ -4633,14 +4688,15 @@ def test_postgres_activation_requires_all_states_and_s3_credential_binding(
                 access_key_fingerprint="a" * 64,
             )
             with pytest.raises(ProvisioningStepError):
-                await repository.record_storage_ready(
+                await repository.finalize_provisioning(
                     claim,
                     cross_tenant_storage,
+                    policy_result,
                 )
-            assert await repository.activate(claim) is False
             async with database_module.platform_session() as session:
                 assert await session.get(TenantStorageCredential, claim.tenant_id) is None
                 assert await session.get(TenantStorageState, claim.tenant_id) is None
+                assert await session.get(TenantDefaultPolicyState, claim.tenant_id) is None
 
             storage_result = replace(
                 local_storage,
@@ -4648,32 +4704,17 @@ def test_postgres_activation_requires_all_states_and_s3_credential_binding(
                 secret_ref="activation-prerequisites/object-store",
                 access_key_fingerprint="a" * 64,
             )
-            assert await repository.record_storage_ready(claim, storage_result) is True
-            assert await repository.activate(claim) is False
-
-            policy_result = build_default_policy_result()
-            assert await repository.record_default_policy_ready(claim, policy_result) is True
-            async with database_module.platform_session() as session:
-                async with session.begin():
-                    credential = await session.get(
-                        TenantStorageCredential,
-                        claim.tenant_id,
-                    )
-                    assert credential is not None
-                    credential.access_key_fingerprint = "b" * 64
-            assert await repository.activate(claim) is False
+            assert (
+                await repository.finalize_provisioning(
+                    claim,
+                    storage_result,
+                    policy_result,
+                )
+                is True
+            )
 
             async with database_module.platform_session() as session:
-                async with session.begin():
-                    credential = await session.get(
-                        TenantStorageCredential,
-                        claim.tenant_id,
-                    )
-                    assert credential is not None
-                    credential.access_key_fingerprint = "a" * 64
-            assert await repository.activate(claim) is True
-
-            async with database_module.platform_session() as session:
+                tenant = await session.get(Tenant, claim.tenant_id)
                 job = await session.get(
                     TenantProvisioningJob,
                     "job-activation-prerequisites",
@@ -4682,16 +4723,360 @@ def test_postgres_activation_requires_all_states_and_s3_credential_binding(
                     TenantDefaultPolicyState,
                     "activation-prerequisites",
                 )
+                credential = await session.get(
+                    TenantStorageCredential,
+                    claim.tenant_id,
+                )
+                storage = await session.get(TenantStorageState, claim.tenant_id)
+                assert tenant is not None
+                assert tenant.status == "active"
                 assert job is not None
                 assert job.status == "completed"
                 assert job.completed_at is not None
                 assert job.lease_owner is None
                 assert policy is not None
+                assert credential is not None
+                assert credential.secret_ref == storage_result.secret_ref
+                assert storage is not None
+                assert storage.credential_secret_ref == storage_result.secret_ref
                 payload = json.loads(policy.policy_payload)
                 assert payload["network_access_enabled"] is False
                 assert payload["open_creation_enabled"] is False
                 assert payload["external_media_enabled"] is False
         finally:
+            await database_module.dispose_platform_engine()
+
+    asyncio.run(exercise())
+
+
+def test_postgres_finalization_failure_rolls_back_all_activation_records(
+    migration_database,
+    monkeypatch,
+) -> None:
+    from deeptutor.teaching.models import (
+        Tenant,
+        TenantDefaultPolicyState,
+        TenantProvisioningJob,
+        TenantStorageCredential,
+        TenantStorageState,
+    )
+    from deeptutor.teaching.provisioning_worker import (
+        TENANT_SCHEMA_REVISION,
+        SchemaProvisioningResult,
+        StorageProvisioningResult,
+        build_default_policy_result,
+    )
+    from deeptutor.teaching.repositories.provisioning import (
+        SqlAlchemyProvisioningRepository,
+    )
+    from deeptutor.teaching.repositories.tenants import TenantRepository
+
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(migration_database, "scope=platform"),
+    )
+    _settings, database_module = _install_source_runtime_database(
+        monkeypatch,
+        migration_database,
+    )
+
+    async def exercise() -> None:
+        await database_module.dispose_platform_engine()
+        repository = SqlAlchemyProvisioningRepository()
+        tenant_id = "atomic-finalization-rollback"
+        trigger_name = "reject_atomic_finalization"
+        function_name = "reject_atomic_finalization"
+        legacy_secret_ref = f"{tenant_id}/legacy-object-store"
+        legacy_fingerprint = "d" * 64
+        try:
+            await TenantRepository().create_provisioning(
+                tenant_id=tenant_id,
+                job_id="job-atomic-finalization-rollback",
+                name="Atomic Finalization Rollback",
+            )
+            claim = await repository.claim_next("worker-atomic", lease_seconds=60)
+            assert claim is not None
+            assert claim.tenant_id == tenant_id
+            assert (
+                await repository.record_schema_ready(
+                    claim,
+                    SchemaProvisioningResult(
+                        schema_name=tenant_schema_name(tenant_id),
+                        revision=TENANT_SCHEMA_REVISION,
+                    ),
+                )
+                is True
+            )
+            async with database_module.platform_session() as session:
+                async with session.begin():
+                    session.add(
+                        TenantStorageCredential(
+                            tenant_id=tenant_id,
+                            secret_ref=legacy_secret_ref,
+                            access_key_fingerprint=legacy_fingerprint,
+                            status="active",
+                        )
+                    )
+                    await session.execute(
+                        text(
+                            f"CREATE FUNCTION platform.{function_name}() RETURNS trigger "
+                            "LANGUAGE plpgsql AS $$ BEGIN "
+                            f"IF NEW.id = '{tenant_id}' AND NEW.status = 'active' THEN "
+                            "RAISE EXCEPTION 'forced activation rollback'; END IF; "
+                            "RETURN NEW; END $$"
+                        )
+                    )
+                    await session.execute(
+                        text(
+                            f"CREATE TRIGGER {trigger_name} BEFORE UPDATE OF status "
+                            "ON platform.tenants FOR EACH ROW "
+                            f"EXECUTE FUNCTION platform.{function_name}()"
+                        )
+                    )
+
+            with pytest.raises(DBAPIError, match="forced activation rollback"):
+                await repository.finalize_provisioning(
+                    claim,
+                    StorageProvisioningResult.local(tenant_id),
+                    build_default_policy_result(),
+                )
+
+            async with database_module.platform_session() as session:
+                tenant = await session.get(Tenant, tenant_id)
+                job = await session.get(
+                    TenantProvisioningJob,
+                    "job-atomic-finalization-rollback",
+                )
+                assert tenant is not None
+                assert tenant.status == "provisioning"
+                assert job is not None
+                assert job.status == "running"
+                credential = await session.get(TenantStorageCredential, tenant_id)
+                assert credential is not None
+                assert credential.status == "active"
+                assert credential.secret_ref == legacy_secret_ref
+                assert credential.access_key_fingerprint == legacy_fingerprint
+                assert await session.get(TenantStorageState, tenant_id) is None
+                assert await session.get(TenantDefaultPolicyState, tenant_id) is None
+        finally:
+            async with database_module.platform_session() as session:
+                async with session.begin():
+                    await session.execute(
+                        text(
+                            f"DROP TRIGGER IF EXISTS {trigger_name} ON platform.tenants"
+                        )
+                    )
+                    await session.execute(
+                        text(
+                            f"DROP FUNCTION IF EXISTS platform.{function_name}()"
+                        )
+                    )
+            await database_module.dispose_platform_engine()
+
+    asyncio.run(exercise())
+
+
+def test_inactive_tenant_storage_credential_is_never_returned_as_active(
+    migration_database,
+    monkeypatch,
+) -> None:
+    from deeptutor.teaching.models import TenantStorageCredential
+    from deeptutor.teaching.repositories.tenants import TenantRepository
+    from deeptutor.teaching.storage_credentials import (
+        SqlAlchemyStorageCredentialRepository,
+    )
+
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(migration_database, "scope=platform"),
+    )
+    _settings, database_module = _install_source_runtime_database(
+        monkeypatch,
+        migration_database,
+    )
+
+    async def exercise() -> None:
+        await database_module.dispose_platform_engine()
+        tenant_id = "inactive-credential-guard"
+        try:
+            await TenantRepository().create_provisioning(
+                tenant_id=tenant_id,
+                job_id="job-inactive-credential-guard",
+                name="Inactive Credential Guard",
+            )
+            async with database_module.platform_session() as session:
+                async with session.begin():
+                    session.add(
+                        TenantStorageCredential(
+                            tenant_id=tenant_id,
+                            secret_ref=f"{tenant_id}/object-store",
+                            access_key_fingerprint="c" * 64,
+                            status="active",
+                        )
+                    )
+
+            assert await SqlAlchemyStorageCredentialRepository().get_active(tenant_id) is None
+        finally:
+            await database_module.dispose_platform_engine()
+
+    asyncio.run(exercise())
+
+
+def test_postgres_bulk_directory_lock_blocks_concurrent_tenant_creation(
+    migration_database,
+    monkeypatch,
+) -> None:
+    from deeptutor.teaching.repositories.tenants import TenantRepository
+    from deeptutor.teaching.tenant_directory_lock import (
+        tenant_directory_session_lock,
+    )
+
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(migration_database, "scope=platform"),
+    )
+    _settings, database_module = _install_source_runtime_database(
+        monkeypatch,
+        migration_database,
+    )
+
+    async def exercise() -> None:
+        await database_module.dispose_platform_engine()
+        engine = database_module.get_platform_engine()
+        create_task = None
+        try:
+            async with engine.connect() as migration_connection:
+                async with tenant_directory_session_lock(
+                    migration_connection,
+                    shared=False,
+                ):
+                    create_task = asyncio.create_task(
+                        TenantRepository().create_provisioning(
+                            tenant_id="directory-lock-tenant",
+                            job_id="job-directory-lock-tenant",
+                            name="Directory Lock Tenant",
+                        )
+                    )
+                    blocked_lock_observed = False
+                    for _attempt in range(40):
+                        if create_task.done():
+                            break
+                        async with engine.connect() as observer:
+                            waiting = await observer.scalar(
+                                text(
+                                    "SELECT count(*) FROM pg_locks "
+                                    "WHERE locktype = 'advisory' AND NOT granted "
+                                    "AND database = (SELECT oid FROM pg_database "
+                                    "WHERE datname = current_database())"
+                                )
+                            )
+                        if int(waiting or 0) > 0:
+                            blocked_lock_observed = True
+                            break
+                        await asyncio.sleep(0.05)
+                    assert create_task.done() is False
+                    assert blocked_lock_observed is True
+
+            summary = await asyncio.wait_for(create_task, timeout=2)
+            assert summary.tenant_id == "directory-lock-tenant"
+            assert summary.status == "provisioning"
+        finally:
+            if create_task is not None and not create_task.done():
+                create_task.cancel()
+                await asyncio.gather(create_task, return_exceptions=True)
+            await database_module.dispose_platform_engine()
+
+    asyncio.run(exercise())
+
+
+def test_postgres_record_schema_ready_waits_for_exclusive_directory_lock(
+    migration_database,
+    monkeypatch,
+) -> None:
+    from deeptutor.teaching.models import TenantSchemaState
+    from deeptutor.teaching.provisioning_worker import (
+        TENANT_SCHEMA_REVISION,
+        SchemaProvisioningResult,
+    )
+    from deeptutor.teaching.repositories.provisioning import (
+        SqlAlchemyProvisioningRepository,
+    )
+    from deeptutor.teaching.repositories.tenants import TenantRepository
+    from deeptutor.teaching.tenant_directory_lock import (
+        tenant_directory_session_lock,
+    )
+
+    _assert_migration_succeeded(
+        migration_database,
+        _run_alembic(migration_database, "scope=platform"),
+    )
+    _settings, database_module = _install_source_runtime_database(
+        monkeypatch,
+        migration_database,
+    )
+
+    async def exercise() -> None:
+        await database_module.dispose_platform_engine()
+        engine = database_module.get_platform_engine()
+        tenant_id = "schema-ready-directory-lock"
+        repository = SqlAlchemyProvisioningRepository()
+        record_task = None
+        try:
+            await TenantRepository().create_provisioning(
+                tenant_id=tenant_id,
+                job_id="job-schema-ready-directory-lock",
+                name="Schema Ready Directory Lock",
+            )
+            claim = await repository.claim_next(
+                "worker-schema-ready-directory-lock",
+                lease_seconds=60,
+            )
+            assert claim is not None
+            assert claim.tenant_id == tenant_id
+            schema_result = SchemaProvisioningResult(
+                schema_name=tenant_schema_name(tenant_id),
+                revision=TENANT_SCHEMA_REVISION,
+            )
+
+            async with engine.connect() as migration_connection:
+                async with tenant_directory_session_lock(
+                    migration_connection,
+                    shared=False,
+                ):
+                    record_task = asyncio.create_task(
+                        repository.record_schema_ready(claim, schema_result)
+                    )
+                    blocked_lock_observed = False
+                    for _attempt in range(40):
+                        if record_task.done():
+                            break
+                        async with engine.connect() as observer:
+                            waiting = await observer.scalar(
+                                text(
+                                    "SELECT count(*) FROM pg_locks "
+                                    "WHERE locktype = 'advisory' AND NOT granted "
+                                    "AND database = (SELECT oid FROM pg_database "
+                                    "WHERE datname = current_database())"
+                                )
+                            )
+                        if int(waiting or 0) > 0:
+                            blocked_lock_observed = True
+                            break
+                        await asyncio.sleep(0.05)
+                    assert record_task.done() is False
+                    assert blocked_lock_observed is True
+
+            assert await asyncio.wait_for(record_task, timeout=2) is True
+            async with database_module.platform_session() as session:
+                schema_state = await session.get(TenantSchemaState, tenant_id)
+                assert schema_state is not None
+                assert schema_state.schema_name == schema_result.schema_name
+                assert schema_state.revision == TENANT_SCHEMA_REVISION
+                assert schema_state.status == "active"
+        finally:
+            if record_task is not None and not record_task.done():
+                record_task.cancel()
+                await asyncio.gather(record_task, return_exceptions=True)
             await database_module.dispose_platform_engine()
 
     asyncio.run(exercise())
@@ -4889,6 +5274,7 @@ def test_create_intent_runs_to_active_with_real_schema_revision_and_local_storag
         TenantDefaultPolicyState,
         TenantProvisioningJob,
         TenantSchemaState,
+        TenantStorageCredential,
         TenantStorageState,
     )
     from deeptutor.teaching.provisioning_worker import (
@@ -4930,6 +5316,18 @@ def test_create_intent_runs_to_active_with_real_schema_revision_and_local_storag
                 idempotency_key="worker-e2e-intent",
             )
             assert intent.status == "provisioning"
+            legacy_secret_ref = f"{intent.tenant_id}/legacy-object-store"
+            legacy_fingerprint = "d" * 64
+            async with database_module.platform_session() as session:
+                async with session.begin():
+                    session.add(
+                        TenantStorageCredential(
+                            tenant_id=intent.tenant_id,
+                            secret_ref=legacy_secret_ref,
+                            access_key_fingerprint=legacy_fingerprint,
+                            status="active",
+                        )
+                    )
             worker = ProvisioningWorker(
                 enabled=True,
                 worker_id="worker-e2e",
@@ -4985,6 +5383,10 @@ def test_create_intent_runs_to_active_with_real_schema_revision_and_local_storag
                 job = await session.get(TenantProvisioningJob, intent.job_id)
                 schema_state = await session.get(TenantSchemaState, intent.tenant_id)
                 storage_state = await session.get(TenantStorageState, intent.tenant_id)
+                credential = await session.get(
+                    TenantStorageCredential,
+                    intent.tenant_id,
+                )
                 policy_state = await session.get(
                     TenantDefaultPolicyState,
                     intent.tenant_id,
@@ -5009,6 +5411,10 @@ def test_create_intent_runs_to_active_with_real_schema_revision_and_local_storag
                 assert storage_state.mode == "local"
                 assert storage_state.credential_secret_ref is None
                 assert storage_state.credential_fingerprint is None
+                assert credential is not None
+                assert credential.status == "inactive"
+                assert credential.secret_ref == legacy_secret_ref
+                assert credential.access_key_fingerprint == legacy_fingerprint
                 assert policy_state is not None
                 policy_payload = json.loads(policy_state.policy_payload)
                 assert policy_payload == {

@@ -12,20 +12,24 @@ from types import MappingProxyType
 from typing import Awaitable, Mapping, Protocol, TypeVar
 import uuid
 
-from sqlalchemy import text
-
 from deeptutor.runtime.home import get_runtime_data_root
 from deeptutor.services.config import PlatformSettings, load_platform_settings
 from deeptutor.teaching.artifacts import tenant_artifact_prefix
 from deeptutor.teaching.database import get_platform_engine
+from deeptutor.teaching.migrations.facade import (
+    TenantMigrationRevisionMismatchError,
+    TenantMigrationVerificationFailedError,
+    TenantMigrationVerificationUnavailableError,
+    migration_lock_scope,
+)
 from deeptutor.teaching.migrations.runner import (
+    TEACHING_MIGRATION_HEAD_REVISION,
     MigrationUnavailableError,
     is_transient_database_error,
-    run_migration,
 )
 from deeptutor.teaching.schema_names import tenant_schema_name
 
-TENANT_SCHEMA_REVISION = "20260810_0017"
+TENANT_SCHEMA_REVISION = TEACHING_MIGRATION_HEAD_REVISION
 OBJECT_STORAGE_POLICY_VERSION = "20260730"
 DEFAULT_POLICY_VERSION = "20260730"
 DEFAULT_POLICY_PAYLOAD = (
@@ -248,19 +252,12 @@ class ProvisioningRepository(Protocol):
         result: SchemaProvisioningResult,
     ) -> bool: ...
 
-    async def record_storage_ready(
+    async def finalize_provisioning(
         self,
         claim: ProvisioningClaim,
-        result: StorageProvisioningResult,
+        storage: StorageProvisioningResult,
+        policy: TenantPolicyProvisioningResult,
     ) -> bool: ...
-
-    async def record_default_policy_ready(
-        self,
-        claim: ProvisioningClaim,
-        result: TenantPolicyProvisioningResult,
-    ) -> bool: ...
-
-    async def activate(self, claim: ProvisioningClaim) -> bool: ...
 
     async def record_failure(
         self,
@@ -324,12 +321,37 @@ class AlembicTenantSchemaProvisioner:
     async def provision(self, tenant_id: str) -> SchemaProvisioningResult:
         schema_name = tenant_schema_name(tenant_id)
         try:
-            await asyncio.to_thread(
-                run_migration,
-                action="upgrade",
+            engine = get_platform_engine()
+            async with migration_lock_scope(
+                engine,
                 scope="tenant",
                 tenant_schema=schema_name,
-            )
+            ) as lease:
+                revision = await lease.run(
+                    action="upgrade",
+                    scope="tenant",
+                    tenant_schema=schema_name,
+                )
+        except TenantMigrationVerificationUnavailableError:
+            raise ProvisioningStepError(
+                category="schema",
+                code="verification_unavailable",
+                retryable=True,
+            ) from None
+        except TenantMigrationVerificationFailedError:
+            raise ProvisioningStepError(
+                category="schema",
+                code="verification_failed",
+                retryable=False,
+            ) from None
+        except TenantMigrationRevisionMismatchError:
+            raise ProvisioningStepError(
+                category="schema",
+                code="revision_mismatch",
+                retryable=False,
+            ) from None
+        except ProvisioningStepError:
+            raise
         except Exception as exc:
             if isinstance(exc, MigrationUnavailableError) or is_transient_database_error(exc):
                 raise ProvisioningStepError(
@@ -342,31 +364,6 @@ class AlembicTenantSchemaProvisioner:
                 code="migration_failed",
                 retryable=False,
             ) from None
-
-        try:
-            engine = get_platform_engine()
-            async with engine.connect() as connection:
-                revision = await connection.scalar(
-                    text(f'SELECT version_num FROM "{schema_name}".alembic_version')
-                )
-        except Exception as exc:
-            if is_transient_database_error(exc):
-                raise ProvisioningStepError(
-                    category="schema",
-                    code="verification_unavailable",
-                    retryable=True,
-                ) from None
-            raise ProvisioningStepError(
-                category="schema",
-                code="verification_failed",
-                retryable=False,
-            ) from None
-        if revision != TENANT_SCHEMA_REVISION:
-            raise ProvisioningStepError(
-                category="schema",
-                code="revision_mismatch",
-                retryable=False,
-            )
         return SchemaProvisioningResult(
             schema_name=schema_name,
             revision=str(revision),
@@ -538,6 +535,29 @@ class ProvisioningWorker:
             lease_seconds=self._lease_seconds,
         )
 
+    async def _record_failure_best_effort(
+        self,
+        repository: ProvisioningRepository,
+        claim: ProvisioningClaim,
+        *,
+        category: str,
+        code: str,
+        retryable: bool,
+    ) -> bool:
+        try:
+            await repository.record_failure(
+                claim,
+                category=category,
+                code=code,
+                retryable=retryable,
+                backoff_seconds=retry_backoff_seconds(claim.attempt_count),
+            )
+        except Exception as exc:
+            if is_transient_database_error(exc):
+                return False
+            raise
+        return True
+
     async def _run_step_with_heartbeat(
         self,
         repository: ProvisioningRepository,
@@ -615,8 +635,6 @@ class ProvisioningWorker:
             storage_result.validate(claim.tenant_id)
             if not await self._refresh_lease(repository, claim):
                 return True
-            if not await repository.record_storage_ready(claim, storage_result):
-                return True
 
             lease_live, policy_result = await self._run_step_with_heartbeat(
                 repository,
@@ -628,33 +646,24 @@ class ProvisioningWorker:
             policy_result.validate()
             if not await self._refresh_lease(repository, claim):
                 return True
-            if not await repository.record_default_policy_ready(claim, policy_result):
-                return True
-
-            await repository.activate(claim)
+            await repository.finalize_provisioning(claim, storage_result, policy_result)
         except ProvisioningStepError as exc:
-            await repository.record_failure(
+            return await self._record_failure_best_effort(
+                repository,
                 claim,
                 category=exc.category,
                 code=exc.code,
                 retryable=exc.retryable,
-                backoff_seconds=retry_backoff_seconds(claim.attempt_count),
             )
-        except (ConnectionError, OSError, TimeoutError):
-            await repository.record_failure(
+        except Exception as exc:
+            if not is_transient_database_error(exc):
+                raise
+            return await self._record_failure_best_effort(
+                repository,
                 claim,
                 category="infrastructure",
                 code="temporarily_unavailable",
                 retryable=True,
-                backoff_seconds=retry_backoff_seconds(claim.attempt_count),
-            )
-        except Exception:
-            await repository.record_failure(
-                claim,
-                category="worker",
-                code="unexpected_error",
-                retryable=False,
-                backoff_seconds=retry_backoff_seconds(claim.attempt_count),
             )
         return True
 
@@ -668,7 +677,12 @@ class ProvisioningWorker:
         if not self._enabled:
             return
         while True:
-            handled = await self.run_once()
+            try:
+                handled = await self.run_once()
+            except Exception as exc:
+                if not is_transient_database_error(exc):
+                    raise
+                handled = False
             if not handled:
                 await asyncio.sleep(poll_interval_seconds)
 

@@ -7,7 +7,7 @@ import hashlib
 import secrets
 from typing import Any
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.sql import Select
 
@@ -22,10 +22,6 @@ from deeptutor.teaching.models import (
     TenantStorageState,
 )
 from deeptutor.teaching.provisioning_worker import (
-    DEFAULT_POLICY_HASH,
-    DEFAULT_POLICY_PAYLOAD,
-    DEFAULT_POLICY_VERSION,
-    OBJECT_STORAGE_POLICY_VERSION,
     TENANT_SCHEMA_REVISION,
     ProvisioningClaim,
     ProvisioningStepError,
@@ -35,6 +31,9 @@ from deeptutor.teaching.provisioning_worker import (
     validate_failure_classification,
 )
 from deeptutor.teaching.schema_names import tenant_schema_name
+from deeptutor.teaching.tenant_directory_lock import (
+    build_tenant_directory_transaction_lock_statement,
+)
 
 _RESOURCE_TYPE = "provisioning_job"
 _AUDIT_ATTEMPT_STARTED = "tenant.provisioning.attempt_started"
@@ -218,57 +217,21 @@ def build_worker_activation_statement(
     claim: ProvisioningClaim,
     reference_time: datetime,
 ) -> Select[Any]:
-    """Lock a live attempt only when every persisted prerequisite is exact."""
+    """Lock a live attempt only when its durable schema prerequisite is exact."""
 
-    expected_storage = StorageProvisioningResult.local(claim.tenant_id)
     return (
         build_fenced_attempt_statement(claim, reference_time)
         .join(
             TenantSchemaState,
             TenantSchemaState.tenant_id == Tenant.id,
         )
-        .join(
-            TenantStorageState,
-            TenantStorageState.tenant_id == Tenant.id,
-        )
-        .outerjoin(
-            TenantStorageCredential,
-            TenantStorageCredential.tenant_id == Tenant.id,
-        )
-        .join(
-            TenantDefaultPolicyState,
-            TenantDefaultPolicyState.tenant_id == Tenant.id,
-        )
         .where(
             TenantProvisioningJob.operation == "provision",
             TenantSchemaState.schema_name == tenant_schema_name(claim.tenant_id),
             TenantSchemaState.revision == TENANT_SCHEMA_REVISION,
             TenantSchemaState.status == "active",
-            TenantStorageState.status == "active",
-            TenantStorageState.policy_version == OBJECT_STORAGE_POLICY_VERSION,
-            TenantStorageState.policy_payload == expected_storage.policy_payload,
-            TenantStorageState.policy_hash == expected_storage.policy_hash,
-            or_(
-                and_(
-                    TenantStorageState.mode == "local",
-                    TenantStorageState.credential_secret_ref.is_(None),
-                    TenantStorageState.credential_fingerprint.is_(None),
-                ),
-                and_(
-                    TenantStorageState.mode == "s3",
-                    TenantStorageCredential.status == "active",
-                    TenantStorageCredential.secret_ref != "",
-                    TenantStorageCredential.access_key_fingerprint != "",
-                    TenantStorageState.credential_secret_ref == TenantStorageCredential.secret_ref,
-                    TenantStorageState.credential_fingerprint
-                    == TenantStorageCredential.access_key_fingerprint,
-                ),
-            ),
-            TenantDefaultPolicyState.status == "active",
-            TenantDefaultPolicyState.policy_version == DEFAULT_POLICY_VERSION,
-            TenantDefaultPolicyState.policy_payload == DEFAULT_POLICY_PAYLOAD,
-            TenantDefaultPolicyState.policy_hash == DEFAULT_POLICY_HASH,
         )
+        .with_for_update(of=(Tenant, TenantProvisioningJob, TenantSchemaState))
     )
 
 
@@ -459,6 +422,7 @@ class SqlAlchemyProvisioningRepository:
             )
         async with platform_session() as session:
             async with session.begin():
+                await session.execute(build_tenant_directory_transaction_lock_statement())
                 now = await _database_now(session)
                 locked = await self._lock_claim(session, claim, now)
                 if locked is None:
@@ -503,124 +467,16 @@ class SqlAlchemyProvisioningRepository:
                 await session.flush()
                 return True
 
-    async def record_storage_ready(
+    async def finalize_provisioning(
         self,
         claim: ProvisioningClaim,
-        result: StorageProvisioningResult,
+        storage: StorageProvisioningResult,
+        policy: TenantPolicyProvisioningResult,
     ) -> bool:
         if claim.operation != "provision":
             return False
-        result.validate(claim.tenant_id)
-        async with platform_session() as session:
-            async with session.begin():
-                now = await _database_now(session)
-                if await self._lock_claim(session, claim, now) is None:
-                    return False
-                if result.mode == "s3":
-                    credential_statement = (
-                        insert(TenantStorageCredential)
-                        .values(
-                            tenant_id=claim.tenant_id,
-                            secret_ref=result.secret_ref,
-                            access_key_fingerprint=result.access_key_fingerprint,
-                            status="active",
-                            rotated_at=now,
-                            updated_at=now,
-                        )
-                        .on_conflict_do_update(
-                            index_elements=[TenantStorageCredential.tenant_id],
-                            set_={
-                                "secret_ref": result.secret_ref,
-                                "access_key_fingerprint": result.access_key_fingerprint,
-                                "status": "active",
-                                "rotated_at": now,
-                                "updated_at": now,
-                            },
-                        )
-                    )
-                    await session.execute(credential_statement)
-                state_statement = (
-                    insert(TenantStorageState)
-                    .values(
-                        tenant_id=claim.tenant_id,
-                        mode=result.mode,
-                        policy_version=result.policy_version,
-                        policy_payload=result.policy_payload,
-                        policy_hash=result.policy_hash,
-                        credential_secret_ref=result.secret_ref,
-                        credential_fingerprint=result.access_key_fingerprint,
-                        status="active",
-                        verified_at=now,
-                        updated_at=now,
-                    )
-                    .on_conflict_do_update(
-                        index_elements=[TenantStorageState.tenant_id],
-                        set_={
-                            "mode": result.mode,
-                            "policy_version": result.policy_version,
-                            "policy_payload": result.policy_payload,
-                            "policy_hash": result.policy_hash,
-                            "credential_secret_ref": result.secret_ref,
-                            "credential_fingerprint": result.access_key_fingerprint,
-                            "status": "active",
-                            "verified_at": now,
-                            "updated_at": now,
-                        },
-                    )
-                )
-                await session.execute(state_statement)
-                await _record_audit_once(session, claim, _AUDIT_STORAGE_READY)
-                await session.flush()
-                return True
-
-    async def record_default_policy_ready(
-        self,
-        claim: ProvisioningClaim,
-        result: TenantPolicyProvisioningResult,
-    ) -> bool:
-        if claim.operation != "provision":
-            return False
-        result.validate()
-        async with platform_session() as session:
-            async with session.begin():
-                now = await _database_now(session)
-                if await self._lock_claim(session, claim, now) is None:
-                    return False
-                statement = (
-                    insert(TenantDefaultPolicyState)
-                    .values(
-                        tenant_id=claim.tenant_id,
-                        policy_version=result.policy_version,
-                        policy_payload=result.policy_payload,
-                        policy_hash=result.policy_hash,
-                        status="active",
-                        verified_at=now,
-                        updated_at=now,
-                    )
-                    .on_conflict_do_update(
-                        index_elements=[TenantDefaultPolicyState.tenant_id],
-                        set_={
-                            "policy_version": result.policy_version,
-                            "policy_payload": result.policy_payload,
-                            "policy_hash": result.policy_hash,
-                            "status": "active",
-                            "verified_at": now,
-                            "updated_at": now,
-                        },
-                    )
-                )
-                await session.execute(statement)
-                await _record_audit_once(
-                    session,
-                    claim,
-                    _AUDIT_DEFAULT_POLICY_READY,
-                )
-                await session.flush()
-                return True
-
-    async def activate(self, claim: ProvisioningClaim) -> bool:
-        if claim.operation != "provision":
-            return False
+        storage.validate(claim.tenant_id)
+        policy.validate()
         async with platform_session() as session:
             async with session.begin():
                 now = await _database_now(session)
@@ -629,6 +485,89 @@ class SqlAlchemyProvisioningRepository:
                 if row is None:
                     return False
                 tenant, job = row
+                if storage.mode == "s3":
+                    credential_statement = (
+                        insert(TenantStorageCredential)
+                        .values(
+                            tenant_id=claim.tenant_id,
+                            secret_ref=storage.secret_ref,
+                            access_key_fingerprint=storage.access_key_fingerprint,
+                            status="active",
+                            rotated_at=now,
+                            updated_at=now,
+                        )
+                        .on_conflict_do_update(
+                            index_elements=[TenantStorageCredential.tenant_id],
+                            set_={
+                                "secret_ref": storage.secret_ref,
+                                "access_key_fingerprint": storage.access_key_fingerprint,
+                                "status": "active",
+                                "rotated_at": now,
+                                "updated_at": now,
+                            },
+                        )
+                    )
+                    await session.execute(credential_statement)
+                else:
+                    await session.execute(
+                        update(TenantStorageCredential)
+                        .where(TenantStorageCredential.tenant_id == claim.tenant_id)
+                        .values(status="inactive", updated_at=now)
+                    )
+                state_statement = (
+                    insert(TenantStorageState)
+                    .values(
+                        tenant_id=claim.tenant_id,
+                        mode=storage.mode,
+                        policy_version=storage.policy_version,
+                        policy_payload=storage.policy_payload,
+                        policy_hash=storage.policy_hash,
+                        credential_secret_ref=storage.secret_ref,
+                        credential_fingerprint=storage.access_key_fingerprint,
+                        status="active",
+                        verified_at=now,
+                        updated_at=now,
+                    )
+                    .on_conflict_do_update(
+                        index_elements=[TenantStorageState.tenant_id],
+                        set_={
+                            "mode": storage.mode,
+                            "policy_version": storage.policy_version,
+                            "policy_payload": storage.policy_payload,
+                            "policy_hash": storage.policy_hash,
+                            "credential_secret_ref": storage.secret_ref,
+                            "credential_fingerprint": storage.access_key_fingerprint,
+                            "status": "active",
+                            "verified_at": now,
+                            "updated_at": now,
+                        },
+                    )
+                )
+                await session.execute(state_statement)
+                statement = (
+                    insert(TenantDefaultPolicyState)
+                    .values(
+                        tenant_id=claim.tenant_id,
+                        policy_version=policy.policy_version,
+                        policy_payload=policy.policy_payload,
+                        policy_hash=policy.policy_hash,
+                        status="active",
+                        verified_at=now,
+                        updated_at=now,
+                    )
+                    .on_conflict_do_update(
+                        index_elements=[TenantDefaultPolicyState.tenant_id],
+                        set_={
+                            "policy_version": policy.policy_version,
+                            "policy_payload": policy.policy_payload,
+                            "policy_hash": policy.policy_hash,
+                            "status": "active",
+                            "verified_at": now,
+                            "updated_at": now,
+                        },
+                    )
+                )
+                await session.execute(statement)
                 tenant.status = "active"
                 tenant.updated_at = now
                 job.status = "completed"
@@ -638,6 +577,8 @@ class SqlAlchemyProvisioningRepository:
                 job.lease_expires_at = None
                 job.heartbeat_at = None
                 job.updated_at = now
+                await _record_audit_once(session, claim, _AUDIT_STORAGE_READY)
+                await _record_audit_once(session, claim, _AUDIT_DEFAULT_POLICY_READY)
                 await _record_audit_once(session, claim, _AUDIT_COMPLETED)
                 await session.flush()
                 return True

@@ -10,9 +10,11 @@ from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 from sqlalchemy.pool import NullPool
 from sqlalchemy.schema import CreateSchema
 
-from deeptutor.services.config import load_platform_settings
 from deeptutor.teaching.migrations.runner import (
     MigrationScope,
+    _migration_timeout_command,
+    _run_migrations_in_transaction,
+    load_migration_database_url,
     translate_migration_runtime_error,
     validate_migration_scope,
 )
@@ -49,40 +51,16 @@ def _parse_x_arguments() -> MigrationScope:
     raise CommandError("scope must be exactly platform or tenant")
 
 
-def _load_database_url() -> str:
-    try:
-        settings = load_platform_settings()
-    except Exception:
-        raise CommandError("platform database settings are invalid") from None
-    if not settings.enabled:
-        raise CommandError("platform database is disabled")
-    if settings.database_url is None:
-        raise CommandError("platform database URL is unavailable")
-    return settings.database_url.get_secret_value()
-
-
-def _run_migrations(
-    connection,
-    migration_scope: MigrationScope,
-) -> None:
-    context.configure(
-        connection=connection,
-        version_table="alembic_version",
-        version_table_schema=migration_scope.schema,
-    )
-    with context.begin_transaction():
-        context.run_migrations()
-
-
 async def _run_online_migrations(migration_scope: MigrationScope) -> None:
     engine = create_async_engine(
-        _load_database_url(),
+        load_migration_database_url(),
         poolclass=NullPool,
     )
     try:
         async with engine.connect() as connection:
-            await connection.execute(CreateSchema(migration_scope.schema, if_not_exists=True))
-            await connection.commit()
+            async with connection.begin():
+                await connection.execute(*_migration_timeout_command())
+                await connection.execute(CreateSchema(migration_scope.schema, if_not_exists=True))
 
             migration_connection: AsyncConnection = connection
             if migration_scope.name == "tenant":
@@ -90,7 +68,7 @@ async def _run_online_migrations(migration_scope: MigrationScope) -> None:
                     schema_translate_map={"tenant": migration_scope.schema}
                 )
             await migration_connection.run_sync(
-                _run_migrations,
+                _run_migrations_in_transaction,
                 migration_scope,
             )
     finally:

@@ -39,6 +39,9 @@ from deeptutor.teaching.provisioning_worker import (
     StorageProvisioningResult,
 )
 from deeptutor.teaching.schema_names import tenant_schema_name
+from deeptutor.teaching.tenant_directory_lock import (
+    build_tenant_directory_transaction_lock_statement,
+)
 
 _POLICY_VERIFIED_ACTION = "tenant.provisioning.policy_verified"
 _PROVISIONING_JOB_RESOURCE = "provisioning_job"
@@ -609,6 +612,7 @@ class TenantRepository:
 
         async with platform_session() as session:
             async with session.begin():
+                await session.execute(build_tenant_directory_transaction_lock_statement())
                 await session.execute(build_provisioning_advisory_lock_statement(tenant_id))
                 existing_result = await session.execute(
                     select(

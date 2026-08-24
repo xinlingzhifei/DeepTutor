@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+import threading
 from types import SimpleNamespace
 from typing import Any
 
@@ -17,6 +18,7 @@ from deeptutor.teaching.models import TenantProvisioningJob
 from deeptutor.teaching.provisioning_worker import (
     DEFAULT_POLICY_PAYLOAD,
     DEFAULT_POLICY_VERSION,
+    TENANT_SCHEMA_REVISION,
     ProvisioningClaim,
     ProvisioningStepError,
     ProvisioningWorker,
@@ -72,24 +74,13 @@ class FakeProvisioningRepository:
     ) -> bool:
         return True
 
-    async def record_storage_ready(
+    async def finalize_provisioning(
         self,
         claim: ProvisioningClaim,
-        result: StorageProvisioningResult,
+        storage: StorageProvisioningResult,
+        policy: TenantPolicyProvisioningResult,
     ) -> bool:
-        self.trace.append(f"persist:storage:{result.mode}")
-        return True
-
-    async def record_default_policy_ready(
-        self,
-        claim: ProvisioningClaim,
-        result: TenantPolicyProvisioningResult,
-    ) -> bool:
-        self.trace.append(f"persist:policy:{result.policy_version}")
-        return True
-
-    async def activate(self, claim: ProvisioningClaim) -> bool:
-        self.trace.append("activate")
+        self.trace.append(f"finalize:{storage.mode}:{policy.policy_version}:activation")
         return True
 
     async def record_failure(
@@ -164,7 +155,7 @@ def _worker(
     )
 
 
-def test_run_once_executes_and_persists_steps_in_fixed_order() -> None:
+def test_run_once_finalizes_storage_policy_and_activation_in_one_repository_call() -> None:
     trace: list[str] = []
     repository = FakeProvisioningRepository(trace)
 
@@ -176,12 +167,282 @@ def test_run_once_executes_and_persists_steps_in_fixed_order() -> None:
         "schema",
         "persist:schema:20260730_0005",
         "storage",
-        "persist:storage:local",
         "policy",
-        f"persist:policy:{DEFAULT_POLICY_VERSION}",
-        "activate",
+        f"finalize:local:{DEFAULT_POLICY_VERSION}:activation",
     ]
     assert repository.failures == []
+
+
+def test_transient_finalization_database_failure_is_retryable() -> None:
+    trace: list[str] = []
+
+    class FailingFinalizeRepository(FakeProvisioningRepository):
+        async def finalize_provisioning(
+            self,
+            claim: ProvisioningClaim,
+            storage: StorageProvisioningResult,
+            policy: TenantPolicyProvisioningResult,
+        ) -> bool:
+            raise sqlalchemy_exc.OperationalError(
+                "COMMIT",
+                {},
+                RuntimeError("deterministic database outage"),
+            )
+
+    repository = FailingFinalizeRepository(trace)
+
+    handled = asyncio.run(_worker(repository, trace).run_once())
+
+    assert handled is True
+    assert trace == [
+        "claim",
+        "schema",
+        "persist:schema:20260730_0005",
+        "storage",
+        "policy",
+        "failure",
+    ]
+    assert repository.failures == [
+        ("infrastructure", "temporarily_unavailable", True, retry_backoff_seconds(0)),
+    ]
+
+
+def test_run_once_does_not_retry_connection_invalidated_programming_error() -> None:
+    trace: list[str] = []
+
+    class BrokenFinalizeRepository(FakeProvisioningRepository):
+        async def finalize_provisioning(
+            self,
+            claim: ProvisioningClaim,
+            storage: StorageProvisioningResult,
+            policy: TenantPolicyProvisioningResult,
+        ) -> bool:
+            raise sqlalchemy_exc.ProgrammingError(
+                "COMMIT",
+                {},
+                RuntimeError("deterministic query defect"),
+                connection_invalidated=True,
+            )
+
+    repository = BrokenFinalizeRepository(trace)
+
+    with pytest.raises(sqlalchemy_exc.ProgrammingError):
+        asyncio.run(_worker(repository, trace).run_once())
+
+    assert "failure" not in trace
+    assert repository.failures == []
+
+
+def test_poll_survives_finalize_and_failure_recording_outage_then_reclaims(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from deeptutor.teaching import provisioning_worker as worker_module
+
+    trace: list[str] = []
+    reclaimed = asyncio.Event()
+
+    class DoubleOutageRepository(FakeProvisioningRepository):
+        def __init__(self) -> None:
+            super().__init__(trace)
+            self.claim_count = 0
+            self.backoff_seen = False
+
+        async def claim_next(
+            self,
+            worker_id: str,
+            *,
+            lease_seconds: int,
+        ) -> ProvisioningClaim | None:
+            trace.append(f"claim:{self.claim_count}")
+            if self.claim_count == 0:
+                self.claim_count += 1
+                return ProvisioningClaim(
+                    tenant_id="tenant-a",
+                    job_id="job-a",
+                    attempt_count=0,
+                    lease_owner=worker_id,
+                    lease_token="lease-a",
+                )
+            if self.claim_count == 1 and self.backoff_seen:
+                self.claim_count += 1
+                return ProvisioningClaim(
+                    tenant_id="tenant-a",
+                    job_id="job-a",
+                    attempt_count=1,
+                    lease_owner=worker_id,
+                    lease_token="lease-b",
+                )
+            return None
+
+        async def finalize_provisioning(
+            self,
+            claim: ProvisioningClaim,
+            storage: StorageProvisioningResult,
+            policy: TenantPolicyProvisioningResult,
+        ) -> bool:
+            trace.append(f"finalize:{claim.attempt_count}")
+            if claim.attempt_count == 0:
+                raise sqlalchemy_exc.OperationalError(
+                    "COMMIT",
+                    {},
+                    RuntimeError("deterministic finalization outage"),
+                )
+            reclaimed.set()
+            return True
+
+        async def record_failure(
+            self,
+            claim: ProvisioningClaim,
+            *,
+            category: str,
+            code: str,
+            retryable: bool,
+            backoff_seconds: int,
+        ) -> bool:
+            trace.append(f"record-failure:{category}:{code}:{retryable}")
+            assert category == "infrastructure"
+            assert code == "temporarily_unavailable"
+            assert retryable is True
+            raise sqlalchemy_exc.OperationalError(
+                "UPDATE",
+                {},
+                RuntimeError("deterministic failure-recording outage"),
+            )
+
+    repository = DoubleOutageRepository()
+    worker = _worker(repository, trace)
+    real_sleep = asyncio.sleep
+
+    async def record_backoff(delay: float) -> None:
+        trace.append(f"sleep:{delay}")
+        repository.backoff_seen = True
+        await real_sleep(0)
+
+    monkeypatch.setattr(worker_module.asyncio, "sleep", record_backoff)
+
+    async def exercise() -> None:
+        poll_task = asyncio.create_task(worker.poll(poll_interval_seconds=0.25))
+        reclaimed_task = asyncio.create_task(reclaimed.wait())
+        try:
+            done, _pending = await asyncio.wait(
+                {poll_task, reclaimed_task},
+                timeout=1,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            failure = poll_task.exception() if poll_task.done() else None
+            assert reclaimed_task in done, (
+                "poll terminated before the expired lease was reclaimed: "
+                f"{type(failure).__name__ if failure else 'timeout'}"
+            )
+        finally:
+            reclaimed_task.cancel()
+            poll_task.cancel()
+            for task in (reclaimed_task, poll_task):
+                try:
+                    await task
+                except (asyncio.CancelledError, sqlalchemy_exc.OperationalError):
+                    pass
+
+    asyncio.run(exercise())
+
+    assert repository.claim_count == 2
+    assert "record-failure:infrastructure:temporarily_unavailable:True" in trace
+    assert trace.index("sleep:0.25") < trace.index("claim:1")
+    assert "finalize:1" in trace
+
+
+def test_poll_backs_off_and_continues_after_top_level_transient_database_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from deeptutor.teaching import provisioning_worker as worker_module
+
+    trace: list[str] = []
+    continued = asyncio.Event()
+
+    class FlakyClaimRepository(FakeProvisioningRepository):
+        def __init__(self) -> None:
+            super().__init__(trace)
+            self.claim_count = 0
+
+        async def claim_next(
+            self,
+            worker_id: str,
+            *,
+            lease_seconds: int,
+        ) -> ProvisioningClaim | None:
+            self.claim_count += 1
+            trace.append(f"claim:{self.claim_count}")
+            if self.claim_count == 1:
+                raise sqlalchemy_exc.OperationalError(
+                    "SELECT",
+                    {},
+                    RuntimeError("deterministic claim outage"),
+                )
+            continued.set()
+            return None
+
+    repository = FlakyClaimRepository()
+    worker = _worker(repository, trace)
+    real_sleep = asyncio.sleep
+
+    async def record_backoff(delay: float) -> None:
+        trace.append(f"sleep:{delay}")
+        await real_sleep(0)
+
+    monkeypatch.setattr(worker_module.asyncio, "sleep", record_backoff)
+
+    async def exercise() -> None:
+        poll_task = asyncio.create_task(worker.poll(poll_interval_seconds=0.5))
+        continued_task = asyncio.create_task(continued.wait())
+        try:
+            done, _pending = await asyncio.wait(
+                {poll_task, continued_task},
+                timeout=1,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            failure = poll_task.exception() if poll_task.done() else None
+            assert continued_task in done, (
+                "poll terminated before retrying the claim: "
+                f"{type(failure).__name__ if failure else 'timeout'}"
+            )
+        finally:
+            continued_task.cancel()
+            poll_task.cancel()
+            for task in (continued_task, poll_task):
+                try:
+                    await task
+                except (asyncio.CancelledError, sqlalchemy_exc.OperationalError):
+                    pass
+
+    asyncio.run(exercise())
+
+    assert trace[:3] == ["claim:1", "sleep:0.5", "claim:2"]
+
+
+def test_poll_does_not_swallow_connection_invalidated_programming_error() -> None:
+    trace: list[str] = []
+
+    class BrokenClaimRepository(FakeProvisioningRepository):
+        async def claim_next(
+            self,
+            worker_id: str,
+            *,
+            lease_seconds: int,
+        ) -> ProvisioningClaim | None:
+            raise sqlalchemy_exc.ProgrammingError(
+                "SELECT",
+                {},
+                RuntimeError("deterministic query defect"),
+                connection_invalidated=True,
+            )
+
+    worker = _worker(BrokenClaimRepository(trace), trace)
+
+    async def exercise() -> None:
+        await asyncio.wait_for(worker.poll(poll_interval_seconds=0.01), timeout=0.2)
+
+    with pytest.raises(sqlalchemy_exc.ProgrammingError):
+        asyncio.run(exercise())
 
 
 def test_active_tenant_schema_upgrade_runs_only_the_schema_step() -> None:
@@ -322,7 +583,6 @@ def test_provisioning_job_attempt_and_lease_state_are_database_constrained() -> 
                 "schema",
                 "persist:schema:20260730_0005",
                 "storage",
-                "persist:storage:local",
                 "policy",
                 "failure",
             ],
@@ -429,6 +689,385 @@ def test_s3_default_admin_boundary_fails_closed_without_credential_metadata(
     assert "password" not in repr(captured.value).lower()
 
 
+class _SchemaLockConnection:
+    def __init__(self, *, revision_error: Exception | None = None) -> None:
+        self.revision_error = revision_error
+        self.directory_locked = False
+        self.tenant_locked = False
+        self.tenant_resource: str | None = None
+        self.seen_tenant_resource: str | None = None
+        self.trace: list[str] = []
+
+    @property
+    def locked(self) -> bool:
+        return self.directory_locked
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args: Any) -> None:
+        assert self.directory_locked is False
+        assert self.tenant_locked is False
+
+    async def execute(self, statement):
+        sql = str(statement)
+        if "pg_advisory_lock_shared" in sql:
+            self.directory_locked = True
+            self.trace.append("lock:directory")
+            return None
+        assert "pg_advisory_lock(" in sql
+        assert self.directory_locked is True
+        resource = str(statement.compile().params["resource"])
+        self.tenant_locked = True
+        self.tenant_resource = resource
+        self.seen_tenant_resource = resource
+        self.trace.append("lock:tenant")
+
+    async def scalar(self, statement):
+        sql = str(statement)
+        if "pg_advisory_unlock_shared" in sql:
+            assert self.directory_locked is True
+            assert self.tenant_locked is False
+            self.directory_locked = False
+            self.trace.append("unlock:directory")
+            return True
+        if "pg_advisory_unlock(" in sql:
+            assert self.directory_locked is True
+            assert self.tenant_locked is True
+            self.tenant_locked = False
+            self.tenant_resource = None
+            self.trace.append("unlock:tenant")
+            return True
+        assert self.directory_locked is True
+        assert self.tenant_locked is True
+        self.trace.append("revision")
+        if self.revision_error is not None:
+            raise self.revision_error
+        return TENANT_SCHEMA_REVISION
+
+    async def commit(self) -> None:
+        return None
+
+    async def rollback(self) -> None:
+        return None
+
+
+class _SchemaLockEngine:
+    def __init__(self, connection: _SchemaLockConnection) -> None:
+        self.connection = connection
+
+    def connect(self) -> _SchemaLockConnection:
+        return self.connection
+
+
+def _install_schema_lock_engine(
+    monkeypatch: pytest.MonkeyPatch,
+    worker_module,
+    *,
+    revision_error: Exception | None = None,
+) -> _SchemaLockConnection:
+    connection = _SchemaLockConnection(revision_error=revision_error)
+    monkeypatch.setattr(
+        worker_module,
+        "get_platform_engine",
+        lambda: _SchemaLockEngine(connection),
+    )
+    return connection
+
+
+def _install_unlocked_migration(
+    monkeypatch: pytest.MonkeyPatch,
+    migration: Any,
+) -> None:
+    from deeptutor.teaching.migrations import facade as migration_facade
+
+    monkeypatch.setattr(migration_facade, "_run_migration_unlocked", migration)
+
+
+def test_schema_migration_holds_shared_directory_lock_through_revision_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from deeptutor.teaching import provisioning_worker as worker_module
+
+    connection = _install_schema_lock_engine(monkeypatch, worker_module)
+
+    def migrate(**_kwargs: Any) -> None:
+        assert connection.directory_locked is True
+        assert connection.tenant_locked is True
+        connection.trace.append("migrate")
+
+    _install_unlocked_migration(monkeypatch, migrate)
+
+    result = asyncio.run(worker_module.AlembicTenantSchemaProvisioner().provision("tenant-a"))
+
+    assert result.revision == TENANT_SCHEMA_REVISION
+    assert connection.trace == [
+        "lock:directory",
+        "lock:tenant",
+        "migrate",
+        "revision",
+        "unlock:tenant",
+        "unlock:directory",
+    ]
+
+
+def test_schema_migration_cancellation_waits_for_real_thread_before_unlocking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from deeptutor.teaching import provisioning_worker as worker_module
+
+    class BlockingUnlockConnection(_SchemaLockConnection):
+        def __init__(self) -> None:
+            super().__init__()
+            self.unlock_started = asyncio.Event()
+            self.allow_unlock = asyncio.Event()
+
+        async def scalar(self, statement):
+            sql = str(statement)
+            if "pg_advisory_unlock(" in sql:
+                self.unlock_started.set()
+                await self.allow_unlock.wait()
+            return await super().scalar(statement)
+
+    connection = BlockingUnlockConnection()
+    monkeypatch.setattr(
+        worker_module,
+        "get_platform_engine",
+        lambda: _SchemaLockEngine(connection),
+    )
+    started = threading.Event()
+    release = threading.Event()
+
+    def migrate(**_kwargs: Any) -> None:
+        started.set()
+        if not release.wait(timeout=2):
+            raise AssertionError("test did not release the migration thread")
+        raise RuntimeError("late migration failure after cancellation")
+
+    _install_unlocked_migration(monkeypatch, migrate)
+
+    async def exercise() -> None:
+        task = asyncio.create_task(
+            worker_module.AlembicTenantSchemaProvisioner().provision("tenant-a")
+        )
+        assert await asyncio.wait_for(asyncio.to_thread(started.wait, 1), timeout=1)
+        task.cancel()
+        await asyncio.sleep(0.01)
+        task.cancel()
+        await asyncio.sleep(0.01)
+        assert task.done() is False
+        assert connection.directory_locked is True
+        assert connection.tenant_locked is True
+        release.set()
+        await asyncio.wait_for(connection.unlock_started.wait(), timeout=1)
+        task.cancel()
+        await asyncio.sleep(0.01)
+        assert task.done() is False
+        assert connection.directory_locked is True
+        assert connection.tenant_locked is True
+        connection.allow_unlock.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert connection.directory_locked is False
+        assert connection.tenant_locked is False
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        release.set()
+
+
+def test_same_tenant_schema_migrations_are_serialized_through_revision_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from deeptutor.teaching import provisioning_worker as worker_module
+
+    class LockRegistry:
+        def __init__(self) -> None:
+            self.locks: dict[str, asyncio.Lock] = {}
+            self.attempts = 0
+            self.second_attempted = asyncio.Event()
+
+        async def acquire(self, resource: str) -> None:
+            self.attempts += 1
+            if self.attempts == 2:
+                self.second_attempted.set()
+            await self.locks.setdefault(resource, asyncio.Lock()).acquire()
+
+        def release(self, resource: str) -> None:
+            self.locks[resource].release()
+
+    class Connection:
+        def __init__(self, registry: LockRegistry) -> None:
+            self.registry = registry
+            self.directory_locked = False
+            self.tenant_resource: str | None = None
+            self.revision_under_tenant_lock = False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args: Any) -> None:
+            assert self.directory_locked is False
+            assert self.tenant_resource is None
+
+        async def execute(self, statement):
+            sql = str(statement)
+            resource = str(statement.compile().params["resource"])
+            if "pg_advisory_lock_shared" in sql:
+                self.directory_locked = True
+                return None
+            assert "pg_advisory_lock(" in sql
+            await self.registry.acquire(resource)
+            self.tenant_resource = resource
+            return None
+
+        async def scalar(self, statement):
+            sql = str(statement)
+            if "pg_advisory_unlock_shared" in sql:
+                self.directory_locked = False
+                return True
+            if "pg_advisory_unlock(" in sql:
+                assert self.tenant_resource is not None
+                self.registry.release(self.tenant_resource)
+                self.tenant_resource = None
+                return True
+            self.revision_under_tenant_lock = self.tenant_resource is not None
+            return TENANT_SCHEMA_REVISION
+
+        async def commit(self) -> None:
+            return None
+
+        async def rollback(self) -> None:
+            return None
+
+    class Engine:
+        def __init__(self) -> None:
+            self.registry = LockRegistry()
+            self.connections: list[Connection] = []
+
+        def connect(self) -> Connection:
+            connection = Connection(self.registry)
+            self.connections.append(connection)
+            return connection
+
+    engine = Engine()
+    monkeypatch.setattr(worker_module, "get_platform_engine", lambda: engine)
+    started = threading.Event()
+    release = threading.Event()
+    state_lock = threading.Lock()
+    starts = 0
+    active = 0
+    max_active = 0
+
+    def migrate(**_kwargs: Any) -> None:
+        nonlocal starts, active, max_active
+        with state_lock:
+            starts += 1
+            is_first = starts == 1
+            active += 1
+            max_active = max(max_active, active)
+            if is_first:
+                started.set()
+        if is_first and not release.wait(timeout=2):
+            raise AssertionError("test did not release the first migration")
+        with state_lock:
+            active -= 1
+
+    _install_unlocked_migration(monkeypatch, migrate)
+
+    async def exercise() -> None:
+        first = asyncio.create_task(
+            worker_module.AlembicTenantSchemaProvisioner().provision("tenant-a")
+        )
+        assert await asyncio.wait_for(asyncio.to_thread(started.wait, 1), timeout=1)
+        second = asyncio.create_task(
+            worker_module.AlembicTenantSchemaProvisioner().provision("tenant-a")
+        )
+        try:
+            await asyncio.wait_for(engine.registry.second_attempted.wait(), timeout=1)
+            assert starts == 1
+            release.set()
+            await asyncio.gather(first, second)
+        finally:
+            release.set()
+            await asyncio.gather(first, second, return_exceptions=True)
+
+    asyncio.run(exercise())
+
+    assert starts == 2
+    assert max_active == 1
+    assert all(connection.revision_under_tenant_lock for connection in engine.connections)
+    assert all(
+        resource.startswith("yfeistai:tenant-schema-migration:v1:")
+        for resource in engine.registry.locks
+    )
+
+
+def test_different_tenant_schema_migrations_can_run_concurrently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from deeptutor.teaching import provisioning_worker as worker_module
+    from deeptutor.teaching.schema_names import tenant_schema_name
+
+    tenant_ids = ("tenant-a", "tenant-b")
+    schemas = tuple(tenant_schema_name(tenant_id) for tenant_id in tenant_ids)
+    started = {schema: threading.Event() for schema in schemas}
+    release = threading.Event()
+
+    class Connection(_SchemaLockConnection):
+        pass
+
+    class Engine:
+        def __init__(self) -> None:
+            self.connections: list[Connection] = []
+
+        def connect(self) -> Connection:
+            connection = Connection()
+            self.connections.append(connection)
+            return connection
+
+    engine = Engine()
+    monkeypatch.setattr(worker_module, "get_platform_engine", lambda: engine)
+
+    def migrate(**kwargs: Any) -> None:
+        schema = kwargs["tenant_schema"]
+        started[schema].set()
+        if not release.wait(timeout=2):
+            raise AssertionError("different tenant migrations were serialized")
+
+    _install_unlocked_migration(monkeypatch, migrate)
+
+    async def exercise() -> None:
+        tasks = [
+            asyncio.create_task(worker_module.AlembicTenantSchemaProvisioner().provision(tenant_id))
+            for tenant_id in tenant_ids
+        ]
+        try:
+            both_started = await asyncio.gather(
+                *(asyncio.to_thread(event.wait, 1) for event in started.values())
+            )
+            assert all(both_started)
+            release.set()
+            await asyncio.gather(*tasks)
+        finally:
+            release.set()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    asyncio.run(exercise())
+
+    resources = {connection.seen_tenant_resource for connection in engine.connections}
+    assert len(resources) == 2
+    assert all(
+        resource is not None and resource.startswith("yfeistai:tenant-schema-migration:v1:")
+        for resource in resources
+    )
+    assert all(
+        connection.trace.index("revision") > connection.trace.index("lock:tenant")
+        for connection in engine.connections
+    )
+
+
 def test_schema_migration_unavailable_error_is_retryable_and_machine_readable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -438,7 +1077,8 @@ def test_schema_migration_unavailable_error_is_retryable_and_machine_readable(
     def unavailable(**_kwargs: Any) -> None:
         raise MigrationUnavailableError()
 
-    monkeypatch.setattr(worker_module, "run_migration", unavailable)
+    _install_schema_lock_engine(monkeypatch, worker_module)
+    _install_unlocked_migration(monkeypatch, unavailable)
 
     with pytest.raises(ProvisioningStepError) as captured:
         asyncio.run(worker_module.AlembicTenantSchemaProvisioner().provision("tenant-a"))
@@ -458,7 +1098,8 @@ def test_schema_deterministic_command_error_is_not_retryable(
     def deterministic(**_kwargs: Any) -> None:
         raise CommandError("deterministic migration failure")
 
-    monkeypatch.setattr(worker_module, "run_migration", deterministic)
+    _install_schema_lock_engine(monkeypatch, worker_module)
+    _install_unlocked_migration(monkeypatch, deterministic)
 
     with pytest.raises(ProvisioningStepError) as captured:
         asyncio.run(worker_module.AlembicTenantSchemaProvisioner().provision("tenant-a"))
@@ -474,26 +1115,12 @@ def _capture_schema_revision_query_failure(
 ) -> ProvisioningStepError:
     from deeptutor.teaching import provisioning_worker as worker_module
 
-    class FailingConnection:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args: Any) -> None:
-            return None
-
-        async def scalar(self, _statement):
-            raise revision_error
-
-    class FailingEngine:
-        def connect(self) -> FailingConnection:
-            return FailingConnection()
-
-    monkeypatch.setattr(worker_module, "run_migration", lambda **_kwargs: None)
-    monkeypatch.setattr(
+    _install_schema_lock_engine(
+        monkeypatch,
         worker_module,
-        "get_platform_engine",
-        lambda: FailingEngine(),
+        revision_error=revision_error,
     )
+    _install_unlocked_migration(monkeypatch, lambda **_kwargs: None)
 
     with pytest.raises(ProvisioningStepError) as captured:
         asyncio.run(worker_module.AlembicTenantSchemaProvisioner().provision("tenant-a"))
@@ -821,7 +1448,7 @@ def test_blocked_step_is_heartbeated_before_another_worker_can_reclaim() -> None
 
     assert competing_claim is None
     assert heartbeat_count >= 1
-    assert trace[-1] == "activate"
+    assert trace[-1] == f"finalize:local:{DEFAULT_POLICY_VERSION}:activation"
 
 
 def test_lost_lease_cancels_blocked_step_and_old_worker_writes_no_state() -> None:
@@ -880,6 +1507,127 @@ def _compiled_sql(statement: Any) -> str:
     ).lower()
 
 
+def test_tenant_directory_writers_use_the_shared_transaction_lock_contract() -> None:
+    from deeptutor.teaching.tenant_directory_lock import (
+        TENANT_DIRECTORY_LOCK_RESOURCE,
+        build_tenant_directory_transaction_lock_statement,
+    )
+
+    sql = _compiled_sql(build_tenant_directory_transaction_lock_statement())
+
+    assert "pg_advisory_xact_lock_shared" in sql
+    assert TENANT_DIRECTORY_LOCK_RESOURCE in sql
+
+
+def test_record_schema_ready_locks_directory_before_reading_or_writing_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from deeptutor.teaching.repositories import provisioning as repository_module
+    from deeptutor.teaching.schema_names import tenant_schema_name
+
+    trace: list[str] = []
+
+    class Transaction:
+        async def __aenter__(self) -> None:
+            trace.append("transaction-enter")
+
+        async def __aexit__(
+            self,
+            exc_type: Any,
+            exc: BaseException | None,
+            traceback: Any,
+        ) -> None:
+            trace.append("transaction-exit")
+
+    class Session:
+        async def __aenter__(self) -> Session:
+            trace.append("session-enter")
+            return self
+
+        async def __aexit__(
+            self,
+            exc_type: Any,
+            exc: BaseException | None,
+            traceback: Any,
+        ) -> None:
+            trace.append("session-exit")
+
+        def begin(self) -> Transaction:
+            return Transaction()
+
+        async def execute(self, statement: Any) -> None:
+            sql = str(statement)
+            if "pg_advisory_xact_lock_shared" in sql:
+                trace.append("directory-lock")
+                return
+            assert "tenant_schema_states" in sql
+            trace.append("state-write")
+
+        async def flush(self) -> None:
+            trace.append("flush")
+
+    session = Session()
+
+    async def database_now(candidate: Any) -> datetime:
+        assert candidate is session
+        trace.append("database-now")
+        return datetime(2026, 8, 24, tzinfo=UTC)
+
+    async def lock_claim(
+        candidate: Any,
+        claim: ProvisioningClaim,
+        now: datetime,
+    ) -> tuple[object, SimpleNamespace]:
+        assert candidate is session
+        trace.append("claim-read")
+        return object(), SimpleNamespace()
+
+    async def record_audit_once(
+        candidate: Any,
+        claim: ProvisioningClaim,
+        action: str,
+    ) -> None:
+        assert candidate is session
+        trace.append("audit-write")
+
+    repository = repository_module.SqlAlchemyProvisioningRepository()
+    monkeypatch.setattr(repository_module, "platform_session", lambda: session)
+    monkeypatch.setattr(repository_module, "_database_now", database_now)
+    monkeypatch.setattr(repository, "_lock_claim", lock_claim)
+    monkeypatch.setattr(repository_module, "_record_audit_once", record_audit_once)
+    claim = ProvisioningClaim(
+        tenant_id="tenant-a",
+        job_id="job-a",
+        attempt_count=0,
+        lease_owner="worker-a",
+        lease_token="lease-a",
+    )
+
+    recorded = asyncio.run(
+        repository.record_schema_ready(
+            claim,
+            SchemaProvisioningResult(
+                schema_name=tenant_schema_name(claim.tenant_id),
+                revision=TENANT_SCHEMA_REVISION,
+            ),
+        )
+    )
+
+    assert recorded is True
+    assert trace == [
+        "session-enter",
+        "transaction-enter",
+        "directory-lock",
+        "database-now",
+        "claim-read",
+        "state-write",
+        "audit-write",
+        "flush",
+        "transaction-exit",
+        "session-exit",
+    ]
+
+
 def test_claim_query_is_due_stale_and_skip_locked() -> None:
     from deeptutor.teaching.repositories.provisioning import build_claim_statement
 
@@ -931,7 +1679,7 @@ def test_fenced_query_binds_tenant_job_attempt_owner_and_live_lease() -> None:
         assert fragment in sql
 
 
-def test_worker_activation_requires_schema_policy_and_mode_specific_storage() -> None:
+def test_worker_finalization_locks_the_exact_schema_prerequisite() -> None:
     from deeptutor.teaching.repositories.provisioning import (
         build_worker_activation_statement,
     )
@@ -951,19 +1699,12 @@ def test_worker_activation_requires_schema_policy_and_mode_specific_storage() ->
     )
 
     for fragment in (
+        "tenant_provisioning_jobs.operation = 'provision'",
         "tenant_schema_states.status = 'active'",
         "tenant_schema_states.revision = '20260810_0017'",
-        "tenant_storage_states.status = 'active'",
-        "tenant_storage_states.mode = 'local'",
-        "tenant_storage_states.mode = 's3'",
-        "tenant_storage_credentials.status = 'active'",
-        "tenant_storage_states.credential_secret_ref = "
-        "platform.tenant_storage_credentials.secret_ref",
-        "tenant_storage_states.credential_fingerprint = "
-        "platform.tenant_storage_credentials.access_key_fingerprint",
-        "tenant_default_policy_states.status = 'active'",
-        f"tenant_default_policy_states.policy_version = '{DEFAULT_POLICY_VERSION}'",
-        f"tenant_default_policy_states.policy_payload = '{DEFAULT_POLICY_PAYLOAD}'",
         "for update",
     ):
         assert fragment in sql
+    assert "tenant_storage_states" not in sql
+    assert "tenant_storage_credentials" not in sql
+    assert "tenant_default_policy_states" not in sql

@@ -17,10 +17,11 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from sqlalchemy import text
 from sqlalchemy.engine import URL
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
 from deeptutor.services.config import PlatformSettings, load_platform_settings
-from deeptutor.teaching.migrations.runner import run_migration
+from deeptutor.teaching.migrations.facade import migration_lock_scope
+from deeptutor.teaching.schema_names import tenant_schema_name
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +73,11 @@ class TenantMigrationError(RuntimeError):
             f"tenant migration failed: tenant={tenant_id} "
             f"schema={schema_name} revision={safe_revision}"
         )
+
+
+class TenantDirectoryError(RuntimeError):
+    def __init__(self, tenant_id: str, reason: str) -> None:
+        super().__init__(f"tenant directory invalid: tenant={tenant_id} reason={reason}")
 
 
 async def migrate_tenant_schemas(
@@ -139,50 +145,106 @@ async def _execute_role_bootstrap(
         )
 
 
+async def _tenant_rows_on_connection(
+    connection: AsyncConnection,
+) -> tuple[tuple[str, str, str | None], ...]:
+    rows = (
+        await connection.execute(
+            text(
+                "SELECT tenants.id, states.schema_name, states.revision "
+                "FROM platform.tenants AS tenants "
+                "LEFT JOIN platform.tenant_schema_states AS states "
+                "ON states.tenant_id = tenants.id "
+                "ORDER BY tenants.id"
+            )
+        )
+    ).all()
+    tenants: list[tuple[str, str, str | None]] = []
+    for row in rows:
+        tenant_id = str(row[0])
+        schema_name = row[1]
+        if schema_name is None:
+            tenants.append((tenant_id, tenant_schema_name(tenant_id), None))
+            continue
+        if str(schema_name) != tenant_schema_name(tenant_id):
+            raise TenantDirectoryError(tenant_id, "schema mapping mismatch")
+        tenants.append((tenant_id, str(schema_name), row[2]))
+    return tuple(tenants)
+
+
 async def _tenant_rows(engine: AsyncEngine) -> tuple[tuple[str, str, str | None], ...]:
     async with engine.connect() as connection:
-        rows = (
-            await connection.execute(
-                text(
-                    "SELECT tenants.id, states.schema_name, states.revision "
-                    "FROM platform.tenants AS tenants "
-                    "JOIN platform.tenant_schema_states AS states "
-                    "ON states.tenant_id = tenants.id "
-                    "ORDER BY tenants.id"
-                )
+        return await _tenant_rows_on_connection(connection)
+
+
+async def _grant_app_access_on_connection(
+    connection: AsyncConnection,
+    schemas: Sequence[str],
+) -> None:
+    for schema in ("platform", *schemas):
+        if not (schema == "platform" or schema.startswith("tenant_")):
+            raise ValueError("database schema is unsafe")
+        quoted = '"' + schema.replace('"', '""') + '"'
+        await connection.execute(text(f"GRANT USAGE ON SCHEMA {quoted} TO yfeistai_app"))
+        await connection.execute(
+            text(
+                f"GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA "
+                f"{quoted} TO yfeistai_app"
             )
-        ).all()
-    return tuple((str(row[0]), str(row[1]), row[2]) for row in rows)
+        )
+        await connection.execute(
+            text(f"GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA {quoted} TO yfeistai_app")
+        )
+        await connection.execute(
+            text(
+                f"ALTER DEFAULT PRIVILEGES FOR ROLE yfeistai_migrator IN SCHEMA "
+                f"{quoted} GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO yfeistai_app"
+            )
+        )
+        await connection.execute(
+            text(
+                f"ALTER DEFAULT PRIVILEGES FOR ROLE yfeistai_migrator IN SCHEMA "
+                f"{quoted} GRANT USAGE, SELECT ON SEQUENCES TO yfeistai_app"
+            )
+        )
 
 
 async def _grant_app_access(engine: AsyncEngine, schemas: Sequence[str]) -> None:
     async with engine.begin() as connection:
-        for schema in ("platform", *schemas):
-            if not (schema == "platform" or schema.startswith("tenant_")):
-                raise ValueError("database schema is unsafe")
-            quoted = '"' + schema.replace('"', '""') + '"'
-            await connection.execute(text(f"GRANT USAGE ON SCHEMA {quoted} TO yfeistai_app"))
-            await connection.execute(
-                text(
-                    f"GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA "
-                    f"{quoted} TO yfeistai_app"
-                )
+        await _grant_app_access_on_connection(connection, schemas)
+
+
+async def migrate_locked_tenant_directory(
+    engine: AsyncEngine,
+    *,
+    migrate_platform: Callable[[], Awaitable[None]] | None = None,
+    migrate: Callable[[str], Awaitable[None]] | None = None,
+) -> None:
+    async with migration_lock_scope(engine, scope="platform") as lease:
+        connection = lease.connection
+        if migrate_platform is None:
+            await lease.run(action="upgrade", scope="platform")
+        else:
+            await migrate_platform()
+        tenants = await _tenant_rows_on_connection(connection)
+        await connection.commit()
+
+        async def migrate_tenant(schema_name: str) -> None:
+            if migrate is not None:
+                await migrate(schema_name)
+                return
+            await lease.run(
+                action="upgrade",
+                scope="tenant",
+                tenant_schema=schema_name,
             )
-            await connection.execute(
-                text(f"GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA {quoted} TO yfeistai_app")
-            )
-            await connection.execute(
-                text(
-                    f"ALTER DEFAULT PRIVILEGES FOR ROLE yfeistai_migrator IN SCHEMA "
-                    f"{quoted} GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO yfeistai_app"
-                )
-            )
-            await connection.execute(
-                text(
-                    f"ALTER DEFAULT PRIVILEGES FOR ROLE yfeistai_migrator IN SCHEMA "
-                    f"{quoted} GRANT USAGE, SELECT ON SEQUENCES TO yfeistai_app"
-                )
-            )
+
+        await migrate_tenant_schemas(tenants, migrate=migrate_tenant)
+        await _grant_app_access_on_connection(
+            connection,
+            tuple(schema for _tenant, schema, _revision in tenants),
+        )
+        await connection.commit()
 
 
 @contextmanager
@@ -240,24 +302,9 @@ async def migrate_platform_and_tenants(settings: PlatformSettings) -> None:
         await admin_engine.dispose()
 
     with _migration_database_url(migration_url):
-        await asyncio.to_thread(run_migration, action="upgrade", scope="platform")
         migration_engine = create_async_engine(migration_url)
         try:
-            tenants = await _tenant_rows(migration_engine)
-
-            async def migrate(schema_name: str) -> None:
-                await asyncio.to_thread(
-                    run_migration,
-                    action="upgrade",
-                    scope="tenant",
-                    tenant_schema=schema_name,
-                )
-
-            await migrate_tenant_schemas(tenants, migrate=migrate)
-            await _grant_app_access(
-                migration_engine,
-                tuple(schema for _tenant, schema, _revision in tenants),
-            )
+            await migrate_locked_tenant_directory(migration_engine)
         finally:
             await migration_engine.dispose()
 

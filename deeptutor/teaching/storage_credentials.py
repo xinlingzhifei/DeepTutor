@@ -11,7 +11,7 @@ from typing import Protocol
 from sqlalchemy import select
 
 from deeptutor.teaching.database import platform_session
-from deeptutor.teaching.models import TenantStorageCredential
+from deeptutor.teaching.models import Tenant, TenantStorageCredential
 
 _ACCESS_KEY_FILE = "object-store-access-key"
 _SECRET_KEY_FILE = "object-store-secret-key"
@@ -65,9 +65,12 @@ class SqlAlchemyStorageCredentialRepository:
     ) -> TenantStorageCredentialRecord | None:
         async with platform_session() as session:
             model = await session.scalar(
-                select(TenantStorageCredential).where(
+                select(TenantStorageCredential)
+                .join(Tenant, Tenant.id == TenantStorageCredential.tenant_id)
+                .where(
                     TenantStorageCredential.tenant_id == tenant_id,
                     TenantStorageCredential.status == "active",
+                    Tenant.status == "active",
                 )
             )
         if model is None:
