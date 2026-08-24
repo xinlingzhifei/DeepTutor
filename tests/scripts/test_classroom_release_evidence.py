@@ -489,3 +489,102 @@ def test_image_digest_receipt_rejects_compose_drift_before_publish(
         )
 
     assert output.read_bytes() == b"sentinel"
+
+
+@pytest.mark.parametrize("command", ("source-head", "image-digests"))
+def test_release_evidence_cli_writes_candidate_receipts(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+    command: str,
+) -> None:
+    module = _load_evidence_module()
+    output = tmp_path / f"{command}.json"
+    candidate_root = tmp_path / "candidate"
+    source_root = tmp_path / "source"
+    captured: dict[str, object] = {}
+
+    def write_receipt(path: Path, **arguments: object) -> dict[str, object]:
+        captured["path"] = path
+        captured.update(arguments)
+        return {}
+
+    function_name = (
+        "write_source_head_receipt" if command == "source-head" else "write_image_digest_receipt"
+    )
+    monkeypatch.setattr(module, function_name, write_receipt)
+    arguments = [
+        command,
+        "--output",
+        str(output),
+        "--candidate-root",
+        str(candidate_root),
+        "--run-id",
+        RELEASE_RUN["runId"],
+        "--environment-id",
+        RELEASE_RUN["environmentId"],
+        "--observed-at",
+        "2026-08-25T00:00:00Z",
+    ]
+    if command == "source-head":
+        arguments.extend(("--source-root", str(source_root)))
+
+    assert module.main(arguments) == 0
+    assert captured == {
+        "path": output,
+        "candidate_root": candidate_root,
+        "release_run": RELEASE_RUN,
+        "observed_at": "2026-08-25T00:00:00Z",
+        **({"source_root": source_root} if command == "source-head" else {}),
+    }
+    assert capsys.readouterr().out == f"{output}\n"
+
+
+def test_release_evidence_cli_assembles_named_receipts(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    module = _load_evidence_module()
+    output = tmp_path / "release-evidence.json"
+    candidate_root = tmp_path / "candidate"
+    source_receipt = tmp_path / "source-head.json"
+    image_receipt = tmp_path / "image-digests.json"
+    captured: dict[str, object] = {}
+
+    def assemble(path: Path, **arguments: object) -> dict[str, object]:
+        captured["path"] = path
+        captured.update(arguments)
+        return {}
+
+    monkeypatch.setattr(module, "assemble_manifest", assemble)
+    assert (
+        module.main(
+            [
+                "assemble",
+                "--output",
+                str(output),
+                "--candidate-root",
+                str(candidate_root),
+                "--run-id",
+                RELEASE_RUN["runId"],
+                "--environment-id",
+                RELEASE_RUN["environmentId"],
+                "--receipt",
+                f"source_head={source_receipt}",
+                "--receipt",
+                f"image_digests={image_receipt}",
+            ]
+        )
+        == 0
+    )
+    assert captured == {
+        "path": output,
+        "candidate_root": candidate_root,
+        "release_run": RELEASE_RUN,
+        "receipt_paths": {
+            "source_head": source_receipt,
+            "image_digests": image_receipt,
+        },
+    }
+    assert capsys.readouterr().out == f"{output}\n"

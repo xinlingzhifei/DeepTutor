@@ -458,6 +458,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     action.add_argument("--write-image-lock", action="store_true")
     action.add_argument("--print-image", choices=tuple(IMAGE_SPECS))
     parser.add_argument("--lock-path", type=Path, default=IMAGE_LOCK_PATH)
+    parser.add_argument("--compose-path", type=Path, action="append", dest="compose_paths")
     parser.add_argument("--source-repository")
     parser.add_argument("--source-head")
     parser.add_argument("--release-tag")
@@ -470,12 +471,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.write_image_lock:
         if not args.source_repository or not args.source_head or not args.release_tag:
             raise ValueError("--source-repository, --source-head, and --release-tag are required")
-        write_image_lock(
-            args.lock_path,
-            compose_paths=(
+        compose_paths = (
+            tuple(args.compose_paths)
+            if args.compose_paths
+            else (
                 PROJECT_ROOT / "docker-compose.platform.yml",
                 PROJECT_ROOT / "docker-compose.data-plane.yml",
-            ),
+            )
+        )
+        if len(compose_paths) != 2 or {path.name for path in compose_paths} != {
+            "docker-compose.platform.yml",
+            "docker-compose.data-plane.yml",
+        }:
+            raise ValueError("exactly both production Compose paths are required")
+        write_image_lock(
+            args.lock_path,
+            compose_paths=compose_paths,
             source_repository=args.source_repository,
             source_head=args.source_head,
             release_tag=args.release_tag,

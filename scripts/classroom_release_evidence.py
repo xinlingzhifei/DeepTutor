@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import argparse
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 import hashlib
 import json
@@ -399,3 +400,77 @@ def assemble_manifest(
     }
     _atomic_write_json(target, manifest)
     return manifest
+
+
+def _add_common_receipt_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--candidate-root", type=Path, required=True)
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--environment-id", required=True)
+    parser.add_argument("--observed-at", required=True)
+
+
+def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    source_head = commands.add_parser("source-head")
+    _add_common_receipt_arguments(source_head)
+    source_head.add_argument("--source-root", type=Path, required=True)
+
+    image_digests = commands.add_parser("image-digests")
+    _add_common_receipt_arguments(image_digests)
+
+    assemble = commands.add_parser("assemble")
+    assemble.add_argument("--output", type=Path, required=True)
+    assemble.add_argument("--candidate-root", type=Path, required=True)
+    assemble.add_argument("--run-id", required=True)
+    assemble.add_argument("--environment-id", required=True)
+    assemble.add_argument("--receipt", action="append", required=True)
+    return parser.parse_args(argv)
+
+
+def _receipt_paths(values: Sequence[str]) -> dict[str, Path]:
+    paths: dict[str, Path] = {}
+    for value in values:
+        evidence, separator, raw_path = value.partition("=")
+        if not separator or evidence not in RECEIPT_CONTRACTS or evidence in paths or not raw_path:
+            raise ValueError("--receipt must contain unique evidence=path values")
+        paths[evidence] = Path(raw_path)
+    return paths
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parse_args(argv)
+    release_run = {
+        "runId": args.run_id,
+        "environmentId": args.environment_id,
+    }
+    if args.command == "source-head":
+        write_source_head_receipt(
+            args.output,
+            candidate_root=args.candidate_root,
+            release_run=release_run,
+            source_root=args.source_root,
+            observed_at=args.observed_at,
+        )
+    elif args.command == "image-digests":
+        write_image_digest_receipt(
+            args.output,
+            candidate_root=args.candidate_root,
+            release_run=release_run,
+            observed_at=args.observed_at,
+        )
+    else:
+        assemble_manifest(
+            args.output,
+            candidate_root=args.candidate_root,
+            release_run=release_run,
+            receipt_paths=_receipt_paths(args.receipt),
+        )
+    print(args.output)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

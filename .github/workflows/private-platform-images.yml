@@ -35,6 +35,15 @@ jobs:
           test "${GITHUB_REF_NAME##*-}" = "${GITHUB_SHA:0:8}"
           test "$(git rev-list -n 1 "$GITHUB_REF_NAME")" = "$GITHUB_SHA"
 
+      - name: Prepare candidate evidence workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '\n/openmaic-upstream/\n/release-candidate/\n' >> .git/info/exclude
+          mkdir -p release-candidate/deploy release-candidate/artifacts
+          cp docker-compose.platform.yml release-candidate/docker-compose.platform.yml
+          cp docker-compose.data-plane.yml release-candidate/docker-compose.data-plane.yml
+
       - name: Checkout OpenMAIC
         uses: actions/checkout@v4
         with:
@@ -115,6 +124,9 @@ jobs:
         run: >-
           python scripts/render_platform_compose.py
           --write-image-lock
+          --lock-path release-candidate/deploy/image-lock.json
+          --compose-path release-candidate/docker-compose.platform.yml
+          --compose-path release-candidate/docker-compose.data-plane.yml
           --source-repository "$GITHUB_REPOSITORY"
           --source-head "$GITHUB_SHA"
           --release-tag "$GITHUB_REF_NAME"
@@ -133,9 +145,10 @@ jobs:
           from scripts.render_platform_compose import validate_image_lock_bindings
 
           validate_image_lock_bindings(
+              Path("release-candidate/deploy/image-lock.json"),
               compose_paths=(
-                  Path("docker-compose.platform.yml"),
-                  Path("docker-compose.data-plane.yml"),
+                  Path("release-candidate/docker-compose.platform.yml"),
+                  Path("release-candidate/docker-compose.data-plane.yml"),
               ),
               expected_candidate={
                   "sourceRepository": os.environ["GITHUB_REPOSITORY"],
@@ -150,6 +163,26 @@ jobs:
               }
           )
           PY
+
+      - name: Record Task1 release evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          observed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          release_run="github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          python scripts/classroom_release_evidence.py source-head \
+            --output release-candidate/artifacts/source_head.json \
+            --candidate-root release-candidate \
+            --source-root . \
+            --run-id "$release_run" \
+            --environment-id ghcr-production \
+            --observed-at "$observed_at"
+          python scripts/classroom_release_evidence.py image-digests \
+            --output release-candidate/artifacts/image_digests.json \
+            --candidate-root release-candidate \
+            --run-id "$release_run" \
+            --environment-id ghcr-production \
+            --observed-at "$observed_at"
 
       - name: Promote verified compatibility image tags
         env:
@@ -174,7 +207,9 @@ jobs:
         with:
           name: private-platform-image-lock-${{ github.ref_name }}-${{ github.sha }}
           path: |
-            deploy/image-lock.json
-            docker-compose.platform.yml
-            docker-compose.data-plane.yml
+            release-candidate/deploy/image-lock.json
+            release-candidate/docker-compose.platform.yml
+            release-candidate/docker-compose.data-plane.yml
+            release-candidate/artifacts/source_head.json
+            release-candidate/artifacts/image_digests.json
           if-no-files-found: error

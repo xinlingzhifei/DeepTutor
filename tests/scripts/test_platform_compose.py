@@ -533,9 +533,11 @@ def test_private_platform_workflow_builds_all_images_and_exports_digest_lock() -
         line.strip() for line in str(upload_step["with"]["path"]).splitlines() if line.strip()
     }
     assert artifact_paths == {
-        "deploy/image-lock.json",
-        "docker-compose.platform.yml",
-        "docker-compose.data-plane.yml",
+        "release-candidate/deploy/image-lock.json",
+        "release-candidate/docker-compose.platform.yml",
+        "release-candidate/docker-compose.data-plane.yml",
+        "release-candidate/artifacts/source_head.json",
+        "release-candidate/artifacts/image_digests.json",
     }
 
 
@@ -674,6 +676,74 @@ def test_private_platform_workflow_refuses_to_overwrite_candidate_image_tags() -
         assert repository in command
     assert 'candidate="$image:$GITHUB_REF_NAME"' in command
     assert "exit 1" in command
+
+
+def test_private_platform_workflow_emits_task1_receipts_from_clean_source() -> None:
+    workflow_path = ROOT / ".github" / "workflows" / "private-platform-images.yml"
+    workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+    job = next(iter(workflow["jobs"].values()))
+    steps = job["steps"]
+
+    prepare_index, prepare = next(
+        (index, step)
+        for index, step in enumerate(steps)
+        if step.get("name") == "Prepare candidate evidence workspace"
+    )
+    checkout_openmaic_index = next(
+        index for index, step in enumerate(steps) if step.get("name") == "Checkout OpenMAIC"
+    )
+    assert prepare_index < checkout_openmaic_index
+    prepare_command = str(prepare["run"])
+    assert ".git/info/exclude" in prepare_command
+    assert "/openmaic-upstream/" in prepare_command
+    assert "/release-candidate/" in prepare_command
+    assert "release-candidate/docker-compose.platform.yml" in prepare_command
+    assert "release-candidate/docker-compose.data-plane.yml" in prepare_command
+
+    write_index, write_step = next(
+        (index, step)
+        for index, step in enumerate(steps)
+        if step.get("name") == "Record image digests"
+    )
+    write_command = str(write_step["run"])
+    assert "--lock-path release-candidate/deploy/image-lock.json" in write_command
+    assert write_command.count("--compose-path release-candidate/") == 2
+
+    verify_index = next(
+        index for index, step in enumerate(steps) if step.get("name") == "Verify image lock"
+    )
+    receipt_index, receipt_step = next(
+        (index, step)
+        for index, step in enumerate(steps)
+        if step.get("name") == "Record Task1 release evidence"
+    )
+    assert write_index < verify_index < receipt_index
+    receipt_command = str(receipt_step["run"])
+    assert "classroom_release_evidence.py source-head" in receipt_command
+    assert "classroom_release_evidence.py image-digests" in receipt_command
+    assert "--candidate-root release-candidate" in receipt_command
+    assert "--source-root ." in receipt_command
+    assert "release-candidate/artifacts/source_head.json" in receipt_command
+    assert "release-candidate/artifacts/image_digests.json" in receipt_command
+    assert "GITHUB_RUN_ID" in receipt_command
+    assert "GITHUB_RUN_ATTEMPT" in receipt_command
+
+    upload_index, upload_step = next(
+        (index, step)
+        for index, step in enumerate(steps)
+        if step.get("uses") == "actions/upload-artifact@v4"
+    )
+    assert receipt_index < upload_index
+    artifact_paths = {
+        line.strip() for line in str(upload_step["with"]["path"]).splitlines() if line.strip()
+    }
+    assert artifact_paths == {
+        "release-candidate/deploy/image-lock.json",
+        "release-candidate/docker-compose.platform.yml",
+        "release-candidate/docker-compose.data-plane.yml",
+        "release-candidate/artifacts/source_head.json",
+        "release-candidate/artifacts/image_digests.json",
+    }
 
 
 def test_image_lock_writer_binds_source_head_release_tag_and_custom_digests(
@@ -927,6 +997,50 @@ def test_image_lock_cli_updates_both_production_compose_files(
         "candidate": CANDIDATE_ARGUMENTS,
     }
     assert capsys.readouterr().out == f"{output_path}\n"
+
+
+def test_image_lock_cli_accepts_explicit_candidate_compose_paths(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    renderer = _load_renderer()
+    candidate_root = tmp_path / "release-candidate"
+    output_path = candidate_root / "deploy" / "image-lock.json"
+    compose_paths = (
+        candidate_root / "docker-compose.platform.yml",
+        candidate_root / "docker-compose.data-plane.yml",
+    )
+    captured: dict[str, Any] = {}
+
+    def write_image_lock(path: Path, **arguments: Any) -> dict[str, Any]:
+        captured["path"] = path
+        captured.update(arguments)
+        return {}
+
+    monkeypatch.setattr(renderer, "write_image_lock", write_image_lock)
+
+    assert (
+        renderer.main(
+            [
+                "--write-image-lock",
+                "--lock-path",
+                str(output_path),
+                "--compose-path",
+                str(compose_paths[0]),
+                "--compose-path",
+                str(compose_paths[1]),
+                "--source-repository",
+                SOURCE_REPOSITORY,
+                "--source-head",
+                SOURCE_HEAD,
+                "--release-tag",
+                RELEASE_TAG,
+            ]
+        )
+        == 0
+    )
+    assert captured["path"] == output_path
+    assert captured["compose_paths"] == compose_paths
 
 
 def test_image_lock_writer_cleans_staged_files_when_publish_fails(
