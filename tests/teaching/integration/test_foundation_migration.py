@@ -24,7 +24,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 FOUNDATION_REVISION = "20260728_0001"
 SCOPED_GRANTS_REVISION = "20260730_0002"
 PROVISIONING_REVISION = "20260730_0003"
-HEAD_REVISION = "20260824_0018"
+HEAD_REVISION = "20260825_0019"
 
 
 @dataclass(frozen=True)
@@ -573,6 +573,7 @@ def test_wheel_packages_migrations_and_full_app_entrypoint(
         "deeptutor/teaching/migrations/versions/20260810_0016_learning_events.py",
         "deeptutor/teaching/migrations/versions/20260810_0017_classroom_ticket_consumptions.py",
         "deeptutor/teaching/migrations/versions/20260824_0018_teaching_runtime_heartbeats.py",
+        "deeptutor/teaching/migrations/versions/20260825_0019_teaching_metric_rollups.py",
     }.issubset(names)
     assert "deeptutor-migrate = deeptutor.teaching.migrations.cli:main" in entry_points
     assert "deeptutor-provisioner = deeptutor.teaching.provisioning_cli:main" in entry_points
@@ -635,6 +636,9 @@ def test_packaged_entrypoint_runs_platform_and_tenant_scopes(
         "tenant_schema_states",
         "tenant_storage_credentials",
         "tenant_storage_states",
+        "teaching_learning_projection_backlog",
+        "teaching_metric_counter_rollups",
+        "teaching_metric_histogram_rollups",
         "teaching_runtime_process_heartbeats",
         "tenants",
     }
@@ -936,6 +940,9 @@ def test_foundation_migration_is_isolated_and_repeatable(migration_database):
         "tenant_schema_states",
         "tenant_storage_credentials",
         "tenant_storage_states",
+        "teaching_learning_projection_backlog",
+        "teaching_metric_counter_rollups",
+        "teaching_metric_histogram_rollups",
         "teaching_runtime_process_heartbeats",
         "tenants",
     }

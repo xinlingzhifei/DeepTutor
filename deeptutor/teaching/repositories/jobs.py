@@ -23,6 +23,7 @@ from deeptutor.teaching.job_route_binding import (
     DataPlaneBindingUnavailable,
     lock_active_job_binding,
 )
+from deeptutor.teaching.metrics import VALIDATION_REASONS
 from deeptutor.teaching.models import Tenant
 from deeptutor.teaching.models.classrooms import (
     ClassroomAsset,
@@ -48,10 +49,22 @@ from deeptutor.teaching.repositories.classroom_version_allocation import (
     allocate_classroom_version_number,
     raise_for_classroom_version_allocation_conflict,
 )
+from deeptutor.teaching.repositories.metric_rollups import (
+    increment_counter_rollup,
+    observe_histogram_rollup,
+)
 from deeptutor.teaching.scheduler import PRIORITY_RANK, ClaimedGenerationJob, slot_pool_for
 from deeptutor.teaching.schema_names import tenant_schema_name
 
 _LOWER_HEX_DIGITS = frozenset("0123456789abcdef")
+_RETRY_METRIC_REASON = {
+    "connect_timeout": "timeout",
+    "read_timeout": "timeout",
+    "provider_429": "rate_limited",
+    "provider_5xx": "unavailable",
+    "engine_unavailable": "unavailable",
+    "worker_lost": "lease_lost",
+}
 
 
 def _required(value: str, name: str, max_length: int) -> str:
@@ -77,6 +90,84 @@ def _reservation_id(job_id: str) -> str:
 
 def _quota_event_id(entry_type: str, job_id: str) -> str:
     return hashlib.sha256(f"{entry_type}\0{job_id}".encode()).hexdigest()
+
+
+def _job_attempt_fact_key(
+    tenant_id: str,
+    job_id: str,
+    phase: str,
+    attempt_count: int,
+) -> str:
+    return f"{tenant_id}/{job_id}/{phase}/{attempt_count}"
+
+
+def _retry_metric_reason(error_category: str) -> str:
+    reason = _RETRY_METRIC_REASON.get(error_category)
+    if reason is None:
+        raise ValueError("retry metric category is invalid")
+    return reason
+
+
+def _stage_seconds(*, now: datetime, claimed_at: datetime | None) -> float:
+    if claimed_at is None:
+        raise RuntimeError("claimed stage start is unavailable")
+    seconds = (now - claimed_at).total_seconds()
+    if seconds < 0:
+        raise RuntimeError("claimed stage duration is invalid")
+    return seconds
+
+
+async def _record_job_status_metric(
+    session: AsyncSession,
+    *,
+    tenant_id: str,
+    job_id: str,
+    phase: str,
+    attempt_count: int,
+    status: str,
+) -> None:
+    await increment_counter_rollup(
+        session,
+        metric="generation_jobs_total",
+        category=status,
+        fact_key=_job_attempt_fact_key(tenant_id, job_id, phase, attempt_count),
+        amount=1,
+    )
+
+
+async def _record_stage_metric(
+    session: AsyncSession,
+    *,
+    tenant_id: str,
+    job_id: str,
+    phase: str,
+    attempt_count: int,
+    claimed_at: datetime | None,
+    now: datetime,
+) -> None:
+    await observe_histogram_rollup(
+        session,
+        metric="generation_stage_seconds",
+        category=phase,
+        fact_key=_job_attempt_fact_key(tenant_id, job_id, phase, attempt_count),
+        seconds=_stage_seconds(now=now, claimed_at=claimed_at),
+    )
+
+
+async def _record_quota_metric(
+    session: AsyncSession,
+    *,
+    operation: str,
+    ledger_id: str,
+    units: int,
+) -> None:
+    await increment_counter_rollup(
+        session,
+        metric="quota_units_total",
+        category=operation,
+        fact_key=ledger_id,
+        amount=units,
+    )
 
 
 def _artifact_id(job_id: str, relative_name: str) -> str:
@@ -128,7 +219,7 @@ def _opaque_route_id(value: str) -> str:
 
 
 async def _database_now(session: AsyncSession) -> datetime:
-    value = await session.scalar(select(func.now()))
+    value = await session.scalar(select(func.clock_timestamp()))
     if not isinstance(value, datetime):
         raise RuntimeError("database clock is unavailable")
     return value
@@ -492,6 +583,8 @@ def require_repository_transition(
     """Allow only transitions that preserve the current lease class."""
 
     require_job_transition(job_kind, current_status, target_status)
+    if target_status == "queued":
+        raise InvalidJobTransition("queued transitions require lifecycle API")
     if target_status in TERMINAL_JOB_STATUSES:
         raise InvalidJobTransition("terminal transitions require completion API")
     if (current_status in LEASED_JOB_STATUSES) != (target_status in LEASED_JOB_STATUSES):
@@ -598,8 +691,7 @@ class SqlAlchemyGenerationJobRepository:
             async with session.begin():
                 await session.execute(
                     text(
-                        "SELECT pg_advisory_xact_lock("
-                        "hashtextextended(:idempotency_lock_key, 0))"
+                        "SELECT pg_advisory_xact_lock(hashtextextended(:idempotency_lock_key, 0))"
                     ),
                     {
                         "idempotency_lock_key": hashlib.sha256(
@@ -678,6 +770,14 @@ class SqlAlchemyGenerationJobRepository:
                 )
                 session.add(job)
                 await session.flush()
+                await _record_job_status_metric(
+                    session,
+                    tenant_id=job.tenant_id,
+                    job_id=job.id,
+                    phase=job.phase,
+                    attempt_count=0,
+                    status="failed",
+                )
                 return self._record(job)
 
     async def create_export_job_and_reserve(
@@ -880,6 +980,12 @@ class SqlAlchemyGenerationJobRepository:
                 if export_id is not None:
                     await self._bind_export_job(session, request, export_id)
                 await session.flush()
+                await _record_quota_metric(
+                    session,
+                    operation="reserved",
+                    ledger_id=_reservation_id(request.job_id),
+                    units=request.quota_units,
+                )
                 return GenerationJobRecord(
                     tenant_id=request.tenant_id,
                     job_id=request.job_id,
@@ -948,6 +1054,8 @@ class SqlAlchemyGenerationJobRepository:
         expected_status: str,
         target_status: str,
     ) -> bool:
+        if target_status == "queued":
+            raise InvalidJobTransition("queued transitions require lifecycle API")
         session_factory = self._session_factory(tenant_id)
         async with session_factory() as session:
             async with session.begin():
@@ -964,8 +1072,6 @@ class SqlAlchemyGenerationJobRepository:
                     expected_status,
                     target_status,
                 )
-                if expected_status == "awaiting_confirmation" and target_status == "queued":
-                    raise InvalidJobTransition("content confirmation requires atomic requeue")
                 result = await session.execute(
                     update(GenerationJob)
                     .where(
@@ -1089,6 +1195,13 @@ class SqlAlchemyGenerationJobRepository:
                     )
                 )
                 await session.flush()
+                await increment_counter_rollup(
+                    session,
+                    metric="generation_jobs_total",
+                    category="queued",
+                    fact_key=_event_id(tenant_id, job_id, "content"),
+                    amount=1,
+                )
                 return True
 
     async def get_job(
@@ -1212,7 +1325,6 @@ class SqlAlchemyGenerationJobRepository:
         *,
         require_unexpired: bool = True,
     ) -> tuple[GenerationJob, GenerationQueue, tuple[GenerationSlot, GenerationSlot], datetime]:
-        now = await _database_now(session)
         job = await session.scalar(
             select(GenerationJob)
             .where(
@@ -1239,6 +1351,7 @@ class SqlAlchemyGenerationJobRepository:
                 )
             ).all()
         )
+        now = await _database_now(session)
         expected_slot_ids = {claim.global_slot_id, claim.tenant_slot_id}
         if (
             job is None
@@ -1381,6 +1494,15 @@ class SqlAlchemyGenerationJobRepository:
                 await session.delete(queue)
                 self._release_slots(slots)
                 await session.flush()
+                await _record_stage_metric(
+                    session,
+                    tenant_id=job.tenant_id,
+                    job_id=job.id,
+                    phase=job.phase,
+                    attempt_count=job.attempt_count,
+                    claimed_at=queue.claimed_at,
+                    now=now,
+                )
 
     async def increment_dsl_repair(
         self,
@@ -1407,6 +1529,7 @@ class SqlAlchemyGenerationJobRepository:
     ) -> bool:
         if not 0 <= delay_seconds <= 300:
             raise ValueError("retry delay is invalid")
+        retry_reason = _retry_metric_reason(error_category)
         session_factory = self._session_factory(claim.tenant_id)
         async with session_factory() as session:
             async with session.begin():
@@ -1415,6 +1538,7 @@ class SqlAlchemyGenerationJobRepository:
                 job.error_code = error_code
                 job.updated_at = now
                 if not job.cancel_requested and job.attempt_count < job.max_attempts:
+                    claimed_at = queue.claimed_at
                     available_at = now + timedelta(seconds=delay_seconds)
                     job.status = "queued"
                     job.next_attempt_at = available_at
@@ -1422,6 +1546,35 @@ class SqlAlchemyGenerationJobRepository:
                     self._clear_job_lease(job)
                     self._requeue(queue, slots, available_at=available_at)
                     await session.flush()
+                    await _record_job_status_metric(
+                        session,
+                        tenant_id=job.tenant_id,
+                        job_id=job.id,
+                        phase=job.phase,
+                        attempt_count=job.attempt_count,
+                        status="queued",
+                    )
+                    await increment_counter_rollup(
+                        session,
+                        metric="generation_retries_total",
+                        category=retry_reason,
+                        fact_key=_job_attempt_fact_key(
+                            job.tenant_id,
+                            job.id,
+                            job.phase,
+                            job.attempt_count,
+                        ),
+                        amount=1,
+                    )
+                    await _record_stage_metric(
+                        session,
+                        tenant_id=job.tenant_id,
+                        job_id=job.id,
+                        phase=job.phase,
+                        attempt_count=job.attempt_count,
+                        claimed_at=claimed_at,
+                        now=now,
+                    )
                     return True
                 terminal_status = "canceled" if job.cancel_requested else "failed"
                 await self._finish_failed_or_canceled(
@@ -1464,6 +1617,29 @@ class SqlAlchemyGenerationJobRepository:
             )
         )
         await session.flush()
+        await _record_job_status_metric(
+            session,
+            tenant_id=job.tenant_id,
+            job_id=job.id,
+            phase=job.phase,
+            attempt_count=job.attempt_count,
+            status=terminal_status,
+        )
+        await _record_stage_metric(
+            session,
+            tenant_id=job.tenant_id,
+            job_id=job.id,
+            phase=job.phase,
+            attempt_count=job.attempt_count,
+            claimed_at=queue.claimed_at,
+            now=now,
+        )
+        await _record_quota_metric(
+            session,
+            operation="released",
+            ledger_id=_quota_event_id("release", job.id),
+            units=job.quota_units,
+        )
 
     async def fail_claim(
         self,
@@ -1471,21 +1647,41 @@ class SqlAlchemyGenerationJobRepository:
         *,
         error_category: str,
         error_code: str,
+        artifact_validation_reason: str | None = None,
     ) -> None:
+        if (
+            artifact_validation_reason is not None
+            and artifact_validation_reason not in VALIDATION_REASONS
+        ):
+            raise ValueError("artifact validation metric reason is invalid")
         session_factory = self._session_factory(claim.tenant_id)
         async with session_factory() as session:
             async with session.begin():
                 job, queue, slots, now = await self._lock_claim(session, claim)
                 job.error_category = error_category
                 job.error_code = error_code
+                terminal_status = "canceled" if job.cancel_requested else "failed"
                 await self._finish_failed_or_canceled(
                     session,
                     job,
                     queue,
                     slots,
                     now=now,
-                    terminal_status="canceled" if job.cancel_requested else "failed",
+                    terminal_status=terminal_status,
                 )
+                if artifact_validation_reason is not None and terminal_status == "failed":
+                    await increment_counter_rollup(
+                        session,
+                        metric="artifact_validation_failures_total",
+                        category=artifact_validation_reason,
+                        fact_key=_job_attempt_fact_key(
+                            job.tenant_id,
+                            job.id,
+                            job.phase,
+                            job.attempt_count,
+                        ),
+                        amount=1,
+                    )
 
     async def cancel_claim(self, claim: ClaimedGenerationJob) -> None:
         session_factory = self._session_factory(claim.tenant_id)
@@ -1514,7 +1710,6 @@ class SqlAlchemyGenerationJobRepository:
         session_factory = self._session_factory(tenant_id)
         async with session_factory() as session:
             async with session.begin():
-                now = await _database_now(session)
                 undelivered_messages = (
                     await session.scalars(
                         select(OutboxMessage)
@@ -1527,6 +1722,15 @@ class SqlAlchemyGenerationJobRepository:
                         .with_for_update()
                     )
                 ).all()
+                queue = await session.scalar(
+                    select(GenerationQueue)
+                    .where(
+                        GenerationQueue.tenant_id == tenant_id,
+                        GenerationQueue.job_id == job_id,
+                        GenerationQueue.status == "queued",
+                    )
+                    .with_for_update()
+                )
                 job = await session.scalar(
                     select(GenerationJob)
                     .where(
@@ -1544,8 +1748,6 @@ class SqlAlchemyGenerationJobRepository:
                     )
                 ):
                     return None
-                job.cancel_requested = True
-                job.updated_at = now
                 request = CancellationRequest(
                     tenant_id=tenant_id,
                     job_id=job_id,
@@ -1557,16 +1759,14 @@ class SqlAlchemyGenerationJobRepository:
                     queue_ref=job.queue_ref,
                 )
                 if request.running:
+                    now = await _database_now(session)
+                    job.cancel_requested = True
+                    job.updated_at = now
                     await session.flush()
                     return request
-                queue = await session.scalar(
-                    select(GenerationQueue)
-                    .where(
-                        GenerationQueue.tenant_id == tenant_id,
-                        GenerationQueue.job_id == job_id,
-                    )
-                    .with_for_update()
-                )
+                now = await _database_now(session)
+                job.cancel_requested = True
+                job.updated_at = now
                 if queue is not None:
                     await session.delete(queue)
                 for message in undelivered_messages:
@@ -1588,6 +1788,20 @@ class SqlAlchemyGenerationJobRepository:
                     )
                 )
                 await session.flush()
+                await _record_job_status_metric(
+                    session,
+                    tenant_id=job.tenant_id,
+                    job_id=job.id,
+                    phase=job.phase,
+                    attempt_count=job.attempt_count,
+                    status="canceled",
+                )
+                await _record_quota_metric(
+                    session,
+                    operation="released",
+                    ledger_id=_quota_event_id("release", job.id),
+                    units=job.quota_units,
+                )
                 return request
 
     async def finish_requested_cancellation(
@@ -1598,7 +1812,6 @@ class SqlAlchemyGenerationJobRepository:
         session_factory = self._session_factory(tenant_id)
         async with session_factory() as session:
             async with session.begin():
-                now = await _database_now(session)
                 job = await session.scalar(
                     select(GenerationJob)
                     .where(
@@ -1633,6 +1846,7 @@ class SqlAlchemyGenerationJobRepository:
                 )
                 if queue is None or len(slots) != 2:
                     raise JobLeaseLost("running cancellation lease is incomplete")
+                now = await _database_now(session)
                 job.status = "canceled"
                 job.error_category = "canceled"
                 job.error_code = "job_canceled"
@@ -1653,6 +1867,29 @@ class SqlAlchemyGenerationJobRepository:
                     )
                 )
                 await session.flush()
+                await _record_job_status_metric(
+                    session,
+                    tenant_id=job.tenant_id,
+                    job_id=job.id,
+                    phase=job.phase,
+                    attempt_count=job.attempt_count,
+                    status="canceled",
+                )
+                await _record_stage_metric(
+                    session,
+                    tenant_id=job.tenant_id,
+                    job_id=job.id,
+                    phase=job.phase,
+                    attempt_count=job.attempt_count,
+                    claimed_at=queue.claimed_at,
+                    now=now,
+                )
+                await _record_quota_metric(
+                    session,
+                    operation="released",
+                    ledger_id=_quota_event_id("release", job.id),
+                    units=job.quota_units,
+                )
                 return True
 
     async def prepare_promotion(
@@ -1943,6 +2180,29 @@ class SqlAlchemyGenerationJobRepository:
                 await session.delete(queue)
                 self._release_slots(slots)
                 await session.flush()
+                await _record_job_status_metric(
+                    session,
+                    tenant_id=job.tenant_id,
+                    job_id=job.id,
+                    phase=job.phase,
+                    attempt_count=job.attempt_count,
+                    status="completed",
+                )
+                await _record_stage_metric(
+                    session,
+                    tenant_id=job.tenant_id,
+                    job_id=job.id,
+                    phase=job.phase,
+                    attempt_count=job.attempt_count,
+                    claimed_at=queue.claimed_at,
+                    now=now,
+                )
+                await _record_quota_metric(
+                    session,
+                    operation="consumed",
+                    ledger_id=_quota_event_id("settle", job.id),
+                    units=job.quota_units,
+                )
 
     async def finalize_export(
         self,
@@ -2034,6 +2294,29 @@ class SqlAlchemyGenerationJobRepository:
                 await session.delete(queue)
                 self._release_slots(slots)
                 await session.flush()
+                await _record_job_status_metric(
+                    session,
+                    tenant_id=job.tenant_id,
+                    job_id=job.id,
+                    phase=job.phase,
+                    attempt_count=job.attempt_count,
+                    status="completed",
+                )
+                await _record_stage_metric(
+                    session,
+                    tenant_id=job.tenant_id,
+                    job_id=job.id,
+                    phase=job.phase,
+                    attempt_count=job.attempt_count,
+                    claimed_at=queue.claimed_at,
+                    now=now,
+                )
+                await _record_quota_metric(
+                    session,
+                    operation="consumed",
+                    ledger_id=_quota_event_id("settle", job.id),
+                    units=job.quota_units,
+                )
 
     async def reap_one_expired(self) -> ReapedJob | None:
         """Fenced recovery of one expired job, queue row, and both slots."""
@@ -2041,19 +2324,63 @@ class SqlAlchemyGenerationJobRepository:
         session_factory = async_sessionmaker(self._engine(), expire_on_commit=False)
         async with session_factory() as session:
             async with session.begin():
-                now = await _database_now(session)
+                selection_now = await _database_now(session)
+                candidate = (
+                    (
+                        await session.execute(
+                            select(
+                                GenerationQueue.tenant_id,
+                                GenerationQueue.job_id,
+                            )
+                            .where(
+                                GenerationQueue.status == "claimed",
+                                GenerationQueue.lease_expires_at <= selection_now,
+                            )
+                            .order_by(
+                                GenerationQueue.lease_expires_at,
+                                GenerationQueue.job_id,
+                            )
+                            .limit(1)
+                        )
+                    )
+                    .mappings()
+                    .one_or_none()
+                )
+                if candidate is None:
+                    return None
+                jobs_table = _tenant_table(candidate["tenant_id"], "generation_jobs")
+                job = (
+                    (
+                        await session.execute(
+                            text(
+                                f"""
+                            SELECT status, attempt_count, max_attempts,
+                                   cancel_requested, quota_units, lease_token,
+                                   lease_expires_at
+                            FROM {jobs_table}
+                            WHERE id = :job_id AND tenant_id = :tenant_id
+                            FOR UPDATE
+                            """
+                            ),
+                            {
+                                "job_id": candidate["job_id"],
+                                "tenant_id": candidate["tenant_id"],
+                            },
+                        )
+                    )
+                    .mappings()
+                    .one_or_none()
+                )
                 queue = await session.scalar(
                     select(GenerationQueue)
                     .where(
-                        GenerationQueue.status == "claimed",
-                        GenerationQueue.lease_expires_at <= now,
+                        GenerationQueue.tenant_id == candidate["tenant_id"],
+                        GenerationQueue.job_id == candidate["job_id"],
                     )
-                    .order_by(GenerationQueue.lease_expires_at, GenerationQueue.job_id)
-                    .limit(1)
-                    .with_for_update(skip_locked=True)
+                    .with_for_update()
                 )
                 if queue is None:
-                    return None
+                    raise JobLeaseLost("expired queue no longer exists")
                 slots = tuple(
                     (
                         await session.scalars(
@@ -2069,28 +2396,12 @@ class SqlAlchemyGenerationJobRepository:
                 )
                 if len(slots) != 2 or queue.lease_token is None:
                     raise JobLeaseLost("expired queue does not own exactly two fenced slots")
-                jobs_table = _tenant_table(queue.tenant_id, "generation_jobs")
-                job = (
-                    (
-                        await session.execute(
-                            text(
-                                f"""
-                            SELECT status, attempt_count, max_attempts,
-                                   cancel_requested, quota_units, lease_token,
-                                   lease_expires_at
-                            FROM {jobs_table}
-                            WHERE id = :job_id AND tenant_id = :tenant_id
-                            FOR UPDATE
-                            """
-                            ),
-                            {"job_id": queue.job_id, "tenant_id": queue.tenant_id},
-                        )
-                    )
-                    .mappings()
-                    .one_or_none()
-                )
+                now = await _database_now(session)
                 if (
                     job is None
+                    or queue.status != "claimed"
+                    or queue.lease_expires_at is None
+                    or queue.lease_expires_at > now
                     or job["status"] not in LEASED_JOB_STATUSES
                     or job["lease_token"] != queue.lease_token
                     or job["lease_expires_at"] is None
@@ -2098,11 +2409,13 @@ class SqlAlchemyGenerationJobRepository:
                 ):
                     raise JobLeaseLost("expired queue does not match the tenant job fence")
 
+                claimed_at = queue.claimed_at
                 should_retry = not job["cancel_requested"] and int(job["attempt_count"]) < int(
                     job["max_attempts"]
                 )
                 terminal_status: str | None = None
                 next_attempt_at: datetime | None = None
+                release_ledger_id: str | None = None
                 if should_retry:
                     next_attempt_at = now + timedelta(
                         seconds=retry_delay_seconds(int(job["attempt_count"]))
@@ -2189,7 +2502,7 @@ class SqlAlchemyGenerationJobRepository:
                     if changed.rowcount != 1:
                         raise JobLeaseLost("expired job terminalization lost its fence")
                     quota_table = _tenant_table(queue.tenant_id, "quota_ledger")
-                    await session.execute(
+                    release = await session.execute(
                         text(
                             f"""
                             INSERT INTO {quota_table}
@@ -2197,6 +2510,7 @@ class SqlAlchemyGenerationJobRepository:
                             VALUES
                                 (:id, :tenant_id, :job_id, 'release', :units)
                             ON CONFLICT (job_id, entry_type) DO NOTHING
+                            RETURNING id
                             """
                         ),
                         {
@@ -2206,6 +2520,7 @@ class SqlAlchemyGenerationJobRepository:
                             "units": int(job["quota_units"]),
                         },
                     )
+                    release_ledger_id = release.scalar_one_or_none()
                     await session.delete(queue)
                 for slot in slots:
                     slot.claimed_tenant_id = None
@@ -2215,6 +2530,44 @@ class SqlAlchemyGenerationJobRepository:
                     slot.lease_expires_at = None
                     slot.heartbeat_at = None
                 await session.flush()
+                metric_fact_key = _job_attempt_fact_key(
+                    queue.tenant_id,
+                    queue.job_id,
+                    queue.phase,
+                    int(job["attempt_count"]),
+                )
+                await _record_job_status_metric(
+                    session,
+                    tenant_id=queue.tenant_id,
+                    job_id=queue.job_id,
+                    phase=queue.phase,
+                    attempt_count=int(job["attempt_count"]),
+                    status="queued" if should_retry else terminal_status or "failed",
+                )
+                if should_retry:
+                    await increment_counter_rollup(
+                        session,
+                        metric="generation_retries_total",
+                        category="lease_lost",
+                        fact_key=metric_fact_key,
+                        amount=1,
+                    )
+                await _record_stage_metric(
+                    session,
+                    tenant_id=queue.tenant_id,
+                    job_id=queue.job_id,
+                    phase=queue.phase,
+                    attempt_count=int(job["attempt_count"]),
+                    claimed_at=claimed_at,
+                    now=now,
+                )
+                if release_ledger_id is not None:
+                    await _record_quota_metric(
+                        session,
+                        operation="released",
+                        ledger_id=release_ledger_id,
+                        units=int(job["quota_units"]),
+                    )
                 return ReapedJob(
                     tenant_id=queue.tenant_id,
                     job_id=queue.job_id,

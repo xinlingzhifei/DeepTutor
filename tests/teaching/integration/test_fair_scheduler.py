@@ -11,14 +11,25 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
-from deeptutor.teaching.models import DataPlaneRoute, ProviderProfile, Tenant
+from deeptutor.teaching.models import (
+    DataPlaneRoute,
+    ProviderProfile,
+    TeachingMetricCounterRollup,
+    TeachingMetricHistogramRollup,
+    Tenant,
+)
 from deeptutor.teaching.models.jobs import (
     GenerationJob,
     GenerationQueue,
     GenerationSlot,
     TenantSchedulerState,
 )
-from deeptutor.teaching.scheduler import PRIORITY_RANK, FairScheduler
+from deeptutor.teaching.repositories.metric_rollups import metric_rollup_shard
+from deeptutor.teaching.scheduler import (
+    PRIORITY_RANK,
+    FairScheduler,
+    SchedulerClaimConflict,
+)
 from deeptutor.teaching.schema_names import tenant_schema_name
 
 pytestmark = pytest.mark.usefixtures("clean_generation_runtime_state")
@@ -145,6 +156,35 @@ async def _insert_queued_job(
                     status="queued",
                 )
             )
+
+
+async def _metric_counter_total(session, *, category: str, shard: int) -> int:
+    return int(
+        await session.scalar(
+            select(func.coalesce(TeachingMetricCounterRollup.total, 0)).where(
+                TeachingMetricCounterRollup.metric == "generation_jobs_total",
+                TeachingMetricCounterRollup.category == category,
+                TeachingMetricCounterRollup.shard == shard,
+            )
+        )
+        or 0
+    )
+
+
+async def _queue_histogram_totals(session, *, shard: int) -> tuple[int, float]:
+    count, sum_seconds = (
+        await session.execute(
+            select(
+                func.coalesce(func.sum(TeachingMetricHistogramRollup.count), 0),
+                func.coalesce(func.sum(TeachingMetricHistogramRollup.sum_seconds), 0.0),
+            ).where(
+                TeachingMetricHistogramRollup.metric == "generation_queue_seconds",
+                TeachingMetricHistogramRollup.category == "",
+                TeachingMetricHistogramRollup.shard == shard,
+            )
+        )
+    ).one()
+    return int(count), float(sum_seconds)
 
 
 def test_busy_tenant_cannot_hide_another_tenants_work(
@@ -606,11 +646,109 @@ def test_route_disable_commits_before_a_waiting_scheduler_claim(
     asyncio.run(scenario())
 
 
+def test_successful_claim_records_one_running_job_and_eligible_queue_wait(
+    generation_database: Any,
+) -> None:
+    tenant_id = "metric-claim-tenant"
+    job_id = "metric-claim-job"
+    generation_database.migrate_tenant(tenant_id)
+
+    async def scenario() -> None:
+        engine = create_async_engine(generation_database.url, poolclass=NullPool)
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            await _insert_active_tenants(engine, (tenant_id,))
+            await _insert_queued_job(
+                engine,
+                tenant_id=tenant_id,
+                job_id=job_id,
+                priority="teacher",
+            )
+            scheduler = FairScheduler(engine)
+            await scheduler.ensure_generation_capacity(
+                [tenant_id],
+                worker_pool_ref="shared-generation",
+            )
+            async with session_factory() as session:
+                async with session.begin():
+                    await session.execute(
+                        update(GenerationQueue)
+                        .where(
+                            GenerationQueue.tenant_id == tenant_id,
+                            GenerationQueue.job_id == job_id,
+                        )
+                        .values(available_at=func.now() - text("INTERVAL '5 seconds'"))
+                    )
+
+            fact_key = f"{tenant_id}/{job_id}/outline/1"
+            running_shard = metric_rollup_shard(
+                fact_key,
+                "generation_jobs_total",
+                "running",
+            )
+            queue_shard = metric_rollup_shard(
+                fact_key,
+                "generation_queue_seconds",
+                "",
+            )
+            async with session_factory() as session:
+                running_before = await _metric_counter_total(
+                    session,
+                    category="running",
+                    shard=running_shard,
+                )
+                queue_before = await _queue_histogram_totals(
+                    session,
+                    shard=queue_shard,
+                )
+
+            claimed = await scheduler.claim(
+                "generation",
+                data_plane_route_id="shared-primary",
+                provider_profile_id="platform-default",
+                worker_pool_ref="shared-generation",
+                queue_ref="openmaic.shared",
+                worker_id="metric-worker",
+                lease_seconds=60,
+            )
+            assert claimed is not None and claimed.attempt_count == 1
+            assert (
+                await scheduler.claim(
+                    "generation",
+                    data_plane_route_id="shared-primary",
+                    provider_profile_id="platform-default",
+                    worker_pool_ref="shared-generation",
+                    queue_ref="openmaic.shared",
+                    worker_id="metric-worker-duplicate",
+                    lease_seconds=60,
+                )
+                is None
+            )
+
+            async with session_factory() as session:
+                running_after = await _metric_counter_total(
+                    session,
+                    category="running",
+                    shard=running_shard,
+                )
+                queue_after = await _queue_histogram_totals(
+                    session,
+                    shard=queue_shard,
+                )
+                assert running_after == running_before + 1
+                assert queue_after[0] == queue_before[0] + 1
+                assert queue_after[1] >= queue_before[1] + 5.0
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
 def test_platform_claim_failure_rolls_back_the_tenant_job_and_all_locks(
     generation_database: Any,
 ) -> None:
-    tenant_id = "rollback-claim-tenant"
-    job_id = "rollback-claim-job"
+    tenant_id = "rollback-slot-claim-tenant"
+    job_id = "rollback-slot-claim-job"
     generation_database.migrate_tenant(tenant_id)
 
     async def scenario() -> None:
@@ -632,6 +770,27 @@ def test_platform_claim_failure_rolls_back_the_tenant_job_and_all_locks(
                 [tenant_id],
                 worker_pool_ref="shared-generation",
             )
+            fact_key = f"{tenant_id}/{job_id}/outline/1"
+            running_shard = metric_rollup_shard(
+                fact_key,
+                "generation_jobs_total",
+                "running",
+            )
+            queue_shard = metric_rollup_shard(
+                fact_key,
+                "generation_queue_seconds",
+                "",
+            )
+            async with session_factory() as session:
+                running_before = await _metric_counter_total(
+                    session,
+                    category="running",
+                    shard=running_shard,
+                )
+                queue_before = await _queue_histogram_totals(
+                    session,
+                    shard=queue_shard,
+                )
             async with session_factory() as session:
                 async with session.begin():
                     await session.execute(
@@ -642,7 +801,7 @@ def test_platform_claim_failure_rolls_back_the_tenant_job_and_all_locks(
                             LANGUAGE plpgsql
                             AS $$
                             BEGIN
-                                IF NEW.claimed_job_id = 'rollback-claim-job' THEN
+                                IF NEW.claimed_job_id = 'rollback-slot-claim-job' THEN
                                     RAISE EXCEPTION 'injected slot failure';
                                 END IF;
                                 RETURN NEW;
@@ -662,16 +821,17 @@ def test_platform_claim_failure_rolls_back_the_tenant_job_and_all_locks(
                         )
                     )
             try:
-                with pytest.raises(DBAPIError):
+                with pytest.raises(DBAPIError) as caught:
                     await scheduler.claim(
                         "generation",
                         data_plane_route_id="shared-primary",
                         provider_profile_id="platform-default",
                         worker_pool_ref="shared-generation",
                         queue_ref="openmaic.shared",
-                        worker_id="rollback-worker",
+                        worker_id="rollback-slot-worker",
                         lease_seconds=60,
                     )
+                assert "injected slot failure" in str(caught.value.orig)
             finally:
                 async with session_factory() as session:
                     async with session.begin():
@@ -729,6 +889,331 @@ def test_platform_claim_failure_rolls_back_the_tenant_job_and_all_locks(
                 assert queue.lease_token is None
                 assert claimed_slots == 0
                 assert state is not None and state.last_dispatched_at is None
+                assert (
+                    await _metric_counter_total(
+                        session,
+                        category="running",
+                        shard=running_shard,
+                    )
+                    == running_before
+                )
+                assert await _queue_histogram_totals(session, shard=queue_shard) == queue_before
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_metric_rollup_failure_rolls_back_job_queue_slots_and_scheduler_state(
+    generation_database: Any,
+) -> None:
+    tenant_id = "rollback-claim-tenant"
+    job_id = "rollback-claim-job"
+    generation_database.migrate_tenant(tenant_id)
+
+    async def scenario() -> None:
+        engine = create_async_engine(
+            generation_database.url,
+            poolclass=NullPool,
+        )
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            await _insert_active_tenants(engine, (tenant_id,))
+            await _insert_queued_job(
+                engine,
+                tenant_id=tenant_id,
+                job_id=job_id,
+                priority="teacher",
+            )
+            scheduler = FairScheduler(engine)
+            await scheduler.ensure_generation_capacity(
+                [tenant_id],
+                worker_pool_ref="shared-generation",
+            )
+            fact_key = f"{tenant_id}/{job_id}/outline/1"
+            running_shard = metric_rollup_shard(
+                fact_key,
+                "generation_jobs_total",
+                "running",
+            )
+            queue_shard = metric_rollup_shard(
+                fact_key,
+                "generation_queue_seconds",
+                "",
+            )
+            async with session_factory() as session:
+                running_before = await _metric_counter_total(
+                    session,
+                    category="running",
+                    shard=running_shard,
+                )
+                queue_before = await _queue_histogram_totals(
+                    session,
+                    shard=queue_shard,
+                )
+            async with session_factory() as session:
+                async with session.begin():
+                    await session.execute(
+                        text(
+                            """
+                            CREATE FUNCTION platform.fail_generation_queue_metric()
+                            RETURNS trigger
+                            LANGUAGE plpgsql
+                            AS $$
+                            BEGIN
+                                IF NEW.metric = 'generation_queue_seconds' THEN
+                                    RAISE EXCEPTION 'injected metric rollup failure';
+                                END IF;
+                                RETURN NEW;
+                            END;
+                            $$
+                            """
+                        )
+                    )
+                    await session.execute(
+                        text(
+                            """
+                            CREATE TRIGGER fail_generation_queue_metric
+                            BEFORE INSERT OR UPDATE
+                            ON platform.teaching_metric_histogram_rollups
+                            FOR EACH ROW
+                            EXECUTE FUNCTION platform.fail_generation_queue_metric()
+                            """
+                        )
+                    )
+            try:
+                with pytest.raises(DBAPIError) as caught:
+                    await scheduler.claim(
+                        "generation",
+                        data_plane_route_id="shared-primary",
+                        provider_profile_id="platform-default",
+                        worker_pool_ref="shared-generation",
+                        queue_ref="openmaic.shared",
+                        worker_id="rollback-worker",
+                        lease_seconds=60,
+                    )
+                assert "injected metric rollup failure" in str(caught.value.orig)
+            finally:
+                async with session_factory() as session:
+                    async with session.begin():
+                        await session.execute(
+                            text(
+                                """
+                                DROP TRIGGER fail_generation_queue_metric
+                                ON platform.teaching_metric_histogram_rollups
+                                """
+                            )
+                        )
+                        await session.execute(
+                            text(
+                                """
+                                DROP FUNCTION platform.fail_generation_queue_metric()
+                                """
+                            )
+                        )
+
+            translated_engine = engine.execution_options(
+                schema_translate_map={"tenant": tenant_schema_name(tenant_id)}
+            )
+            translated_factory = async_sessionmaker(
+                translated_engine,
+                expire_on_commit=False,
+            )
+            async with translated_factory() as session:
+                job = await session.scalar(
+                    select(GenerationJob).where(
+                        GenerationJob.id == job_id,
+                        GenerationJob.tenant_id == tenant_id,
+                    )
+                )
+                queue = await session.get(
+                    GenerationQueue,
+                    (tenant_id, job_id),
+                )
+                claimed_slots = await session.scalar(
+                    select(func.count())
+                    .select_from(GenerationSlot)
+                    .where(
+                        GenerationSlot.claimed_tenant_id == tenant_id,
+                        GenerationSlot.claimed_job_id == job_id,
+                    )
+                )
+                state = await session.get(
+                    TenantSchedulerState,
+                    (tenant_id, "shared-generation", "generation"),
+                )
+                assert job is not None
+                assert job.status == "queued"
+                assert job.attempt_count == 0
+                assert job.lease_token is None
+                assert queue is not None and queue.status == "queued"
+                assert queue.lease_token is None
+                assert claimed_slots == 0
+                assert state is not None and state.last_dispatched_at is None
+                assert (
+                    await _metric_counter_total(
+                        session,
+                        category="running",
+                        shard=running_shard,
+                    )
+                    == running_before
+                )
+                assert await _queue_histogram_totals(session, shard=queue_shard) == queue_before
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("case", "job_kind", "phase", "export_format", "slot_pool", "job_update"),
+    (
+        (
+            "priority",
+            "generation",
+            "outline",
+            None,
+            "generation",
+            {"priority": PRIORITY_RANK["student_micro"]},
+        ),
+        (
+            "mp4-into-generation",
+            "export",
+            "export",
+            "pptx",
+            "generation",
+            {"export_format": "mp4"},
+        ),
+        (
+            "non-mp4-into-mp4",
+            "export",
+            "export",
+            "mp4",
+            "mp4_export",
+            {"export_format": "pptx"},
+        ),
+    ),
+)
+def test_authoritative_job_shape_drift_rolls_back_every_claim_side_effect(
+    generation_database: Any,
+    case: str,
+    job_kind: str,
+    phase: str,
+    export_format: str | None,
+    slot_pool: str,
+    job_update: dict[str, object],
+) -> None:
+    tenant_id = f"claim-drift-{case}-tenant"
+    job_id = f"claim-drift-{case}-job"
+    generation_database.migrate_tenant(tenant_id)
+
+    async def scenario() -> None:
+        engine = create_async_engine(generation_database.url, poolclass=NullPool)
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        translated_engine = engine.execution_options(
+            schema_translate_map={"tenant": tenant_schema_name(tenant_id)}
+        )
+        translated_factory = async_sessionmaker(
+            translated_engine,
+            expire_on_commit=False,
+        )
+        try:
+            await _insert_active_tenants(engine, (tenant_id,))
+            await _insert_queued_job(
+                engine,
+                tenant_id=tenant_id,
+                job_id=job_id,
+                priority="teacher",
+                job_kind=job_kind,
+                phase=phase,
+                export_format=export_format,
+                slot_pool=slot_pool,
+            )
+            scheduler = FairScheduler(engine)
+            await scheduler.ensure_slots(
+                [tenant_id],
+                worker_pool_ref="shared-generation",
+                slot_pool=slot_pool,
+                global_limit=1,
+                tenant_limit=1,
+            )
+            async with translated_factory() as session:
+                async with session.begin():
+                    await session.execute(
+                        update(GenerationJob)
+                        .where(
+                            GenerationJob.id == job_id,
+                            GenerationJob.tenant_id == tenant_id,
+                        )
+                        .values(**job_update)
+                    )
+
+            fact_key = f"{tenant_id}/{job_id}/{phase}/1"
+            running_shard = metric_rollup_shard(
+                fact_key,
+                "generation_jobs_total",
+                "running",
+            )
+            queue_shard = metric_rollup_shard(
+                fact_key,
+                "generation_queue_seconds",
+                "",
+            )
+            async with session_factory() as session:
+                running_before = await _metric_counter_total(
+                    session,
+                    category="running",
+                    shard=running_shard,
+                )
+                queue_before = await _queue_histogram_totals(
+                    session,
+                    shard=queue_shard,
+                )
+
+            with pytest.raises(
+                SchedulerClaimConflict,
+                match="tenant job shape no longer matches queue projection",
+            ):
+                await scheduler.claim(
+                    slot_pool,
+                    data_plane_route_id="shared-primary",
+                    provider_profile_id="platform-default",
+                    worker_pool_ref="shared-generation",
+                    queue_ref="openmaic.shared",
+                    worker_id=f"claim-drift-{case}-worker",
+                    lease_seconds=60,
+                )
+
+            async with translated_factory() as session:
+                job = await session.get(GenerationJob, job_id)
+                queue = await session.get(GenerationQueue, (tenant_id, job_id))
+                claimed_slots = await session.scalar(
+                    select(func.count())
+                    .select_from(GenerationSlot)
+                    .where(
+                        GenerationSlot.claimed_tenant_id == tenant_id,
+                        GenerationSlot.claimed_job_id == job_id,
+                    )
+                )
+                state = await session.get(
+                    TenantSchedulerState,
+                    (tenant_id, "shared-generation", slot_pool),
+                )
+                assert job is not None and job.status == "queued"
+                assert job.attempt_count == 0 and job.lease_token is None
+                assert queue is not None and queue.status == "queued"
+                assert queue.lease_token is None
+                assert claimed_slots == 0
+                assert state is not None and state.last_dispatched_at is None
+                assert (
+                    await _metric_counter_total(
+                        session,
+                        category="running",
+                        shard=running_shard,
+                    )
+                    == running_before
+                )
+                assert await _queue_histogram_totals(session, shard=queue_shard) == queue_before
         finally:
             await engine.dispose()
 

@@ -9,11 +9,17 @@ from typing import Literal
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
+from deeptutor.teaching.metrics import LEARNING_EVENT_TYPES
 from deeptutor.teaching.models import (
     LearningEvent,
     LearningEventQuarantine,
     LearningProjectionQueueItem,
     LearningSession,
+)
+from deeptutor.teaching.repositories.metric_rollups import (
+    CounterRollupObservation,
+    increment_counter_rollup,
+    insert_learning_projection_backlog,
 )
 from deeptutor.teaching.schema_names import tenant_schema_name
 
@@ -54,6 +60,8 @@ class LearningEventAppend:
         }
         if any(not value.strip() for value in required.values()):
             raise ValueError("learning event identifiers must not be blank")
+        if self.event_type not in LEARNING_EVENT_TYPES:
+            raise ValueError("learning event type is unsupported")
         if self.occurred_at.tzinfo is None or self.occurred_at.utcoffset() is None:
             raise ValueError("occurred_at must be timezone-aware")
         if not isinstance(self.payload, dict):
@@ -89,15 +97,13 @@ class SqlAlchemyLearningEventRepository:
         self,
         database_session: AsyncSession,
         event: LearningEventAppend,
+        *,
+        counter_observations: list[CounterRollupObservation] | None = None,
     ) -> LearningEventAppendResult:
         """Append inside a transaction owned by the caller."""
         if event.tenant_id != self._tenant_id:
             raise LearningEventBindingError("learning event tenant does not match repository")
 
-        await database_session.execute(
-            text("SELECT pg_advisory_xact_lock(hashtextextended(:event_id, 0))"),
-            {"event_id": event.event_id},
-        )
         learning_session = await database_session.scalar(
             select(LearningSession)
             .where(
@@ -105,6 +111,10 @@ class SqlAlchemyLearningEventRepository:
                 LearningSession.tenant_id == self._tenant_id,
             )
             .with_for_update()
+        )
+        await database_session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:event_id, 0))"),
+            {"event_id": event.event_id},
         )
         if learning_session is None:
             raise LearningSessionUnavailable("learning session is unavailable")
@@ -181,6 +191,28 @@ class SqlAlchemyLearningEventRepository:
             )
         )
         await database_session.flush()
+        await insert_learning_projection_backlog(
+            database_session,
+            tenant_id=self._tenant_id,
+            event_id=stored.event_id,
+            received_at=stored.received_at,
+        )
+        counter_observation = CounterRollupObservation(
+            metric="learning_events_total",
+            category=stored.event_type,
+            fact_key=stored.event_id,
+            amount=1,
+        )
+        if counter_observations is None:
+            await increment_counter_rollup(
+                database_session,
+                metric=counter_observation.metric,
+                category=counter_observation.category,
+                fact_key=counter_observation.fact_key,
+                amount=counter_observation.amount,
+            )
+        else:
+            counter_observations.append(counter_observation)
         return LearningEventAppendResult(
             event_id=event.event_id,
             outcome="accepted",

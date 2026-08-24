@@ -32,9 +32,7 @@ def _engine_result() -> dict[str, object]:
         "classroomId": document["classroom_id"],
         "classroomDocument": document,
         "classroomDocumentSha256": document_sha,
-        "mediaManifestSha256": hashlib.sha256(
-            _canonical(document["media_manifest"])
-        ).hexdigest(),
+        "mediaManifestSha256": hashlib.sha256(_canonical(document["media_manifest"])).hexdigest(),
         "artifacts": [
             {
                 "relativePath": "classroom.json",
@@ -49,9 +47,7 @@ def _engine_result() -> dict[str, object]:
                 "sha256": media["sha256"],
                 "bytes": media["size_bytes"],
                 "mime": media["mime_type"],
-                "downloadPath": (
-                    "/api/yfeistai/v1/artifacts/job-1/" + media["relative_path"]
-                ),
+                "downloadPath": ("/api/yfeistai/v1/artifacts/job-1/" + media["relative_path"]),
                 "expiresAt": "2030-07-30T09:00:00Z",
             },
         ],
@@ -211,6 +207,75 @@ def test_bad_output_is_rejected_before_promotion(mutator, code: str) -> None:
             result_payload=result,
         )
     assert caught.value.code == code
+
+
+@pytest.mark.parametrize(
+    ("mutator", "reason"),
+    (
+        (lambda result: result.update(artifacts=[]), "missing_artifact"),
+        (
+            lambda result: result["artifacts"][0].update(bytes=512 * 1024 * 1024 + 1),
+            "size_mismatch",
+        ),
+    ),
+)
+def test_output_artifact_shape_exposes_only_fixed_metric_reason(mutator, reason: str) -> None:
+    from deeptutor.teaching.artifact_validation import (
+        ArtifactValidationError,
+        validate_generation_result,
+    )
+
+    result = _engine_result()
+    mutator(result)
+
+    with pytest.raises(ArtifactValidationError) as caught:
+        validate_generation_result(
+            tenant_id="tenant-1",
+            job_id="job-1",
+            request_payload=valid_content_generation_request(),
+            result_payload=result,
+        )
+
+    assert caught.value.metric_reason == reason
+
+
+@pytest.mark.parametrize(
+    ("case", "code", "reason"),
+    (
+        ("policy", "policy_denied", None),
+        ("receipt", "media_invalid", "receipt_mismatch"),
+        ("hash", "hash_invalid", "hash_mismatch"),
+    ),
+)
+def test_media_validation_separates_policy_receipt_and_hash_metrics(
+    case: str,
+    code: str,
+    reason: str | None,
+) -> None:
+    from deeptutor.teaching.artifact_validation import (
+        ArtifactValidationError,
+        validate_generation_result,
+    )
+
+    request = valid_content_generation_request()
+    result = _engine_result()
+    if case == "policy":
+        request["teaching_brief"]["media_policy"]["allowed_mime_types"] = ["image/png"]
+    elif case == "receipt":
+        result["artifacts"][1]["mime"] = "application/pdf"
+    else:
+        result["artifacts"][1]["sha256"] = "b" * 64
+
+    with pytest.raises(ArtifactValidationError) as caught:
+        validate_generation_result(
+            tenant_id="tenant-1",
+            job_id="job-1",
+            request_payload=request,
+            result_payload=result,
+        )
+
+    assert caught.value.code == code
+    assert caught.value.metric_reason == reason
 
 
 def test_protocol_relative_network_resource_is_denied_by_policy() -> None:

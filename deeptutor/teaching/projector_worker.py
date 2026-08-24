@@ -32,11 +32,14 @@ from deeptutor.teaching.projectors.mastery import (
     QuizEvaluation,
 )
 from deeptutor.teaching.projectors.progress import ProgressState, project_progress
+from deeptutor.teaching.repositories.metric_rollups import (
+    delete_learning_projection_backlog,
+)
 from deeptutor.teaching.schema_names import tenant_schema_name
 from deeptutor.teaching.services.classroom_content import ClassroomContentUnavailable
 
 _FINAL_QUEUE_STATUSES = ("completed", "quarantined")
-_MINIMUM_SCHEMA_REVISION = "20260810_0016"
+_MINIMUM_SCHEMA_REVISION = "20260825_0019"
 
 
 class ProjectionLeaseLost(RuntimeError):
@@ -351,6 +354,11 @@ class SqlAlchemyProjectionQueueRepository:
             item.status = "quarantined"
             item.last_error_code = "projection_attempts_exhausted"
             _clear_lease(item)
+            await delete_learning_projection_backlog(
+                session,
+                tenant_id=stored_event.tenant_id,
+                event_id=stored_event.event_id,
+            )
 
     async def claim(
         self,
@@ -530,6 +538,11 @@ class SqlAlchemyProjectionQueueRepository:
                 item.status = "completed"
                 item.last_error_code = None
                 _clear_lease(item)
+                await delete_learning_projection_backlog(
+                    session,
+                    tenant_id=claim.event.tenant_id,
+                    event_id=claim.event.event_id,
+                )
 
     async def _apply_projection(
         self,
@@ -630,10 +643,15 @@ class SqlAlchemyProjectionQueueRepository:
         session_factory = self._tenant_sessions(claim.event.tenant_id)
         async with session_factory() as session:
             async with session.begin():
-                item, _event = await self._locked_claim(session, claim)
+                item, event = await self._locked_claim(session, claim)
                 item.status = "completed"
                 item.last_error_code = None
                 _clear_lease(item)
+                await delete_learning_projection_backlog(
+                    session,
+                    tenant_id=event.tenant_id,
+                    event_id=event.event_id,
+                )
 
     async def quarantine(self, claim: ProjectionClaim, *, reason_code: str) -> None:
         session_factory = self._tenant_sessions(claim.event.tenant_id)
@@ -644,6 +662,11 @@ class SqlAlchemyProjectionQueueRepository:
                 item.status = "quarantined"
                 item.last_error_code = reason_code
                 _clear_lease(item)
+                await delete_learning_projection_backlog(
+                    session,
+                    tenant_id=event.tenant_id,
+                    event_id=event.event_id,
+                )
 
     async def retry(self, claim: ProjectionClaim, *, error_code: str) -> None:
         session_factory = self._tenant_sessions(claim.event.tenant_id)
@@ -656,6 +679,11 @@ class SqlAlchemyProjectionQueueRepository:
                     item.status = "quarantined"
                     item.last_error_code = reason
                     _clear_lease(item)
+                    await delete_learning_projection_backlog(
+                        session,
+                        tenant_id=event.tenant_id,
+                        event_id=event.event_id,
+                    )
                     return
                 now = await session.scalar(select(func.clock_timestamp()))
                 delay_seconds = min(60, 2 ** min(item.attempt_count, 6))

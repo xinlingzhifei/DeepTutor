@@ -8,9 +8,9 @@ import json
 from typing import Any
 
 import pytest
-from sqlalchemy import delete, event, func, select, update
+from sqlalchemy import delete, event, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -25,9 +25,14 @@ from deeptutor.teaching.contracts import (
     canonical_json_bytes,
     canonical_outline_sha256,
 )
-from deeptutor.teaching.dispatcher import OutboxDispatcher
+from deeptutor.teaching.dispatcher import OutboxDispatchConflict, OutboxDispatcher
 from deeptutor.teaching.job_route_binding import DataPlaneBindingUnavailable
-from deeptutor.teaching.models import DataPlaneRoute, ProviderProfile, Tenant
+from deeptutor.teaching.models import (
+    DataPlaneRoute,
+    ProviderProfile,
+    TeachingMetricCounterRollup,
+    Tenant,
+)
 from deeptutor.teaching.models.classrooms import (
     BatchItem,
     BatchJob,
@@ -40,6 +45,7 @@ from deeptutor.teaching.models.jobs import (
     GenerationQueue,
     GenerationSlot,
     OutboxMessage,
+    TenantSchedulerState,
 )
 from deeptutor.teaching.models.tenant import Course, TeachingClass
 from deeptutor.teaching.permissions import permissions_for_roles
@@ -50,6 +56,7 @@ from deeptutor.teaching.repositories.jobs import (
     IdempotencyConflict,
     SqlAlchemyGenerationJobRepository,
 )
+from deeptutor.teaching.repositories.metric_rollups import metric_rollup_shard
 from deeptutor.teaching.schema_names import tenant_schema_name
 from deeptutor.teaching.services.batches import (
     BatchPersistenceError,
@@ -134,6 +141,19 @@ async def _insert_active_tenant(engine, tenant_id: str) -> None:
                 )
                 .on_conflict_do_nothing(index_elements=[DataPlaneRoute.id])
             )
+
+
+async def _queued_metric_total(session, shard: int) -> int:
+    return int(
+        await session.scalar(
+            select(func.coalesce(TeachingMetricCounterRollup.total, 0)).where(
+                TeachingMetricCounterRollup.metric == "generation_jobs_total",
+                TeachingMetricCounterRollup.category == "queued",
+                TeachingMetricCounterRollup.shard == shard,
+            )
+        )
+        or 0
+    )
 
 
 def test_job_quota_and_platform_outbox_roll_back_as_one_postgres_transaction(
@@ -328,6 +348,21 @@ def test_skip_locked_dispatch_is_concurrent_and_queue_insertion_is_idempotent(
                 )
             session_factory = async_sessionmaker(engine, expire_on_commit=False)
             async with session_factory() as session:
+                message = await session.scalar(
+                    select(OutboxMessage).where(
+                        OutboxMessage.tenant_id == tenant_id,
+                        OutboxMessage.job_id == job_id,
+                        OutboxMessage.phase == "outline",
+                    )
+                )
+                assert message is not None
+                queued_shard = metric_rollup_shard(
+                    message.event_id,
+                    "generation_jobs_total",
+                    "queued",
+                )
+                queued_before = await _queued_metric_total(session, queued_shard)
+            async with session_factory() as session:
                 async with session.begin():
                     await session.execute(
                         update(Tenant).where(Tenant.id == tenant_id).values(status="disabled")
@@ -371,6 +406,10 @@ def test_skip_locked_dispatch_is_concurrent_and_queue_insertion_is_idempotent(
                         .values(delivered_at=None)
                     )
 
+            async with session_factory() as session:
+                queued_after_first = await _queued_metric_total(session, queued_shard)
+                assert queued_after_first == queued_before + 1
+
             retried = await OutboxDispatcher(engine).dispatch_next()
             assert retried is not None
             async with session_factory() as session:
@@ -383,8 +422,276 @@ def test_skip_locked_dispatch_is_concurrent_and_queue_insertion_is_idempotent(
                     )
                 )
                 assert queue_count == 1
+                queued_after_repair = await _queued_metric_total(session, queued_shard)
+                assert queued_after_repair == queued_after_first
             job = await repository.get_job(tenant_id, job_id)
             assert job is not None and job.status == "queued"
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_dispatch_metric_rollup_failure_rolls_back_the_entire_queue_transition(
+    generation_database: Any,
+) -> None:
+    tenant_id = "dispatch-metric-rollback-tenant"
+    job_id = "dispatch-metric-rollback-job"
+    generation_database.migrate_tenant(tenant_id)
+
+    async def scenario() -> None:
+        engine = create_async_engine(generation_database.url, poolclass=NullPool)
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        translated_engine = engine.execution_options(
+            schema_translate_map={"tenant": tenant_schema_name(tenant_id)}
+        )
+        tenant_sessions = async_sessionmaker(translated_engine, expire_on_commit=False)
+        try:
+            await _insert_active_tenant(engine, tenant_id)
+            repository = SqlAlchemyGenerationJobRepository(engine)
+            await repository.grant_quota(
+                tenant_id,
+                grant_id="grant-dispatch-metric-rollback",
+                units=10,
+            )
+            await repository.create_job_and_reserve(_request(tenant_id, job_id))
+            async with session_factory() as session:
+                async with session.begin():
+                    message = await session.scalar(
+                        select(OutboxMessage).where(
+                            OutboxMessage.tenant_id == tenant_id,
+                            OutboxMessage.job_id == job_id,
+                        )
+                    )
+                    assert message is not None
+                    queued_shard = metric_rollup_shard(
+                        message.event_id,
+                        "generation_jobs_total",
+                        "queued",
+                    )
+                    queued_before = await _queued_metric_total(session, queued_shard)
+                    await session.execute(
+                        text(
+                            """
+                            CREATE FUNCTION platform.fail_dispatcher_queued_metric()
+                            RETURNS trigger
+                            LANGUAGE plpgsql
+                            AS $$
+                            BEGIN
+                                IF NEW.metric = 'generation_jobs_total'
+                                   AND NEW.category = 'queued' THEN
+                                    RAISE EXCEPTION
+                                        'injected dispatcher metric rollup failure';
+                                END IF;
+                                RETURN NEW;
+                            END;
+                            $$
+                            """
+                        )
+                    )
+                    await session.execute(
+                        text(
+                            """
+                            CREATE TRIGGER fail_dispatcher_queued_metric
+                            BEFORE INSERT OR UPDATE
+                            ON platform.teaching_metric_counter_rollups
+                            FOR EACH ROW
+                            EXECUTE FUNCTION platform.fail_dispatcher_queued_metric()
+                            """
+                        )
+                    )
+
+            try:
+                with pytest.raises(DBAPIError) as caught:
+                    await OutboxDispatcher(engine).dispatch_next()
+                assert "injected dispatcher metric rollup failure" in str(caught.value.orig)
+            finally:
+                async with session_factory() as session:
+                    async with session.begin():
+                        await session.execute(
+                            text(
+                                """
+                                DROP TRIGGER fail_dispatcher_queued_metric
+                                ON platform.teaching_metric_counter_rollups
+                                """
+                            )
+                        )
+                        await session.execute(
+                            text(
+                                """
+                                DROP FUNCTION platform.fail_dispatcher_queued_metric()
+                                """
+                            )
+                        )
+
+            async with tenant_sessions() as session:
+                job = await session.get(GenerationJob, job_id)
+                assert job is not None and job.status == "quota_reserved"
+            async with session_factory() as session:
+                message = await session.scalar(
+                    select(OutboxMessage).where(
+                        OutboxMessage.tenant_id == tenant_id,
+                        OutboxMessage.job_id == job_id,
+                    )
+                )
+                assert message is not None and message.delivered_at is None
+                assert await session.get(GenerationQueue, (tenant_id, job_id)) is None
+                assert (
+                    await session.get(
+                        TenantSchedulerState,
+                        (tenant_id, "shared-generation", "generation"),
+                    )
+                    is None
+                )
+                assert await _queued_metric_total(session, queued_shard) == queued_before
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_dispatch_uses_the_tenant_job_priority_instead_of_the_outbox_copy(
+    generation_database: Any,
+) -> None:
+    tenant_id = "authoritative-priority-tenant"
+    job_id = "authoritative-priority-job"
+    generation_database.migrate_tenant(tenant_id)
+
+    async def scenario() -> None:
+        engine = create_async_engine(generation_database.url, poolclass=NullPool)
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            await _insert_active_tenant(engine, tenant_id)
+            repository = SqlAlchemyGenerationJobRepository(engine)
+            await repository.grant_quota(
+                tenant_id,
+                grant_id="grant-authoritative-priority",
+                units=10,
+            )
+            await repository.create_job_and_reserve(_request(tenant_id, job_id))
+            async with session_factory() as session:
+                async with session.begin():
+                    await session.execute(
+                        update(OutboxMessage)
+                        .where(
+                            OutboxMessage.tenant_id == tenant_id,
+                            OutboxMessage.job_id == job_id,
+                        )
+                        .values(priority=0)
+                    )
+
+            assert await OutboxDispatcher(engine).dispatch_next() is not None
+
+            async with session_factory() as session:
+                queue = await session.get(GenerationQueue, (tenant_id, job_id))
+                assert queue is not None
+                assert queue.priority == 300
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_dispatch_rejects_a_slot_pool_that_disagrees_with_the_tenant_job_shape(
+    generation_database: Any,
+) -> None:
+    tenant_id = "slot-pool-drift-tenant"
+    job_id = "slot-pool-drift-job"
+    generation_database.migrate_tenant(tenant_id)
+
+    async def scenario() -> None:
+        engine = create_async_engine(generation_database.url, poolclass=NullPool)
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        translated_engine = engine.execution_options(
+            schema_translate_map={"tenant": tenant_schema_name(tenant_id)}
+        )
+        tenant_sessions = async_sessionmaker(translated_engine, expire_on_commit=False)
+        try:
+            await _insert_active_tenant(engine, tenant_id)
+            repository = SqlAlchemyGenerationJobRepository(engine)
+            await repository.grant_quota(
+                tenant_id,
+                grant_id="grant-slot-pool-drift",
+                units=10,
+            )
+            await repository.create_job_and_reserve(_request(tenant_id, job_id))
+            async with session_factory() as session:
+                async with session.begin():
+                    await session.execute(
+                        update(OutboxMessage)
+                        .where(
+                            OutboxMessage.tenant_id == tenant_id,
+                            OutboxMessage.job_id == job_id,
+                        )
+                        .values(slot_pool="mp4_export")
+                    )
+
+            with pytest.raises(OutboxDispatchConflict):
+                await OutboxDispatcher(engine).dispatch_next()
+
+            async with tenant_sessions() as session:
+                job = await session.get(GenerationJob, job_id)
+                assert job is not None and job.status == "quota_reserved"
+            async with session_factory() as session:
+                message = await session.scalar(
+                    select(OutboxMessage).where(
+                        OutboxMessage.tenant_id == tenant_id,
+                        OutboxMessage.job_id == job_id,
+                    )
+                )
+                assert message is not None and message.delivered_at is None
+                assert await session.get(GenerationQueue, (tenant_id, job_id)) is None
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_already_queued_repair_rejects_a_drifted_slot_pool(
+    generation_database: Any,
+) -> None:
+    tenant_id = "queued-slot-pool-drift-tenant"
+    job_id = "queued-slot-pool-drift-job"
+    generation_database.migrate_tenant(tenant_id)
+
+    async def scenario() -> None:
+        engine = create_async_engine(generation_database.url, poolclass=NullPool)
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            await _insert_active_tenant(engine, tenant_id)
+            repository = SqlAlchemyGenerationJobRepository(engine)
+            await repository.grant_quota(
+                tenant_id,
+                grant_id="grant-queued-slot-pool-drift",
+                units=10,
+            )
+            await repository.create_job_and_reserve(_request(tenant_id, job_id))
+            assert await OutboxDispatcher(engine).dispatch_next() is not None
+            async with session_factory() as session:
+                async with session.begin():
+                    await session.execute(
+                        update(OutboxMessage)
+                        .where(
+                            OutboxMessage.tenant_id == tenant_id,
+                            OutboxMessage.job_id == job_id,
+                        )
+                        .values(delivered_at=None, slot_pool="mp4_export")
+                    )
+
+            with pytest.raises(OutboxDispatchConflict):
+                await OutboxDispatcher(engine).dispatch_next()
+
+            async with session_factory() as session:
+                queue = await session.get(GenerationQueue, (tenant_id, job_id))
+                assert queue is not None
+                assert queue.slot_pool == "generation"
+                message = await session.scalar(
+                    select(OutboxMessage).where(
+                        OutboxMessage.tenant_id == tenant_id,
+                        OutboxMessage.job_id == job_id,
+                    )
+                )
+                assert message is not None and message.delivered_at is None
         finally:
             await engine.dispose()
 
@@ -422,6 +729,15 @@ def test_cancel_retires_outbox_and_dispatcher_consumes_terminal_stale_event(
                     )
                 )
                 assert message is not None and message.delivered_at is not None
+                queued_shard = metric_rollup_shard(
+                    message.event_id,
+                    "generation_jobs_total",
+                    "queued",
+                )
+                queued_before_terminal_repair = await _queued_metric_total(
+                    session,
+                    queued_shard,
+                )
                 assert (
                     await session.scalar(
                         select(GenerationQueue).where(
@@ -455,6 +771,10 @@ def test_cancel_retires_outbox_and_dispatcher_consumes_terminal_stale_event(
                 )
                 assert message is not None and message.delivered_at is not None
                 assert (
+                    await _queued_metric_total(session, queued_shard)
+                    == queued_before_terminal_repair
+                )
+                assert (
                     await session.scalar(
                         select(GenerationQueue).where(
                             GenerationQueue.tenant_id == tenant_id,
@@ -463,6 +783,128 @@ def test_cancel_retires_outbox_and_dispatcher_consumes_terminal_stale_event(
                     )
                     is None
                 )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_terminal_stale_outbox_is_not_retired_when_its_job_binding_drifted(
+    generation_database: Any,
+) -> None:
+    tenant_id = "terminal-binding-drift-tenant"
+    job_id = "terminal-binding-drift-job"
+    generation_database.migrate_tenant(tenant_id)
+
+    async def scenario() -> None:
+        engine = create_async_engine(generation_database.url, poolclass=NullPool)
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            await _insert_active_tenant(engine, tenant_id)
+            repository = SqlAlchemyGenerationJobRepository(engine)
+            await repository.grant_quota(
+                tenant_id,
+                grant_id="grant-terminal-binding-drift",
+                units=10,
+            )
+            await repository.create_job_and_reserve(_request(tenant_id, job_id))
+            cancellation = await repository.request_cancel(tenant_id, job_id)
+            assert cancellation is not None and not cancellation.running
+            async with session_factory() as session:
+                async with session.begin():
+                    await session.execute(
+                        update(OutboxMessage)
+                        .where(
+                            OutboxMessage.tenant_id == tenant_id,
+                            OutboxMessage.job_id == job_id,
+                        )
+                        .values(
+                            delivered_at=None,
+                            worker_pool_ref="drifted-worker-pool",
+                        )
+                    )
+
+            with pytest.raises(OutboxDispatchConflict):
+                await OutboxDispatcher(engine).dispatch_next()
+
+            async with session_factory() as session:
+                message = await session.scalar(
+                    select(OutboxMessage).where(
+                        OutboxMessage.tenant_id == tenant_id,
+                        OutboxMessage.job_id == job_id,
+                    )
+                )
+                assert message is not None and message.delivered_at is None
+                assert await session.get(GenerationQueue, (tenant_id, job_id)) is None
+        finally:
+            await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_dispatch_conflict_does_not_record_a_queued_lifecycle_entry(
+    generation_database: Any,
+) -> None:
+    tenant_id = "dispatch-conflict-tenant"
+    job_id = "dispatch-conflict-job"
+    generation_database.migrate_tenant(tenant_id)
+
+    async def scenario() -> None:
+        engine = create_async_engine(generation_database.url, poolclass=NullPool)
+        session_factory = async_sessionmaker(engine, expire_on_commit=False)
+        translated_engine = engine.execution_options(
+            schema_translate_map={"tenant": tenant_schema_name(tenant_id)}
+        )
+        tenant_sessions = async_sessionmaker(translated_engine, expire_on_commit=False)
+        try:
+            await _insert_active_tenant(engine, tenant_id)
+            repository = SqlAlchemyGenerationJobRepository(engine)
+            await repository.grant_quota(
+                tenant_id,
+                grant_id="grant-dispatch-conflict",
+                units=10,
+            )
+            await repository.create_job_and_reserve(_request(tenant_id, job_id))
+            async with tenant_sessions() as session:
+                async with session.begin():
+                    job = await session.scalar(
+                        select(GenerationJob)
+                        .where(
+                            GenerationJob.tenant_id == tenant_id,
+                            GenerationJob.id == job_id,
+                        )
+                        .with_for_update()
+                    )
+                    assert job is not None
+                    job.worker_pool_ref = "mismatched-worker-pool"
+
+            async with session_factory() as session:
+                message = await session.scalar(
+                    select(OutboxMessage).where(
+                        OutboxMessage.tenant_id == tenant_id,
+                        OutboxMessage.job_id == job_id,
+                    )
+                )
+                assert message is not None
+                queued_shard = metric_rollup_shard(
+                    message.event_id,
+                    "generation_jobs_total",
+                    "queued",
+                )
+                queued_before = await _queued_metric_total(session, queued_shard)
+
+            with pytest.raises(OutboxDispatchConflict):
+                await OutboxDispatcher(engine).dispatch_next()
+
+            async with session_factory() as session:
+                assert await _queued_metric_total(session, queued_shard) == queued_before
+                message = await session.scalar(
+                    select(OutboxMessage).where(
+                        OutboxMessage.tenant_id == tenant_id,
+                        OutboxMessage.job_id == job_id,
+                    )
+                )
+                assert message is not None and message.delivered_at is None
         finally:
             await engine.dispose()
 
@@ -616,10 +1058,13 @@ def test_rejected_batch_jobs_are_terminal_replayable_and_tenant_bound(
             assert projected.items[0].resource_class_id == "class-a"
             access = BatchService(batch_repository, object(), object())
             assert await access.get(context, batch_id) is not None
-            assert await access.get(
-                replace(context, permissions=frozenset()),
-                batch_id,
-            ) is None
+            assert (
+                await access.get(
+                    replace(context, permissions=frozenset()),
+                    batch_id,
+                )
+                is None
+            )
             assert await jobs.rejected_input(context, job_id=first_job_id) == request
 
             with pytest.raises(BatchPersistenceError, match="unavailable"):
@@ -999,8 +1444,7 @@ def test_batch_reconciliation_requires_confirmed_content_binding_and_read_is_cle
                 ("item-b", "awaiting_confirmation"),
             )
             assert {
-                (item.resource_course_id, item.resource_class_id)
-                for item in recovered.items
+                (item.resource_course_id, item.resource_class_id) for item in recovered.items
             } == {("course-a", "class-a")}
             async with session_factory() as session:
                 async with session.begin():
@@ -1089,9 +1533,7 @@ def test_batch_reconciliation_requires_confirmed_content_binding_and_read_is_cle
                 if "batch_jobs" in statement and "for update" in statement
             )
             assert locked_batch_queries
-            assert all(
-                "batch_jobs.id =" in statement for statement in locked_batch_queries
-            )
+            assert all("batch_jobs.id =" in statement for statement in locked_batch_queries)
             scope_projection_queries = tuple(
                 statement
                 for statement in read_statements
@@ -1170,9 +1612,7 @@ def test_locked_outline_confirmation_recovers_only_the_same_reviewed_payload(
         try:
             await _insert_active_tenant(engine, tenant_id)
             reviewed = OutlineBundle.model_validate(valid_outline_bundle()).model_copy(
-                update={
-                    "confirmation_metadata": OutlineConfirmationMetadata(status="draft")
-                }
+                update={"confirmation_metadata": OutlineConfirmationMetadata(status="draft")}
             )
             reviewed_sha256 = canonical_outline_sha256(reviewed)
             confirmed = reviewed.model_copy(
@@ -1342,9 +1782,7 @@ def test_locked_outline_confirmation_recovers_only_the_same_reviewed_payload(
             assert recovered.revision == reviewed_revision + 1
             assert recovered.confirmed_outline_sha256 == confirmed_sha256
 
-            tampered = confirmed.model_copy(
-                update={"title": "Tampered after durable confirmation"}
-            )
+            tampered = confirmed.model_copy(update={"title": "Tampered after durable confirmation"})
             tampered_payload = canonical_json_bytes(tampered).decode()
             tampered_sha256 = canonical_outline_sha256(tampered)
             async with session_factory() as session:

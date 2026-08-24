@@ -8,11 +8,13 @@ from sqlalchemy import (
     BigInteger,
     CheckConstraint,
     DateTime,
+    Float,
     ForeignKey,
     ForeignKeyConstraint,
     Index,
     Integer,
     MetaData,
+    SmallInteger,
     String,
     Text,
     UniqueConstraint,
@@ -297,6 +299,101 @@ class DataPlaneRoute(PlatformBase):
             "health_status",
         ),
     )
+
+
+class TeachingMetricCounterRollup(PlatformBase):
+    """Internally sharded absolute counters for the fixed public metric contract."""
+
+    __tablename__ = "teaching_metric_counter_rollups"
+
+    metric: Mapped[str] = mapped_column(String(64), primary_key=True)
+    category: Mapped[str] = mapped_column(String(64), primary_key=True)
+    shard: Mapped[int] = mapped_column(SmallInteger, primary_key=True)
+    total: Mapped[int] = mapped_column(BigInteger, server_default="0")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        CheckConstraint("shard BETWEEN 0 AND 15", name="shard"),
+        CheckConstraint("total >= 0", name="total"),
+        CheckConstraint(
+            "(metric = 'generation_jobs_total' "
+            "AND category IN ('queued', 'running', 'completed', 'failed', 'canceled')) "
+            "OR (metric = 'generation_retries_total' "
+            "AND category IN "
+            "('timeout', 'unavailable', 'lease_lost', 'rate_limited', 'unknown')) "
+            "OR (metric = 'quota_units_total' "
+            "AND category IN ('reserved', 'consumed', 'released')) "
+            "OR (metric = 'learning_events_total' "
+            "AND category IN "
+            "('classroom.started', 'scene.completed', 'quiz.graded', 'hint.used', "
+            "'pbl.milestone_completed', 'classroom.completed')) "
+            "OR (metric = 'artifact_validation_failures_total' "
+            "AND category IN "
+            "('schema_invalid', 'receipt_mismatch', 'hash_mismatch', 'size_mismatch', "
+            "'missing_artifact', 'unknown'))",
+            name="metric_category",
+        ),
+    )
+
+
+class TeachingMetricHistogramRollup(PlatformBase):
+    """Noncumulative fixed-bucket bins summed into public histograms at scrape time."""
+
+    __tablename__ = "teaching_metric_histogram_rollups"
+
+    metric: Mapped[str] = mapped_column(String(64), primary_key=True)
+    category: Mapped[str] = mapped_column(String(64), primary_key=True)
+    bucket: Mapped[str] = mapped_column(String(16), primary_key=True)
+    shard: Mapped[int] = mapped_column(SmallInteger, primary_key=True)
+    count: Mapped[int] = mapped_column(BigInteger, server_default="0")
+    sum_seconds: Mapped[float] = mapped_column(Float, server_default="0")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        CheckConstraint("shard BETWEEN 0 AND 15", name="shard"),
+        CheckConstraint("count >= 0", name="count"),
+        CheckConstraint(
+            "sum_seconds >= 0 AND sum_seconds < 'Infinity'::double precision",
+            name="sum_seconds",
+        ),
+        CheckConstraint(
+            "count > 0 OR sum_seconds = 0",
+            name="count_sum",
+        ),
+        CheckConstraint(
+            "(metric = 'generation_queue_seconds' AND category = '' "
+            "AND bucket IN "
+            "('0.1', '0.5', '1', '2', '5', '10', '30', '60', '120', '300', '+Inf')) "
+            "OR (metric = 'generation_stage_seconds' "
+            "AND category IN ('outline', 'content', 'export') "
+            "AND bucket IN "
+            "('0.5', '1', '2', '5', '10', '30', '60', '120', '300', '900', "
+            "'1800', '+Inf'))",
+            name="metric_category_bucket",
+        ),
+    )
+
+
+class TeachingLearningProjectionBacklog(PlatformBase):
+    """Platform mirror of current nonterminal tenant projection work."""
+
+    __tablename__ = "teaching_learning_projection_backlog"
+
+    tenant_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("platform.tenants.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    event_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (Index("ix_teaching_projection_backlog_received_at", "received_at"),)
 
 
 class TenantSchemaState(PlatformBase):

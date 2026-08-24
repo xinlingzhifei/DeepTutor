@@ -27,9 +27,7 @@ from deeptutor.teaching.contracts import (
 )
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
-_DOWNLOAD_PATH = re.compile(
-    r"^/api/yfeistai/v1/artifacts/(?P<job>[A-Za-z0-9._~-]+)/(?P<name>.+)$"
-)
+_DOWNLOAD_PATH = re.compile(r"^/api/yfeistai/v1/artifacts/(?P<job>[A-Za-z0-9._~-]+)/(?P<name>.+)$")
 _NETWORK_RESOURCE = re.compile(
     r"(?P<url>(?:(?:https?|wss?|file):\s*//|(?<!:)//)[^\s'\"<>]+)",
     re.IGNORECASE,
@@ -50,8 +48,9 @@ _EXPORT_ARTIFACT_BINDINGS = {
 class ArtifactValidationError(ValueError):
     """Stable validation failure safe to persist on a tenant job."""
 
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: str, *, metric_reason: str | None = None) -> None:
         self.code = code
+        self.metric_reason = metric_reason
         super().__init__(code)
 
 
@@ -155,12 +154,15 @@ def _parse_artifact(
         or _SHA256.fullmatch(sha256) is None
         or isinstance(size, bool)
         or not isinstance(size, int)
-        or size < 0
-        or size > _MAX_ARTIFACT_BYTES
         or not isinstance(content_type, str)
         or not isinstance(download_path, str)
     ):
         raise ArtifactValidationError("artifact_invalid")
+    if size < 0 or size > _MAX_ARTIFACT_BYTES:
+        raise ArtifactValidationError(
+            "artifact_invalid",
+            metric_reason="size_mismatch",
+        )
     if re.fullmatch(r"[^\s/]+/[^\s;/]+(?:\s*;\s*[^\r\n]+)?", content_type) is None:
         raise ArtifactValidationError("artifact_invalid")
     normalized_content_type = content_type.split(";", 1)[0].strip().lower()
@@ -173,7 +175,10 @@ def _parse_artifact(
         )
         entry.validate()
     except (ArtifactManifestError, ValueError):
-        raise ArtifactValidationError("media_invalid") from None
+        raise ArtifactValidationError(
+            "media_invalid",
+            metric_reason="receipt_mismatch",
+        ) from None
     parsed_path = urlsplit(download_path)
     match = _DOWNLOAD_PATH.fullmatch(download_path)
     if (
@@ -246,8 +251,10 @@ def _validate_dsl(document: ClassroomDocument) -> None:
 
 
 def _source_triple(value: object) -> tuple[str, str, str]:
-    raw = value.model_dump() if hasattr(value, "model_dump") else _required_mapping(
-        value, "source_invalid"
+    raw = (
+        value.model_dump()
+        if hasattr(value, "model_dump")
+        else _required_mapping(value, "source_invalid")
     )
     return (
         str(_field(raw, "citation_id", "citationId")),
@@ -292,9 +299,7 @@ def _validate_policy(document: ClassroomDocument, request: GenerationRequest) ->
             raw_url = re.sub(r"\s+", "", match.group("url"))
             if not policy.allow_web_access or raw_url.lower().startswith("file:"):
                 raise ArtifactValidationError("policy_denied")
-            parsed = urlsplit(
-                f"https:{raw_url}" if raw_url.startswith("//") else raw_url
-            )
+            parsed = urlsplit(f"https:{raw_url}" if raw_url.startswith("//") else raw_url)
             hostname = (parsed.hostname or "").lower()
             if not hostname or not any(
                 hostname == domain.lower()
@@ -326,19 +331,36 @@ def _validate_media(
         raise ArtifactValidationError("media_invalid")
     for media in document.media_manifest:
         artifact = artifacts_by_name.get(media.relative_path)
-        if (
-            artifact is None
-            or media.mime_type not in allowed_mimes
-            or artifact.content_type != media.mime_type
-            or artifact.sha256 != media.sha256
-            or artifact.size != media.size_bytes
-        ):
-            raise ArtifactValidationError("media_invalid")
+        if artifact is None:
+            raise ArtifactValidationError(
+                "media_invalid",
+                metric_reason="missing_artifact",
+            )
+        if media.mime_type not in allowed_mimes:
+            raise ArtifactValidationError("policy_denied")
+        if artifact.content_type != media.mime_type:
+            raise ArtifactValidationError(
+                "media_invalid",
+                metric_reason="receipt_mismatch",
+            )
+        if artifact.sha256 != media.sha256:
+            raise ArtifactValidationError(
+                "hash_invalid",
+                metric_reason="hash_mismatch",
+            )
+        if artifact.size != media.size_bytes:
+            raise ArtifactValidationError(
+                "media_invalid",
+                metric_reason="size_mismatch",
+            )
     declared_names = {"classroom.json", *(item.relative_path for item in document.media_manifest)}
     if set(artifacts_by_name) != declared_names:
         raise ArtifactValidationError("media_invalid")
     if sum(item.size for item in artifacts) > _MAX_TOTAL_BYTES:
-        raise ArtifactValidationError("media_invalid")
+        raise ArtifactValidationError(
+            "media_invalid",
+            metric_reason="size_mismatch",
+        )
     return media_sha256
 
 
@@ -375,15 +397,25 @@ def validate_generation_result(
         _field(result_payload, "classroom_document_sha256", "classroomDocumentSha256"),
     )
     raw_artifacts = _field(result_payload, "artifacts")
-    if not isinstance(raw_artifacts, list) or not raw_artifacts:
+    if not isinstance(raw_artifacts, list):
         raise ArtifactValidationError("artifact_invalid")
+    if not raw_artifacts:
+        raise ArtifactValidationError(
+            "artifact_invalid",
+            metric_reason="missing_artifact",
+        )
     artifacts = tuple(
         _parse_artifact(item, job_id=job_id, now=reference_time) for item in raw_artifacts
     )
     document_artifact = next(
         (item for item in artifacts if item.relative_name == "classroom.json"), None
     )
-    if document_artifact is None or document_artifact.sha256 != document_sha256:
+    if document_artifact is None:
+        raise ArtifactValidationError(
+            "hash_invalid",
+            metric_reason="missing_artifact",
+        )
+    if document_artifact.sha256 != document_sha256:
         raise ArtifactValidationError("hash_invalid")
     raw_media = _field(raw_document, "media_manifest", "mediaManifest")
     media_sha256 = _validate_media(
@@ -438,7 +470,10 @@ def validate_export_result(
         PurePosixPath(artifact.relative_name).suffix.lower() != expected_suffix
         or artifact.content_type != expected_content_type
     ):
-        raise ArtifactValidationError("artifact_invalid")
+        raise ArtifactValidationError(
+            "artifact_invalid",
+            metric_reason="receipt_mismatch",
+        )
     return ValidatedExportOutput(
         tenant_id=tenant_id,
         format=request.format.value,

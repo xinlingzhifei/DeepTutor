@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import asdict
 
-from fastapi import APIRouter, Depends, Response
+from fastapi import APIRouter, Depends, HTTPException, Response
 import httpx
 from prometheus_client import CONTENT_TYPE_LATEST
 
@@ -26,8 +27,12 @@ from deeptutor.teaching.health_probes import (
     RuntimeOpenMAICHealthClientFactory,
     SqlAlchemyMigrationHealthRepository,
 )
-from deeptutor.teaching.metrics import TeachingMetrics, get_teaching_metrics
+from deeptutor.teaching.metrics import TeachingMetrics
 from deeptutor.teaching.repositories.data_planes import SqlAlchemyDataPlaneRepository
+from deeptutor.teaching.repositories.metrics import (
+    SqlAlchemyTeachingMetricsRepository,
+    get_teaching_metrics_repository,
+)
 from deeptutor.teaching.repositories.runtime_heartbeats import (
     get_runtime_heartbeat_repository,
 )
@@ -122,7 +127,14 @@ async def teaching_health(
 
 
 @router.get("/internal/metrics", include_in_schema=False)
-def teaching_metrics(
-    metrics: TeachingMetrics = Depends(get_teaching_metrics),
+async def teaching_metrics(
+    repository: SqlAlchemyTeachingMetricsRepository = Depends(get_teaching_metrics_repository),
 ) -> Response:
-    return Response(content=metrics.render(), media_type=CONTENT_TYPE_LATEST)
+    try:
+        snapshot = await repository.fetch_snapshot()
+        content = TeachingMetrics().render(snapshot)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        raise HTTPException(status_code=503, detail="metrics_unavailable") from None
+    return Response(content=content, media_type=CONTENT_TYPE_LATEST)

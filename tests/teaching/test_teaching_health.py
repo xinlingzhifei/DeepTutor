@@ -4,7 +4,7 @@ import asyncio
 from datetime import datetime, timezone
 import inspect
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
@@ -221,9 +221,15 @@ def test_teaching_health_routes_register_only_for_enabled_platform() -> None:
     from deeptutor.api.main import _register_teaching_health_routes
     from deeptutor.api.routers import teaching_health
     from deeptutor.api.routers.teaching_health import get_active_health_probe_service
+    from deeptutor.teaching.metrics import TeachingMetricsSnapshot
+    from deeptutor.teaching.repositories.metrics import get_teaching_metrics_repository
     from deeptutor.teaching.repositories.runtime_heartbeats import (
         get_runtime_heartbeat_repository,
     )
+
+    class MetricsRepository:
+        async def fetch_snapshot(self):
+            return TeachingMetricsSnapshot()
 
     disabled = FastAPI()
     assert not _register_teaching_health_routes(disabled, enabled=False)
@@ -233,6 +239,7 @@ def test_teaching_health_routes_register_only_for_enabled_platform() -> None:
     enabled = FastAPI()
     assert _register_teaching_health_routes(enabled, enabled=True)
     assert "/api/v1/system/teaching-health" in enabled.openapi()["paths"]
+    enabled.dependency_overrides[get_teaching_metrics_repository] = MetricsRepository
     assert TestClient(enabled).get("/internal/metrics").status_code == 200
     routes = {
         route.path: route for route in teaching_health.router.routes if isinstance(route, APIRoute)
@@ -248,7 +255,70 @@ def test_teaching_health_routes_register_only_for_enabled_platform() -> None:
     assert get_runtime_heartbeat_repository in health_dependencies
     assert get_active_health_probe_service in health_dependencies
     assert require_platform_admin not in metrics_dependencies
+    assert get_teaching_metrics_repository in metrics_dependencies
     assert inspect.iscoroutinefunction(teaching_health.teaching_health)
+    assert inspect.iscoroutinefunction(teaching_health.teaching_metrics)
+
+
+@pytest.mark.asyncio
+async def test_internal_metrics_renders_one_durable_absolute_snapshot() -> None:
+    from prometheus_client import CONTENT_TYPE_LATEST
+
+    from deeptutor.api.routers.teaching_health import teaching_metrics
+    from deeptutor.teaching.metrics import (
+        CounterRollup,
+        GaugeValue,
+        TeachingMetricsSnapshot,
+    )
+
+    class Repository:
+        calls = 0
+
+        async def fetch_snapshot(self):
+            self.calls += 1
+            return TeachingMetricsSnapshot(
+                counters=(CounterRollup("generation_retries_total", "lease_lost", 9),),
+                gauges=(
+                    GaugeValue("openmaic_health", "shared", 1),
+                    GaugeValue("openmaic_health", "dedicated", 1),
+                ),
+            )
+
+    repository = Repository()
+    response = await teaching_metrics(repository)
+
+    assert repository.calls == 1
+    assert response.status_code == 200
+    assert response.media_type == CONTENT_TYPE_LATEST
+    assert b'yfeistai_generation_retries_total{reason="lease_lost"} 9.0' in response.body
+
+
+@pytest.mark.asyncio
+async def test_internal_metrics_database_or_snapshot_failure_returns_fixed_503() -> None:
+    from deeptutor.api.routers.teaching_health import teaching_metrics
+
+    class FailingRepository:
+        async def fetch_snapshot(self):
+            raise RuntimeError("postgresql://private-user:private-secret@private-host/db")
+
+    with pytest.raises(HTTPException) as raised:
+        await teaching_metrics(FailingRepository())
+
+    assert raised.value.status_code == 503
+    assert raised.value.detail == "metrics_unavailable"
+    assert "private" not in repr(raised.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_internal_metrics_external_cancellation_propagates() -> None:
+    from deeptutor.api.routers.teaching_health import teaching_metrics
+
+    class CancelledRepository:
+        async def fetch_snapshot(self):
+            raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await teaching_metrics(CancelledRepository())
 
 
 @pytest.mark.asyncio

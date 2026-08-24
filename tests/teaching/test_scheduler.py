@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy.dialects import postgresql
 
-from deeptutor.teaching.dispatcher import build_outbox_claim_statement
+from deeptutor.teaching import scheduler as scheduler_module
+from deeptutor.teaching.dispatcher import (
+    build_job_queue_transition_statement,
+    build_outbox_claim_statement,
+)
 from deeptutor.teaching.job_route_binding import (
     build_locked_job_binding_statement,
 )
@@ -15,6 +21,7 @@ from deeptutor.teaching.scheduler import (
     STANDARD_TENANT_SLOT_LIMIT,
     FairScheduler,
     build_tenant_claim_statement,
+    eligible_queue_wait_seconds,
     slot_pool_for,
 )
 
@@ -124,6 +131,70 @@ def test_outbox_and_tenant_claims_are_skip_locked() -> None:
     assert "tenants.status = 'active'" in tenant_sql
     assert "available_at <= now()" in outbox_sql
     assert "last_dispatched_at" in tenant_sql
+
+
+def test_dispatcher_first_queue_transition_excludes_already_queued_repairs() -> None:
+    transition_sql = str(build_job_queue_transition_statement("tenant-a"))
+
+    assert "status = 'quota_reserved'" in transition_sql
+    assert "status IN ('quota_reserved', 'queued')" not in transition_sql
+    for authoritative_column in (
+        "status",
+        "job_kind",
+        "phase",
+        "export_format",
+        "priority",
+        "data_plane_route_id",
+        "provider_profile_id",
+        "worker_pool_ref",
+        "queue_ref",
+    ):
+        assert authoritative_column in transition_sql.split("RETURNING", maxsplit=1)[1]
+
+
+def test_scheduler_queue_wait_measures_only_eligible_nonnegative_time() -> None:
+    now = datetime(2026, 8, 25, 4, 0, tzinfo=UTC)
+
+    assert eligible_queue_wait_seconds(now, now - timedelta(seconds=2.5)) == 2.5
+    assert eligible_queue_wait_seconds(now, now + timedelta(seconds=1)) == 0.0
+
+
+@pytest.mark.parametrize(
+    ("queue_shape", "job_shape"),
+    (
+        (
+            {
+                "job_kind": "generation",
+                "phase": "content",
+                "slot_pool": "generation",
+                "priority": 300,
+            },
+            {"job_kind": "generation", "phase": "content", "export_format": None, "priority": 500},
+        ),
+        (
+            {"job_kind": "export", "phase": "export", "slot_pool": "generation", "priority": 300},
+            {"job_kind": "export", "phase": "export", "export_format": "mp4", "priority": 300},
+        ),
+        (
+            {"job_kind": "export", "phase": "export", "slot_pool": "mp4_export", "priority": 300},
+            {"job_kind": "export", "phase": "export", "export_format": "pptx", "priority": 300},
+        ),
+    ),
+)
+def test_scheduler_rejects_queue_priority_or_slot_drift_before_claim_side_effects(
+    queue_shape: dict[str, object],
+    job_shape: dict[str, object],
+) -> None:
+    queue_job = SimpleNamespace(**queue_shape)
+
+    with pytest.raises(
+        scheduler_module.SchedulerClaimConflict,
+        match="tenant job shape no longer matches queue projection",
+    ):
+        scheduler_module._claimed_attempt_count(
+            queue_job,
+            {"attempt_count": 1, **job_shape},
+        )
 
 
 def test_job_binding_lock_is_complete_and_uses_database_rows_as_authority() -> None:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 import re
@@ -20,6 +20,10 @@ from deeptutor.teaching.models.jobs import (
     GenerationSlot,
     TenantSchedulerState,
 )
+from deeptutor.teaching.repositories.metric_rollups import (
+    increment_counter_rollup,
+    observe_histogram_rollup,
+)
 from deeptutor.teaching.schema_names import tenant_schema_name
 
 GENERATION_GLOBAL_SLOT_LIMIT = 20
@@ -32,6 +36,10 @@ PRIORITY_RANK = {
     "interaction": 400,
     "student_micro": 500,
 }
+
+
+class SchedulerClaimConflict(RuntimeError):
+    """The tenant job no longer matches its scheduling projection."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +78,40 @@ def slot_pool_for(job_kind: str, export_format: str | None) -> str:
     raise ValueError("job kind and export format are inconsistent")
 
 
+def eligible_queue_wait_seconds(now: datetime, available_at: datetime) -> float:
+    """Return time spent eligible for scheduling, excluding deliberate backoff."""
+
+    return max(0.0, (now - available_at).total_seconds())
+
+
+def _claimed_attempt_count(
+    queue_job: GenerationQueue,
+    claimed_job: Mapping[str, object],
+) -> int:
+    attempt_count = claimed_job.get("attempt_count")
+    job_kind = claimed_job.get("job_kind")
+    phase = claimed_job.get("phase")
+    export_format = claimed_job.get("export_format")
+    priority = claimed_job.get("priority")
+    try:
+        authoritative_slot_pool = slot_pool_for(
+            job_kind if isinstance(job_kind, str) else "",
+            export_format if isinstance(export_format, str) else None,
+        )
+    except ValueError:
+        authoritative_slot_pool = None
+    if (
+        isinstance(attempt_count, bool)
+        or not isinstance(attempt_count, int)
+        or job_kind != queue_job.job_kind
+        or phase != queue_job.phase
+        or priority != queue_job.priority
+        or authoritative_slot_pool != queue_job.slot_pool
+    ):
+        raise SchedulerClaimConflict("tenant job shape no longer matches queue projection")
+    return attempt_count
+
+
 def build_tenant_claim_statement(
     data_plane_route_id: str,
     provider_profile_id: str,
@@ -90,11 +132,7 @@ def build_tenant_claim_statement(
             GenerationQueue.slot_pool == slot_pool,
             GenerationQueue.status == "queued",
             GenerationQueue.available_at <= func.now(),
-            *(
-                (GenerationQueue.job_kind == job_kind,)
-                if job_kind is not None
-                else ()
-            ),
+            *((GenerationQueue.job_kind == job_kind,) if job_kind is not None else ()),
         )
     ).exists()
     available_tenant_slot = (
@@ -431,7 +469,11 @@ class FairScheduler:
                               AND cancel_requested = false
                               AND attempt_count < max_attempts
                               AND next_attempt_at <= :now
-                            RETURNING attempt_count
+                            RETURNING attempt_count,
+                                      job_kind,
+                                      phase,
+                                      export_format,
+                                      priority
                             """
                         ),
                         {
@@ -450,11 +492,12 @@ class FairScheduler:
                             "queue_ref": queue_ref,
                         },
                     )
-                    attempt_count = claimed_job.scalar_one_or_none()
-                    if attempt_count is None:
+                    claimed_shape = claimed_job.mappings().one_or_none()
+                    if claimed_shape is None:
                         await session.delete(queue_job)
                         await session.flush()
                         continue
+                    attempt_count = _claimed_attempt_count(queue_job, claimed_shape)
                     break
                 queue_job.status = "claimed"
                 queue_job.claimed_at = now
@@ -472,6 +515,23 @@ class FairScheduler:
                 tenant_state.last_dispatched_at = now
                 tenant_state.updated_at = now
                 await session.flush()
+                metric_fact_key = (
+                    f"{queue_job.tenant_id}/{queue_job.job_id}/{queue_job.phase}/{attempt_count}"
+                )
+                await increment_counter_rollup(
+                    session,
+                    metric="generation_jobs_total",
+                    category="running",
+                    fact_key=metric_fact_key,
+                    amount=1,
+                )
+                await observe_histogram_rollup(
+                    session,
+                    metric="generation_queue_seconds",
+                    category="",
+                    fact_key=metric_fact_key,
+                    seconds=eligible_queue_wait_seconds(now, queue_job.available_at),
+                )
                 return ClaimedGenerationJob(
                     tenant_id=queue_job.tenant_id,
                     job_id=queue_job.job_id,

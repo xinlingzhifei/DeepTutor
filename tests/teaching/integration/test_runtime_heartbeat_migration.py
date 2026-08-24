@@ -396,7 +396,7 @@ def test_runtime_heartbeat_migration_keeps_tenant_revision_in_sync(
         generation_database,
         schema_name,
         "upgrade",
-        "head",
+        "20260824_0018",
     )
     assert upgraded.returncode == 0, f"{upgraded.stdout}\n{upgraded.stderr}"
     assert asyncio.run(revisions()) == ("20260824_0018", "20260824_0018")

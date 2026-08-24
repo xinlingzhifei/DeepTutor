@@ -672,7 +672,7 @@ async def test_health_route_reads_the_durable_repository() -> None:
     assert "instance_id" not in repr(payload)
 
 
-def test_runtime_heartbeat_migration_is_the_declared_head() -> None:
+def test_runtime_heartbeat_migration_is_packaged_before_the_declared_head() -> None:
     from deeptutor.teaching.migrations.runner import TEACHING_MIGRATION_HEAD_REVISION
 
     root = Path(__file__).resolve().parents[2]
@@ -685,5 +685,5 @@ def test_runtime_heartbeat_migration_is_the_declared_head() -> None:
         / "20260824_0018_teaching_runtime_heartbeats.py"
     )
 
-    assert TEACHING_MIGRATION_HEAD_REVISION == "20260824_0018"
+    assert TEACHING_MIGRATION_HEAD_REVISION == "20260825_0019"
     assert migration.is_file()

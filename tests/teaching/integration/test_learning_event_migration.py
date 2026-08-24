@@ -11,10 +11,16 @@ import uuid
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.exc import DBAPIError
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 from sqlalchemy.schema import DropSchema
 
+from deeptutor.teaching.repositories.metric_rollups import (
+    CounterRollupObservation,
+    increment_counter_rollup,
+    increment_counter_rollups,
+)
 from deeptutor.teaching.schema_names import tenant_schema_name
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -93,6 +99,30 @@ async def _cleanup_tenant(engine, tenant_id: str, schema_name: str) -> None:
             text("DELETE FROM platform.tenants WHERE id = :tenant_id"),
             {"tenant_id": tenant_id},
         )
+
+
+async def _learning_event_counter_total(connection) -> int:
+    total = await connection.scalar(
+        text(
+            "SELECT coalesce(sum(total), 0) "
+            "FROM platform.teaching_metric_counter_rollups "
+            "WHERE metric = 'learning_events_total' "
+            "AND category = 'scene.completed'"
+        )
+    )
+    return int(total or 0)
+
+
+async def _backlog_event_ids(connection, tenant_id: str) -> list[str]:
+    return list(
+        await connection.scalars(
+            text(
+                "SELECT event_id FROM platform.teaching_learning_projection_backlog "
+                "WHERE tenant_id = :tenant_id ORDER BY event_id"
+            ),
+            {"tenant_id": tenant_id},
+        )
+    )
 
 
 async def _seed_learning_session(
@@ -401,9 +431,16 @@ async def test_repository_appends_idempotently_in_order_and_blocks_fact_downgrad
         )
         repository = repository_module.SqlAlchemyLearningEventRepository(engine, tenant_id)
 
+        async with engine.connect() as connection:
+            counter_before = await _learning_event_counter_total(connection)
+
         event_a = _event(repository_module, "event-a", tenant_id=tenant_id)
         first = await repository.append(event_a)
         duplicate = await repository.append(event_a)
+
+        async with engine.connect() as connection:
+            assert await _learning_event_counter_total(connection) == counter_before + 1
+            assert await _backlog_event_ids(connection, tenant_id) == ["event-a"]
 
         event_b = _event(repository_module, "event-b", tenant_id=tenant_id)
         second = await repository.append(event_b)
@@ -423,6 +460,42 @@ async def test_repository_appends_idempotently_in_order_and_blocks_fact_downgrad
         assert sorted(result.seq for result in concurrent) == [3, 4]
         assert await repository.count_events("session-1") == 4
         assert await repository.count_projection_items("session-1") == 4
+
+        async with engine.connect() as connection:
+            assert await _learning_event_counter_total(connection) == counter_before + 4
+            assert await _backlog_event_ids(connection, tenant_id) == [
+                "event-a",
+                "event-b",
+                "event-c",
+                "event-d",
+            ]
+
+        event_rolled_back = _event(
+            repository_module,
+            "event-rolled-back",
+            tenant_id=tenant_id,
+        )
+        with pytest.raises(RuntimeError, match="rollback probe"):
+            async with repository._session_factory() as database_session:
+                async with database_session.begin():
+                    await repository.append_in_session(database_session, event_rolled_back)
+                    raise RuntimeError("rollback probe")
+
+        async with engine.connect() as connection:
+            rolled_back_event = await connection.scalar(
+                text(
+                    f'SELECT event_id FROM "{schema_name}".learning_events '
+                    "WHERE event_id = 'event-rolled-back'"
+                )
+            )
+            assert rolled_back_event is None
+            assert await _learning_event_counter_total(connection) == counter_before + 4
+            assert await _backlog_event_ids(connection, tenant_id) == [
+                "event-a",
+                "event-b",
+                "event-c",
+                "event-d",
+            ]
 
         wrong_user = _event(
             repository_module,
@@ -483,4 +556,108 @@ async def test_repository_appends_idempotently_in_order_and_blocks_fact_downgrad
         assert (revision, state_revision) == (LEARNING_REVISION, LEARNING_REVISION)
     finally:
         await _cleanup_tenant(engine, tenant_id, schema_name)
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_reversed_learning_counter_batches_use_one_postgres_lock_order(
+    generation_database,
+) -> None:
+    engine = create_async_engine(generation_database.url, poolclass=NullPool)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    suffix = uuid.uuid4().hex
+    observations = (
+        CounterRollupObservation(
+            metric="learning_events_total",
+            category="quiz.graded",
+            fact_key=f"quiz-{suffix}",
+            amount=1,
+        ),
+        CounterRollupObservation(
+            metric="learning_events_total",
+            category="scene.completed",
+            fact_key=f"event-{suffix}",
+            amount=1,
+        ),
+    )
+
+    legacy_ready_count = 0
+    legacy_ready_lock = asyncio.Lock()
+    legacy_second_write = asyncio.Event()
+
+    async def prove_reversed_row_writes_deadlock(
+        ordered: tuple[CounterRollupObservation, ...],
+    ) -> None:
+        nonlocal legacy_ready_count
+        async with sessions() as session:
+            transaction = await session.begin()
+            try:
+                await session.execute(text("SET LOCAL lock_timeout = '5s'"))
+                first, second = ordered
+                await increment_counter_rollup(
+                    session,
+                    metric=first.metric,
+                    category=first.category,
+                    fact_key=first.fact_key,
+                    amount=first.amount,
+                )
+                async with legacy_ready_lock:
+                    legacy_ready_count += 1
+                    if legacy_ready_count == 2:
+                        legacy_second_write.set()
+                await legacy_second_write.wait()
+                await increment_counter_rollup(
+                    session,
+                    metric=second.metric,
+                    category=second.category,
+                    fact_key=second.fact_key,
+                    amount=second.amount,
+                )
+            finally:
+                if transaction.is_active:
+                    await transaction.rollback()
+
+    legacy_results = await asyncio.wait_for(
+        asyncio.gather(
+            prove_reversed_row_writes_deadlock(observations),
+            prove_reversed_row_writes_deadlock(tuple(reversed(observations))),
+            return_exceptions=True,
+        ),
+        timeout=10,
+    )
+    legacy_errors = [result for result in legacy_results if isinstance(result, DBAPIError)]
+    assert len(legacy_errors) == 1
+    assert getattr(legacy_errors[0].orig, "sqlstate", None) == "40P01"
+
+    ready_count = 0
+    ready_lock = asyncio.Lock()
+    start = asyncio.Event()
+
+    async def write_and_rollback(
+        ordered: tuple[CounterRollupObservation, ...],
+    ) -> None:
+        nonlocal ready_count
+        async with sessions() as session:
+            transaction = await session.begin()
+            try:
+                await session.execute(text("SET LOCAL lock_timeout = '5s'"))
+                async with ready_lock:
+                    ready_count += 1
+                    if ready_count == 2:
+                        start.set()
+                await start.wait()
+                await increment_counter_rollups(session, observations=ordered)
+            finally:
+                if transaction.is_active:
+                    await transaction.rollback()
+
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(
+                write_and_rollback(observations),
+                write_and_rollback(tuple(reversed(observations))),
+            ),
+            timeout=10,
+        )
+    finally:
         await engine.dispose()

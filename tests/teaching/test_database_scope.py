@@ -59,6 +59,10 @@ def test_model_metadata_uses_only_platform_and_logical_tenant_schemas():
         "platform.tenant_schema_states",
         "platform.tenant_storage_credentials",
         "platform.tenant_storage_states",
+        "platform.teaching_learning_projection_backlog",
+        "platform.teaching_metric_counter_rollups",
+        "platform.teaching_metric_histogram_rollups",
+        "platform.teaching_runtime_process_heartbeats",
         "platform.tenants",
     }
     assert set(TenantBase.metadata.tables) == {

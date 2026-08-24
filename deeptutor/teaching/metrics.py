@@ -1,195 +1,373 @@
-"""Low-cardinality Prometheus metrics for the private teaching runtime."""
+"""Fixed-contract Prometheus rendering for durable teaching metric snapshots."""
 
 from __future__ import annotations
 
-import hashlib
+from dataclasses import dataclass
 import math
-from typing import Final
+from typing import Final, Protocol
 
-from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram, generate_latest
-
-_GENERATION_STATUSES: Final = frozenset({"queued", "running", "completed", "failed", "canceled"})
-_GENERATION_STAGES: Final = frozenset({"outline", "content", "export"})
-_RETRY_REASONS: Final = frozenset(
-    {"timeout", "unavailable", "lease_lost", "rate_limited", "unknown"}
-)
-_QUOTA_OPERATIONS: Final = frozenset({"reserved", "consumed", "released"})
-_LEARNING_EVENT_TYPES: Final = frozenset(
-    {
-        "classroom.started",
-        "scene.completed",
-        "quiz.graded",
-        "hint.used",
-        "pbl.milestone_completed",
-        "classroom.completed",
-    }
-)
-_VALIDATION_REASONS: Final = frozenset(
-    {
-        "schema_invalid",
-        "receipt_mismatch",
-        "hash_mismatch",
-        "size_mismatch",
-        "missing_artifact",
-        "unknown",
-    }
+from prometheus_client import CollectorRegistry, generate_latest
+from prometheus_client.core import (
+    CounterMetricFamily,
+    GaugeMetricFamily,
+    HistogramMetricFamily,
 )
 
+GENERATION_STATUSES: Final = ("queued", "running", "completed", "failed", "canceled")
+GENERATION_STAGES: Final = ("outline", "content", "export")
+RETRY_REASONS: Final = (
+    "timeout",
+    "unavailable",
+    "lease_lost",
+    "rate_limited",
+    "unknown",
+)
+SLOT_POOLS: Final = ("generation", "mp4_export")
+QUOTA_OPERATIONS: Final = ("reserved", "consumed", "released")
+LEARNING_EVENT_TYPES: Final = (
+    "classroom.started",
+    "scene.completed",
+    "quiz.graded",
+    "hint.used",
+    "pbl.milestone_completed",
+    "classroom.completed",
+)
+VALIDATION_REASONS: Final = (
+    "schema_invalid",
+    "receipt_mismatch",
+    "hash_mismatch",
+    "size_mismatch",
+    "missing_artifact",
+    "unknown",
+)
+OPENMAIC_MODES: Final = ("shared", "dedicated")
 
-def _short_hash(value: str, field: str) -> str:
-    if not isinstance(value, str) or not value or "\x00" in value:
-        raise ValueError(f"{field} is invalid")
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+QUEUE_BUCKETS: Final = (
+    "0.1",
+    "0.5",
+    "1",
+    "2",
+    "5",
+    "10",
+    "30",
+    "60",
+    "120",
+    "300",
+    "+Inf",
+)
+STAGE_BUCKETS: Final = (
+    "0.5",
+    "1",
+    "2",
+    "5",
+    "10",
+    "30",
+    "60",
+    "120",
+    "300",
+    "900",
+    "1800",
+    "+Inf",
+)
+
+COUNTER_CATEGORIES: Final = {
+    "generation_jobs_total": GENERATION_STATUSES,
+    "generation_retries_total": RETRY_REASONS,
+    "quota_units_total": QUOTA_OPERATIONS,
+    "learning_events_total": LEARNING_EVENT_TYPES,
+    "artifact_validation_failures_total": VALIDATION_REASONS,
+}
+HISTOGRAM_CATEGORIES: Final = {
+    "generation_queue_seconds": ("",),
+    "generation_stage_seconds": GENERATION_STAGES,
+}
+HISTOGRAM_BUCKETS: Final = {
+    "generation_queue_seconds": QUEUE_BUCKETS,
+    "generation_stage_seconds": STAGE_BUCKETS,
+}
+GAUGE_CATEGORIES: Final = {
+    "generation_slots_in_use": SLOT_POOLS,
+    "learning_projection_lag_seconds": ("",),
+    "openmaic_health": OPENMAIC_MODES,
+}
 
 
-def hash_tenant_id(tenant_id: str) -> str:
-    return _short_hash(tenant_id, "tenant_id")
+@dataclass(frozen=True, slots=True)
+class CounterRollup:
+    metric: str
+    category: str
+    total: int
 
 
-def _category(value: str, allowed: frozenset[str], field: str) -> str:
-    if value not in allowed:
-        raise ValueError(f"{field} is invalid")
-    return value
+@dataclass(frozen=True, slots=True)
+class HistogramRollup:
+    metric: str
+    category: str
+    bucket: str
+    count: int
+    sum_seconds: float
 
 
-def _nonnegative_number(value: float | int, field: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (float, int)):
-        raise ValueError(f"{field} is invalid")
-    number = float(value)
-    if not math.isfinite(number) or number < 0:
-        raise ValueError(f"{field} is invalid")
-    return number
+@dataclass(frozen=True, slots=True)
+class GaugeValue:
+    metric: str
+    category: str
+    value: float | int
+
+
+@dataclass(frozen=True, slots=True)
+class TeachingMetricsSnapshot:
+    counters: tuple[CounterRollup, ...] = ()
+    histograms: tuple[HistogramRollup, ...] = ()
+    gauges: tuple[GaugeValue, ...] = ()
+
+
+def _snapshot_error() -> ValueError:
+    return ValueError("metrics snapshot is invalid")
+
+
+def _valid_count(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _valid_number(value: object) -> bool:
+    return (
+        isinstance(value, (float, int))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+        and float(value) >= 0
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _NormalizedSnapshot:
+    counters: dict[tuple[str, str], int]
+    histograms: dict[tuple[str, str, str], tuple[int, float]]
+    gauges: dict[tuple[str, str], float]
+
+
+def _normalize_snapshot(snapshot: TeachingMetricsSnapshot) -> _NormalizedSnapshot:
+    if not isinstance(snapshot, TeachingMetricsSnapshot):
+        raise _snapshot_error()
+    counters: dict[tuple[str, str], int] = {}
+    histograms: dict[tuple[str, str, str], tuple[int, float]] = {}
+    gauges: dict[tuple[str, str], float] = {}
+    try:
+        for row in snapshot.counters:
+            key = (row.metric, row.category)
+            if (
+                row.metric not in COUNTER_CATEGORIES
+                or row.category not in COUNTER_CATEGORIES[row.metric]
+                or not _valid_count(row.total)
+                or key in counters
+            ):
+                raise _snapshot_error()
+            counters[key] = row.total
+        for row in snapshot.histograms:
+            key = (row.metric, row.category, row.bucket)
+            if (
+                row.metric not in HISTOGRAM_CATEGORIES
+                or row.category not in HISTOGRAM_CATEGORIES[row.metric]
+                or row.bucket not in HISTOGRAM_BUCKETS[row.metric]
+                or not _valid_count(row.count)
+                or not _valid_number(row.sum_seconds)
+                or (row.count == 0 and float(row.sum_seconds) != 0.0)
+                or key in histograms
+            ):
+                raise _snapshot_error()
+            histograms[key] = (row.count, float(row.sum_seconds))
+        for row in snapshot.gauges:
+            key = (row.metric, row.category)
+            if (
+                row.metric not in GAUGE_CATEGORIES
+                or row.category not in GAUGE_CATEGORIES[row.metric]
+                or not _valid_number(row.value)
+                or key in gauges
+                or (row.metric == "openmaic_health" and row.value not in (0, 1))
+                or (row.metric == "generation_slots_in_use" and not _valid_count(row.value))
+            ):
+                raise _snapshot_error()
+            gauges[key] = float(row.value)
+    except (AttributeError, TypeError):
+        raise _snapshot_error() from None
+    return _NormalizedSnapshot(counters, histograms, gauges)
+
+
+def validate_teaching_metrics_snapshot(
+    snapshot: TeachingMetricsSnapshot,
+) -> TeachingMetricsSnapshot:
+    """Fail closed when a durable snapshot violates the fixed public contract."""
+
+    _normalize_snapshot(snapshot)
+    return snapshot
+
+
+class _MetricCollector(Protocol):
+    def collect(self) -> list[object]: ...
+
+
+class _SnapshotCollector:
+    def __init__(self, snapshot: _NormalizedSnapshot) -> None:
+        self._snapshot = snapshot
+
+    def _histogram(
+        self,
+        metric: str,
+        category: str,
+    ) -> tuple[list[tuple[str, float]], float]:
+        cumulative = 0
+        sum_value = 0.0
+        buckets: list[tuple[str, float]] = []
+        for bucket in HISTOGRAM_BUCKETS[metric]:
+            count, bin_sum = self._snapshot.histograms.get(
+                (metric, category, bucket),
+                (0, 0.0),
+            )
+            cumulative += count
+            sum_value += bin_sum
+            buckets.append((bucket, float(cumulative)))
+        return buckets, sum_value
+
+    def collect(self) -> list[object]:
+        families: list[object] = []
+
+        queue_buckets, queue_sum = self._histogram("generation_queue_seconds", "")
+        families.append(
+            HistogramMetricFamily(
+                "yfeistai_generation_queue_seconds",
+                "Seconds an eligible generation attempt waited before it was claimed.",
+                buckets=queue_buckets,
+                sum_value=queue_sum,
+            )
+        )
+
+        stages = HistogramMetricFamily(
+            "yfeistai_generation_stage_seconds",
+            "Seconds spent in one generation stage.",
+            labels=("stage",),
+        )
+        for stage in GENERATION_STAGES:
+            buckets, sum_value = self._histogram("generation_stage_seconds", stage)
+            stages.add_metric((stage,), buckets, sum_value)
+        families.append(stages)
+
+        counter_contracts = (
+            (
+                "generation_jobs_total",
+                "Committed generation lifecycle state entries.",
+                "status",
+            ),
+            ("generation_retries_total", "Generation retries by stable reason.", "reason"),
+        )
+        for metric, documentation, label in counter_contracts:
+            family = CounterMetricFamily(
+                f"yfeistai_{metric}",
+                documentation,
+                labels=(label,),
+            )
+            for category in COUNTER_CATEGORIES[metric]:
+                family.add_metric(
+                    (category,),
+                    self._snapshot.counters.get((metric, category), 0),
+                )
+            families.append(family)
+
+        slots = GaugeMetricFamily(
+            "yfeistai_generation_slots_in_use",
+            "Global generation slots currently in use.",
+            labels=("pool",),
+        )
+        for pool in SLOT_POOLS:
+            slots.add_metric(
+                (pool,),
+                self._snapshot.gauges.get(("generation_slots_in_use", pool), 0),
+            )
+        families.append(slots)
+
+        quota = CounterMetricFamily(
+            "yfeistai_quota_units_total",
+            "Quota unit changes by operation.",
+            labels=("operation",),
+        )
+        for operation in QUOTA_OPERATIONS:
+            quota.add_metric(
+                (operation,),
+                self._snapshot.counters.get(("quota_units_total", operation), 0),
+            )
+        families.append(quota)
+
+        events = CounterMetricFamily(
+            "yfeistai_learning_events_total",
+            "Accepted learning events by canonical type.",
+            labels=("event_type",),
+        )
+        for event_type in LEARNING_EVENT_TYPES:
+            events.add_metric(
+                (event_type,),
+                self._snapshot.counters.get(("learning_events_total", event_type), 0),
+            )
+        families.append(events)
+
+        families.append(
+            GaugeMetricFamily(
+                "yfeistai_learning_projection_lag_seconds",
+                "Age in seconds of the oldest nonterminal learning projection.",
+                value=self._snapshot.gauges.get(
+                    ("learning_projection_lag_seconds", ""),
+                    0,
+                ),
+            )
+        )
+
+        validation = CounterMetricFamily(
+            "yfeistai_artifact_validation_failures_total",
+            "Artifact validation failures by stable reason.",
+            labels=("reason",),
+        )
+        for reason in VALIDATION_REASONS:
+            validation.add_metric(
+                (reason,),
+                self._snapshot.counters.get(
+                    ("artifact_validation_failures_total", reason),
+                    0,
+                ),
+            )
+        families.append(validation)
+
+        openmaic = GaugeMetricFamily(
+            "yfeistai_openmaic_health",
+            "Durable database admission health; this is not live network health.",
+            labels=("mode",),
+        )
+        for mode in OPENMAIC_MODES:
+            openmaic.add_metric(
+                (mode,),
+                self._snapshot.gauges.get(("openmaic_health", mode), 0),
+            )
+        families.append(openmaic)
+        return families
 
 
 class TeachingMetrics:
-    def __init__(self, registry: CollectorRegistry | None = None) -> None:
-        self.registry = registry if registry is not None else CollectorRegistry(auto_describe=True)
-        self.generation_queue = Histogram(
-            "yfeistai_generation_queue_seconds",
-            "Seconds a generation job waited before it was claimed.",
-            ("tenant",),
-            registry=self.registry,
-        )
-        self.generation_stage = Histogram(
-            "yfeistai_generation_stage_seconds",
-            "Seconds spent in one generation stage.",
-            ("tenant", "stage"),
-            registry=self.registry,
-        )
-        self.generation_jobs = Counter(
-            "yfeistai_generation_jobs_total",
-            "Generation job outcomes.",
-            ("tenant", "status"),
-            registry=self.registry,
-        )
-        self.generation_retries = Counter(
-            "yfeistai_generation_retries_total",
-            "Generation retries by stable reason.",
-            ("tenant", "reason"),
-            registry=self.registry,
-        )
-        self.generation_slots = Gauge(
-            "yfeistai_generation_slots_in_use",
-            "Generation slots currently in use.",
-            ("tenant",),
-            registry=self.registry,
-        )
-        self.quota_units = Counter(
-            "yfeistai_quota_units_total",
-            "Quota unit changes by operation.",
-            ("tenant", "operation"),
-            registry=self.registry,
-        )
-        self.learning_events = Counter(
-            "yfeistai_learning_events_total",
-            "Accepted learning events by canonical type.",
-            ("tenant", "event_type"),
-            registry=self.registry,
-        )
-        self.learning_projection_lag = Gauge(
-            "yfeistai_learning_projection_lag_seconds",
-            "Age in seconds of the oldest pending learning projection.",
-            ("tenant",),
-            registry=self.registry,
-        )
-        self.artifact_validation_failures = Counter(
-            "yfeistai_artifact_validation_failures_total",
-            "Artifact validation failures by stable reason.",
-            ("tenant", "reason"),
-            registry=self.registry,
-        )
-        self.openmaic_health = Gauge(
-            "yfeistai_openmaic_health",
-            "OpenMAIC route health, where 1 is healthy and 0 is unhealthy.",
-            ("route",),
-            registry=self.registry,
-        )
+    """Render an absolute durable snapshot without process-local mutation."""
 
-    def observe_generation_queue(self, *, tenant_id: str, seconds: float) -> None:
-        seconds = _nonnegative_number(seconds, "seconds")
-        self.generation_queue.labels(hash_tenant_id(tenant_id)).observe(seconds)
-
-    def observe_generation_stage(
-        self,
-        *,
-        tenant_id: str,
-        stage: str,
-        seconds: float,
-    ) -> None:
-        stage = _category(stage, _GENERATION_STAGES, "generation stage")
-        seconds = _nonnegative_number(seconds, "seconds")
-        self.generation_stage.labels(hash_tenant_id(tenant_id), stage).observe(seconds)
-
-    def record_generation_job(self, *, tenant_id: str, status: str) -> None:
-        status = _category(status, _GENERATION_STATUSES, "generation status")
-        self.generation_jobs.labels(hash_tenant_id(tenant_id), status).inc()
-
-    def record_generation_retry(self, *, tenant_id: str, reason: str) -> None:
-        reason = _category(reason, _RETRY_REASONS, "retry reason")
-        self.generation_retries.labels(hash_tenant_id(tenant_id), reason).inc()
-
-    def set_generation_slots(self, *, tenant_id: str, in_use: int) -> None:
-        in_use = _nonnegative_number(in_use, "slots")
-        self.generation_slots.labels(hash_tenant_id(tenant_id)).set(in_use)
-
-    def add_quota_units(
-        self,
-        *,
-        tenant_id: str,
-        operation: str,
-        units: int,
-    ) -> None:
-        operation = _category(operation, _QUOTA_OPERATIONS, "quota operation")
-        units = _nonnegative_number(units, "quota units")
-        self.quota_units.labels(hash_tenant_id(tenant_id), operation).inc(units)
-
-    def record_learning_event(self, *, tenant_id: str, event_type: str) -> None:
-        event_type = _category(event_type, _LEARNING_EVENT_TYPES, "event type")
-        self.learning_events.labels(hash_tenant_id(tenant_id), event_type).inc()
-
-    def set_projection_lag(self, *, tenant_id: str, seconds: float) -> None:
-        seconds = _nonnegative_number(seconds, "seconds")
-        self.learning_projection_lag.labels(hash_tenant_id(tenant_id)).set(seconds)
-
-    def record_artifact_validation_failure(
-        self,
-        *,
-        tenant_id: str,
-        reason: str,
-    ) -> None:
-        reason = _category(reason, _VALIDATION_REASONS, "validation reason")
-        self.artifact_validation_failures.labels(hash_tenant_id(tenant_id), reason).inc()
-
-    def set_openmaic_health(self, *, route_id: str, healthy: bool) -> None:
-        route_hash = _short_hash(route_id, "route_id")
-        self.openmaic_health.labels(route_hash).set(1 if healthy else 0)
-
-    def render(self) -> bytes:
-        return generate_latest(self.registry)
+    def render(self, snapshot: TeachingMetricsSnapshot) -> bytes:
+        normalized = _normalize_snapshot(snapshot)
+        registry = CollectorRegistry()
+        collector: _MetricCollector = _SnapshotCollector(normalized)
+        registry.register(collector)
+        return generate_latest(registry)
 
 
-_metrics = TeachingMetrics()
-
-
-def get_teaching_metrics() -> TeachingMetrics:
-    return _metrics
+__all__ = [
+    "COUNTER_CATEGORIES",
+    "CounterRollup",
+    "GAUGE_CATEGORIES",
+    "GaugeValue",
+    "HISTOGRAM_BUCKETS",
+    "HISTOGRAM_CATEGORIES",
+    "HistogramRollup",
+    "TeachingMetrics",
+    "TeachingMetricsSnapshot",
+    "validate_teaching_metrics_snapshot",
+]

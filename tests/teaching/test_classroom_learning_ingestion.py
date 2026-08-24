@@ -10,6 +10,7 @@ from deeptutor.teaching.repositories.learning_events import (
     LearningEventAppendResult,
     LearningEventBindingError,
 )
+from deeptutor.teaching.repositories.metric_rollups import CounterRollupObservation
 from deeptutor.teaching.schema_names import tenant_schema_name
 from deeptutor.teaching.tenant_context import TenantContext
 
@@ -51,6 +52,7 @@ async def test_ingestion_uses_ticket_claims_and_returns_per_item_outcomes(monkey
 
     context = _context()
     appended: list[object] = []
+    actions: list[tuple[str, object]] = []
 
     class DatabaseSession:
         def __init__(self) -> None:
@@ -59,8 +61,11 @@ async def test_ingestion_uses_ticket_claims_and_returns_per_item_outcomes(monkey
 
         def add(self, value: object) -> None:
             self.added.append(value)
+            if isinstance(value, LearningEventQuarantine):
+                actions.append(("quarantine", value.event_id))
 
-        async def execute(self, _statement, _parameters=None) -> None:
+        async def execute(self, _statement, parameters=None) -> None:
+            actions.append(("event_lock", parameters["event_id"]))
             return None
 
         async def scalar(self, statement):
@@ -103,6 +108,7 @@ async def test_ingestion_uses_ticket_claims_and_returns_per_item_outcomes(monkey
                 session_id="session-a",
                 classroom_version_id="version-a",
             )
+            actions.append(("session_lock", session_id))
             return await protected_action(database_session, claims)
 
     class Loader:
@@ -111,15 +117,43 @@ async def test_ingestion_uses_ticket_claims_and_returns_per_item_outcomes(monkey
             return _document()
 
     class Repository:
-        async def append_in_session(self, received_session, event):
+        async def append_in_session(
+            self,
+            received_session,
+            event,
+            *,
+            counter_observations,
+        ):
             assert received_session is database_session
             appended.append(event)
+            actions.append(("append", event.event_id))
             outcome = "accepted" if len(appended) == 1 else "duplicate"
+            if outcome == "accepted":
+                counter_observations.append(
+                    CounterRollupObservation(
+                        metric="learning_events_total",
+                        category=event.event_type,
+                        fact_key=event.event_id,
+                        amount=1,
+                    )
+                )
             return LearningEventAppendResult(
                 event_id=event.event_id,
                 outcome=outcome,
                 seq=1,
             )
+
+    async def increment_counter_batch(received_session, *, observations) -> None:
+        assert received_session is database_session
+        actions.append(
+            (
+                "counter_batch",
+                tuple(
+                    (item.metric, item.category, item.fact_key, item.amount)
+                    for item in observations
+                ),
+            )
+        )
 
     monkeypatch.setattr(
         classroom_learning,
@@ -127,6 +161,12 @@ async def test_ingestion_uses_ticket_claims_and_returns_per_item_outcomes(monkey
         lambda _engine, tenant_id: (
             Repository() if tenant_id == "tenant-a" else pytest.fail("wrong tenant")
         ),
+    )
+    monkeypatch.setattr(
+        classroom_learning,
+        "increment_counter_rollups",
+        increment_counter_batch,
+        raising=False,
     )
     service = classroom_learning.ClassroomLearningEventIngestionService(
         engine=object(),
@@ -179,6 +219,15 @@ async def test_ingestion_uses_ticket_claims_and_returns_per_item_outcomes(monkey
     )
     assert len(database_session.added) == 1
     assert database_session.flush_count == 1
+    assert actions[:3] == [
+        ("session_lock", "session-a"),
+        ("event_lock", "event-1"),
+        ("event_lock", "event-q"),
+    ]
+    assert actions[-1] == (
+        "counter_batch",
+        (("learning_events_total", "scene.completed", "event-1", 1),),
+    )
 
 
 @pytest.mark.asyncio

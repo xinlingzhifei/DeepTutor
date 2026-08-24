@@ -288,10 +288,7 @@ def test_worker_rejects_semantically_unbound_outline_drafts(reason: str) -> None
 def test_explicit_retry_requires_a_new_job_identity() -> None:
     from deeptutor.teaching.repositories.jobs import build_explicit_retry_request
 
-    original_payload = (
-        '{"idempotencyKey":"key-old","jobId":"job-old",'
-        '"requestId":"request-old"}'
-    )
+    original_payload = '{"idempotencyKey":"key-old","jobId":"job-old","requestId":"request-old"}'
     original_sha = hashlib.sha256(original_payload.encode()).hexdigest()
     original = __import__(
         "deeptutor.teaching.repositories.jobs", fromlist=["GenerationJobRequest"]
@@ -390,7 +387,7 @@ def test_bad_manifest_fails_before_store_or_version_finalization() -> None:
     class Repository:
         def __init__(self) -> None:
             self.transitions: list[tuple[str, str]] = []
-            self.failures: list[tuple[str, str]] = []
+            self.failures: list[tuple[str, str, str | None]] = []
             self.finalized = 0
 
         async def load_claimed_payload(self, _claim):
@@ -406,8 +403,15 @@ def test_bad_manifest_fails_before_store_or_version_finalization() -> None:
         async def transition_claim(self, _claim, **values):
             self.transitions.append((values["expected_status"], values["target_status"]))
 
-        async def fail_claim(self, _claim, *, error_category, error_code):
-            self.failures.append((error_category, error_code))
+        async def fail_claim(
+            self,
+            _claim,
+            *,
+            error_category,
+            error_code,
+            artifact_validation_reason=None,
+        ):
+            self.failures.append((error_category, error_code, artifact_validation_reason))
 
         async def heartbeat_claim(self, *_args, **_kwargs):
             raise AssertionError("short test must not need a heartbeat")
@@ -457,8 +461,251 @@ def test_bad_manifest_fails_before_store_or_version_finalization() -> None:
 
     assert claimed
     assert repository.transitions == [("generating_content", "validating")]
-    assert repository.failures == [("contract_invalid", "hash_invalid")]
+    assert repository.failures == [("contract_invalid", "hash_invalid", "hash_mismatch")]
     assert repository.finalized == 0
+
+
+@pytest.mark.parametrize(
+    ("code", "expected"),
+    (
+        ("hash_invalid", "hash_mismatch"),
+        ("artifact_commit_missing", "missing_artifact"),
+        ("artifact_target_mismatch", "receipt_mismatch"),
+        ("artifact_size_invalid", "size_mismatch"),
+        ("contract_invalid", "schema_invalid"),
+        ("private_new_code", "unknown"),
+        ("source_invalid", None),
+        ("policy_denied", None),
+    ),
+)
+def test_output_artifact_validation_reason_is_fixed_and_excludes_input_policy(
+    code: str,
+    expected: str | None,
+) -> None:
+    from deeptutor.teaching.worker import _artifact_validation_metric_reason
+
+    assert _artifact_validation_metric_reason(code) == expected
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected"),
+    (
+        ("missing", ("artifact_commit_missing", "missing_artifact")),
+        ("schema", ("artifact_invalid", "schema_invalid")),
+        ("receipt", ("artifact_invalid", "receipt_mismatch")),
+        ("hash", ("hash_invalid", "hash_mismatch")),
+        ("size", ("artifact_invalid", "size_mismatch")),
+        ("untagged", ("artifact_invalid", "unknown")),
+        ("arbitrary", ("artifact_invalid", "unknown")),
+        ("configuration", None),
+    ),
+)
+def test_output_store_error_translation_requires_a_fixed_typed_reason(
+    kind: str,
+    expected: tuple[str, str] | None,
+) -> None:
+    from deeptutor.teaching.object_store import (
+        ObjectStoreConfigurationError,
+        ObjectStoreIntegrityError,
+        ObjectStoreNotFound,
+    )
+    from deeptutor.teaching.worker import _translate_output_store_error
+
+    if kind == "missing":
+        error = ObjectStoreNotFound("private detail")
+    elif kind == "configuration":
+        error = ObjectStoreConfigurationError("private detail")
+    else:
+        reason = None if kind == "untagged" else f"{kind}_mismatch"
+        if kind == "schema":
+            reason = "schema_invalid"
+        error = ObjectStoreIntegrityError(
+            "private detail",
+            validation_reason=reason,
+        )
+
+    translated = _translate_output_store_error(error)
+
+    if expected is None:
+        assert translated is None
+    else:
+        assert translated is not None
+        assert (translated.code, translated.metric_reason) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_kind", "expected"),
+    (
+        ("missing", ("artifact_commit_missing", "missing_artifact")),
+        ("hash", ("hash_invalid", "hash_mismatch")),
+    ),
+)
+async def test_promoted_document_readback_translates_typed_store_failures(
+    error_kind: str,
+    expected: tuple[str, str],
+) -> None:
+    from deeptutor.teaching.artifact_validation import ArtifactValidationError
+    from deeptutor.teaching.object_store import (
+        ObjectStoreIntegrityError,
+        ObjectStoreNotFound,
+    )
+    from deeptutor.teaching.worker import _load_promoted_classroom_document
+
+    class Store:
+        async def open(self, _key):
+            if error_kind == "missing":
+                raise ObjectStoreNotFound("private detail")
+            raise ObjectStoreIntegrityError(
+                "private detail",
+                validation_reason="hash_mismatch",
+            )
+
+    with pytest.raises(ArtifactValidationError) as caught:
+        await _load_promoted_classroom_document(
+            Store(),
+            object_key="tenants/tenant-1/classrooms/classroom-1/versions/1/classroom.json",
+            expected_sha256="a" * 64,
+            expected_size=1,
+            expected_media_manifest_sha256="b" * 64,
+            expected_classroom_id="classroom-1",
+            expected_classroom_version_id="version-1",
+        )
+
+    assert (caught.value.code, caught.value.metric_reason) == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_kind", "expected"),
+    (
+        ("missing", ("artifact_commit_missing", "missing_artifact")),
+        ("receipt", ("artifact_invalid", "receipt_mismatch")),
+    ),
+)
+async def test_confirmed_output_publish_translates_store_failures_at_every_call_site(
+    error_kind: str,
+    expected: tuple[str, str],
+) -> None:
+    from deeptutor.teaching.artifact_validation import ArtifactValidationError
+    from deeptutor.teaching.object_store import (
+        ObjectStoreIntegrityError,
+        ObjectStoreNotFound,
+    )
+    from deeptutor.teaching.worker import _confirmed_output_publish
+
+    class Store:
+        async def confirmed_publish(self, _manifest):
+            if error_kind == "missing":
+                raise ObjectStoreNotFound("private detail")
+            raise ObjectStoreIntegrityError(
+                "private detail",
+                validation_reason="receipt_mismatch",
+            )
+
+    with pytest.raises(ArtifactValidationError) as caught:
+        await _confirmed_output_publish(Store(), object())
+
+    assert (caught.value.code, caught.value.metric_reason) == expected
+
+
+@pytest.mark.asyncio
+async def test_output_promotion_counts_a_declared_artifact_missing_on_first_stream_read(
+    tmp_path,
+) -> None:
+    from deeptutor.teaching.artifact_validation import ArtifactValidationError
+    from deeptutor.teaching.artifacts import (
+        ArtifactManifestEntry,
+        ClassroomArtifactManifest,
+        classroom_artifact_key,
+    )
+    from deeptutor.teaching.object_store import LocalClassroomArtifactStore
+    from deeptutor.teaching.openmaic.client import OpenMAICRequestFailed
+    from deeptutor.teaching.scheduler import ClaimedGenerationJob
+    from deeptutor.teaching.worker import GenerationWorker
+
+    payload = b"{}"
+    manifest = ClassroomArtifactManifest(
+        tenant_id="tenant-1",
+        job_id="job-1",
+        asset_id="classroom-1",
+        version=1,
+        entries=(
+            ArtifactManifestEntry(
+                "classroom.json",
+                "application/json",
+                hashlib.sha256(payload).hexdigest(),
+                len(payload),
+            ),
+        ),
+    )
+    claim = ClaimedGenerationJob(
+        tenant_id="tenant-1",
+        job_id="job-1",
+        job_kind="generation",
+        phase="content",
+        status="materializing",
+        slot_pool="generation",
+        data_plane_route_id="shared-primary",
+        provider_profile_id="provider-default",
+        worker_pool_ref="shared-generation",
+        queue_ref="openmaic.shared",
+        attempt_count=1,
+        lease_owner="worker-1",
+        lease_token="a" * 64,
+        lease_expires_at=datetime(2030, 1, 1, tzinfo=timezone.utc),
+        global_slot_id=1,
+        tenant_slot_id=2,
+    )
+
+    class Repository:
+        async def bind_promotion_manifest(self, *_args, **_kwargs):
+            return None
+
+        async def mark_object_committed(self, *_args, **_kwargs):
+            raise AssertionError("missing output must not be committed")
+
+    class Stores:
+        async def store_for_tenant(self, _tenant_id):
+            return LocalClassroomArtifactStore(tmp_path, "tenant-1")
+
+    class Client:
+        async def stream_artifact(self, _path):
+            raise OpenMAICRequestFailed(404)
+            yield b"unreachable"
+
+    class Heartbeat:
+        def assert_current(self):
+            return None
+
+    worker = GenerationWorker(
+        scheduler=object(),
+        repository=Repository(),
+        clients=object(),
+        stores=Stores(),
+        worker_id="worker-1",
+    )
+    target_key = classroom_artifact_key(
+        "tenant-1",
+        "classroom-1",
+        1,
+        "classroom.json",
+    )
+
+    with pytest.raises(ArtifactValidationError) as caught:
+        await worker._promote(
+            claim=claim,
+            client=Client(),
+            manifest=manifest,
+            download_paths={"classroom.json": "/api/yfeistai/v1/artifacts/job-1/classroom.json"},
+            target_keys=(target_key,),
+            heartbeat=Heartbeat(),
+        )
+
+    assert (caught.value.code, caught.value.metric_reason) == (
+        "artifact_commit_missing",
+        "missing_artifact",
+    )
 
 
 def test_running_cancel_calls_engine_before_terminal_db_update() -> None:

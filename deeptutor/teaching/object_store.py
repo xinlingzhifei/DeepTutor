@@ -14,7 +14,7 @@ import os
 from pathlib import Path, PureWindowsPath
 import tempfile
 from threading import BoundedSemaphore
-from typing import Any, Mapping, Protocol
+from typing import Any, Literal, Mapping, Protocol
 import uuid
 
 import boto3
@@ -77,6 +77,21 @@ class ObjectStoreNotFound(ObjectStoreError):
 
 class ObjectStoreIntegrityError(ObjectStoreError):
     """A streamed object did not match its declared integrity metadata."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        validation_reason: Literal[
+            "schema_invalid",
+            "receipt_mismatch",
+            "hash_mismatch",
+            "size_mismatch",
+        ]
+        | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.validation_reason = validation_reason
 
 
 class ObjectStoreConfigurationError(ObjectStoreError):
@@ -171,13 +186,19 @@ def _validate_sha256(value: str) -> str:
         or len(value) != 64
         or any(character not in "0123456789abcdef" for character in value)
     ):
-        raise ObjectStoreIntegrityError("sha256 must be a lowercase hexadecimal digest")
+        raise ObjectStoreIntegrityError(
+            "sha256 must be a lowercase hexadecimal digest",
+            validation_reason="schema_invalid",
+        )
     return value
 
 
 def _validate_size(value: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ObjectStoreIntegrityError("size must be a non-negative integer")
+        raise ObjectStoreIntegrityError(
+            "size must be a non-negative integer",
+            validation_reason="schema_invalid",
+        )
     return value
 
 
@@ -190,7 +211,10 @@ def _validate_content_type(value: str) -> str:
         or "\r" in value
         or "\n" in value
     ):
-        raise ObjectStoreIntegrityError("content type is invalid")
+        raise ObjectStoreIntegrityError(
+            "content type is invalid",
+            validation_reason="schema_invalid",
+        )
     return value
 
 
@@ -225,7 +249,10 @@ def _is_owner_token(value: object) -> bool:
 def _owner_token(value: str | None) -> str:
     token = uuid.uuid4().hex if value is None else value
     if not _is_owner_token(token):
-        raise ObjectStoreIntegrityError("ownership token is invalid")
+        raise ObjectStoreIntegrityError(
+            "ownership token is invalid",
+            validation_reason="schema_invalid",
+        )
     return token
 
 
@@ -380,7 +407,8 @@ def _validate_json_bytes(payload: bytes) -> None:
         json.loads(payload.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ObjectStoreIntegrityError(
-            "application/json object must contain valid UTF-8 JSON"
+            "application/json object must contain valid UTF-8 JSON",
+            validation_reason="schema_invalid",
         ) from exc
 
 
@@ -400,9 +428,15 @@ def _verify_seekable(
         if json_bytes is not None:
             json_bytes.extend(chunk)
     if received != expected_size:
-        raise ObjectStoreIntegrityError("object size does not match")
+        raise ObjectStoreIntegrityError(
+            "object size does not match",
+            validation_reason="size_mismatch",
+        )
     if not hmac.compare_digest(digest.hexdigest(), expected_sha256):
-        raise ObjectStoreIntegrityError("object sha256 does not match")
+        raise ObjectStoreIntegrityError(
+            "object sha256 does not match",
+            validation_reason="hash_mismatch",
+        )
     if json_bytes is not None:
         _validate_json_bytes(bytes(json_bytes))
     handle.seek(0)
@@ -421,10 +455,16 @@ async def _write_verified(
     try:
         async for chunk in body:
             if not isinstance(chunk, bytes):
-                raise ObjectStoreIntegrityError("object body chunks must be bytes")
+                raise ObjectStoreIntegrityError(
+                    "object body chunks must be bytes",
+                    validation_reason="schema_invalid",
+                )
             received += len(chunk)
             if received > expected_size:
-                raise ObjectStoreIntegrityError("object body exceeds declared size")
+                raise ObjectStoreIntegrityError(
+                    "object body exceeds declared size",
+                    validation_reason="size_mismatch",
+                )
             digest.update(chunk)
             if json_bytes is not None:
                 json_bytes.extend(chunk)
@@ -432,12 +472,21 @@ async def _write_verified(
     except ObjectStoreIntegrityError:
         raise
     except (TypeError, AttributeError) as exc:
-        raise ObjectStoreIntegrityError("object body must be an async byte stream") from exc
+        raise ObjectStoreIntegrityError(
+            "object body must be an async byte stream",
+            validation_reason="schema_invalid",
+        ) from exc
 
     if received != expected_size:
-        raise ObjectStoreIntegrityError("object body is shorter than declared size")
+        raise ObjectStoreIntegrityError(
+            "object body is shorter than declared size",
+            validation_reason="size_mismatch",
+        )
     if not hmac.compare_digest(digest.hexdigest(), expected_sha256):
-        raise ObjectStoreIntegrityError("object body sha256 does not match")
+        raise ObjectStoreIntegrityError(
+            "object body sha256 does not match",
+            validation_reason="hash_mismatch",
+        )
     if json_bytes is not None:
         _validate_json_bytes(bytes(json_bytes))
     await asyncio.to_thread(handle.flush)
@@ -451,9 +500,15 @@ def _commit_payload(
     owner_token: str,
 ) -> bytes:
     if not _is_owner_token(owner_token):
-        raise ObjectStoreIntegrityError("publication owner token is invalid")
+        raise ObjectStoreIntegrityError(
+            "publication owner token is invalid",
+            validation_reason="receipt_mismatch",
+        )
     if len(artifacts) != len(manifest.entries):
-        raise ObjectStoreIntegrityError("promoted artifacts do not match the manifest")
+        raise ObjectStoreIntegrityError(
+            "promoted artifacts do not match the manifest",
+            validation_reason="receipt_mismatch",
+        )
     entries: list[list[object]] = []
     for entry, artifact in zip(manifest.entries, artifacts, strict=True):
         if (
@@ -468,7 +523,10 @@ def _commit_payload(
             or artifact.size != entry.size
             or artifact.content_type != entry.content_type
         ):
-            raise ObjectStoreIntegrityError("promoted artifacts do not match the manifest")
+            raise ObjectStoreIntegrityError(
+                "promoted artifacts do not match the manifest",
+                validation_reason="receipt_mismatch",
+            )
         entries.append([entry.relative_name, entry.content_type, entry.sha256, entry.size])
     return json.dumps(
         {
@@ -492,17 +550,26 @@ def _parse_commit_payload(
     tenant_id: str,
 ) -> tuple[str, tuple[StoredArtifact, ...]]:
     if len(payload) > _MAX_COMMIT_MARKER_SIZE:
-        raise ObjectStoreIntegrityError("classroom commit marker is too large")
+        raise ObjectStoreIntegrityError(
+            "classroom commit marker is too large",
+            validation_reason="size_mismatch",
+        )
     try:
         document = json.loads(payload.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ObjectStoreIntegrityError("classroom commit marker is invalid") from exc
+        raise ObjectStoreIntegrityError(
+            "classroom commit marker is invalid",
+            validation_reason="schema_invalid",
+        ) from exc
     if (
         not isinstance(document, dict)
         or set(document) != {"asset_id", "attempt", "entries", "schema", "tenant_id", "version"}
         or document.get("schema") != 1
     ):
-        raise ObjectStoreIntegrityError("classroom commit marker is invalid")
+        raise ObjectStoreIntegrityError(
+            "classroom commit marker is invalid",
+            validation_reason="schema_invalid",
+        )
     asset_id, version, marker_name = _classroom_key_parts(marker_key, tenant_id)
     attempt = document.get("attempt")
     if (
@@ -510,16 +577,28 @@ def _parse_commit_payload(
         or document.get("tenant_id") != tenant_id
         or document.get("asset_id") != asset_id
         or document.get("version") != version
-        or not _is_owner_token(attempt)
+    ):
+        raise ObjectStoreIntegrityError(
+            "classroom commit marker binding is invalid",
+            validation_reason="receipt_mismatch",
+        )
+    if (
+        not _is_owner_token(attempt)
         or not isinstance(document.get("entries"), list)
         or not document["entries"]
     ):
-        raise ObjectStoreIntegrityError("classroom commit marker is invalid")
+        raise ObjectStoreIntegrityError(
+            "classroom commit marker is invalid",
+            validation_reason="schema_invalid",
+        )
     keys: set[str] = set()
     artifacts: list[StoredArtifact] = []
     for raw_entry in document["entries"]:
         if not isinstance(raw_entry, list) or len(raw_entry) != 4:
-            raise ObjectStoreIntegrityError("classroom commit marker is invalid")
+            raise ObjectStoreIntegrityError(
+                "classroom commit marker is invalid",
+                validation_reason="schema_invalid",
+            )
         try:
             entry = ArtifactManifestEntry(*raw_entry)
             entry.validate()
@@ -530,9 +609,15 @@ def _parse_commit_payload(
                 entry.relative_name,
             )
         except (ArtifactManifestError, TypeError, ValueError) as exc:
-            raise ObjectStoreIntegrityError("classroom commit marker is invalid") from exc
+            raise ObjectStoreIntegrityError(
+                "classroom commit marker is invalid",
+                validation_reason="schema_invalid",
+            ) from exc
         if key in keys:
-            raise ObjectStoreIntegrityError("classroom commit marker is invalid")
+            raise ObjectStoreIntegrityError(
+                "classroom commit marker is invalid",
+                validation_reason="schema_invalid",
+            )
         keys.add(key)
         artifacts.append(
             _stored_artifact(
@@ -747,12 +832,18 @@ class _TenantScopedStore:
             None,
         )
         if await self._validate_published_artifact(marker) is None:
-            raise ObjectStoreIntegrityError("publication marker is not durable")
+            raise ObjectStoreIntegrityError(
+                "publication marker is not durable",
+                validation_reason="receipt_mismatch",
+            )
         confirmed: list[StoredArtifact] = []
         for artifact in artifacts:
             validated = await self._validate_published_artifact(artifact)
             if validated is None:
-                raise ObjectStoreIntegrityError("published artifact is not durable")
+                raise ObjectStoreIntegrityError(
+                    "published artifact is not durable",
+                    validation_reason="receipt_mismatch",
+                )
             confirmed.append(validated)
         return tuple(confirmed)
 
@@ -852,7 +943,10 @@ def _verified_local_spool(
         with path.open("rb") as source:
             revision = _local_stat_revision(os.fstat(source.fileno()))
             if artifact.revision is not None and revision != artifact.revision:
-                raise ObjectStoreIntegrityError("local object revision changed")
+                raise ObjectStoreIntegrityError(
+                    "local object revision changed",
+                    validation_reason="receipt_mismatch",
+                )
             while chunk := source.read(_READ_CHUNK_SIZE):
                 spool.write(chunk)
         spool.flush()
@@ -1124,7 +1218,10 @@ class LocalClassroomArtifactStore(_TenantScopedStore):
             with path.open("rb") as handle:
                 payload = handle.read(max_size + 1)
             if len(payload) > max_size:
-                raise ObjectStoreIntegrityError("internal object is too large")
+                raise ObjectStoreIntegrityError(
+                    "internal object is too large",
+                    validation_reason="size_mismatch",
+                )
             return payload
 
         return await asyncio.to_thread(read)
@@ -1134,14 +1231,11 @@ class LocalClassroomArtifactStore(_TenantScopedStore):
         artifact: StoredArtifact,
     ) -> StoredArtifact | None:
         path = self._path_for(artifact.key)
-        try:
-            spool, revision = await asyncio.to_thread(
-                _verified_local_spool,
-                path,
-                artifact,
-            )
-        except (ObjectStoreIntegrityError, ObjectStoreNotFound):
-            return None
+        spool, revision = await asyncio.to_thread(
+            _verified_local_spool,
+            path,
+            artifact,
+        )
         await asyncio.to_thread(spool.close)
         return _stored_artifact(
             artifact.key,
@@ -1303,7 +1397,9 @@ class LocalClassroomArtifactStore(_TenantScopedStore):
                         path,
                         artifact,
                     )
-                except ObjectStoreIntegrityError:
+                except ObjectStoreIntegrityError as exc:
+                    if exc.validation_reason is not None:
+                        raise
                     raise ObjectStoreNotFound("object was not found") from None
             try:
                 while chunk := await asyncio.to_thread(
@@ -1831,7 +1927,10 @@ class S3ClassroomArtifactStore(_TenantScopedStore):
         finally:
             await asyncio.to_thread(body.close)
         if len(payload) > max_size:
-            raise ObjectStoreIntegrityError("internal object is too large")
+            raise ObjectStoreIntegrityError(
+                "internal object is too large",
+                validation_reason="size_mismatch",
+            )
         return payload
 
     async def put_verified(
@@ -2014,7 +2113,10 @@ class S3ClassroomArtifactStore(_TenantScopedStore):
             response = await _get_object_response(self._client, **arguments)
         except ClientError as exc:
             if _is_s3_precondition_error(exc):
-                raise ObjectStoreIntegrityError(changed_message) from None
+                raise ObjectStoreIntegrityError(
+                    changed_message,
+                    validation_reason="receipt_mismatch",
+                ) from None
             _raise_s3_error(exc)
         except BotoCoreError as exc:
             _raise_s3_error(exc)
@@ -2028,7 +2130,10 @@ class S3ClassroomArtifactStore(_TenantScopedStore):
 
     async def _spool_validated_s3_artifact(self, artifact: StoredArtifact):
         if artifact.revision is None or artifact.version_id is None:
-            raise ObjectStoreIntegrityError("validated S3 object revision is missing")
+            raise ObjectStoreIntegrityError(
+                "validated S3 object revision is missing",
+                validation_reason="receipt_mismatch",
+            )
         response, spool, revision = await self._spool_s3_revision(
             artifact.key,
             {
@@ -2050,7 +2155,10 @@ class S3ClassroomArtifactStore(_TenantScopedStore):
             or metadata.get("sha256") != artifact.sha256
         ):
             await asyncio.to_thread(spool.close)
-            raise ObjectStoreIntegrityError("validated S3 object metadata changed")
+            raise ObjectStoreIntegrityError(
+                "validated S3 object metadata changed",
+                validation_reason="receipt_mismatch",
+            )
         return spool
 
     async def _spool_s3_source(
@@ -2064,7 +2172,10 @@ class S3ClassroomArtifactStore(_TenantScopedStore):
         if head is None:
             raise ObjectStoreNotFound("source object was not found")
         if head.get("ContentLength") != expected_size:
-            raise ObjectStoreIntegrityError("source object size does not match")
+            raise ObjectStoreIntegrityError(
+                "source object size does not match",
+                validation_reason="size_mismatch",
+            )
         _, spool, _ = await self._spool_s3_revision(
             source_key,
             head,
@@ -2096,12 +2207,21 @@ class S3ClassroomArtifactStore(_TenantScopedStore):
         metadata = head.get("Metadata", {})
         if not isinstance(metadata, dict) or metadata.get("owner") != owner_token:
             raise ObjectStoreConflictError("object is not owned by this publication attempt")
-        if (
-            metadata.get("sha256") != expected_sha256
-            or head.get("ContentLength") != expected_size
-            or head.get("ContentType") != content_type
-        ):
-            raise ObjectStoreIntegrityError("stored object metadata does not match")
+        if metadata.get("sha256") != expected_sha256:
+            raise ObjectStoreIntegrityError(
+                "stored object digest metadata does not match",
+                validation_reason="receipt_mismatch",
+            )
+        if head.get("ContentLength") != expected_size:
+            raise ObjectStoreIntegrityError(
+                "stored object size metadata does not match",
+                validation_reason="size_mismatch",
+            )
+        if head.get("ContentType") != content_type:
+            raise ObjectStoreIntegrityError(
+                "stored object content type does not match",
+                validation_reason="receipt_mismatch",
+            )
         response, spool, revision = await self._spool_s3_revision(
             key,
             head,
@@ -2112,14 +2232,26 @@ class S3ClassroomArtifactStore(_TenantScopedStore):
         )
         await asyncio.to_thread(spool.close)
         if _etag(response) != revision:
-            raise ObjectStoreIntegrityError("destination object revision does not match")
+            raise ObjectStoreIntegrityError(
+                "destination object revision does not match",
+                validation_reason="receipt_mismatch",
+            )
         actual_version_id = _version_id(head)
         if version_id is not None and actual_version_id != version_id:
-            raise ObjectStoreIntegrityError("destination object version does not match")
+            raise ObjectStoreIntegrityError(
+                "destination object version does not match",
+                validation_reason="receipt_mismatch",
+            )
         if _version_id(response) != actual_version_id:
-            raise ObjectStoreIntegrityError("destination object version does not match")
+            raise ObjectStoreIntegrityError(
+                "destination object version does not match",
+                validation_reason="receipt_mismatch",
+            )
         if response.get("ContentType") != content_type:
-            raise ObjectStoreIntegrityError("destination content type does not match")
+            raise ObjectStoreIntegrityError(
+                "destination content type does not match",
+                validation_reason="receipt_mismatch",
+            )
         return _stored_artifact(
             key,
             expected_sha256,
@@ -2138,7 +2270,7 @@ class S3ClassroomArtifactStore(_TenantScopedStore):
         if not _is_owner_token(owner_token):
             return None
         try:
-            return await self._reconcile_s3_created(
+            validated = await self._reconcile_s3_created(
                 artifact.key,
                 artifact.sha256,
                 artifact.size,
@@ -2146,12 +2278,11 @@ class S3ClassroomArtifactStore(_TenantScopedStore):
                 owner_token,
                 None,
             )
-        except (
-            ObjectStoreConflictError,
-            ObjectStoreIntegrityError,
-            ObjectStoreNotFound,
-        ):
+        except ObjectStoreConflictError:
             return None
+        if validated is None:
+            raise ObjectStoreNotFound("object was not found")
+        return validated
 
     async def _require_current_claim(
         self,
@@ -2235,7 +2366,10 @@ class S3ClassroomArtifactStore(_TenantScopedStore):
             or reconciled.revision != revision
             or reconciled.version_id != version_id
         ):
-            raise ObjectStoreIntegrityError("destination object changed during verification")
+            raise ObjectStoreIntegrityError(
+                "destination object changed during verification",
+                validation_reason="receipt_mismatch",
+            )
         return reconciled
 
     async def copy(

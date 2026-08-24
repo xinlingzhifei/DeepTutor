@@ -45,8 +45,10 @@ from deeptutor.teaching.job_errors import (
 from deeptutor.teaching.object_store import (
     ClassroomArtifactPromotionService,
     ClassroomArtifactStore,
+    ObjectStoreIntegrityError,
+    ObjectStoreNotFound,
 )
-from deeptutor.teaching.openmaic.client import EngineJob
+from deeptutor.teaching.openmaic.client import EngineJob, OpenMAICRequestFailed
 from deeptutor.teaching.repositories.jobs import (
     CancellationRequest,
     JobLeaseLost,
@@ -211,6 +213,54 @@ def _manifest_sha256(manifest: ClassroomArtifactManifest) -> str:
     ).hexdigest()
 
 
+def _translate_output_store_error(
+    error: Exception,
+) -> ArtifactValidationError | None:
+    if isinstance(error, ObjectStoreNotFound):
+        return ArtifactValidationError(
+            "artifact_commit_missing",
+            metric_reason="missing_artifact",
+        )
+    if not isinstance(error, ObjectStoreIntegrityError):
+        return None
+    mapping = {
+        "schema_invalid": "artifact_invalid",
+        "receipt_mismatch": "artifact_invalid",
+        "hash_mismatch": "hash_invalid",
+        "size_mismatch": "artifact_invalid",
+    }
+    reason = error.validation_reason if error.validation_reason in mapping else "unknown"
+    code = mapping.get(reason, "artifact_invalid")
+    return ArtifactValidationError(
+        code,
+        metric_reason=reason,
+    )
+
+
+def _translate_output_promotion_error(
+    error: Exception,
+) -> ArtifactValidationError | None:
+    if isinstance(error, OpenMAICRequestFailed) and error.status_code == 404:
+        return ArtifactValidationError(
+            "artifact_commit_missing",
+            metric_reason="missing_artifact",
+        )
+    return _translate_output_store_error(error)
+
+
+async def _confirmed_output_publish(
+    store: ClassroomArtifactStore,
+    manifest: ClassroomArtifactManifest,
+):
+    try:
+        return await store.confirmed_publish(manifest)
+    except (ObjectStoreIntegrityError, ObjectStoreNotFound) as exc:
+        translated = _translate_output_store_error(exc)
+        if translated is not None:
+            raise translated from None
+        raise
+
+
 async def _load_promoted_classroom_document(
     store: ClassroomArtifactStore,
     *,
@@ -229,16 +279,34 @@ async def _load_promoted_classroom_document(
         or expected_size < 1
         or expected_size > _MAX_CLASSROOM_DOCUMENT_BYTES
     ):
-        raise ArtifactValidationError("artifact_invalid")
+        raise ArtifactValidationError(
+            "artifact_invalid",
+            metric_reason="size_mismatch",
+        )
     body = bytearray()
-    async for chunk in await store.open(object_key):
-        if not isinstance(chunk, bytes):
-            raise ArtifactValidationError("artifact_invalid")
-        body.extend(chunk)
-        if len(body) > expected_size or len(body) > _MAX_CLASSROOM_DOCUMENT_BYTES:
-            raise ArtifactValidationError("artifact_invalid")
+    try:
+        stream = await store.open(object_key)
+        async for chunk in stream:
+            if not isinstance(chunk, bytes):
+                raise ArtifactValidationError("artifact_invalid")
+            body.extend(chunk)
+            if len(body) > expected_size or len(body) > _MAX_CLASSROOM_DOCUMENT_BYTES:
+                raise ArtifactValidationError(
+                    "artifact_invalid",
+                    metric_reason="size_mismatch",
+                )
+    except (ObjectStoreIntegrityError, ObjectStoreNotFound) as exc:
+        translated = _translate_output_store_error(exc)
+        if translated is not None:
+            raise translated from None
+        raise
     payload = bytes(body)
-    if len(payload) != expected_size or hashlib.sha256(payload).hexdigest() != expected_sha256:
+    if len(payload) != expected_size:
+        raise ArtifactValidationError(
+            "artifact_invalid",
+            metric_reason="size_mismatch",
+        )
+    if hashlib.sha256(payload).hexdigest() != expected_sha256:
         raise ArtifactValidationError("hash_invalid")
     try:
         document = ClassroomDocument.model_validate_json(payload)
@@ -265,6 +333,35 @@ def _validation_failure(error: ArtifactValidationError) -> JobFailure:
     if error.code == "source_invalid":
         return JobFailure("source_snapshot_invalid", error.code, False)
     return JobFailure("contract_invalid", error.code, False)
+
+
+def _artifact_validation_metric_reason(code: str) -> str | None:
+    """Map generated-output failures to the fixed, non-sensitive metric contract."""
+
+    if code in {"source_invalid", "policy_denied"}:
+        return None
+    if code == "hash_invalid":
+        return "hash_mismatch"
+    if code == "artifact_commit_missing":
+        return "missing_artifact"
+    if code in {"artifact_target_mismatch", "tenant_prefix_invalid", "media_invalid"}:
+        return "receipt_mismatch"
+    if code == "artifact_size_invalid":
+        return "size_mismatch"
+    if code in {"artifact_invalid", "contract_invalid", "dsl_invalid"}:
+        return "schema_invalid"
+    return "unknown"
+
+
+def _mark_output_validation(error: ArtifactValidationError) -> ArtifactValidationError:
+    return ArtifactValidationError(
+        error.code,
+        metric_reason=(
+            error.metric_reason
+            if error.metric_reason is not None
+            else _artifact_validation_metric_reason(error.code)
+        ),
+    )
 
 
 def _validated_outline_result(
@@ -346,10 +443,15 @@ class GenerationWorker:
         except ArtifactValidationError as exc:
             failure = _validation_failure(exc)
             try:
+                failure_kwargs: dict[str, str] = {
+                    "error_category": failure.category,
+                    "error_code": failure.code,
+                }
+                if exc.metric_reason is not None:
+                    failure_kwargs["artifact_validation_reason"] = exc.metric_reason
                 await self._repository.fail_claim(
                     claim,
-                    error_category=failure.category,
-                    error_code=failure.code,
+                    **failure_kwargs,
                 )
             except JobLeaseLost:
                 pass
@@ -392,6 +494,8 @@ class GenerationWorker:
                 return
             if claim.job_kind == "export":
                 request = ExportRequest.model_validate(request_payload)
+                if request.tenant_id != claim.tenant_id or request.job_id != claim.job_id:
+                    raise ArtifactValidationError("contract_invalid")
                 location = await self._repository.get_export_input_location(
                     claim.tenant_id,
                     claim.job_id,
@@ -453,7 +557,10 @@ class GenerationWorker:
                 return
             result_payload = terminal.payload.get("result")
             if not isinstance(result_payload, Mapping):
-                raise ArtifactValidationError("contract_invalid")
+                raise ArtifactValidationError(
+                    "contract_invalid",
+                    metric_reason=(None if claim.phase == "outline" else "schema_invalid"),
+                )
             if claim.phase == "outline":
                 outline = _validated_outline_result(result_payload, request)
                 await self._repository.complete_outline(
@@ -462,21 +569,27 @@ class GenerationWorker:
                 )
                 return
             if claim.job_kind == "export":
-                await self._materialize_export(
-                    claim,
-                    client,
-                    request_payload,
-                    result_payload,
-                    heartbeat,
-                )
+                try:
+                    await self._materialize_export(
+                        claim,
+                        client,
+                        request_payload,
+                        result_payload,
+                        heartbeat,
+                    )
+                except ArtifactValidationError as exc:
+                    raise _mark_output_validation(exc) from exc
             else:
-                await self._materialize_classroom(
-                    claim,
-                    client,
-                    request_payload,
-                    result_payload,
-                    heartbeat,
-                )
+                try:
+                    await self._materialize_classroom(
+                        claim,
+                        client,
+                        request_payload,
+                        result_payload,
+                        heartbeat,
+                    )
+                except ArtifactValidationError as exc:
+                    raise _mark_output_validation(exc) from exc
 
     async def _validated_classroom(
         self,
@@ -526,7 +639,7 @@ class GenerationWorker:
             manifest_sha256=manifest_sha256,
         )
         store = await self._stores.store_for_tenant(claim.tenant_id)
-        confirmed = await store.confirmed_publish(manifest)
+        confirmed = await _confirmed_output_publish(store, manifest)
         if confirmed is None:
             bodies = {
                 entry.relative_name: client.stream_artifact(download_paths[entry.relative_name])
@@ -534,19 +647,28 @@ class GenerationWorker:
             }
             try:
                 await ClassroomArtifactPromotionService(store).promote(manifest, bodies)
-            except Exception:
+            except Exception as exc:
                 # A commit-marker write or post-commit cleanup can be ambiguous.
                 # Only an exact, durable commit marker authorizes recovery.
-                confirmed = await store.confirmed_publish(manifest)
+                confirmed = await _confirmed_output_publish(store, manifest)
                 if confirmed is None:
+                    translated = _translate_output_promotion_error(exc)
+                    if translated is not None:
+                        raise translated from None
                     raise
             else:
-                confirmed = await store.confirmed_publish(manifest)
+                confirmed = await _confirmed_output_publish(store, manifest)
             heartbeat.assert_current()
             if confirmed is None:
-                raise ArtifactValidationError("artifact_commit_missing")
+                raise ArtifactValidationError(
+                    "artifact_commit_missing",
+                    metric_reason="missing_artifact",
+                )
         if tuple(artifact.key for artifact in confirmed) != target_keys:
-            raise ArtifactValidationError("artifact_target_mismatch")
+            raise ArtifactValidationError(
+                "artifact_target_mismatch",
+                metric_reason="receipt_mismatch",
+            )
         heartbeat.assert_current()
         await self._repository.mark_object_committed(
             claim,

@@ -952,13 +952,20 @@ async def test_store_methods_reject_noncanonical_artifact_paths(
 
 
 @pytest.mark.parametrize(
-    "failure",
-    ["bad-format", "wrong-digest", "too-short", "too-long", "non-bytes"],
+    ("failure", "validation_reason"),
+    [
+        ("bad-format", "schema_invalid"),
+        ("wrong-digest", "hash_mismatch"),
+        ("too-short", "size_mismatch"),
+        ("too-long", "size_mismatch"),
+        ("non-bytes", "schema_invalid"),
+    ],
 )
 @pytest.mark.asyncio
 async def test_failed_stream_integrity_leaves_no_object_or_temporary_file(
     tmp_path,
     failure: str,
+    validation_reason: str,
 ) -> None:
     payload = b"verified-payload"
     chunks: tuple[object, ...] = (payload,)
@@ -982,12 +989,68 @@ async def test_failed_stream_integrity_leaves_no_object_or_temporary_file(
     store = LocalClassroomArtifactStore(tmp_path, "tenant-a")
     key = temporary_artifact_key("tenant-a", "job-1", "classroom.json")
 
-    with pytest.raises(ObjectStoreIntegrityError):
+    with pytest.raises(ObjectStoreIntegrityError) as caught:
         await store.put_verified(key, untyped_body(), digest, size)
+    assert caught.value.validation_reason == validation_reason
 
     with pytest.raises(ObjectStoreNotFound):
         await store.open(key)
     assert not list(tmp_path.rglob("*.tmp"))
+
+
+@pytest.mark.asyncio
+async def test_oversized_internal_commit_marker_has_a_fixed_size_reason(tmp_path) -> None:
+    store = LocalClassroomArtifactStore(tmp_path, "tenant-a")
+    key = object_store_module._version_internal_key(
+        "tenant-a",
+        "asset-1",
+        1,
+        object_store_module._COMMIT_NAME,
+    )
+    path = tmp_path.joinpath(*key.split("/"))
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"{}")
+
+    with pytest.raises(ObjectStoreIntegrityError) as caught:
+        await store._read_raw_bytes(key, 1)
+
+    assert caught.value.validation_reason == "size_mismatch"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mutation", "error_type", "validation_reason"),
+    (
+        ("missing", ObjectStoreNotFound, None),
+        ("short", ObjectStoreIntegrityError, "size_mismatch"),
+        ("hash", ObjectStoreIntegrityError, "hash_mismatch"),
+    ),
+)
+async def test_confirmed_local_publication_preserves_precise_artifact_failure(
+    tmp_path,
+    mutation: str,
+    error_type: type[ObjectStoreError],
+    validation_reason: str | None,
+) -> None:
+    payload = b'{"ok":true}'
+    manifest = _manifest(payload, f"confirmed-{mutation}")
+    store = LocalClassroomArtifactStore(tmp_path, "tenant-a")
+    promoted = await ClassroomArtifactPromotionService(store).promote(
+        manifest,
+        {"classroom.json": _body(payload)},
+    )
+    path = tmp_path.joinpath(*promoted[0].key.split("/"))
+    if mutation == "missing":
+        path.replace(tmp_path / "moved-classroom.json")
+    elif mutation == "short":
+        path.write_bytes(payload[:-1])
+    else:
+        path.write_bytes(b'{"no":true}')
+
+    with pytest.raises(error_type) as caught:
+        await store.confirmed_publish(manifest)
+
+    assert getattr(caught.value, "validation_reason", None) == validation_reason
 
 
 @pytest.mark.asyncio

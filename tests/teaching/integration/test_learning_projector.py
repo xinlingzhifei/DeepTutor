@@ -43,7 +43,7 @@ async def _seed_classroom(engine: AsyncEngine, tenant_id: str, schema_name: str)
             text(
                 "INSERT INTO platform.tenant_schema_states "
                 "(tenant_id, schema_name, revision, status) "
-                "VALUES (:tenant_id, :schema_name, '20260824_0018', 'active')"
+                "VALUES (:tenant_id, :schema_name, '20260825_0019', 'active')"
             ),
             {"tenant_id": tenant_id, "schema_name": schema_name},
         )
@@ -190,6 +190,19 @@ async def _append(
     )
 
 
+async def _backlog_event_ids(database: ProjectorDatabase) -> list[str]:
+    async with database.engine.connect() as connection:
+        return list(
+            await connection.scalars(
+                text(
+                    "SELECT event_id FROM platform.teaching_learning_projection_backlog "
+                    "WHERE tenant_id = :tenant_id ORDER BY event_id"
+                ),
+                {"tenant_id": database.tenant_id},
+            )
+        )
+
+
 @pytest.mark.asyncio
 async def test_worker_projects_distinct_progress_and_server_graded_mastery_atomically(
     projector_database: ProjectorDatabase,
@@ -223,6 +236,12 @@ async def test_worker_projects_distinct_progress_and_server_graded_mastery_atomi
             "score": 0.0,
         },
     )
+    assert await _backlog_event_ids(projector_database) == [
+        "event-quiz",
+        "event-scene-1",
+        "event-scene-duplicate",
+        "event-start",
+    ]
     worker = LearningProjectionWorker(
         engine=projector_database.engine,
         documents=Documents(),
@@ -270,6 +289,7 @@ async def test_worker_projects_distinct_progress_and_server_graded_mastery_atomi
     assert tuple(attempt) == (True, 1.0, "published_answer")
     assert tuple(mastery) == (0.5, 1)
     assert statuses == ["completed"] * 4
+    assert await _backlog_event_ids(projector_database) == []
 
 
 @pytest.mark.asyncio
@@ -283,6 +303,7 @@ async def test_lease_fencing_reclaims_expired_work_and_blocks_later_session_seq(
 
     await _append(projector_database, event_id="event-1", event_type="classroom.started")
     await _append(projector_database, event_id="event-2", event_type="hint.used")
+    assert await _backlog_event_ids(projector_database) == ["event-1", "event-2"]
     repository = SqlAlchemyProjectionQueueRepository(projector_database.engine)
 
     first = await repository.claim(
@@ -320,8 +341,10 @@ async def test_lease_fencing_reclaims_expired_work_and_blocks_later_session_seq(
     assert reclaimed.lease_token != first.lease_token
     with pytest.raises(ProjectionLeaseLost):
         await repository.project(first, document=None)
+    assert await _backlog_event_ids(projector_database) == ["event-1", "event-2"]
 
     await repository.project(reclaimed, document=None)
+    assert await _backlog_event_ids(projector_database) == ["event-2"]
     second = await repository.claim(
         projector_database.tenant_id,
         owner="worker-b",
@@ -379,6 +402,7 @@ async def test_transient_failure_backs_off_then_quarantines_at_attempt_limit(
             )
         ).one()
     assert tuple(first) == ("failed", 1, True, True, True, True, True)
+    assert await _backlog_event_ids(projector_database) == ["event-transient"]
 
     async with projector_database.engine.begin() as connection:
         await connection.execute(
@@ -419,6 +443,145 @@ async def test_transient_failure_backs_off_then_quarantines_at_attempt_limit(
     assert tuple(final) == ("quarantined", 2, "projection_attempts_exhausted")
     assert reason == "projection_attempts_exhausted"
     assert tuple(derived_counts) == (0, 0, 0, 0)
+    assert await _backlog_event_ids(projector_database) == []
+
+
+@pytest.mark.asyncio
+async def test_complete_and_quarantine_delete_only_their_terminal_backlog(
+    projector_database: ProjectorDatabase,
+) -> None:
+    from deeptutor.teaching.projector_worker import SqlAlchemyProjectionQueueRepository
+
+    await _append(
+        projector_database,
+        event_id="event-complete",
+        event_type="classroom.started",
+    )
+    await _append(
+        projector_database,
+        event_id="event-quarantine",
+        event_type="hint.used",
+    )
+    repository = SqlAlchemyProjectionQueueRepository(projector_database.engine)
+
+    completed = await repository.claim(
+        projector_database.tenant_id,
+        owner="projector-terminal",
+        lease_seconds=60,
+    )
+    assert completed is not None and completed.event.event_id == "event-complete"
+    await repository.complete(completed)
+    assert await _backlog_event_ids(projector_database) == ["event-quarantine"]
+
+    quarantined = await repository.claim(
+        projector_database.tenant_id,
+        owner="projector-terminal",
+        lease_seconds=60,
+    )
+    assert quarantined is not None and quarantined.event.event_id == "event-quarantine"
+    await repository.quarantine(quarantined, reason_code="projection_event_invalid")
+    assert await _backlog_event_ids(projector_database) == []
+
+
+@pytest.mark.asyncio
+async def test_claim_sweeps_expired_exhausted_lease_and_deletes_backlog(
+    projector_database: ProjectorDatabase,
+) -> None:
+    from deeptutor.teaching.projector_worker import SqlAlchemyProjectionQueueRepository
+
+    await _append(
+        projector_database,
+        event_id="event-expired-exhausted",
+        event_type="classroom.started",
+    )
+    repository = SqlAlchemyProjectionQueueRepository(projector_database.engine)
+    claimed = await repository.claim(
+        projector_database.tenant_id,
+        owner="projector-expired",
+        lease_seconds=60,
+    )
+    assert claimed is not None
+    quoted = f'"{projector_database.schema_name}"'
+    async with projector_database.engine.begin() as connection:
+        await connection.execute(
+            text(
+                f"UPDATE {quoted}.learning_projection_queue "
+                "SET attempt_count = max_attempts, "
+                "lease_expires_at = clock_timestamp() - interval '1 second' "
+                "WHERE event_id = 'event-expired-exhausted'"
+            )
+        )
+
+    assert (
+        await repository.claim(
+            projector_database.tenant_id,
+            owner="projector-other",
+            lease_seconds=60,
+        )
+        is None
+    )
+    async with projector_database.engine.connect() as connection:
+        status = await connection.scalar(
+            text(
+                f"SELECT status FROM {quoted}.learning_projection_queue "
+                "WHERE event_id = 'event-expired-exhausted'"
+            )
+        )
+        reason = await connection.scalar(
+            text(
+                f"SELECT reason_code FROM {quoted}.learning_event_quarantine "
+                "WHERE event_id = 'event-expired-exhausted'"
+            )
+        )
+    assert (status, reason) == ("quarantined", "projection_attempts_exhausted")
+    assert await _backlog_event_ids(projector_database) == []
+
+
+@pytest.mark.asyncio
+async def test_missing_terminal_backlog_fails_closed_and_rolls_back_queue_status(
+    projector_database: ProjectorDatabase,
+) -> None:
+    from deeptutor.teaching.projector_worker import SqlAlchemyProjectionQueueRepository
+    from deeptutor.teaching.repositories.metric_rollups import MetricRollupConsistencyError
+
+    await _append(
+        projector_database,
+        event_id="event-missing-backlog",
+        event_type="classroom.started",
+    )
+    repository = SqlAlchemyProjectionQueueRepository(projector_database.engine)
+    claim = await repository.claim(
+        projector_database.tenant_id,
+        owner="projector-missing",
+        lease_seconds=60,
+    )
+    assert claim is not None
+    quoted = f'"{projector_database.schema_name}"'
+    async with projector_database.engine.begin() as connection:
+        await connection.execute(
+            text(
+                "DELETE FROM platform.teaching_learning_projection_backlog "
+                "WHERE tenant_id = :tenant_id AND event_id = 'event-missing-backlog'"
+            ),
+            {"tenant_id": projector_database.tenant_id},
+        )
+
+    with pytest.raises(
+        MetricRollupConsistencyError,
+        match="learning projection backlog row is missing",
+    ):
+        await repository.complete(claim)
+
+    async with projector_database.engine.connect() as connection:
+        queue = (
+            await connection.execute(
+                text(
+                    f"SELECT status, lease_owner, lease_token FROM {quoted}.learning_projection_queue "
+                    "WHERE event_id = 'event-missing-backlog'"
+                )
+            )
+        ).one()
+    assert tuple(queue) == ("running", claim.lease_owner, claim.lease_token)
 
 
 @pytest.mark.asyncio
@@ -659,3 +822,4 @@ async def test_projection_failure_rolls_back_all_derived_writes_before_retry(
 
     assert tuple(queue) == ("failed", 1, "transient_runtimeerror")
     assert tuple(derived_counts) == (0, 0, 0, 0)
+    assert await _backlog_event_ids(projector_database) == ["event-atomic-failure"]

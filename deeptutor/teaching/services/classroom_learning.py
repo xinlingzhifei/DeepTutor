@@ -19,6 +19,10 @@ from deeptutor.teaching.repositories.learning_events import (
     LearningEventBindingError,
     SqlAlchemyLearningEventRepository,
 )
+from deeptutor.teaching.repositories.metric_rollups import (
+    CounterRollupObservation,
+    increment_counter_rollups,
+)
 from deeptutor.teaching.tenant_context import TenantContext
 from deeptutor.teaching.tickets import ClassroomTicketClaims
 
@@ -96,9 +100,15 @@ class ClassroomLearningEventIngestionService:
             database_session: AsyncSession,
             claims: ClassroomTicketClaims,
         ) -> LearningEventIngestionResult:
+            for event_id in sorted({event.event_id for event in batch.events}):
+                await database_session.execute(
+                    text("SELECT pg_advisory_xact_lock(hashtextextended(:event_id, 0))"),
+                    {"event_id": event_id},
+                )
             accepted: list[IngestedEvent] = []
             duplicate: list[IngestedEvent] = []
             quarantined: list[QuarantinedEvent] = []
+            counter_observations: list[CounterRollupObservation] = []
             for event in batch.events:
                 reason = validate_learning_event(event, document)
                 if reason is not None:
@@ -129,12 +139,17 @@ class ClassroomLearningEventIngestionService:
                         ),
                         payload=event.model_dump(mode="json"),
                     ),
+                    counter_observations=counter_observations,
                 )
                 outcome = IngestedEvent(event_id=stored.event_id, seq=stored.seq)
                 if stored.outcome == "accepted":
                     accepted.append(outcome)
                 else:
                     duplicate.append(outcome)
+            await increment_counter_rollups(
+                database_session,
+                observations=counter_observations,
+            )
             return LearningEventIngestionResult(
                 accepted=tuple(accepted),
                 duplicate=tuple(duplicate),
