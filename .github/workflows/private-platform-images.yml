@@ -21,6 +21,19 @@ jobs:
     steps:
       - name: Checkout yFeiSTAI
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate immutable release candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF_TYPE" = "tag"
+          printf '%s\n' "$GITHUB_REF_NAME" | grep -Eq '^yfeistai-first-release-[0-9]{8}-[0-9a-f]{8}$'
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "${GITHUB_REF_NAME##*-}" = "${GITHUB_SHA:0:8}"
+          test "$(git rev-list -n 1 "$GITHUB_REF_NAME")" = "$GITHUB_SHA"
 
       - name: Checkout OpenMAIC
         uses: actions/checkout@v4
@@ -28,6 +41,7 @@ jobs:
           repository: xinlingzhifei/OpenMAIC
           ref: 0cf2a330411681190e89f48e20f305345ff99f87
           path: openmaic-upstream
+          persist-credentials: false
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -39,7 +53,29 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Reject existing candidate image tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          for image in \
+            ghcr.io/xinlingzhifei/deeptutor \
+            ghcr.io/xinlingzhifei/openmaic \
+            ghcr.io/xinlingzhifei/openmaic-render
+          do
+            candidate="$image:$GITHUB_REF_NAME"
+            if diagnostic="$(docker buildx imagetools inspect "$candidate" 2>&1)"; then
+              echo "::error::candidate image tag already exists: $candidate"
+              exit 1
+            fi
+            if ! grep -Eqi 'manifest unknown|name unknown|not found' <<<"$diagnostic"; then
+              echo "::error::candidate image tag could not be checked: $candidate"
+              printf '%s\n' "$diagnostic"
+              exit 1
+            fi
+          done
+
       - name: Build and push yFeiSTAI
+        id: build_deeptutor
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -47,47 +83,96 @@ jobs:
           target: production
           platforms: linux/amd64
           push: true
-          tags: ghcr.io/xinlingzhifei/deeptutor:first-release
+          tags: ghcr.io/xinlingzhifei/deeptutor:${{ github.ref_name }}
           cache-from: type=gha,scope=deeptutor-first-release
           cache-to: type=gha,mode=max,scope=deeptutor-first-release
 
       - name: Build and push OpenMAIC
+        id: build_openmaic
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./integrations/openmaic/Dockerfile
           platforms: linux/amd64
           push: true
-          tags: ghcr.io/xinlingzhifei/openmaic:0.3.1-0cf2a330
+          tags: ghcr.io/xinlingzhifei/openmaic:${{ github.ref_name }}
           cache-from: type=gha,scope=openmaic-0.3.1-0cf2a330
           cache-to: type=gha,mode=max,scope=openmaic-0.3.1-0cf2a330
 
       - name: Build and push OpenMAIC Render
+        id: build_openmaic_render
         uses: docker/build-push-action@v6
         with:
           context: ./openmaic-upstream/render-service
           file: ./openmaic-upstream/render-service/Dockerfile
           platforms: linux/amd64
           push: true
-          tags: ghcr.io/xinlingzhifei/openmaic-render:0.3.1-0cf2a330
+          tags: ghcr.io/xinlingzhifei/openmaic-render:${{ github.ref_name }}
           cache-from: type=gha,scope=openmaic-render-0.3.1-0cf2a330
           cache-to: type=gha,mode=max,scope=openmaic-render-0.3.1-0cf2a330
 
       - name: Record image digests
-        run: python scripts/render_platform_compose.py --write-image-lock
+        run: >-
+          python scripts/render_platform_compose.py
+          --write-image-lock
+          --source-repository "$GITHUB_REPOSITORY"
+          --source-head "$GITHUB_SHA"
+          --release-tag "$GITHUB_REF_NAME"
+          --openmaic-head 0cf2a330411681190e89f48e20f305345ff99f87
 
       - name: Verify image lock
+        env:
+          DEEPTUTOR_DIGEST: ${{ steps.build_deeptutor.outputs.digest }}
+          OPENMAIC_DIGEST: ${{ steps.build_openmaic.outputs.digest }}
+          OPENMAIC_RENDER_DIGEST: ${{ steps.build_openmaic_render.outputs.digest }}
         run: |
           python - <<'PY'
-          from scripts.render_platform_compose import load_image_lock
+          import os
+          from pathlib import Path
 
-          load_image_lock()
+          from scripts.render_platform_compose import validate_image_lock_bindings
+
+          validate_image_lock_bindings(
+              compose_paths=(
+                  Path("docker-compose.platform.yml"),
+                  Path("docker-compose.data-plane.yml"),
+              ),
+              expected_candidate={
+                  "sourceRepository": os.environ["GITHUB_REPOSITORY"],
+                  "sourceHead": os.environ["GITHUB_SHA"],
+                  "releaseTag": os.environ["GITHUB_REF_NAME"],
+                  "openmaicHead": "0cf2a330411681190e89f48e20f305345ff99f87",
+                  "imageDigests": {
+                      "deeptutor": os.environ["DEEPTUTOR_DIGEST"],
+                      "openmaic": os.environ["OPENMAIC_DIGEST"],
+                      "openmaic_render": os.environ["OPENMAIC_RENDER_DIGEST"],
+                  },
+              }
+          )
           PY
+
+      - name: Promote verified compatibility image tags
+        env:
+          DEEPTUTOR_DIGEST: ${{ steps.build_deeptutor.outputs.digest }}
+          OPENMAIC_DIGEST: ${{ steps.build_openmaic.outputs.digest }}
+          OPENMAIC_RENDER_DIGEST: ${{ steps.build_openmaic_render.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            --tag ghcr.io/xinlingzhifei/deeptutor:first-release \
+            "ghcr.io/xinlingzhifei/deeptutor@$DEEPTUTOR_DIGEST"
+          docker buildx imagetools create \
+            --tag ghcr.io/xinlingzhifei/openmaic:0.3.1-0cf2a330 \
+            "ghcr.io/xinlingzhifei/openmaic@$OPENMAIC_DIGEST"
+          docker buildx imagetools create \
+            --tag ghcr.io/xinlingzhifei/openmaic-render:0.3.1-0cf2a330 \
+            "ghcr.io/xinlingzhifei/openmaic-render@$OPENMAIC_RENDER_DIGEST"
 
       - name: Upload image lock
         uses: actions/upload-artifact@v4
         with:
-          name: private-platform-image-lock-${{ github.sha }}
+          name: private-platform-image-lock-${{ github.ref_name }}-${{ github.sha }}
           path: |
             deploy/image-lock.json
             docker-compose.platform.yml

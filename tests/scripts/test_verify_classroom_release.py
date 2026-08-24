@@ -13,6 +13,8 @@ _RELEASE_RUN = {
     "runId": "first-release-run-20260824",
     "environmentId": "test-environment",
 }
+_SOURCE_REPOSITORY = "xinlingzhifei/DeepTutor"
+_OPENMAIC_HEAD = "0cf2a330411681190e89f48e20f305345ff99f87"
 
 
 def _load_verifier():
@@ -27,7 +29,10 @@ def _load_verifier():
 
 def _candidate(source_head: str) -> dict[str, object]:
     return {
+        "sourceRepository": _SOURCE_REPOSITORY,
         "sourceHead": source_head,
+        "releaseTag": f"yfeistai-first-release-20260825-{source_head[:8]}",
+        "openmaicHead": _OPENMAIC_HEAD,
         "imageDigests": {
             "deeptutor": "sha256:" + "1" * 64,
             "openmaic": "sha256:" + "2" * 64,
@@ -77,32 +82,32 @@ def _manifest_document(
 def _write_candidate_files(tmp_path: Path, candidate: dict[str, object]) -> None:
     digests = candidate["imageDigests"]
     assert isinstance(digests, dict)
+    release_tag = candidate["releaseTag"]
+    assert isinstance(release_tag, str)
     specifications = {
-        "deeptutor": ("ghcr.io/xinlingzhifei/deeptutor", "first-release"),
-        "openmaic": ("ghcr.io/xinlingzhifei/openmaic", "0.3.1-0cf2a330"),
-        "openmaic_render": (
-            "ghcr.io/xinlingzhifei/openmaic-render",
-            "0.3.1-0cf2a330",
-        ),
+        "deeptutor": "ghcr.io/xinlingzhifei/deeptutor",
+        "openmaic": "ghcr.io/xinlingzhifei/openmaic",
+        "openmaic_render": "ghcr.io/xinlingzhifei/openmaic-render",
     }
     lock = {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
+        "candidate": candidate,
         "images": {
             name: {
                 "repository": repository,
-                "tag": tag,
+                "tag": release_tag,
                 "digest": digests[name],
-                "reference": f"{repository}:{tag}@{digests[name]}",
+                "reference": f"{repository}:{release_tag}@{digests[name]}",
             }
-            for name, (repository, tag) in specifications.items()
+            for name, repository in specifications.items()
         },
     }
     deploy = tmp_path / "deploy"
     deploy.mkdir()
     (deploy / "image-lock.json").write_text(json.dumps(lock), encoding="utf-8")
     references = {
-        name: f"{repository}:{tag}@{digests[name]}"
-        for name, (repository, tag) in specifications.items()
+        name: f"{repository}:{release_tag}@{digests[name]}"
+        for name, repository in specifications.items()
     }
     (tmp_path / "docker-compose.platform.yml").write_text(
         json.dumps(
@@ -168,6 +173,28 @@ def _write_complete_bundle(
         encoding="utf-8",
     )
     return manifest, evidence, candidate
+
+
+def _rewrite_bundle_candidate(
+    tmp_path: Path,
+    module,
+    manifest: Path,
+    evidence: dict[str, object],
+    candidate: dict[str, object],
+) -> None:
+    for name, raw in evidence.items():
+        assert isinstance(raw, dict)
+        artifact_path = tmp_path / str(raw["artifact"])
+        artifact_body = json.dumps(
+            _artifact_document(module, candidate, name),
+            sort_keys=True,
+        ).encode()
+        artifact_path.write_bytes(artifact_body)
+        raw["artifactSha256"] = hashlib.sha256(artifact_body).hexdigest()
+    manifest.write_text(
+        json.dumps(_manifest_document(module, candidate, evidence)),
+        encoding="utf-8",
+    )
 
 
 class FakeRuntime:
@@ -429,6 +456,52 @@ def test_file_runtime_rejects_nonzero_candidate_digests_that_do_not_match_image_
     assert "image lock" in result.layers["image_digests"].detail
 
 
+@pytest.mark.parametrize(
+    ("case", "expected_detail"),
+    (
+        pytest.param("source-head", "source head", id="source-head"),
+        pytest.param("release-tag", "release tag", id="release-tag"),
+        pytest.param("openmaic-head", "OpenMAIC head", id="openmaic-head"),
+        pytest.param("image-digest", "image digests", id="image-digest"),
+    ),
+)
+def test_file_runtime_rejects_candidate_metadata_that_does_not_match_image_lock(
+    tmp_path: Path,
+    case: str,
+    expected_detail: str,
+) -> None:
+    module = _load_verifier()
+    manifest, evidence, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    expected_source_head = str(candidate["sourceHead"])
+    if case == "source-head":
+        candidate["sourceHead"] = "b" * 40
+        candidate["releaseTag"] = "yfeistai-first-release-20260825-bbbbbbbb"
+        expected_source_head = "b" * 40
+    elif case == "release-tag":
+        candidate["releaseTag"] = "yfeistai-first-release-20260826-aaaaaaaa"
+    elif case == "openmaic-head":
+        candidate["openmaicHead"] = "c" * 40
+    else:
+        image_digests = candidate["imageDigests"]
+        assert isinstance(image_digests, dict)
+        image_digests["openmaic"] = "sha256:" + "4" * 64
+    _rewrite_bundle_candidate(tmp_path, module, manifest, evidence, candidate)
+
+    result = module.verify(
+        module.FileReleaseRuntime(
+            manifest,
+            expected_source_head=expected_source_head,
+        )
+    )
+
+    assert result.layers["image_digests"].status == "fail"
+    assert expected_detail in result.layers["image_digests"].detail
+
+
 def test_file_runtime_rejects_candidate_not_referenced_by_both_production_compose_files(
     tmp_path: Path,
 ) -> None:
@@ -540,18 +613,25 @@ services:
     assert result.ok is True
 
 
-def test_current_production_compose_custom_services_match_image_lock(tmp_path: Path) -> None:
+def test_current_schema_one_image_lock_is_historical_not_a_release_candidate(
+    tmp_path: Path,
+) -> None:
     module = _load_verifier()
     lock = json.loads(
         (module.PROJECT_ROOT / "deploy" / "image-lock.json").read_text(encoding="utf-8")
     )
     digests = {name: lock["images"][name]["digest"] for name in module.CUSTOM_IMAGE_NAMES}
+    candidate = _candidate("f" * 40)
+    candidate["imageDigests"] = digests
     runtime = module.FileReleaseRuntime(
         tmp_path / "unused.json",
         expected_source_head="f" * 40,
     )
 
-    assert runtime._candidate_binding_error(digests) is None
+    assert (
+        runtime._candidate_binding_error(candidate)
+        == "candidate image lock is unavailable or invalid"
+    )
 
 
 def test_file_runtime_rejects_stale_secondary_compose_service_image(
@@ -821,6 +901,41 @@ def test_main_rechecks_source_tree_after_reading_evidence_bundle(
     assert payload["status"] == "not_ready"
     assert payload["layers"]["source_head"]["status"] == "fail"
     assert "changed during verification" in payload["layers"]["source_head"]["detail"]
+
+
+def test_main_verifies_candidate_artifact_outside_the_clean_source_root(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    module = _load_verifier()
+    source_head = "e" * 40
+    candidate_root = tmp_path / "candidate-artifact"
+    candidate_root.mkdir()
+    manifest, _, _ = _write_complete_bundle(
+        candidate_root,
+        module,
+        source_head=source_head,
+    )
+    clean_source_root = tmp_path / "clean-source"
+    clean_source_root.mkdir()
+    module.PROJECT_ROOT = clean_source_root
+    monkeypatch.setattr(module, "_git_head", lambda: source_head)
+
+    exit_code = module.main(
+        [
+            "--evidence",
+            str(manifest),
+            "--candidate-root",
+            str(candidate_root),
+            "--json",
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert payload["status"] == "ready"
+    assert payload["candidate"]["sourceHead"] == source_head
 
 
 def test_git_head_rejects_a_dirty_source_candidate(monkeypatch) -> None:

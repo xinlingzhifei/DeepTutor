@@ -16,8 +16,13 @@ import sys
 from typing import Any, Protocol
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+SCRIPTS_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+if str(SCRIPTS_ROOT) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_ROOT))
+
+from render_platform_compose import load_image_lock
 
 from deeptutor.teaching.secret_permissions import secret_file_is_restricted
 
@@ -537,6 +542,10 @@ def _inspect_image_lock(path: Path) -> tuple[str, ...]:
             or not reference.endswith(f"@{digest}")
         ):
             errors.append("image lock reference")
+    try:
+        load_image_lock(path, require_candidate=True)
+    except ValueError:
+        errors.append("image lock candidate")
     return tuple(dict.fromkeys(errors))
 
 
@@ -599,23 +608,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not arguments.offline_contract_check:
         if arguments.hostname is None:
             errors.append("gateway TLS hostname")
-        try:
-            from deeptutor.services.config import load_platform_settings
+        if not errors:
+            try:
+                from deeptutor.services.config import load_platform_settings
 
-            settings = load_platform_settings(arguments.config)
-        except Exception:
-            errors.append("platform settings")
-        else:
-            errors.extend(
-                asyncio.run(
-                    run_runtime_preflight(
-                        settings=settings,
-                        secret_dir=arguments.secret_dir,
-                        image_lock_path=arguments.image_lock,
-                        project_root=PROJECT_ROOT,
+                settings = load_platform_settings(arguments.config)
+            except Exception:
+                errors.append("platform settings")
+            else:
+                errors.extend(
+                    asyncio.run(
+                        run_runtime_preflight(
+                            settings=settings,
+                            secret_dir=arguments.secret_dir,
+                            image_lock_path=arguments.image_lock,
+                            project_root=PROJECT_ROOT,
+                        )
                     )
                 )
-            )
     errors = list(dict.fromkeys(errors))
     if errors:
         for error in errors:

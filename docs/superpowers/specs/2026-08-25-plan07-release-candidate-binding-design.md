@@ -28,10 +28,15 @@ exact tag matching this format and the `<HEAD8>` suffix matches the checked-out
 commit. Manual dispatch remains available only when the workflow itself is run
 from such a tag.
 
-Each of the three images is pushed with both:
+Each of the three images is first pushed with:
 
-- the immutable release-candidate tag; and
-- its existing compatibility tag.
+- the immutable release-candidate tag.
+
+After all three builds succeed, their candidate-tag remote digests match the
+three build outputs, and the generated lock and Compose files validate, the
+workflow promotes each existing compatibility tag from the corresponding
+verified digest. A later build failure therefore cannot split compatibility
+aliases across candidates.
 
 The candidate tag is the authoritative source for resolving the final remote
 OCI manifest digest. Compatibility tags are aliases only and are never used to
@@ -106,6 +111,8 @@ is selected; its non-zero digests cannot be treated as proof for current HEAD.
 - The workflow has one global concurrency group so candidate publications do
   not overlap.
 - Registry login occurs only after candidate-ref validation.
+- Existing candidate image tags are rejected before any build, and generated
+  lock digests must equal the three build-action output digests.
 - The workflow never commits or pushes repository contents.
 - No branch push or local `main` merge is part of publishing a candidate.
 - Compatibility image tags remain available, but acceptance evidence uses only

@@ -48,6 +48,8 @@ REQUIRED_LAYERS = REQUIRED_OPERATIONAL_LAYERS + REQUIRED_ACCEPTANCE_EVIDENCE
 
 EVIDENCE_SCHEMA_VERSION = 3
 ARTIFACT_SCHEMA_VERSION = 2
+SOURCE_REPOSITORY = "xinlingzhifei/DeepTutor"
+OPENMAIC_HEAD = "0cf2a330411681190e89f48e20f305345ff99f87"
 CUSTOM_IMAGE_SPECS = {
     "deeptutor": ("ghcr.io/xinlingzhifei/deeptutor", "first-release"),
     "openmaic": ("ghcr.io/xinlingzhifei/openmaic", "0.3.1-0cf2a330"),
@@ -114,6 +116,7 @@ RECEIPT_CONTRACTS = {
 
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _DIGEST = re.compile(r"^sha256:([0-9a-f]{64})$")
+_RELEASE_TAG = re.compile(r"^yfeistai-first-release-[0-9]{8}-([0-9a-f]{8})$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _RELEASE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _OBSERVED_AT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
@@ -172,10 +175,16 @@ class ReleaseRuntime(Protocol):
 class FileReleaseRuntime:
     """Read explicit evidence for one immutable source candidate."""
 
-    def __init__(self, path: Path, *, expected_source_head: str) -> None:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        expected_source_head: str,
+        candidate_root: Path | None = None,
+    ) -> None:
         self._path = Path(path)
         self._expected_source_head = expected_source_head
-        self._project_root = PROJECT_ROOT
+        self._candidate_root = Path(candidate_root) if candidate_root is not None else PROJECT_ROOT
         self._loaded = False
         self._candidate_head = ""
         self._candidate: dict[str, object] = {}
@@ -215,16 +224,42 @@ class FileReleaseRuntime:
         source_head = candidate.get("sourceHead")
         if isinstance(source_head, str) and _COMMIT.fullmatch(source_head):
             self._candidate_head = source_head
-        image_digests = candidate.get("imageDigests")
-        digests_are_valid = self._valid_image_digests(image_digests)
-        binding_error = self._candidate_binding_error(image_digests) if digests_are_valid else None
-        self._candidate_is_valid = (
-            self._candidate_head != "" and digests_are_valid and binding_error is None
-        )
-        if binding_error is not None:
+        metadata_error = self._candidate_metadata_error(candidate)
+        binding_error = self._candidate_binding_error(candidate) if metadata_error is None else None
+        self._candidate_is_valid = metadata_error is None and binding_error is None
+        if metadata_error is not None:
+            self._candidate_error = metadata_error
+        elif binding_error is not None:
             self._candidate_error = binding_error
         self._candidate = candidate
         self._evidence = evidence
+
+    @staticmethod
+    def _candidate_metadata_error(raw: object) -> str | None:
+        if not isinstance(raw, dict) or set(raw) != {
+            "sourceRepository",
+            "sourceHead",
+            "releaseTag",
+            "openmaicHead",
+            "imageDigests",
+        }:
+            return "evidence candidate metadata is invalid"
+        if raw.get("sourceRepository") != SOURCE_REPOSITORY:
+            return "evidence candidate source repository is invalid"
+        source_head = raw.get("sourceHead")
+        if not isinstance(source_head, str) or _COMMIT.fullmatch(source_head) is None:
+            return "evidence candidate source head is invalid"
+        release_tag = raw.get("releaseTag")
+        release_match = (
+            _RELEASE_TAG.fullmatch(release_tag) if isinstance(release_tag, str) else None
+        )
+        if release_match is None or release_match.group(1) != source_head[:8]:
+            return "evidence candidate release tag is invalid"
+        if raw.get("openmaicHead") != OPENMAIC_HEAD:
+            return "evidence candidate OpenMAIC head is invalid"
+        if not FileReleaseRuntime._valid_image_digests(raw.get("imageDigests")):
+            return "evidence candidate image digests are invalid"
+        return None
 
     @staticmethod
     def _valid_image_digests(raw: object) -> bool:
@@ -285,36 +320,55 @@ class FileReleaseRuntime:
         return True
 
     def _candidate_binding_error(self, raw: object) -> str | None:
-        if not isinstance(raw, dict):
-            return "evidence candidate image digests are invalid"
-        lock_path = self._project_root / "deploy" / "image-lock.json"
+        metadata_error = self._candidate_metadata_error(raw)
+        if metadata_error is not None:
+            return metadata_error
+        assert isinstance(raw, dict)
+        lock_path = self._candidate_root / "deploy" / "image-lock.json"
         try:
             lock = json.loads(lock_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError):
             return "candidate image lock is unavailable or invalid"
-        if not isinstance(lock, dict) or lock.get("schemaVersion") != 1:
+        if not isinstance(lock, dict) or lock.get("schemaVersion") != 2:
             return "candidate image lock is unavailable or invalid"
+        lock_candidate = lock.get("candidate")
+        if self._candidate_metadata_error(lock_candidate) is not None:
+            return "candidate image lock is unavailable or invalid"
+        assert isinstance(lock_candidate, dict)
+        for field, detail in (
+            ("sourceRepository", "source repository"),
+            ("sourceHead", "source head"),
+            ("releaseTag", "release tag"),
+            ("openmaicHead", "OpenMAIC head"),
+            ("imageDigests", "image digests"),
+        ):
+            if lock_candidate.get(field) != raw.get(field):
+                return f"candidate {detail} does not match the image lock"
         images = lock.get("images")
         if not isinstance(images, dict):
             return "candidate image lock is unavailable or invalid"
+        image_digests = raw["imageDigests"]
+        release_tag = raw["releaseTag"]
+        assert isinstance(image_digests, dict)
+        assert isinstance(release_tag, str)
         references: dict[str, str] = {}
         for name in CUSTOM_IMAGE_NAMES:
             record = images.get(name)
-            if not isinstance(record, dict) or record.get("digest") != raw.get(name):
+            if not isinstance(record, dict) or record.get("digest") != image_digests.get(name):
                 return "candidate image digests do not match the image lock"
             repository = record.get("repository")
             tag = record.get("tag")
-            expected_repository, expected_tag = CUSTOM_IMAGE_SPECS[name]
-            if repository != expected_repository or tag != expected_tag:
+            expected_repository, _compatibility_tag = CUSTOM_IMAGE_SPECS[name]
+            if repository != expected_repository or tag != release_tag:
                 return "candidate image lock entry is invalid"
-            reference = f"{repository}:{tag}@{raw[name]}"
+            reference = f"{repository}:{tag}@{image_digests[name]}"
             if record.get("reference") != reference:
                 return "candidate image lock reference is invalid"
             references[name] = reference
         for relative, bindings in CUSTOM_IMAGE_SERVICE_BINDINGS.items():
             try:
                 compose = yaml.load(
-                    (self._project_root / relative).read_text(encoding="utf-8"),
+                    (self._candidate_root / relative).read_text(encoding="utf-8"),
                     Loader=_ComposeLoader,
                 )
             except (OSError, UnicodeError, yaml.YAMLError):
@@ -474,14 +528,9 @@ def verify(runtime: ReleaseRuntime) -> ReleaseVerification:
     candidate = _runtime_metadata(runtime, "candidate")
     evidence_bundle_sha256 = _runtime_metadata(runtime, "evidence_bundle_sha256")
     release_run = _runtime_metadata(runtime, "release_run")
-    candidate_source_is_valid = (
-        isinstance(candidate, dict)
-        and isinstance(candidate.get("sourceHead"), str)
-        and _COMMIT.fullmatch(candidate["sourceHead"]) is not None
-    )
-    candidate_images_are_valid = isinstance(candidate, dict) and (
-        FileReleaseRuntime._valid_image_digests(candidate.get("imageDigests"))
-    )
+    candidate_is_valid = FileReleaseRuntime._candidate_metadata_error(candidate) is None
+    candidate_source_is_valid = candidate_is_valid
+    candidate_images_are_valid = candidate_is_valid
     bundle_is_valid = (
         isinstance(evidence_bundle_sha256, str)
         and _SHA256.fullmatch(evidence_bundle_sha256) is not None
@@ -562,6 +611,7 @@ def _git_head() -> str:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--evidence", type=Path, default=DEFAULT_EVIDENCE_PATH)
+    parser.add_argument("--candidate-root", type=Path)
     parser.add_argument("--json", action="store_true")
     return parser
 
@@ -590,6 +640,7 @@ def main(argv: list[str] | None = None) -> int:
         FileReleaseRuntime(
             args.evidence,
             expected_source_head=expected_source_head,
+            candidate_root=args.candidate_root,
         )
     )
     if not expected_source_head or _git_head() != expected_source_head:

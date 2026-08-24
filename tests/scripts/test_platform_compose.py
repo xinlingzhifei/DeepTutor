@@ -15,6 +15,16 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 IMAGE_DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
+SOURCE_REPOSITORY = "xinlingzhifei/DeepTutor"
+SOURCE_HEAD = "a" * 40
+RELEASE_TAG = f"yfeistai-first-release-20260825-{SOURCE_HEAD[:8]}"
+OPENMAIC_HEAD = "0cf2a330411681190e89f48e20f305345ff99f87"
+CANDIDATE_ARGUMENTS = {
+    "source_repository": SOURCE_REPOSITORY,
+    "source_head": SOURCE_HEAD,
+    "release_tag": RELEASE_TAG,
+    "openmaic_head": OPENMAIC_HEAD,
+}
 REQUIRED_PLATFORM_SERVICES = {
     "gateway",
     "postgres",
@@ -448,6 +458,7 @@ def test_private_platform_workflow_builds_all_images_and_exports_digest_lock() -
         "repository": "xinlingzhifei/OpenMAIC",
         "ref": "0cf2a330411681190e89f48e20f305345ff99f87",
         "path": "openmaic-upstream",
+        "persist-credentials": False,
     }
 
     build_steps = [
@@ -461,21 +472,22 @@ def test_private_platform_workflow_builds_all_images_and_exports_digest_lock() -
         settings = step["with"]
         tags = [line.strip() for line in str(settings["tags"]).splitlines() if line.strip()]
         assert len(tags) == 1
+        assert "${{ github.ref_name }}" in tags[0]
         assert settings["platforms"] == "linux/amd64"
         assert settings["push"] is True
         builds_by_tag[tags[0]] = (index, settings)
 
     expected_builds = {
-        "ghcr.io/xinlingzhifei/deeptutor:first-release": {
+        "ghcr.io/xinlingzhifei/deeptutor:${{ github.ref_name }}": {
             "context": ".",
             "file": "./Dockerfile",
             "target": "production",
         },
-        "ghcr.io/xinlingzhifei/openmaic:0.3.1-0cf2a330": {
+        "ghcr.io/xinlingzhifei/openmaic:${{ github.ref_name }}": {
             "context": ".",
             "file": "./integrations/openmaic/Dockerfile",
         },
-        "ghcr.io/xinlingzhifei/openmaic-render:0.3.1-0cf2a330": {
+        "ghcr.io/xinlingzhifei/openmaic-render:${{ github.ref_name }}": {
             "context": "./openmaic-upstream/render-service",
             "file": "./openmaic-upstream/render-service/Dockerfile",
         },
@@ -492,16 +504,24 @@ def test_private_platform_workflow_builds_all_images_and_exports_digest_lock() -
         if "render_platform_compose.py --write-image-lock" in str(step.get("run", ""))
     )
     assert all(index < write_index for index, _step in build_steps)
+    write_command = str(write_step["run"])
+    assert '--source-repository "$GITHUB_REPOSITORY"' in write_command
+    assert '--source-head "$GITHUB_SHA"' in write_command
+    assert '--release-tag "$GITHUB_REF_NAME"' in write_command
 
     verify_index, verify_step = next(
         (index, step)
         for index, step in enumerate(steps)
-        if "load_image_lock" in str(step.get("run", ""))
+        if "validate_image_lock_bindings" in str(step.get("run", ""))
     )
     assert verify_index > write_index
     verify_command = str(verify_step["run"])
-    assert "from scripts.render_platform_compose import load_image_lock" in verify_command
-    assert "load_image_lock()" in verify_command
+    assert (
+        "from scripts.render_platform_compose import validate_image_lock_bindings" in verify_command
+    )
+    assert "expected_candidate=" in verify_command
+    assert "docker-compose.platform.yml" in verify_command
+    assert "docker-compose.data-plane.yml" in verify_command
 
     upload_index, upload_step = next(
         (index, step)
@@ -517,6 +537,266 @@ def test_private_platform_workflow_builds_all_images_and_exports_digest_lock() -
         "docker-compose.platform.yml",
         "docker-compose.data-plane.yml",
     }
+
+
+def test_private_platform_workflow_rejects_non_release_refs_before_registry_login() -> None:
+    workflow_path = ROOT / ".github" / "workflows" / "private-platform-images.yml"
+    workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+    job = next(iter(workflow["jobs"].values()))
+    steps = job["steps"]
+
+    validation_steps = [
+        (index, step)
+        for index, step in enumerate(steps)
+        if step.get("name") == "Validate immutable release candidate"
+    ]
+    assert len(validation_steps) == 1, "candidate validation step is missing"
+    validate_index, validate_step = validation_steps[0]
+    login_index = next(
+        index for index, step in enumerate(steps) if step.get("uses") == "docker/login-action@v3"
+    )
+    first_build_index = next(
+        index
+        for index, step in enumerate(steps)
+        if step.get("uses") == "docker/build-push-action@v6"
+    )
+    setup_buildx_index = next(
+        index
+        for index, step in enumerate(steps)
+        if step.get("uses") == "docker/setup-buildx-action@v3"
+    )
+
+    assert validate_index < setup_buildx_index < login_index < first_build_index
+    command = str(validate_step["run"])
+    assert 'GITHUB_REF_TYPE" = "tag"' in command
+    assert "^yfeistai-first-release-[0-9]{8}-[0-9a-f]{8}$" in command
+    assert "git rev-parse HEAD" in command
+    assert "GITHUB_SHA" in command
+    assert "GITHUB_REF_NAME" in command
+
+
+def test_private_platform_workflow_publishes_candidate_and_compatibility_tags() -> None:
+    workflow_path = ROOT / ".github" / "workflows" / "private-platform-images.yml"
+    workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+    job = next(iter(workflow["jobs"].values()))
+    steps = job["steps"]
+    build_steps = [
+        (index, step)
+        for index, step in enumerate(steps)
+        if step.get("uses") == "docker/build-push-action@v6"
+    ]
+    expected = {
+        "build_deeptutor": (
+            "ghcr.io/xinlingzhifei/deeptutor:${{ github.ref_name }}",
+            "ghcr.io/xinlingzhifei/deeptutor:first-release",
+        ),
+        "build_openmaic": (
+            "ghcr.io/xinlingzhifei/openmaic:${{ github.ref_name }}",
+            "ghcr.io/xinlingzhifei/openmaic:0.3.1-0cf2a330",
+        ),
+        "build_openmaic_render": (
+            "ghcr.io/xinlingzhifei/openmaic-render:${{ github.ref_name }}",
+            "ghcr.io/xinlingzhifei/openmaic-render:0.3.1-0cf2a330",
+        ),
+    }
+    assert len(build_steps) == 3
+    for _index, step in build_steps:
+        tags = {line.strip() for line in str(step["with"]["tags"]).splitlines() if line.strip()}
+        assert tags == {expected[step["id"]][0]}
+
+    promotion_steps = [
+        (index, step)
+        for index, step in enumerate(steps)
+        if step.get("name") == "Promote verified compatibility image tags"
+    ]
+    assert len(promotion_steps) == 1, "verified alias promotion step is missing"
+    promotion_index, promotion_step = promotion_steps[0]
+    verify_index = next(
+        index for index, step in enumerate(steps) if step.get("name") == "Verify image lock"
+    )
+    assert verify_index < promotion_index
+    command = str(promotion_step["run"])
+    for _candidate, alias in expected.values():
+        assert alias in command
+    assert command.count("docker buildx imagetools create") == 3
+
+
+def test_private_platform_workflow_binds_remote_digests_to_build_outputs() -> None:
+    workflow_path = ROOT / ".github" / "workflows" / "private-platform-images.yml"
+    workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+    job = next(iter(workflow["jobs"].values()))
+    steps = job["steps"]
+    build_ids = {
+        step.get("id") for step in steps if step.get("uses") == "docker/build-push-action@v6"
+    }
+    assert build_ids == {"build_deeptutor", "build_openmaic", "build_openmaic_render"}
+    verify_step = next(step for step in steps if step.get("name") == "Verify image lock")
+    assert verify_step["env"] == {
+        "DEEPTUTOR_DIGEST": "${{ steps.build_deeptutor.outputs.digest }}",
+        "OPENMAIC_DIGEST": "${{ steps.build_openmaic.outputs.digest }}",
+        "OPENMAIC_RENDER_DIGEST": "${{ steps.build_openmaic_render.outputs.digest }}",
+    }
+    command = str(verify_step["run"])
+    assert '"imageDigests"' in command
+    for name in ("DEEPTUTOR_DIGEST", "OPENMAIC_DIGEST", "OPENMAIC_RENDER_DIGEST"):
+        assert f'os.environ["{name}"]' in command
+
+
+def test_private_platform_workflow_refuses_to_overwrite_candidate_image_tags() -> None:
+    workflow_path = ROOT / ".github" / "workflows" / "private-platform-images.yml"
+    workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+    job = next(iter(workflow["jobs"].values()))
+    steps = job["steps"]
+    login_index = next(
+        index for index, step in enumerate(steps) if step.get("uses") == "docker/login-action@v3"
+    )
+    guard_steps = [
+        (index, step)
+        for index, step in enumerate(steps)
+        if step.get("name") == "Reject existing candidate image tags"
+    ]
+    assert len(guard_steps) == 1, "candidate image overwrite guard is missing"
+    guard_index, guard_step = guard_steps[0]
+    first_build_index = next(
+        index
+        for index, step in enumerate(steps)
+        if step.get("uses") == "docker/build-push-action@v6"
+    )
+
+    assert login_index < guard_index < first_build_index
+    command = str(guard_step["run"])
+    assert "docker buildx imagetools inspect" in command
+    for repository in (
+        "ghcr.io/xinlingzhifei/deeptutor",
+        "ghcr.io/xinlingzhifei/openmaic",
+        "ghcr.io/xinlingzhifei/openmaic-render",
+    ):
+        assert repository in command
+    assert 'candidate="$image:$GITHUB_REF_NAME"' in command
+    assert "exit 1" in command
+
+
+def test_image_lock_writer_binds_source_head_release_tag_and_custom_digests(
+    tmp_path: Path,
+) -> None:
+    renderer = _load_renderer()
+    output_path = tmp_path / "image-lock.json"
+    platform_compose = tmp_path / "docker-compose.platform.yml"
+    data_plane_compose = tmp_path / "docker-compose.data-plane.yml"
+    platform_compose.write_bytes((ROOT / "docker-compose.platform.yml").read_bytes())
+    data_plane_compose.write_bytes((ROOT / "docker-compose.data-plane.yml").read_bytes())
+    calls: list[str] = []
+
+    def resolve(reference: str) -> str:
+        calls.append(reference)
+        return "sha256:" + f"{len(calls):064x}"
+
+    written = renderer.write_image_lock(
+        output_path,
+        digest_resolver=resolve,
+        compose_paths=(platform_compose, data_plane_compose),
+        source_repository=SOURCE_REPOSITORY,
+        source_head=SOURCE_HEAD,
+        release_tag=RELEASE_TAG,
+        openmaic_head=OPENMAIC_HEAD,
+    )
+
+    assert written["schemaVersion"] == 2
+    assert written["candidate"] == {
+        "sourceRepository": SOURCE_REPOSITORY,
+        "sourceHead": SOURCE_HEAD,
+        "releaseTag": RELEASE_TAG,
+        "openmaicHead": OPENMAIC_HEAD,
+        "imageDigests": {
+            name: written["images"][name]["digest"]
+            for name in ("deeptutor", "openmaic", "openmaic_render")
+        },
+    }
+    for name in ("deeptutor", "openmaic", "openmaic_render"):
+        record = written["images"][name]
+        assert record["tag"] == RELEASE_TAG
+        assert record["reference"] == (f"{record['repository']}:{RELEASE_TAG}@{record['digest']}")
+    assert calls[:3] == [
+        f"ghcr.io/xinlingzhifei/deeptutor:{RELEASE_TAG}",
+        f"ghcr.io/xinlingzhifei/openmaic:{RELEASE_TAG}",
+        f"ghcr.io/xinlingzhifei/openmaic-render:{RELEASE_TAG}",
+    ]
+    assert (
+        renderer.load_image_lock(
+            output_path,
+            expected_candidate={
+                "sourceRepository": SOURCE_REPOSITORY,
+                "sourceHead": SOURCE_HEAD,
+                "releaseTag": RELEASE_TAG,
+                "openmaicHead": OPENMAIC_HEAD,
+            },
+        )
+        == written
+    )
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "source-repository",
+        "source-head",
+        "release-tag",
+        "openmaic-head",
+        "image-digests",
+        "extra-field",
+    ),
+)
+def test_image_lock_loader_rejects_candidate_binding_drift(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    renderer = _load_renderer()
+    output_path = tmp_path / "image-lock.json"
+    platform_compose = tmp_path / "docker-compose.platform.yml"
+    data_plane_compose = tmp_path / "docker-compose.data-plane.yml"
+    platform_compose.write_bytes((ROOT / "docker-compose.platform.yml").read_bytes())
+    data_plane_compose.write_bytes((ROOT / "docker-compose.data-plane.yml").read_bytes())
+    digest_calls = 0
+
+    def resolve(reference: str) -> str:
+        nonlocal digest_calls
+        digest_calls += 1
+        return "sha256:" + f"{digest_calls:064x}"
+
+    renderer.write_image_lock(
+        output_path,
+        digest_resolver=resolve,
+        compose_paths=(platform_compose, data_plane_compose),
+        source_repository=SOURCE_REPOSITORY,
+        source_head=SOURCE_HEAD,
+        release_tag=RELEASE_TAG,
+        openmaic_head=OPENMAIC_HEAD,
+    )
+    document = json.loads(output_path.read_text(encoding="utf-8"))
+    if case == "source-repository":
+        document["candidate"]["sourceRepository"] = "example/Other"
+    elif case == "source-head":
+        document["candidate"]["sourceHead"] = "b" * 40
+    elif case == "release-tag":
+        document["candidate"]["releaseTag"] = "yfeistai-first-release-20260825-bbbbbbbb"
+    elif case == "openmaic-head":
+        document["candidate"]["openmaicHead"] = "c" * 40
+    elif case == "image-digests":
+        document["candidate"]["imageDigests"]["deeptutor"] = "sha256:" + "9" * 64
+    else:
+        document["candidate"]["unexpected"] = True
+    output_path.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="candidate"):
+        renderer.load_image_lock(
+            output_path,
+            expected_candidate={
+                "sourceRepository": SOURCE_REPOSITORY,
+                "sourceHead": SOURCE_HEAD,
+                "releaseTag": RELEASE_TAG,
+                "openmaicHead": OPENMAIC_HEAD,
+            },
+        )
 
 
 def test_image_lock_writer_updates_compose_atomically_from_registry_digests(
@@ -545,6 +825,7 @@ def test_image_lock_writer_updates_compose_atomically_from_registry_digests(
             output_path,
             digest_resolver=resolve_until_missing,
             compose_paths=(platform_compose, data_plane_compose),
+            **CANDIDATE_ARGUMENTS,
         )
     assert len(partial_calls) == 4
     assert json.loads(output_path.read_text(encoding="utf-8")) == {"sentinel": True}
@@ -561,6 +842,7 @@ def test_image_lock_writer_updates_compose_atomically_from_registry_digests(
         output_path,
         digest_resolver=resolve,
         compose_paths=(platform_compose, data_plane_compose),
+        **CANDIDATE_ARGUMENTS,
     )
     assert set(written["images"]) == {
         "deeptutor",
@@ -601,20 +883,48 @@ def test_image_lock_cli_updates_both_production_compose_files(
         path: Path,
         *,
         compose_paths: tuple[Path, Path],
+        source_repository: str,
+        source_head: str,
+        release_tag: str,
+        openmaic_head: str,
     ) -> dict[str, Any]:
         captured["path"] = path
         captured["compose_paths"] = compose_paths
+        captured["candidate"] = {
+            "source_repository": source_repository,
+            "source_head": source_head,
+            "release_tag": release_tag,
+            "openmaic_head": openmaic_head,
+        }
         return {}
 
     monkeypatch.setattr(renderer, "write_image_lock", write_image_lock)
 
-    assert renderer.main(["--write-image-lock", "--lock-path", str(output_path)]) == 0
+    assert (
+        renderer.main(
+            [
+                "--write-image-lock",
+                "--lock-path",
+                str(output_path),
+                "--source-repository",
+                SOURCE_REPOSITORY,
+                "--source-head",
+                SOURCE_HEAD,
+                "--release-tag",
+                RELEASE_TAG,
+                "--openmaic-head",
+                OPENMAIC_HEAD,
+            ]
+        )
+        == 0
+    )
     assert captured == {
         "path": output_path,
         "compose_paths": (
             ROOT / "docker-compose.platform.yml",
             ROOT / "docker-compose.data-plane.yml",
         ),
+        "candidate": CANDIDATE_ARGUMENTS,
     }
     assert capsys.readouterr().out == f"{output_path}\n"
 
@@ -651,6 +961,7 @@ def test_image_lock_writer_cleans_staged_files_when_publish_fails(
             output_path,
             digest_resolver=resolve,
             compose_paths=(platform_compose, data_plane_compose),
+            **CANDIDATE_ARGUMENTS,
         )
     assert calls == 7
     for path, original in originals.items():
@@ -704,6 +1015,7 @@ def test_image_lock_writer_rolls_back_every_file_after_late_publish_failure(
                 output_path,
                 digest_resolver=resolve,
                 compose_paths=(platform_compose, data_plane_compose),
+                **CANDIDATE_ARGUMENTS,
             )
 
         assert digest_calls == 7

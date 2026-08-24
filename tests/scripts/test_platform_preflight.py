@@ -16,6 +16,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 from pydantic import SecretStr
 
+import deeptutor.services.config as config_module
 from deeptutor.services.config import PlatformSettings
 from deeptutor.teaching.secret_permissions import restrict_secret_file
 
@@ -184,6 +185,72 @@ def test_preflight_rejects_zero_or_unbound_image_digests(tmp_path: Path) -> None
 
     assert "image lock digest" in result.errors
     assert "image lock reference" in result.errors
+
+
+def test_preflight_rejects_legacy_image_lock_candidate(tmp_path: Path) -> None:
+    image_lock = tmp_path / "image-lock.json"
+    digest = "sha256:" + "1" * 64
+    image_lock.write_text(
+        json.dumps(
+            {
+                "schemaVersion": 1,
+                "images": {
+                    "deeptutor": {
+                        "repository": "ghcr.io/xinlingzhifei/deeptutor",
+                        "tag": "first-release",
+                        "digest": digest,
+                        "reference": ("ghcr.io/xinlingzhifei/deeptutor:first-release@" + digest),
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = _module().run_preflight(
+        secret_dir=tmp_path,
+        required_secret_names=(),
+        image_lock_path=image_lock,
+    )
+
+    assert "image lock candidate" in result.errors
+
+
+def test_main_rejects_legacy_image_lock_before_runtime_probes(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    module = _module()
+    image_lock = tmp_path / "image-lock.json"
+    image_lock.write_bytes((ROOT / "deploy" / "image-lock.json").read_bytes())
+    runtime_calls: list[str] = []
+
+    async def record_runtime_probe(**_kwargs) -> tuple[str, ...]:
+        runtime_calls.append("runtime")
+        return ()
+
+    monkeypatch.setattr(module, "DEFAULT_REQUIRED_SECRETS", ())
+    monkeypatch.setattr(module, "_inspect_tls", lambda *_args: ())
+    monkeypatch.setattr(module, "run_runtime_preflight", record_runtime_probe)
+    monkeypatch.setattr(config_module, "load_platform_settings", lambda _path: object())
+
+    exit_code = module.main(
+        [
+            "--config",
+            str(ROOT / "deploy" / "platform.example.json"),
+            "--secret-dir",
+            str(tmp_path),
+            "--image-lock",
+            str(image_lock),
+            "--hostname",
+            "classroom.example.com",
+        ]
+    )
+
+    assert exit_code == 1
+    assert "image lock candidate" in capsys.readouterr().out
+    assert runtime_calls == []
 
 
 def test_preflight_rejects_capacity_settings_outside_release_contract(

@@ -464,13 +464,28 @@ def test_platform_wrapper_rejects_invalid_image_lock_before_subprocess(
         deploy_dir.mkdir()
 
         lock = json.loads(json.dumps(source_lock))
+        source_head = "a" * 40
+        release_tag = f"yfeistai-first-release-20260825-{source_head[:8]}"
+        lock["schemaVersion"] = 2
         replacements: dict[str, str] = {}
-        for index, record in enumerate(lock["images"].values(), start=1):
-            previous = record["reference"]
+        for index, (name, record) in enumerate(lock["images"].items(), start=1):
+            previous = source_lock["images"][name]["reference"]
+            if name in {"deeptutor", "openmaic", "openmaic_render"}:
+                record["tag"] = release_tag
             digest = "sha256:" + f"{index:064x}"
             record["digest"] = digest
             record["reference"] = f"{record['repository']}:{record['tag']}@{digest}"
             replacements[previous] = record["reference"]
+        lock["candidate"] = {
+            "sourceRepository": "xinlingzhifei/DeepTutor",
+            "sourceHead": source_head,
+            "releaseTag": release_tag,
+            "openmaicHead": "0cf2a330411681190e89f48e20f305345ff99f87",
+            "imageDigests": {
+                name: lock["images"][name]["digest"]
+                for name in ("deeptutor", "openmaic", "openmaic_render")
+            },
+        }
 
         if scenario == "zero-digest":
             record = lock["images"]["deeptutor"]
@@ -528,6 +543,52 @@ def test_platform_wrapper_rejects_invalid_image_lock_before_subprocess(
         "zero-digest": "image lock entry is invalid for deeptutor",
         "compose-drift": "production Compose image references do not match image lock",
     }
+
+
+@pytest.mark.parametrize(
+    "topology_arguments",
+    [
+        pytest.param(["--platform"], id="platform"),
+        pytest.param(["--data-plane", "tenant-acme"], id="data-plane"),
+    ],
+)
+def test_production_wrapper_rejects_legacy_image_lock_before_subprocess(
+    tmp_path: Path,
+    monkeypatch,
+    topology_arguments: list[str],
+) -> None:
+    module = _load_module()
+    root = Path(__file__).resolve().parents[2]
+    settings_dir = tmp_path / "data" / "user" / "settings"
+    settings_dir.mkdir(parents=True)
+    deploy_dir = tmp_path / "deploy"
+    deploy_dir.mkdir()
+    (deploy_dir / "image-lock.json").write_bytes((root / "deploy" / "image-lock.json").read_bytes())
+    for name in ("docker-compose.platform.yml", "docker-compose.data-plane.yml"):
+        (tmp_path / name).write_bytes((root / name).read_bytes())
+
+    downstream_calls: list[str] = []
+    subprocess_calls: list[list[str]] = []
+
+    def record_render(**_kwargs) -> dict[str, str]:
+        downstream_calls.append("render")
+        return {}
+
+    def record_subprocess(command: list[str], **_kwargs) -> SimpleNamespace:
+        subprocess_calls.append(command)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(module, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(module, "SETTINGS_DIR", settings_dir)
+    monkeypatch.setattr(module, "DOCKER_ENV_PATH", settings_dir / "docker.env")
+    monkeypatch.setattr(module, "render_docker_env", record_render)
+    monkeypatch.setattr(module.subprocess, "run", record_subprocess)
+
+    with pytest.raises(ValueError, match="candidate"):
+        module.main([*topology_arguments, "config"])
+
+    assert downstream_calls == []
+    assert subprocess_calls == []
 
 
 def _compose_service(root: Path, name: str) -> dict:

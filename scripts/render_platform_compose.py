@@ -18,6 +18,13 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 IMAGE_LOCK_PATH = PROJECT_ROOT / "deploy" / "image-lock.json"
 DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
+COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+RELEASE_TAG_PATTERN = re.compile(r"^yfeistai-first-release-[0-9]{8}-([0-9a-f]{8})$")
+SOURCE_REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+ZERO_DIGEST = "sha256:" + ("0" * 64)
+SOURCE_REPOSITORY = "xinlingzhifei/DeepTutor"
+OPENMAIC_HEAD = "0cf2a330411681190e89f48e20f305345ff99f87"
+CUSTOM_IMAGE_NAMES = ("deeptutor", "openmaic", "openmaic_render")
 COMPOSE_IMAGE_NAMES = {
     "docker-compose.platform.yml": (
         "deeptutor",
@@ -73,8 +80,52 @@ IMAGE_SPECS: dict[str, dict[str, Any]] = {
 }
 
 
-def _tagged_reference(spec: Mapping[str, Any]) -> str:
-    return f"{spec['repository']}:{spec['tag']}"
+def _tagged_reference(spec: Mapping[str, Any], *, tag: str | None = None) -> str:
+    return f"{spec['repository']}:{tag or spec['tag']}"
+
+
+def _candidate_identity(
+    *,
+    source_repository: object,
+    source_head: object,
+    release_tag: object,
+    openmaic_head: object,
+    image_digests: object | None = None,
+) -> dict[str, Any]:
+    if (
+        not isinstance(source_repository, str)
+        or SOURCE_REPOSITORY_PATTERN.fullmatch(source_repository) is None
+        or source_repository != SOURCE_REPOSITORY
+    ):
+        raise ValueError("image lock candidate source repository is invalid")
+    if not isinstance(source_head, str) or COMMIT_PATTERN.fullmatch(source_head) is None:
+        raise ValueError("image lock candidate source head is invalid")
+    release_match = (
+        RELEASE_TAG_PATTERN.fullmatch(release_tag) if isinstance(release_tag, str) else None
+    )
+    if release_match is None or release_match.group(1) != source_head[:8]:
+        raise ValueError("image lock candidate release tag is invalid")
+    if openmaic_head != OPENMAIC_HEAD:
+        raise ValueError("image lock candidate OpenMAIC head is invalid")
+    candidate: dict[str, Any] = {
+        "sourceRepository": source_repository,
+        "sourceHead": source_head,
+        "releaseTag": release_tag,
+        "openmaicHead": openmaic_head,
+    }
+    if image_digests is not None:
+        if not isinstance(image_digests, dict) or set(image_digests) != set(CUSTOM_IMAGE_NAMES):
+            raise ValueError("image lock candidate image digests are invalid")
+        for name in CUSTOM_IMAGE_NAMES:
+            digest = image_digests.get(name)
+            if (
+                not isinstance(digest, str)
+                or DIGEST_PATTERN.fullmatch(digest) is None
+                or digest == ZERO_DIGEST
+            ):
+                raise ValueError("image lock candidate image digests are invalid")
+        candidate["imageDigests"] = dict(image_digests)
+    return candidate
 
 
 def _registry_digest(reference: str) -> str | None:
@@ -119,8 +170,11 @@ def _render_compose_references(
     except (OSError, UnicodeError) as exc:
         raise ValueError(f"production Compose file could not be read: {compose_path.name}") from exc
     for name in image_names:
-        tagged_reference = _tagged_reference(IMAGE_SPECS[name])
-        pattern = re.compile(rf"{re.escape(tagged_reference)}@sha256:[0-9a-f]{{64}}")
+        repository = str(IMAGE_SPECS[name]["repository"])
+        pattern = re.compile(
+            rf"{re.escape(repository)}:[A-Za-z0-9_][A-Za-z0-9_.-]{{0,127}}"
+            rf"@sha256:[0-9a-f]{{64}}"
+        )
         rendered, count = pattern.subn(str(images[name]["reference"]), rendered)
         if count != 1:
             raise ValueError(f"production Compose image reference is invalid for {name}")
@@ -156,17 +210,28 @@ def write_image_lock(
     *,
     digest_resolver: Callable[[str], str | None] = _registry_digest,
     compose_paths: Sequence[Path] = (),
+    source_repository: str,
+    source_head: str,
+    release_tag: str,
+    openmaic_head: str,
 ) -> dict[str, Any]:
     """Record one resolved image set in the lock and selected Compose files."""
+    candidate = _candidate_identity(
+        source_repository=source_repository,
+        source_head=source_head,
+        release_tag=release_tag,
+        openmaic_head=openmaic_head,
+    )
     images: dict[str, dict[str, Any]] = {}
     for name, spec in IMAGE_SPECS.items():
-        tagged_reference = _tagged_reference(spec)
+        tag = release_tag if name in CUSTOM_IMAGE_NAMES else str(spec["tag"])
+        tagged_reference = _tagged_reference(spec, tag=tag)
         digest = digest_resolver(tagged_reference)
-        if digest is None or not DIGEST_PATTERN.fullmatch(digest):
+        if digest is None or not DIGEST_PATTERN.fullmatch(digest) or digest == ZERO_DIGEST:
             raise ValueError(f"registry digest is unavailable for image {name}")
         record: dict[str, Any] = {
             "repository": spec["repository"],
-            "tag": spec["tag"],
+            "tag": tag,
             "digest": digest,
             "reference": f"{tagged_reference}@{digest}",
         }
@@ -175,7 +240,8 @@ def write_image_lock(
             record["source"] = dict(source)
         images[name] = record
 
-    document = {"schemaVersion": 1, "images": images}
+    candidate["imageDigests"] = {name: images[name]["digest"] for name in CUSTOM_IMAGE_NAMES}
+    document = {"schemaVersion": 2, "candidate": candidate, "images": images}
     rendered_compose = {
         Path(compose_path): _render_compose_references(Path(compose_path), images)
         for compose_path in compose_paths
@@ -231,12 +297,40 @@ def write_image_lock(
     return document
 
 
-def load_image_lock(lock_path: Path = IMAGE_LOCK_PATH) -> dict[str, Any]:
+def load_image_lock(
+    lock_path: Path = IMAGE_LOCK_PATH,
+    *,
+    require_candidate: bool = True,
+    expected_candidate: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     try:
         document = json.loads(lock_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ValueError("image lock could not be read") from exc
-    images = document.get("images") if isinstance(document, dict) else None
+    if not isinstance(document, dict):
+        raise ValueError("image lock is invalid")
+    schema_version = document.get("schemaVersion")
+    candidate: dict[str, Any] | None = None
+    if schema_version == 2:
+        raw_candidate = document.get("candidate")
+        if not isinstance(raw_candidate, dict) or set(raw_candidate) != {
+            "sourceRepository",
+            "sourceHead",
+            "releaseTag",
+            "openmaicHead",
+            "imageDigests",
+        }:
+            raise ValueError("image lock candidate is invalid")
+        candidate = _candidate_identity(
+            source_repository=raw_candidate.get("sourceRepository"),
+            source_head=raw_candidate.get("sourceHead"),
+            release_tag=raw_candidate.get("releaseTag"),
+            openmaic_head=raw_candidate.get("openmaicHead"),
+            image_digests=raw_candidate.get("imageDigests"),
+        )
+    elif schema_version != 1 or require_candidate or expected_candidate is not None:
+        raise ValueError("image lock candidate is required")
+    images = document.get("images")
     if not isinstance(images, dict):
         raise ValueError("image lock is invalid")
     for name, spec in IMAGE_SPECS.items():
@@ -244,18 +338,31 @@ def load_image_lock(lock_path: Path = IMAGE_LOCK_PATH) -> dict[str, Any]:
         if not isinstance(record, dict):
             raise ValueError(f"image lock is missing {name}")
         digest = record.get("digest")
+        expected_tag = (
+            str(candidate["releaseTag"])
+            if candidate is not None and name in CUSTOM_IMAGE_NAMES
+            else str(spec["tag"])
+        )
         expected = (
-            f"{spec['repository']}:{spec['tag']}@{digest}" if isinstance(digest, str) else None
+            f"{spec['repository']}:{expected_tag}@{digest}" if isinstance(digest, str) else None
         )
         if (
             not isinstance(digest, str)
             or not DIGEST_PATTERN.fullmatch(digest)
-            or digest == "sha256:" + ("0" * 64)
+            or digest == ZERO_DIGEST
             or record.get("repository") != spec["repository"]
-            or record.get("tag") != spec["tag"]
+            or record.get("tag") != expected_tag
             or record.get("reference") != expected
         ):
             raise ValueError(f"image lock entry is invalid for {name}")
+    if candidate is not None:
+        image_digests = candidate["imageDigests"]
+        if any(images[name]["digest"] != image_digests[name] for name in CUSTOM_IMAGE_NAMES):
+            raise ValueError("image lock candidate image digests do not match images")
+        if expected_candidate is not None and any(
+            candidate.get(name) != value for name, value in expected_candidate.items()
+        ):
+            raise ValueError("image lock candidate does not match expected candidate")
     return document
 
 
@@ -263,8 +370,14 @@ def validate_image_lock_bindings(
     lock_path: Path = IMAGE_LOCK_PATH,
     *,
     compose_paths: Sequence[Path] = (),
+    require_candidate: bool = True,
+    expected_candidate: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    lock = load_image_lock(lock_path)
+    lock = load_image_lock(
+        lock_path,
+        require_candidate=require_candidate,
+        expected_candidate=expected_candidate,
+    )
     images = lock["images"]
     for compose_path in compose_paths:
         path = Path(compose_path)
@@ -281,7 +394,7 @@ def validate_image_lock_bindings(
 def image_reference(name: str, *, lock_path: Path = IMAGE_LOCK_PATH) -> str:
     if name not in IMAGE_SPECS:
         raise ValueError(f"unknown image name: {name}")
-    lock = load_image_lock(lock_path)
+    lock = load_image_lock(lock_path, require_candidate=False)
     return str(lock["images"][name]["reference"])
 
 
@@ -345,18 +458,28 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     action.add_argument("--write-image-lock", action="store_true")
     action.add_argument("--print-image", choices=tuple(IMAGE_SPECS))
     parser.add_argument("--lock-path", type=Path, default=IMAGE_LOCK_PATH)
+    parser.add_argument("--source-repository")
+    parser.add_argument("--source-head")
+    parser.add_argument("--release-tag")
+    parser.add_argument("--openmaic-head", default=OPENMAIC_HEAD)
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
     if args.write_image_lock:
+        if not args.source_repository or not args.source_head or not args.release_tag:
+            raise ValueError("--source-repository, --source-head, and --release-tag are required")
         write_image_lock(
             args.lock_path,
             compose_paths=(
                 PROJECT_ROOT / "docker-compose.platform.yml",
                 PROJECT_ROOT / "docker-compose.data-plane.yml",
             ),
+            source_repository=args.source_repository,
+            source_head=args.source_head,
+            release_tag=args.release_tag,
+            openmaic_head=args.openmaic_head,
         )
         print(args.lock_path)
         return 0

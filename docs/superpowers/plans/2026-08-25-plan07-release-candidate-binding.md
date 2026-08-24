@@ -96,16 +96,17 @@ files.
 
 1. Add a first step that validates the exact release tag and checkout commit
    before Buildx setup or GHCR login.
-2. Give every build both the immutable candidate tag and the existing
-   compatibility tag; retain `linux/amd64`, pinned contexts, and pinned
-   Dockerfiles.
+2. Give every build only the immutable candidate tag, stable step IDs, and the
+   existing `linux/amd64`, pinned contexts, and pinned Dockerfiles.
 3. After all pushes, resolve candidate-tag manifests and call the writer with
    exact repository, source HEAD, release tag, and pinned OpenMAIC HEAD.
 4. Validate the generated candidate lock against the workflow source values
-   before artifact upload.
-5. Upload the schema-version-2 lock and two rendered Compose files without any
+   and the three build-step output digests.
+5. Promote compatibility aliases from those verified digests only after the
+   candidate lock and both Compose files validate.
+6. Upload the schema-version-2 lock and two rendered Compose files without any
    repository commit or push step.
-6. Retain a single workflow concurrency group and least-privilege
+7. Retain a single workflow concurrency group and least-privilege
    `contents: read`, `packages: write` permissions.
 
 Run an offline YAML parse, the exact workflow contract node, and scoped

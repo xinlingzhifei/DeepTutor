@@ -58,6 +58,7 @@ def _validate_production_image_lock() -> None:
     renderer = _load_platform_renderer()
     renderer.validate_image_lock_bindings(
         PROJECT_ROOT / "deploy" / "image-lock.json",
+        require_candidate=True,
         compose_paths=(
             PROJECT_ROOT / "docker-compose.platform.yml",
             PROJECT_ROOT / "docker-compose.data-plane.yml",
