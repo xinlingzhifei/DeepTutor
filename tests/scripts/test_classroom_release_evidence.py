@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
 import sys
 
 import pytest
@@ -276,3 +277,215 @@ def test_manifest_rejects_output_path_that_would_overwrite_receipt(
         )
 
     assert receipt_path.read_bytes() == original
+
+
+def test_source_head_receipt_is_derived_from_clean_matching_git_checkout(
+    tmp_path: Path,
+) -> None:
+    module = _load_evidence_module()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    calls: list[tuple[str, ...]] = []
+
+    def run_git(arguments: list[str], *, cwd: Path):
+        assert cwd == source_root
+        calls.append(tuple(arguments))
+        if arguments[-2:] == ["rev-parse", "HEAD"]:
+            stdout = SOURCE_HEAD + "\n"
+        elif arguments[-3:] == ["status", "--porcelain=v1", "--untracked-files=all"]:
+            stdout = ""
+        elif arguments[-3:] == ["remote", "get-url", "origin"]:
+            stdout = "https://github.com/xinlingzhifei/DeepTutor.git\n"
+        else:
+            raise AssertionError(arguments)
+        return subprocess.CompletedProcess(arguments, 0, stdout=stdout, stderr="")
+
+    output = tmp_path / "source-head.json"
+    receipt = module.write_source_head_receipt(
+        output,
+        candidate_root=candidate_root,
+        release_run=RELEASE_RUN,
+        source_root=source_root,
+        observed_at="2026-08-25T00:00:00Z",
+        git_runner=run_git,
+    )
+
+    assert receipt["candidate"] == candidate
+    assert receipt["receipt"]["producer"] == "git-probe"
+    assert receipt["receipt"]["result"] == {
+        "outcome": "pass",
+        "nativeExit": 0,
+        "checks": {"headMatches": True, "worktreeClean": True},
+    }
+    assert len(calls) == 4
+
+
+@pytest.mark.parametrize("case", ("head", "dirty", "origin", "exit"))
+def test_source_head_receipt_rejects_untrusted_git_checkout_before_publish(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    module = _load_evidence_module()
+    candidate_root, _candidate = _write_candidate_root(tmp_path)
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+
+    def run_git(arguments: list[str], *, cwd: Path):
+        assert cwd == source_root
+        if arguments[-2:] == ["rev-parse", "HEAD"]:
+            stdout = ("b" * 40 if case == "head" else SOURCE_HEAD) + "\n"
+        elif arguments[-3:] == ["status", "--porcelain=v1", "--untracked-files=all"]:
+            stdout = " M changed.py\n" if case == "dirty" else ""
+        else:
+            stdout = (
+                "https://github.com/someone/another-repository.git\n"
+                if case == "origin"
+                else "https://github.com/xinlingzhifei/DeepTutor.git\n"
+            )
+        return subprocess.CompletedProcess(
+            arguments,
+            1 if case == "exit" else 0,
+            stdout=stdout,
+            stderr="probe failed" if case == "exit" else "",
+        )
+
+    output = tmp_path / "source-head.json"
+    output.write_bytes(b"sentinel")
+    with pytest.raises(ValueError, match="Git"):
+        module.write_source_head_receipt(
+            output,
+            candidate_root=candidate_root,
+            release_run=RELEASE_RUN,
+            source_root=source_root,
+            observed_at="2026-08-25T00:00:00Z",
+            git_runner=run_git,
+        )
+
+    assert output.read_bytes() == b"sentinel"
+
+
+def test_source_head_receipt_rejects_candidate_change_during_probe_before_publish(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = _load_evidence_module()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    changed_candidate = json.loads(json.dumps(candidate))
+    changed_candidate["sourceHead"] = "b" * 40
+    changed_candidate["releaseTag"] = (
+        f"yfeistai-first-release-20260825-{changed_candidate['sourceHead'][:8]}"
+    )
+    candidates = iter((candidate, changed_candidate))
+    monkeypatch.setattr(module, "_candidate", lambda _root: next(candidates))
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+
+    def run_git(arguments: list[str], *, cwd: Path):
+        assert cwd == source_root
+        if arguments[-2:] == ["rev-parse", "HEAD"]:
+            stdout = SOURCE_HEAD + "\n"
+        elif arguments[-3:] == ["status", "--porcelain=v1", "--untracked-files=all"]:
+            stdout = ""
+        else:
+            stdout = "https://github.com/xinlingzhifei/DeepTutor.git\n"
+        return subprocess.CompletedProcess(arguments, 0, stdout=stdout, stderr="")
+
+    output = tmp_path / "source-head.json"
+    with pytest.raises(ValueError, match="candidate changed"):
+        module.write_source_head_receipt(
+            output,
+            candidate_root=candidate_root,
+            release_run=RELEASE_RUN,
+            source_root=source_root,
+            observed_at="2026-08-25T00:00:00Z",
+            git_runner=run_git,
+        )
+
+    assert not output.exists()
+
+
+def test_source_head_receipt_rejects_git_head_change_during_probe_before_publish(
+    tmp_path: Path,
+) -> None:
+    module = _load_evidence_module()
+    candidate_root, _candidate = _write_candidate_root(tmp_path)
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    head_reads = 0
+
+    def run_git(arguments: list[str], *, cwd: Path):
+        nonlocal head_reads
+        assert cwd == source_root
+        if arguments[-2:] == ["rev-parse", "HEAD"]:
+            head_reads += 1
+            stdout = (SOURCE_HEAD if head_reads == 1 else "b" * 40) + "\n"
+        elif arguments[-3:] == ["status", "--porcelain=v1", "--untracked-files=all"]:
+            stdout = ""
+        else:
+            stdout = "https://github.com/xinlingzhifei/DeepTutor.git\n"
+        return subprocess.CompletedProcess(arguments, 0, stdout=stdout, stderr="")
+
+    output = tmp_path / "source-head.json"
+    with pytest.raises(ValueError, match="Git HEAD changed"):
+        module.write_source_head_receipt(
+            output,
+            candidate_root=candidate_root,
+            release_run=RELEASE_RUN,
+            source_root=source_root,
+            observed_at="2026-08-25T00:00:00Z",
+            git_runner=run_git,
+        )
+
+    assert not output.exists()
+
+
+def test_image_digest_receipt_is_derived_from_candidate_lock_and_compose(
+    tmp_path: Path,
+) -> None:
+    module = _load_evidence_module()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    output = tmp_path / "image-digests.json"
+
+    receipt = module.write_image_digest_receipt(
+        output,
+        candidate_root=candidate_root,
+        release_run=RELEASE_RUN,
+        observed_at="2026-08-25T00:00:00Z",
+    )
+
+    assert receipt["candidate"] == candidate
+    assert receipt["receipt"]["producer"] == "image-lock"
+    assert receipt["receipt"]["result"] == {
+        "outcome": "pass",
+        "nativeExit": 0,
+        "checks": {"lockMatches": True, "composeMatches": True},
+    }
+
+
+def test_image_digest_receipt_rejects_compose_drift_before_publish(
+    tmp_path: Path,
+) -> None:
+    module = _load_evidence_module()
+    candidate_root, _candidate = _write_candidate_root(tmp_path)
+    compose_path = candidate_root / "docker-compose.platform.yml"
+    compose_path.write_text(
+        compose_path.read_text(encoding="utf-8").replace(
+            "ghcr.io/xinlingzhifei/deeptutor:",
+            "ghcr.io/xinlingzhifei/deeptutor-drifted:",
+            1,
+        ),
+        encoding="utf-8",
+    )
+    output = tmp_path / "image-digests.json"
+    output.write_bytes(b"sentinel")
+
+    with pytest.raises(ValueError, match="Compose"):
+        module.write_image_digest_receipt(
+            output,
+            candidate_root=candidate_root,
+            release_run=RELEASE_RUN,
+            observed_at="2026-08-25T00:00:00Z",
+        )
+
+    assert output.read_bytes() == b"sentinel"

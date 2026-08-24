@@ -9,9 +9,10 @@ import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 import tempfile
-from typing import Any
+from typing import Any, Protocol
 
 SCRIPTS_ROOT = Path(__file__).resolve().parent
 if str(SCRIPTS_ROOT) not in sys.path:
@@ -26,6 +27,19 @@ from verify_classroom_release import (  # noqa: E402
 
 _RELEASE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _OBSERVED_AT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
+_GITHUB_REMOTE = re.compile(
+    r"^(?:https://github\.com/|ssh://git@github\.com/|git@github\.com:)"
+    r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?$"
+)
+
+
+class GitRunner(Protocol):
+    def __call__(
+        self,
+        arguments: list[str],
+        *,
+        cwd: Path,
+    ) -> subprocess.CompletedProcess[str]: ...
 
 
 def _candidate(candidate_root: Path) -> dict[str, Any]:
@@ -125,7 +139,27 @@ def write_pass_receipt(
     checks: Mapping[str, object],
 ) -> dict[str, object]:
     """Write one passing receipt only from explicit, candidate-bound facts."""
-    candidate = _candidate(candidate_root)
+    return _write_pass_receipt_from_candidate(
+        output_path,
+        candidate=_candidate(candidate_root),
+        release_run=release_run,
+        evidence=evidence,
+        observed_at=observed_at,
+        native_exit=native_exit,
+        checks=checks,
+    )
+
+
+def _write_pass_receipt_from_candidate(
+    output_path: Path,
+    *,
+    candidate: Mapping[str, object],
+    release_run: Mapping[str, object],
+    evidence: str,
+    observed_at: str,
+    native_exit: int,
+    checks: Mapping[str, object],
+) -> dict[str, object]:
     bound_run = _release_run(release_run)
     if not _valid_observed_at(observed_at):
         raise ValueError("receipt observedAt is invalid")
@@ -136,7 +170,7 @@ def write_pass_receipt(
     )
     document: dict[str, object] = {
         "schemaVersion": ARTIFACT_SCHEMA_VERSION,
-        "candidate": candidate,
+        "candidate": json.loads(json.dumps(candidate)),
         "releaseRun": bound_run,
         "evidence": evidence,
         "receipt": {
@@ -151,6 +185,133 @@ def write_pass_receipt(
     }
     _atomic_write_json(Path(output_path), document)
     return document
+
+
+def _run_git(arguments: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
+    environment = os.environ.copy()
+    for name in (
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_WORK_TREE",
+    ):
+        environment.pop(name, None)
+    environment.update(
+        {
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
+    return subprocess.run(
+        [
+            "git",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            f"safe.directory={cwd.as_posix()}",
+            *arguments,
+        ],
+        cwd=cwd,
+        capture_output=True,
+        check=False,
+        env=environment,
+        text=True,
+        timeout=30,
+    )
+
+
+def _git_stdout(
+    runner: GitRunner,
+    arguments: list[str],
+    *,
+    cwd: Path,
+) -> str:
+    try:
+        result = runner(arguments, cwd=cwd)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError("Git probe could not run") from exc
+    if (
+        not isinstance(result.returncode, int)
+        or isinstance(result.returncode, bool)
+        or result.returncode != 0
+        or not isinstance(result.stdout, str)
+    ):
+        raise ValueError("Git probe failed")
+    return result.stdout.strip()
+
+
+def _github_repository(remote: str) -> str | None:
+    match = _GITHUB_REMOTE.fullmatch(remote)
+    return match.group(1) if match is not None else None
+
+
+def write_source_head_receipt(
+    output_path: Path,
+    *,
+    candidate_root: Path,
+    release_run: Mapping[str, object],
+    source_root: Path,
+    observed_at: str,
+    git_runner: GitRunner = _run_git,
+) -> dict[str, object]:
+    """Probe one trusted, clean Git checkout and bind it to the candidate."""
+    candidate = _candidate(candidate_root)
+    root = Path(source_root).resolve()
+    if not root.is_dir():
+        raise ValueError("Git source root is unavailable")
+    head = _git_stdout(git_runner, ["rev-parse", "HEAD"], cwd=root)
+    status = _git_stdout(
+        git_runner,
+        ["status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=root,
+    )
+    origin = _git_stdout(git_runner, ["remote", "get-url", "origin"], cwd=root)
+    final_head = _git_stdout(git_runner, ["rev-parse", "HEAD"], cwd=root)
+    try:
+        final_candidate = _candidate(candidate_root)
+    except ValueError as exc:
+        raise ValueError("release candidate changed during Git probe") from exc
+    if final_candidate != candidate:
+        raise ValueError("release candidate changed during Git probe")
+    if head != candidate["sourceHead"]:
+        raise ValueError("Git HEAD does not match the release candidate")
+    if final_head != head:
+        raise ValueError("Git HEAD changed during release probe")
+    if status:
+        raise ValueError("Git worktree is not clean")
+    if _github_repository(origin) != candidate["sourceRepository"]:
+        raise ValueError("Git origin does not match the release candidate")
+    return _write_pass_receipt_from_candidate(
+        output_path,
+        candidate=candidate,
+        release_run=release_run,
+        evidence="source_head",
+        observed_at=observed_at,
+        native_exit=0,
+        checks={"headMatches": True, "worktreeClean": True},
+    )
+
+
+def write_image_digest_receipt(
+    output_path: Path,
+    *,
+    candidate_root: Path,
+    release_run: Mapping[str, object],
+    observed_at: str,
+) -> dict[str, object]:
+    """Revalidate the candidate lock and both Compose files before receipt."""
+    candidate = _candidate(candidate_root)
+    return _write_pass_receipt_from_candidate(
+        output_path,
+        candidate=candidate,
+        release_run=release_run,
+        evidence="image_digests",
+        observed_at=observed_at,
+        native_exit=0,
+        checks={"lockMatches": True, "composeMatches": True},
+    )
 
 
 def _validated_receipt(
