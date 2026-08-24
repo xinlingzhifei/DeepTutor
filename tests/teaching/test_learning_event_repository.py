@@ -126,7 +126,7 @@ def test_append_command_rejects_naive_occurrence_time() -> None:
 def test_learning_revision_is_the_tenant_schema_head() -> None:
     from deeptutor.teaching.provisioning_worker import TENANT_SCHEMA_REVISION
 
-    assert TENANT_SCHEMA_REVISION == "20260810_0017"
+    assert TENANT_SCHEMA_REVISION == "20260824_0018"
 
 
 @pytest.mark.asyncio

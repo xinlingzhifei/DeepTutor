@@ -36,6 +36,14 @@ from deeptutor.teaching.repositories.jobs import (
     CancellationRequest,
     SqlAlchemyGenerationJobRepository,
 )
+from deeptutor.teaching.repositories.runtime_heartbeats import (
+    SqlAlchemyRuntimeHeartbeatRepository,
+)
+from deeptutor.teaching.runtime_heartbeat import (
+    RuntimeHeartbeatRepository,
+    RuntimeHeartbeatSupervisor,
+    RuntimeProcessRole,
+)
 from deeptutor.teaching.scheduler import FairScheduler
 from deeptutor.teaching.schema_names import tenant_schema_name
 from deeptutor.teaching.tenant_context import TenantContext
@@ -49,6 +57,14 @@ PROCESS_NAMES = (
     "learning-projector",
     "tenant-provisioner",
 )
+PROCESS_HEALTH_ROLES: dict[str, RuntimeProcessRole] = {
+    "dispatcher": "dispatcher",
+    "worker": "generation_worker",
+    "export-worker": "export_worker",
+    "reaper": "reaper",
+    "learning-projector": "projector",
+    "tenant-provisioner": "tenant_provisioner",
+}
 _IDLE_SECONDS = 0.5
 
 
@@ -528,22 +544,39 @@ async def run_process(
     *,
     once: bool = False,
     settings: PlatformSettings | None = None,
+    heartbeat_repository: RuntimeHeartbeatRepository | None = None,
+    heartbeat_interval_seconds: float = 30,
 ) -> bool:
     if process_name not in PROCESS_NAMES:
         raise ValueError("unknown teaching process")
     resolved = settings or load_platform_settings()
     if not resolved.enabled:
         return False
+    repository = heartbeat_repository or SqlAlchemyRuntimeHeartbeatRepository()
+    supervisor = RuntimeHeartbeatSupervisor(
+        repository,
+        role=PROCESS_HEALTH_ROLES[process_name],
+        heartbeat_interval_seconds=heartbeat_interval_seconds,
+    )
+    return await supervisor.run(lambda: _run_process_workload(process_name, resolved, once=once))
+
+
+async def _run_process_workload(
+    process_name: str,
+    settings: PlatformSettings,
+    *,
+    once: bool,
+) -> bool:
     if process_name == "dispatcher":
         return await _run_dispatcher(once=once)
     if process_name == "reaper":
         return await _run_reaper(once=once)
     if process_name == "learning-projector":
-        return await _run_learning_projector(resolved, once=once)
+        return await _run_learning_projector(settings, once=once)
     if process_name == "tenant-provisioner":
-        return await _run_tenant_provisioner(resolved, once=once)
+        return await _run_tenant_provisioner(settings, once=once)
     return await _run_worker(
-        resolved,
+        settings,
         job_kind="generation" if process_name == "worker" else "export",
         once=once,
     )
@@ -570,6 +603,7 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "PROCESS_HEALTH_ROLES",
     "PROCESS_NAMES",
     "RuntimeCancellationGateway",
     "RuntimeOpenMAICClients",

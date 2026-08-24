@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import inspect
 
 from fastapi import FastAPI
 from fastapi.routing import APIRoute
@@ -74,6 +75,9 @@ def test_health_includes_registered_shared_and_dedicated_data_planes() -> None:
 def test_teaching_health_routes_register_only_for_enabled_platform() -> None:
     from deeptutor.api.main import _register_teaching_health_routes
     from deeptutor.api.routers import teaching_health
+    from deeptutor.teaching.repositories.runtime_heartbeats import (
+        get_runtime_heartbeat_repository,
+    )
 
     disabled = FastAPI()
     assert not _register_teaching_health_routes(disabled, enabled=False)
@@ -95,4 +99,6 @@ def test_teaching_health_routes_register_only_for_enabled_platform() -> None:
         dependency.call for dependency in routes["/internal/metrics"].dependant.dependencies
     }
     assert require_platform_admin in health_dependencies
+    assert get_runtime_heartbeat_repository in health_dependencies
     assert require_platform_admin not in metrics_dependencies
+    assert inspect.iscoroutinefunction(teaching_health.teaching_health)

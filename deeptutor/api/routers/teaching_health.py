@@ -13,6 +13,10 @@ from deeptutor.teaching.health import (
     get_teaching_health_service,
 )
 from deeptutor.teaching.metrics import TeachingMetrics, get_teaching_metrics
+from deeptutor.teaching.repositories.runtime_heartbeats import (
+    get_runtime_heartbeat_repository,
+)
+from deeptutor.teaching.runtime_heartbeat import RuntimeHeartbeatRepository
 
 router = APIRouter()
 
@@ -21,10 +25,11 @@ router = APIRouter()
     "/api/v1/system/teaching-health",
     dependencies=[Depends(require_platform_admin)],
 )
-def teaching_health(
+async def teaching_health(
     service: TeachingHealthService = Depends(get_teaching_health_service),
+    runtime_repository: RuntimeHeartbeatRepository = Depends(get_runtime_heartbeat_repository),
 ) -> dict[str, object]:
-    return asdict(service.report())
+    return asdict(await service.report_durable(runtime_repository))
 
 
 @router.get("/internal/metrics", include_in_schema=False)

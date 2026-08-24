@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import subprocess
 import sys
 
@@ -14,9 +15,9 @@ from deeptutor.teaching.repositories.jobs import CancellationRequest
 
 
 def test_process_module_exposes_exact_lifecycle_commands() -> None:
-    from deeptutor.teaching.processes import PROCESS_NAMES
+    from deeptutor.teaching import processes
 
-    assert PROCESS_NAMES == (
+    assert processes.PROCESS_NAMES == (
         "dispatcher",
         "worker",
         "export-worker",
@@ -24,6 +25,15 @@ def test_process_module_exposes_exact_lifecycle_commands() -> None:
         "learning-projector",
         "tenant-provisioner",
     )
+    assert getattr(processes, "PROCESS_HEALTH_ROLES", None) == {
+        "dispatcher": "dispatcher",
+        "worker": "generation_worker",
+        "export-worker": "export_worker",
+        "reaper": "reaper",
+        "learning-projector": "projector",
+        "tenant-provisioner": "tenant_provisioner",
+    }
+    assert "heartbeat_repository" in inspect.signature(processes.run_process).parameters
 
 
 def test_process_module_help_does_not_touch_external_services() -> None:

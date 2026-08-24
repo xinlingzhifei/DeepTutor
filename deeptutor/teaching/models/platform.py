@@ -458,6 +458,67 @@ class TenantProvisioningJob(PlatformBase):
     )
 
 
+class TeachingRuntimeProcessHeartbeat(PlatformBase):
+    __tablename__ = "teaching_runtime_process_heartbeats"
+
+    role: Mapped[str] = mapped_column(String(64), primary_key=True)
+    instance_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+    heartbeat_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+    status: Mapped[str] = mapped_column(String(16), server_default="running")
+    stopped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        CheckConstraint("length(btrim(role)) > 0", name="role_not_empty"),
+        CheckConstraint(
+            "role IN ('tenant_provisioner', 'dispatcher', 'generation_worker', "
+            "'export_worker', 'projector', 'reaper')",
+            name="role",
+        ),
+        CheckConstraint(
+            "length(btrim(instance_id)) > 0",
+            name="instance_id_not_empty",
+        ),
+        CheckConstraint("status IN ('running', 'stopped')", name="status"),
+        CheckConstraint(
+            "(status = 'running' AND stopped_at IS NULL) OR "
+            "(status = 'stopped' AND stopped_at IS NOT NULL)",
+            name="status_stopped_at",
+        ),
+        CheckConstraint(
+            "heartbeat_at >= started_at AND updated_at >= started_at "
+            "AND (stopped_at IS NULL OR stopped_at >= started_at)",
+            name="timestamps",
+        ),
+        Index(
+            "ix_teaching_runtime_process_heartbeats_role_heartbeat_running",
+            "role",
+            heartbeat_at.desc(),
+            postgresql_where=text("status = 'running'"),
+        ),
+        Index(
+            "ix_teaching_runtime_process_heartbeats_heartbeat_running_ttl",
+            "heartbeat_at",
+            postgresql_where=text("status = 'running'"),
+        ),
+        Index(
+            "ix_teaching_runtime_process_heartbeats_stopped_at_retention",
+            "stopped_at",
+            postgresql_where=text("status = 'stopped'"),
+        ),
+    )
+
+
 class AuditLog(PlatformBase):
     __tablename__ = "audit_log"
 

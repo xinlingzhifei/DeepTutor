@@ -9,6 +9,11 @@ import math
 import re
 from typing import Callable, Literal
 
+from deeptutor.teaching.runtime_heartbeat import (
+    RUNTIME_PROCESS_ROLES,
+    RuntimeHeartbeatRepository,
+)
+
 HealthStatus = Literal["healthy", "stale", "unhealthy", "unknown"]
 DataPlaneMode = Literal["shared", "dedicated"]
 DataPlaneService = Literal["openmaic", "render"]
@@ -24,6 +29,7 @@ REQUIRED_HEALTH_COMPONENTS = (
     "projector",
     "openmaic_shared",
     "render_shared",
+    "reaper",
 )
 
 _STATUS_VALUES = frozenset({"healthy", "unhealthy", "unknown"})
@@ -54,6 +60,7 @@ class _Signal:
     checked_at: datetime | None
     reason: str | None = None
     heartbeat: bool = False
+    heartbeat_age_seconds: float | None = None
     service: DataPlaneService | None = None
     mode: DataPlaneMode | None = None
 
@@ -147,7 +154,9 @@ class TeachingHealthService:
         age_seconds: float | None = None
         status: HealthStatus = signal.status
         reason = signal.reason
-        if signal.checked_at is not None:
+        if signal.heartbeat_age_seconds is not None:
+            age_seconds = max(0.0, signal.heartbeat_age_seconds)
+        elif signal.checked_at is not None:
             age_seconds = max(0.0, (now - signal.checked_at).total_seconds())
         if signal.heartbeat and age_seconds is not None:
             if age_seconds > self._stale_after_seconds:
@@ -164,9 +173,16 @@ class TeachingHealthService:
             mode=signal.mode,
         )
 
-    def report(self) -> TeachingHealthReport:
+    def _report(
+        self,
+        *,
+        signal_overrides: dict[str, _Signal] | None = None,
+    ) -> TeachingHealthReport:
         now = self._now()
-        components = {name: self._component(signal, now) for name, signal in self._signals.items()}
+        signals = dict(self._signals)
+        if signal_overrides is not None:
+            signals.update(signal_overrides)
+        components = {name: self._component(signal, now) for name, signal in signals.items()}
         components.update(
             {
                 f"data_plane:{route_id}": self._component(signal, now)
@@ -183,6 +199,51 @@ class TeachingHealthService:
             generated_at=now,
             components=components,
         )
+
+    def report(self) -> TeachingHealthReport:
+        return self._report()
+
+    async def report_durable(
+        self,
+        repository: RuntimeHeartbeatRepository,
+    ) -> TeachingHealthReport:
+        try:
+            snapshots = await repository.latest_running_heartbeats(RUNTIME_PROCESS_ROLES)
+        except Exception:
+            overrides = {
+                role: _Signal(
+                    status="unknown",
+                    checked_at=None,
+                    reason="heartbeat_repository_unavailable",
+                )
+                for role in RUNTIME_PROCESS_ROLES
+            }
+            return self._report(signal_overrides=overrides)
+
+        latest: dict[str, float] = {}
+        for snapshot in snapshots:
+            age_seconds = max(0.0, float(snapshot.age_seconds))
+            existing = latest.get(snapshot.role)
+            if existing is None or age_seconds < existing:
+                latest[snapshot.role] = age_seconds
+        overrides = {
+            role: (
+                _Signal(
+                    status="healthy",
+                    checked_at=None,
+                    heartbeat=True,
+                    heartbeat_age_seconds=latest[role],
+                )
+                if role in latest
+                else _Signal(
+                    status="unknown",
+                    checked_at=None,
+                    reason="heartbeat_missing",
+                )
+            )
+            for role in RUNTIME_PROCESS_ROLES
+        }
+        return self._report(signal_overrides=overrides)
 
 
 _service = TeachingHealthService()
