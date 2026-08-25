@@ -600,6 +600,13 @@ async def test_postgres_pbl_grading_rolls_back_if_backlog_restore_conflicts(
                 "WHERE event_id = 'event-pbl-rollback'"
             )
         )
+        await connection.execute(
+            text(
+                "DELETE FROM platform.teaching_learning_projection_backlog "
+                "WHERE tenant_id = :tenant_id AND event_id = 'event-pbl-rollback'"
+            ),
+            {"tenant_id": projector_database.tenant_id},
+        )
     async with projector_database.engine.begin() as connection:
         await connection.execute(
             text(
@@ -725,6 +732,14 @@ async def test_postgres_identical_pbl_replay_survives_later_quarantine_without_q
                 f"UPDATE {quoted}.learning_projection_queue SET status = 'quarantined' "
                 "WHERE event_id = 'event-pbl-quarantined-replay'"
             )
+        )
+        await connection.execute(
+            text(
+                "DELETE FROM platform.teaching_learning_projection_backlog "
+                "WHERE tenant_id = :tenant_id "
+                "AND event_id = 'event-pbl-quarantined-replay'"
+            ),
+            {"tenant_id": projector_database.tenant_id},
         )
 
     replay = await _grade_pbl(
