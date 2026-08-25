@@ -3,17 +3,31 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 import subprocess
+import sys
 from typing import Protocol
 
 import yaml
 from yaml.nodes import MappingNode, ScalarNode, SequenceNode
+
+SCRIPTS_ROOT = Path(__file__).resolve().parent
+if str(SCRIPTS_ROOT) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_ROOT))
+
+from classroom_release_probe_contract import (  # noqa: E402
+    LIVE_PROJECT,
+    LIVE_SPEC,
+    PROBE_RECIPES,
+    probe_command_record,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_EVIDENCE_PATH = (
@@ -114,12 +128,307 @@ RECEIPT_CONTRACTS = {
     "gateway_only_public": ("gateway-probe", ("gatewayPublic", "internalPortsClosed")),
 }
 
+PROBE_TITLE_PATTERNS = {
+    evidence: re.compile(rf"^\[release-evidence:{re.escape(evidence)}\] .+$")
+    for evidence in PROBE_RECIPES
+}
+
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _DIGEST = re.compile(r"^sha256:([0-9a-f]{64})$")
 _RELEASE_TAG = re.compile(r"^yfeistai-first-release-[0-9]{8}-([0-9a-f]{8})$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _RELEASE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _OBSERVED_AT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
+
+
+def _valid_observed_at_value(raw: object) -> bool:
+    if not isinstance(raw, str) or _OBSERVED_AT.fullmatch(raw) is None:
+        return False
+    try:
+        datetime.fromisoformat(raw.removesuffix("Z") + "+00:00")
+    except ValueError:
+        return False
+    return True
+
+
+def derive_probe_checks(
+    evidence: str,
+    *,
+    raw_report: bytes,
+    candidate: Mapping[str, object],
+    release_run: Mapping[str, str],
+) -> dict[str, bool]:
+    """Derive checks by recounting a native Playwright JSON reporter document."""
+    del candidate, release_run  # Bound independently by the hashed execution record.
+    recipe = PROBE_RECIPES.get(evidence)
+    if recipe is None:
+        raise ValueError("probe recipe is not implemented for this evidence layer")
+    _recipe_id, expected_count = recipe
+    try:
+        document = json.loads(raw_report)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("probe raw report is invalid") from exc
+    if not isinstance(document, dict) or set(document) != {
+        "config",
+        "suites",
+        "errors",
+        "stats",
+    }:
+        raise ValueError("probe raw report is not native Playwright JSON")
+    config = document.get("config")
+    projects = config.get("projects") if isinstance(config, dict) else None
+    if not isinstance(projects, list) or len(projects) != 1:
+        raise ValueError("probe Playwright config does not match the fixed project")
+    project = projects[0]
+    retries = project.get("retries") if isinstance(project, dict) else None
+    if (
+        not isinstance(project, dict)
+        or project.get("id") != LIVE_PROJECT
+        or project.get("name") != LIVE_PROJECT
+        or not isinstance(retries, int)
+        or isinstance(retries, bool)
+        or retries != 0
+    ):
+        raise ValueError("probe Playwright config does not match the fixed project")
+    errors = document.get("errors")
+    if errors != []:
+        raise ValueError("probe Playwright report contains global errors")
+    stats = document.get("stats")
+    if not isinstance(stats, dict) or set(stats) != {
+        "startTime",
+        "duration",
+        "expected",
+        "unexpected",
+        "flaky",
+        "skipped",
+    }:
+        raise ValueError("probe Playwright stats are invalid")
+    if not _valid_observed_at_value(stats.get("startTime")):
+        raise ValueError("probe Playwright stats are invalid")
+    duration = stats.get("duration")
+    if (
+        not isinstance(duration, (int, float))
+        or isinstance(duration, bool)
+        or not math.isfinite(duration)
+        or duration < 0
+    ):
+        raise ValueError("probe Playwright stats are invalid")
+    outcome_names = ("expected", "unexpected", "flaky", "skipped")
+    if any(
+        not isinstance(stats.get(name), int) or isinstance(stats.get(name), bool) or stats[name] < 0
+        for name in outcome_names
+    ):
+        raise ValueError("probe Playwright stats are invalid")
+
+    suites = document.get("suites")
+    if not isinstance(suites, list):
+        raise ValueError("probe Playwright suites are invalid")
+    specs: list[dict[str, object]] = []
+    pending: list[object] = list(suites)
+    while pending:
+        suite = pending.pop()
+        if not isinstance(suite, dict) or not isinstance(suite.get("specs"), list):
+            raise ValueError("probe Playwright suites are invalid")
+        nested = suite.get("suites", [])
+        if not isinstance(nested, list):
+            raise ValueError("probe Playwright suites are invalid")
+        pending.extend(nested)
+        for spec in suite["specs"]:
+            if not isinstance(spec, dict):
+                raise ValueError("probe Playwright suites are invalid")
+            specs.append(spec)
+    if len(specs) != expected_count:
+        raise ValueError("probe selected test count does not match the fixed recipe")
+
+    recounted = {name: 0 for name in outcome_names}
+    title_pattern = PROBE_TITLE_PATTERNS[evidence]
+    for spec in specs:
+        title = spec.get("title")
+        tests = spec.get("tests")
+        if (
+            spec.get("file") != LIVE_SPEC
+            or not isinstance(title, str)
+            or title_pattern.fullmatch(title) is None
+            or spec.get("ok") is not True
+            or not isinstance(tests, list)
+            or len(tests) != 1
+        ):
+            raise ValueError("probe selected spec does not match the fixed recipe")
+        test = tests[0]
+        if not isinstance(test, dict):
+            raise ValueError("probe selected test is invalid")
+        outcome = test.get("status")
+        if outcome not in recounted:
+            raise ValueError("probe selected test outcome is invalid")
+        recounted[outcome] += 1
+        results = test.get("results")
+        if (
+            test.get("projectId") != LIVE_PROJECT
+            or test.get("projectName") != LIVE_PROJECT
+            or test.get("expectedStatus") != "passed"
+            or outcome != "expected"
+            or not isinstance(results, list)
+            or len(results) != 1
+        ):
+            raise ValueError("probe selected test does not prove a clean pass")
+        result = results[0]
+        result_duration = result.get("duration") if isinstance(result, dict) else None
+        retry = result.get("retry") if isinstance(result, dict) else None
+        if (
+            not isinstance(result, dict)
+            or result.get("status") != "passed"
+            or not isinstance(result_duration, (int, float))
+            or isinstance(result_duration, bool)
+            or not math.isfinite(result_duration)
+            or result_duration < 0
+            or not isinstance(retry, int)
+            or isinstance(retry, bool)
+            or retry != 0
+            or result.get("errors") != []
+            or result.get("error") not in (None, {})
+        ):
+            raise ValueError("probe selected test does not prove a clean pass")
+    if any(stats[name] != recounted[name] for name in outcome_names):
+        raise ValueError("probe Playwright stats do not match selected test results")
+    if recounted != {
+        "expected": expected_count,
+        "unexpected": 0,
+        "flaky": 0,
+        "skipped": 0,
+    }:
+        raise ValueError("probe selected tests do not prove passing evidence")
+    required_checks = RECEIPT_CONTRACTS[evidence][1]
+    if len(required_checks) != 1:
+        raise ValueError("probe recipe does not match the evidence contract")
+    return {required_checks[0]: True}
+
+
+def _proof_bytes(
+    bundle_root: Path,
+    raw: object,
+    *,
+    label: str,
+) -> tuple[bytes, str] | str:
+    if not isinstance(raw, dict) or set(raw) != {"artifact", "sha256"}:
+        return f"{label} reference is invalid"
+    artifact = raw.get("artifact")
+    expected_sha256 = raw.get("sha256")
+    if (
+        not isinstance(artifact, str)
+        or not artifact.strip()
+        or Path(artifact).is_absolute()
+        or not isinstance(expected_sha256, str)
+        or _SHA256.fullmatch(expected_sha256) is None
+    ):
+        return f"{label} reference is invalid"
+    root = Path(bundle_root).resolve()
+    unresolved = root / artifact
+    try:
+        resolved = unresolved.resolve()
+        resolved.relative_to(root)
+    except (OSError, ValueError):
+        return f"{label} is outside the evidence bundle"
+    cursor = unresolved
+    while cursor != root:
+        if cursor.is_symlink():
+            return f"{label} must not use a symlink"
+        cursor = cursor.parent
+    try:
+        body = resolved.read_bytes()
+    except OSError:
+        return f"{label} does not exist"
+    if hashlib.sha256(body).hexdigest() != expected_sha256:
+        return f"{label} digest does not match"
+    return body, artifact
+
+
+def probe_provenance_error(
+    document: Mapping[str, object],
+    *,
+    evidence: str,
+    candidate: Mapping[str, object],
+    release_run: Mapping[str, str],
+    bundle_root: Path,
+) -> str | None:
+    """Revalidate raw/execution proof for evidence backed by a fixed probe."""
+    recipe = PROBE_RECIPES.get(evidence)
+    if recipe is None:
+        return None
+    provenance = document.get("provenance")
+    if not isinstance(provenance, dict) or set(provenance) != {
+        "recipe",
+        "command",
+        "rawReport",
+        "execution",
+    }:
+        return "evidence execution proof is missing or invalid"
+    recipe_id, _expected_count = recipe
+    command = provenance.get("command")
+    expected_command = probe_command_record(evidence)
+    if (
+        provenance.get("recipe") != recipe_id
+        or not isinstance(command, dict)
+        or command != expected_command
+    ):
+        return "evidence execution proof is invalid"
+    raw_proof = _proof_bytes(bundle_root, provenance.get("rawReport"), label="probe raw report")
+    if isinstance(raw_proof, str):
+        return raw_proof
+    raw_body, _raw_artifact = raw_proof
+    execution_proof = _proof_bytes(
+        bundle_root,
+        provenance.get("execution"),
+        label="probe execution record",
+    )
+    if isinstance(execution_proof, str):
+        return execution_proof
+    execution_body, _execution_artifact = execution_proof
+    try:
+        execution = json.loads(execution_body)
+    except (UnicodeError, json.JSONDecodeError):
+        return "probe execution record is invalid"
+    if (
+        not isinstance(execution, dict)
+        or set(execution)
+        != {
+            "schemaVersion",
+            "candidate",
+            "releaseRun",
+            "evidence",
+            "recipe",
+            "command",
+            "observedAt",
+            "nativeExit",
+            "rawReportSha256",
+        }
+        or execution.get("schemaVersion") != 1
+        or execution.get("candidate") != candidate
+        or execution.get("releaseRun") != release_run
+        or execution.get("evidence") != evidence
+        or execution.get("recipe") != recipe_id
+        or execution.get("command") != command
+        or not _valid_observed_at_value(execution.get("observedAt"))
+        or not isinstance(execution.get("nativeExit"), int)
+        or isinstance(execution.get("nativeExit"), bool)
+        or execution.get("nativeExit") != 0
+        or execution.get("rawReportSha256") != hashlib.sha256(raw_body).hexdigest()
+    ):
+        return "probe execution record is invalid"
+    try:
+        derived_checks = derive_probe_checks(
+            evidence,
+            raw_report=raw_body,
+            candidate=candidate,
+            release_run=release_run,
+        )
+    except ValueError as exc:
+        return str(exc)
+    receipt = document.get("receipt")
+    result = receipt.get("result") if isinstance(receipt, dict) else None
+    checks = result.get("checks") if isinstance(result, dict) else None
+    if checks != derived_checks:
+        return "receipt checks do not match the probe raw report"
+    return None
 
 
 class _ComposeLoader(yaml.SafeLoader):
@@ -466,6 +775,17 @@ class FileReleaseRuntime:
             return LayerEvidence("fail", "evidence artifact release run does not match")
         if not self._valid_receipt(name, artifact_document.get("receipt")):
             return LayerEvidence("fail", "evidence artifact receipt is invalid")
+        assert isinstance(self._candidate, dict)
+        assert isinstance(self._release_run, dict)
+        provenance_error = probe_provenance_error(
+            artifact_document,
+            evidence=name,
+            candidate=self._candidate,
+            release_run=self._release_run,
+            bundle_root=self._path.parent,
+        )
+        if provenance_error is not None:
+            return LayerEvidence("fail", provenance_error)
         return LayerEvidence(
             status=status,
             detail=detail.strip(),

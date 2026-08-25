@@ -1,0 +1,406 @@
+from __future__ import annotations
+
+import importlib.util
+from pathlib import Path
+import subprocess
+import sys
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def _load_probe():
+    path = ROOT / "scripts" / "classroom_release_probe.py"
+    assert path.is_file(), "fixed classroom release probe is missing"
+    spec = importlib.util.spec_from_file_location("classroom_release_probe_under_test", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _trusted_node_runtime(tmp_path: Path) -> Path:
+    runtime = tmp_path / "trusted-node"
+    runtime.mkdir()
+    npm = runtime / "npm.cmd"
+    npm.write_bytes(b"trusted npm launcher")
+    (runtime / "node.exe").write_bytes(b"trusted node executable")
+    return npm
+
+
+def _probe_environment(tmp_path: Path, report: Path, evidence: str) -> dict[str, str]:
+    return {
+        "YFEISTAI_EVIDENCE_REPORT": str(report),
+        "YFEISTAI_CANDIDATE_ROOT": str(tmp_path),
+        "YFEISTAI_RELEASE_RUN_ID": "release-run-1",
+        "YFEISTAI_ENVIRONMENT_ID": "staging-1",
+        "YFEISTAI_EVIDENCE": evidence,
+        "YFEISTAI_PROBE_TIMEOUT_SECONDS": "20",
+        "WEB_BASE_URL": "https://candidate.example.test",
+    }
+
+
+def test_probe_runs_only_the_fixed_teacher_recipe_and_writes_native_stdout(
+    tmp_path: Path,
+) -> None:
+    module = _load_probe()
+    npm = _trusted_node_runtime(tmp_path)
+    report = tmp_path / "raw" / "teacher.json"
+    native_stdout = b'{"config":{},"suites":[],"errors":[],"stats":{}}\n'
+    captured: dict[str, object] = {}
+
+    def run(arguments: list[str], **options: object) -> subprocess.CompletedProcess[bytes]:
+        captured.update(arguments=arguments, options=options)
+        return subprocess.CompletedProcess(arguments, 0, stdout=native_stdout)
+
+    exit_code = module.main(
+        ["teacher_flow"],
+        environ=_probe_environment(tmp_path, report, "teacher_flow"),
+        runner=run,
+        runtime_resolver=lambda: module.resolve_fixed_node_runtime(
+            platform="win32", trusted_roots=(npm.parent,)
+        ),
+    )
+
+    assert exit_code == 0
+    assert captured["arguments"] == [
+        str(npm),
+        "--prefix",
+        "web",
+        "exec",
+        "playwright",
+        "--",
+        "test",
+        "tests/e2e/classroom-first-release.live.spec.ts",
+        "--project=first-release-live",
+        "--grep",
+        r"\[release-evidence:teacher_flow\]",
+        "--reporter=json",
+        "--workers=1",
+        "--retries=0",
+    ]
+    options = captured["options"]
+    assert isinstance(options, dict)
+    assert options["cwd"] == ROOT
+    assert options["stdout"] == subprocess.PIPE
+    assert options["check"] is False
+    child_environment = options["env"]
+    assert isinstance(child_environment, dict)
+    assert child_environment["WEB_BASE_URL"] == "https://candidate.example.test"
+    assert child_environment["YFEISTAI_RELEASE_RUN_ID"] == "release-run-1"
+    assert report.read_bytes() == native_stdout
+
+
+def test_probe_command_is_built_from_the_canonical_descriptor(tmp_path: Path) -> None:
+    module = _load_probe()
+    npm = _trusted_node_runtime(tmp_path)
+
+    descriptor = module.probe_command_descriptor("teacher_flow")
+
+    assert descriptor == {
+        "commandId": "yfeistai.classroom-release.playwright",
+        "version": 1,
+        "evidence": "teacher_flow",
+        "innerNpmArgv": module._command("teacher_flow", str(npm))[1:],
+        "liveSpec": "tests/e2e/classroom-first-release.live.spec.ts",
+        "project": "first-release-live",
+        "grep": r"\[release-evidence:teacher_flow\]",
+        "reporter": "json",
+        "workers": 1,
+        "retries": 0,
+        "reportFormat": "playwright-json-reporter",
+        "environmentPolicyVersion": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    "forbidden",
+    (
+        "--command",
+        "--test-file",
+        "--project",
+        "--grep",
+        "--reporter",
+        "--workers",
+        "--retries",
+    ),
+)
+def test_probe_cli_rejects_command_injection_inputs(forbidden: str) -> None:
+    module = _load_probe()
+
+    with pytest.raises(SystemExit):
+        module._parse_args(["teacher_flow", forbidden, "attacker-controlled"])
+
+
+def test_probe_preserves_non_json_stdout_and_returns_native_failure(
+    tmp_path: Path,
+) -> None:
+    module = _load_probe()
+    npm = _trusted_node_runtime(tmp_path)
+    report = tmp_path / "probe.json"
+    native_stdout = b"playwright failed before producing JSON\r\n"
+
+    def run(arguments: list[str], **_options: object) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(arguments, 7, stdout=native_stdout)
+
+    exit_code = module.main(
+        ["student_micro_flow"],
+        environ={
+            **_probe_environment(tmp_path, report, "student_micro_flow"),
+            "YFEISTAI_EVIDENCE_PASS": "true",
+            "YFEISTAI_EVIDENCE_CHECKS": '{"studentMicroFlowPassed":true}',
+        },
+        runner=run,
+        runtime_resolver=lambda: module.resolve_fixed_node_runtime(
+            platform="win32", trusted_roots=(npm.parent,)
+        ),
+    )
+
+    assert exit_code == 7
+    assert report.read_bytes() == native_stdout
+
+
+def test_probe_filters_hostile_host_environment_before_npm(
+    tmp_path: Path,
+) -> None:
+    module = _load_probe()
+    npm = _trusted_node_runtime(tmp_path)
+    report = tmp_path / "probe.json"
+    captured: dict[str, str] = {}
+    hostile = {
+        "NODE_OPTIONS": "--require=attacker.js",
+        "node_path": "C:/attacker/modules",
+        "PW_TEST_HTML_REPORT_OPEN": "always",
+        "playwright_json_output_name": "attacker.json",
+        "PLAYWRIGHT_CONNECT_WS_ENDPOINT": "ws://attacker.invalid",
+        "npm_config_registry": "https://attacker.invalid",
+        "NPM_CONFIG_USERCONFIG": "C:/attacker/.npmrc",
+        "BABEL_ENV": "attacker",
+        "RANDOM_HOST_SECRET": "must-not-pass",
+    }
+
+    def run(arguments: list[str], **options: object) -> subprocess.CompletedProcess[bytes]:
+        child = options["env"]
+        assert isinstance(child, dict)
+        captured.update(child)
+        return subprocess.CompletedProcess(arguments, 0, stdout=b"{}")
+
+    module.main(
+        ["teacher_flow"],
+        environ={
+            **_probe_environment(tmp_path, report, "teacher_flow"),
+            **hostile,
+            "SystemRoot": "C:/Windows",
+            "TEMP": str(tmp_path / "temp"),
+            "YFEISTAI_LIVE_FIXTURE_TOKEN": "fixture-token",
+        },
+        runner=run,
+        runtime_resolver=lambda: module.resolve_fixed_node_runtime(
+            platform="win32", trusted_roots=(npm.parent,)
+        ),
+    )
+
+    upper_child = {name.upper() for name in captured}
+    assert not upper_child.intersection(
+        {
+            "NODE_OPTIONS",
+            "NODE_PATH",
+            "PW_TEST_HTML_REPORT_OPEN",
+            "PLAYWRIGHT_JSON_OUTPUT_NAME",
+            "PLAYWRIGHT_CONNECT_WS_ENDPOINT",
+            "NPM_CONFIG_REGISTRY",
+            "NPM_CONFIG_USERCONFIG",
+            "BABEL_ENV",
+            "RANDOM_HOST_SECRET",
+        }
+    )
+    assert captured["PATH"] == str(npm.parent)
+    assert captured["WEB_BASE_URL"] == "https://candidate.example.test"
+    assert captured["YFEISTAI_LIVE_FIXTURE_TOKEN"] == "fixture-token"
+
+
+def test_default_runtime_resolver_ignores_path_hijack_and_fails_closed(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = _load_probe()
+    attacker = tmp_path / "attacker"
+    attacker.mkdir()
+    (attacker / "npm.cmd").write_bytes(b"attacker npm")
+    (attacker / "node.exe").write_bytes(b"attacker node")
+    missing_trusted_root = tmp_path / "trusted-system-nodejs"
+    monkeypatch.setenv("PATH", str(attacker))
+    monkeypatch.setattr(module, "WINDOWS_RUNTIME_ROOTS", (missing_trusted_root,))
+
+    with pytest.raises(ValueError, match="trusted.*runtime"):
+        module.resolve_fixed_node_runtime(platform="win32")
+
+
+def test_fixed_runtime_resolver_accepts_only_a_trusted_root(tmp_path: Path) -> None:
+    module = _load_probe()
+    trusted_root = tmp_path / "Program Files" / "nodejs"
+    trusted_root.mkdir(parents=True)
+    npm = trusted_root / "npm.cmd"
+    node = trusted_root / "node.exe"
+    npm.write_bytes(b"trusted npm")
+    node.write_bytes(b"trusted node")
+
+    resolved_npm, resolved_root = module.resolve_fixed_node_runtime(
+        platform="win32",
+        trusted_roots=(trusted_root,),
+    )
+
+    assert resolved_npm == str(npm)
+    assert resolved_root == trusted_root
+
+
+def test_fixed_runtime_resolver_rejects_symlink_resolution_outside_trusted_root(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = _load_probe()
+    trusted_root = tmp_path / "Program Files" / "nodejs"
+    trusted_root.mkdir(parents=True)
+    npm = trusted_root / "npm.cmd"
+    node = trusted_root / "node.exe"
+    npm.write_bytes(b"npm symlink placeholder")
+    node.write_bytes(b"trusted node")
+    outside = tmp_path / "attacker" / "npm.cmd"
+    outside.parent.mkdir()
+    outside.write_bytes(b"attacker npm")
+    real_resolve = module.Path.resolve
+
+    def resolve(path: Path, strict: bool = False) -> Path:
+        if path == npm:
+            return outside
+        return real_resolve(path, strict=strict)
+
+    monkeypatch.setattr(module.Path, "resolve", resolve)
+    with pytest.raises(ValueError, match="trusted.*runtime"):
+        module.resolve_fixed_node_runtime(
+            platform="win32",
+            trusted_roots=(trusted_root,),
+        )
+
+
+@pytest.mark.parametrize("case", ("relative-root", "missing-npm", "missing-node", "npm-directory"))
+def test_probe_rejects_untrusted_npm_or_node_boundary(tmp_path: Path, case: str) -> None:
+    module = _load_probe()
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    npm = runtime / "npm.cmd"
+    if case == "npm-directory":
+        npm.mkdir()
+    elif case != "missing-npm":
+        npm.write_bytes(b"npm")
+    if case not in {"missing-node", "relative-root"}:
+        (runtime / "node.exe").write_bytes(b"node")
+    root = Path("relative-runtime") if case == "relative-root" else runtime
+
+    with pytest.raises(ValueError, match="trusted.*runtime"):
+        module.resolve_fixed_node_runtime(
+            platform="win32",
+            trusted_roots=(root,),
+        )
+
+
+def test_timeout_terminates_only_the_owned_tree_and_waits() -> None:
+    module = _load_probe()
+    events: list[str] = []
+
+    class OwnedProcess:
+        pid = 4242
+        returncode = 124
+        calls = 0
+
+        def communicate(self, timeout=None):
+            self.calls += 1
+            if self.calls == 1:
+                events.append(f"communicate:{timeout}")
+                raise subprocess.TimeoutExpired(["npm"], timeout)
+            events.append("communicate:final")
+            return b"partial timeout diagnostics", None
+
+        def wait(self, timeout=None):
+            events.append(f"wait:{timeout}")
+            return self.returncode
+
+    owned = OwnedProcess()
+
+    def terminate(process, *, platform: str) -> None:
+        assert process is owned
+        events.append(f"terminate:{platform}:{process.pid}")
+        process.wait(timeout=5)
+
+    completed = module._run(
+        ["C:/trusted/npm.cmd"],
+        cwd=ROOT,
+        env={},
+        stdout=subprocess.PIPE,
+        check=False,
+        timeout_seconds=3,
+        popen_factory=lambda *_args, **_options: owned,
+        tree_terminator=terminate,
+        platform="win32",
+    )
+
+    assert completed.returncode == module.TIMEOUT_EXIT
+    assert completed.stdout == b"partial timeout diagnostics"
+    assert events == [
+        "communicate:3",
+        "terminate:win32:4242",
+        "wait:5",
+        "communicate:final",
+    ]
+
+
+def test_windows_tree_helper_targets_only_the_owned_pid_and_waits(tmp_path: Path) -> None:
+    module = _load_probe()
+    system_root = tmp_path / "Windows"
+    taskkill = system_root / "System32" / "taskkill.exe"
+    taskkill.parent.mkdir(parents=True)
+    taskkill.write_bytes(b"trusted taskkill")
+    calls: list[list[str]] = []
+    waits: list[int] = []
+
+    class OwnedProcess:
+        pid = 4242
+
+        def wait(self, timeout: int) -> int:
+            waits.append(timeout)
+            return 1
+
+    def run(arguments: list[str], **options: object) -> subprocess.CompletedProcess[bytes]:
+        calls.append(arguments)
+        assert options["check"] is False
+        return subprocess.CompletedProcess(arguments, 0)
+
+    module._terminate_owned_process_tree(
+        OwnedProcess(),
+        platform="win32",
+        environment={"SystemRoot": str(system_root)},
+        command_runner=run,
+    )
+
+    assert calls == [[str(taskkill), "/PID", "4242", "/T", "/F"]]
+    assert waits == [module.TERMINATION_WAIT_SECONDS]
+
+
+def test_atomic_raw_write_cleans_only_its_temp_when_replace_fails(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = _load_probe()
+    report = tmp_path / "probe.json"
+
+    def fail_replace(_source: Path, _target: Path) -> None:
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(module.os, "replace", fail_replace)
+    with pytest.raises(OSError, match="simulated replace failure"):
+        module._atomic_write(report, b"raw")
+
+    assert not report.exists()
+    assert list(tmp_path.glob(".probe.json.*.tmp")) == []

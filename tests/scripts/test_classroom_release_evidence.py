@@ -51,6 +51,74 @@ def _load_verifier():
     )
 
 
+def _teacher_playwright_report() -> dict[str, object]:
+    file = "tests/e2e/classroom-first-release.live.spec.ts"
+    return {
+        "config": {
+            "projects": [
+                {
+                    "id": "first-release-live",
+                    "name": "first-release-live",
+                    "retries": 0,
+                }
+            ]
+        },
+        "suites": [
+            {
+                "title": "classroom-first-release.live.spec.ts",
+                "file": file,
+                "column": 0,
+                "line": 0,
+                "specs": [
+                    {
+                        "title": "[release-evidence:teacher_flow] teacher flow",
+                        "ok": True,
+                        "tags": [],
+                        "tests": [
+                            {
+                                "timeout": 30_000,
+                                "annotations": [],
+                                "expectedStatus": "passed",
+                                "projectId": "first-release-live",
+                                "projectName": "first-release-live",
+                                "results": [
+                                    {
+                                        "workerIndex": 0,
+                                        "parallelIndex": 0,
+                                        "status": "passed",
+                                        "duration": 10,
+                                        "errors": [],
+                                        "stdout": [],
+                                        "stderr": [],
+                                        "retry": 0,
+                                        "startTime": "2026-08-25T00:00:00.000Z",
+                                        "attachments": [],
+                                        "annotations": [],
+                                    }
+                                ],
+                                "status": "expected",
+                            }
+                        ],
+                        "id": "first-release-live-teacher",
+                        "file": file,
+                        "line": 1,
+                        "column": 1,
+                    }
+                ],
+            }
+        ],
+        "errors": [],
+        "stats": {
+            "startTime": "2026-08-25T00:00:00.000Z",
+            "duration": 10,
+            "expected": 1,
+            "unexpected": 0,
+            "flaky": 0,
+            "skipped": 0,
+        },
+    }
+
+
 def _write_candidate_root(tmp_path: Path) -> tuple[Path, dict[str, object]]:
     renderer = _load_renderer()
     candidate_root = tmp_path / "candidate"
@@ -79,10 +147,52 @@ def _write_candidate_root(tmp_path: Path) -> tuple[Path, dict[str, object]]:
     return candidate_root, lock["candidate"]
 
 
+def _write_teacher_probe_receipt(
+    module,
+    *,
+    candidate_root: Path,
+    candidate: dict[str, object],
+    working_directory: Path,
+) -> tuple[Path, Path, Path]:
+    output = candidate_root / "artifacts" / "teacher_flow.json"
+    raw_report = candidate_root / "raw" / "teacher_flow.json"
+    execution_record = candidate_root / "raw" / "teacher_flow.execution.json"
+
+    def run_probe(
+        arguments: list[str],
+        *,
+        cwd: Path,
+        env: dict[str, str],
+        timeout: int,
+    ) -> subprocess.CompletedProcess[str]:
+        del cwd, timeout
+        report = _teacher_playwright_report()
+        target = Path(env["YFEISTAI_EVIDENCE_REPORT"])
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(report), encoding="utf-8")
+        return subprocess.CompletedProcess(arguments, 0)
+
+    module.run_probe_receipt(
+        output,
+        candidate_root=candidate_root,
+        bundle_root=candidate_root,
+        release_run=RELEASE_RUN,
+        evidence="teacher_flow",
+        observed_at="2026-08-25T00:00:00Z",
+        raw_report_path=raw_report,
+        execution_record_path=execution_record,
+        recipe="teacher_flow",
+        working_directory=working_directory,
+        timeout_seconds=300,
+        runner=run_probe,
+    )
+    return output, raw_report, execution_record
+
+
 def test_pass_receipt_requires_explicit_checks_not_only_zero_exit(tmp_path: Path) -> None:
     module = _load_evidence_module()
     candidate_root, _candidate = _write_candidate_root(tmp_path)
-    output = tmp_path / "teacher-flow.json"
+    output = tmp_path / "source-head.json"
     output.write_bytes(b"sentinel")
 
     with pytest.raises(ValueError, match="checks"):
@@ -90,30 +200,100 @@ def test_pass_receipt_requires_explicit_checks_not_only_zero_exit(tmp_path: Path
             output,
             candidate_root=candidate_root,
             release_run=RELEASE_RUN,
-            evidence="teacher_flow",
+            evidence="source_head",
             observed_at="2026-08-25T00:00:00Z",
             native_exit=0,
-            checks={"teacherFlowPassed": False},
+            checks={"headMatches": True, "worktreeClean": False},
         )
 
     assert output.read_bytes() == b"sentinel"
 
 
-def test_pass_receipt_is_bound_to_candidate_and_release_run(tmp_path: Path) -> None:
+def test_direct_pass_receipt_cannot_self_attest_probe_backed_evidence(
+    tmp_path: Path,
+) -> None:
+    module = _load_evidence_module()
+    candidate_root, _candidate = _write_candidate_root(tmp_path)
+    output = tmp_path / "teacher-flow.json"
+    output.write_bytes(b"sentinel")
+
+    with pytest.raises(ValueError, match="probe"):
+        module.write_pass_receipt(
+            output,
+            candidate_root=candidate_root,
+            release_run=RELEASE_RUN,
+            evidence="teacher_flow",
+            observed_at="2026-08-25T00:00:00Z",
+            native_exit=0,
+            checks={"teacherFlowPassed": True},
+        )
+
+    assert output.read_bytes() == b"sentinel"
+
+
+def test_probe_receipt_is_derived_from_executed_candidate_bound_report(
+    tmp_path: Path,
+) -> None:
     module = _load_evidence_module()
     candidate_root, candidate = _write_candidate_root(tmp_path)
-    output = tmp_path / "teacher-flow.json"
+    output = candidate_root / "artifacts" / "teacher_flow.json"
+    raw_report = candidate_root / "raw" / "teacher_flow.json"
+    execution_record = candidate_root / "raw" / "teacher_flow.execution.json"
+    raw_report.parent.mkdir()
+    command = [
+        sys.executable,
+        str(ROOT / "scripts" / "classroom_release_probe.py"),
+        "teacher_flow",
+    ]
+    captured: dict[str, object] = {}
 
-    receipt = module.write_pass_receipt(
+    def run_probe(
+        arguments: list[str],
+        *,
+        cwd: Path,
+        env: dict[str, str],
+        timeout: int,
+    ) -> subprocess.CompletedProcess[str]:
+        captured.update(arguments=arguments, cwd=cwd, env=env, timeout=timeout)
+        report = _teacher_playwright_report()
+        Path(env["YFEISTAI_EVIDENCE_REPORT"]).write_text(
+            json.dumps(report),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(arguments, 0)
+
+    receipt = module.run_probe_receipt(
         output,
         candidate_root=candidate_root,
+        bundle_root=candidate_root,
         release_run=RELEASE_RUN,
         evidence="teacher_flow",
         observed_at="2026-08-25T00:00:00Z",
-        native_exit=0,
-        checks={"teacherFlowPassed": True},
+        raw_report_path=raw_report,
+        execution_record_path=execution_record,
+        recipe="teacher_flow",
+        working_directory=tmp_path,
+        timeout_seconds=300,
+        runner=run_probe,
     )
 
+    raw_body = raw_report.read_bytes()
+    assert captured["arguments"] == command
+    assert captured["cwd"] == tmp_path.resolve()
+    assert captured["timeout"] == 300
+    environment = captured["env"]
+    assert isinstance(environment, dict)
+    staged_report = Path(environment["YFEISTAI_EVIDENCE_REPORT"])
+    assert staged_report != raw_report.resolve()
+    assert staged_report.parent == raw_report.resolve().parent
+    assert staged_report.name.startswith(".teacher_flow.json.")
+    assert staged_report.name.endswith(".staging")
+    assert environment["YFEISTAI_CANDIDATE_ROOT"] == str(candidate_root.resolve())
+    assert environment["YFEISTAI_RELEASE_RUN_ID"] == RELEASE_RUN["runId"]
+    assert environment["YFEISTAI_ENVIRONMENT_ID"] == RELEASE_RUN["environmentId"]
+    assert environment["YFEISTAI_EVIDENCE"] == "teacher_flow"
+    assert environment["YFEISTAI_PROBE_TIMEOUT_SECONDS"] == "270"
+    assert not staged_report.exists()
     assert receipt == json.loads(output.read_text(encoding="utf-8"))
     assert receipt["schemaVersion"] == 2
     assert receipt["candidate"] == candidate
@@ -128,23 +308,464 @@ def test_pass_receipt_is_bound_to_candidate_and_release_run(tmp_path: Path) -> N
             "checks": {"teacherFlowPassed": True},
         },
     }
+    expected_command = module.probe_command_record("teacher_flow")
+    assert receipt["provenance"] == {
+        "recipe": "teacher_flow",
+        "command": expected_command,
+        "rawReport": {
+            "artifact": "raw/teacher_flow.json",
+            "sha256": hashlib.sha256(raw_body).hexdigest(),
+        },
+        "execution": {
+            "artifact": "raw/teacher_flow.execution.json",
+            "sha256": hashlib.sha256(execution_record.read_bytes()).hexdigest(),
+        },
+    }
+    execution = json.loads(execution_record.read_text(encoding="utf-8"))
+    assert execution == {
+        "schemaVersion": 1,
+        "candidate": candidate,
+        "releaseRun": RELEASE_RUN,
+        "evidence": "teacher_flow",
+        "recipe": "teacher_flow",
+        "command": receipt["provenance"]["command"],
+        "observedAt": "2026-08-25T00:00:00Z",
+        "nativeExit": 0,
+        "rawReportSha256": hashlib.sha256(raw_body).hexdigest(),
+    }
+
+
+def test_probe_receipt_preserves_existing_output_when_command_fails(
+    tmp_path: Path,
+) -> None:
+    module = _load_evidence_module()
+    candidate_root, _candidate = _write_candidate_root(tmp_path)
+    output = candidate_root / "artifacts" / "teacher_flow.json"
+    output.parent.mkdir()
+    output.write_bytes(b"sentinel")
+    raw_report = candidate_root / "raw" / "teacher_flow.json"
+
+    def fail_probe(*_args, **_options):
+        pytest.fail("probe must not replace a pre-existing canonical receipt")
+
+    with pytest.raises(ValueError, match="must not already exist"):
+        module.run_probe_receipt(
+            output,
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            evidence="teacher_flow",
+            observed_at="2026-08-25T00:00:00Z",
+            raw_report_path=raw_report,
+            execution_record_path=candidate_root / "raw" / "teacher_flow.execution.json",
+            recipe="teacher_flow",
+            working_directory=tmp_path,
+            timeout_seconds=300,
+            runner=fail_probe,
+        )
+
+    assert output.read_bytes() == b"sentinel"
+    assert not raw_report.exists()
+
+
+def test_failed_probe_preserves_diagnostics_and_canonical_paths_are_retryable(
+    tmp_path: Path,
+) -> None:
+    module = _load_evidence_module()
+    candidate_root, _candidate = _write_candidate_root(tmp_path)
+    output = candidate_root / "artifacts" / "teacher_flow.json"
+    raw_report = candidate_root / "raw" / "teacher_flow.json"
+    execution = candidate_root / "raw" / "teacher_flow.execution.json"
+    staged_paths: list[Path] = []
+
+    def fail_probe(arguments, *, cwd, env, timeout):
+        del cwd, timeout
+        staged = Path(env["YFEISTAI_EVIDENCE_REPORT"])
+        staged_paths.append(staged)
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        staged.write_bytes(b"native failure diagnostics")
+        return subprocess.CompletedProcess(arguments, 7)
+
+    with pytest.raises(ValueError, match="native exit 7"):
+        module.run_probe_receipt(
+            output,
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            evidence="teacher_flow",
+            observed_at="2026-08-25T00:00:00Z",
+            raw_report_path=raw_report,
+            execution_record_path=execution,
+            recipe="teacher_flow",
+            working_directory=tmp_path,
+            timeout_seconds=300,
+            runner=fail_probe,
+        )
+
+    assert staged_paths[0] != raw_report.resolve()
+    assert not output.exists()
+    assert not raw_report.exists()
+    assert not execution.exists()
+    failure_raw = list((candidate_root / "failures" / "teacher_flow").glob("*/raw.json"))
+    assert len(failure_raw) == 1
+    assert failure_raw[0].read_bytes() == b"native failure diagnostics"
+    assert list((candidate_root / "failures" / "teacher_flow").glob("*/failure.json"))
+
+    def pass_probe(arguments, *, cwd, env, timeout):
+        del cwd, timeout
+        staged = Path(env["YFEISTAI_EVIDENCE_REPORT"])
+        staged_paths.append(staged)
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        staged.write_text(json.dumps(_teacher_playwright_report()), encoding="utf-8")
+        return subprocess.CompletedProcess(arguments, 0)
+
+    receipt = module.run_probe_receipt(
+        output,
+        candidate_root=candidate_root,
+        bundle_root=candidate_root,
+        release_run=RELEASE_RUN,
+        evidence="teacher_flow",
+        observed_at="2026-08-25T00:01:00Z",
+        raw_report_path=raw_report,
+        execution_record_path=execution,
+        recipe="teacher_flow",
+        working_directory=tmp_path,
+        timeout_seconds=300,
+        runner=pass_probe,
+    )
+
+    assert staged_paths[1] != staged_paths[0]
+    assert receipt == json.loads(output.read_text(encoding="utf-8"))
+    assert raw_report.exists()
+    assert execution.exists()
+    assert failure_raw[0].exists()
+
+
+@pytest.mark.parametrize("case", ("invalid-raw", "outer-timeout"))
+def test_invalid_or_timed_out_probe_leaves_only_failure_diagnostics(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    module = _load_evidence_module()
+    candidate_root, _candidate = _write_candidate_root(tmp_path)
+    output = candidate_root / "artifacts" / "teacher_flow.json"
+    raw_report = candidate_root / "raw" / "teacher_flow.json"
+    execution = candidate_root / "raw" / "teacher_flow.execution.json"
+
+    def fail_probe(arguments, *, cwd, env, timeout):
+        del cwd
+        staged = Path(env["YFEISTAI_EVIDENCE_REPORT"])
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        staged.write_bytes(b"invalid or timed out diagnostics")
+        if case == "outer-timeout":
+            raise subprocess.TimeoutExpired(arguments, timeout)
+        return subprocess.CompletedProcess(arguments, 0)
+
+    with pytest.raises((ValueError, subprocess.TimeoutExpired)):
+        module.run_probe_receipt(
+            output,
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            evidence="teacher_flow",
+            observed_at="2026-08-25T00:00:00Z",
+            raw_report_path=raw_report,
+            execution_record_path=execution,
+            recipe="teacher_flow",
+            working_directory=tmp_path,
+            timeout_seconds=300,
+            runner=fail_probe,
+        )
+
+    assert not output.exists()
+    assert not raw_report.exists()
+    assert not execution.exists()
+    assert list((candidate_root / "failures" / "teacher_flow").glob("*/raw.json"))
+
+
+def test_receipt_publication_failure_rolls_back_proof_and_allows_retry(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = _load_evidence_module()
+    candidate_root, _candidate = _write_candidate_root(tmp_path)
+    output = candidate_root / "artifacts" / "teacher_flow.json"
+    raw_report = candidate_root / "raw" / "teacher_flow.json"
+    execution = candidate_root / "raw" / "teacher_flow.execution.json"
+
+    def pass_probe(arguments, *, cwd, env, timeout):
+        del cwd, timeout
+        staged = Path(env["YFEISTAI_EVIDENCE_REPORT"])
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        staged.write_text(json.dumps(_teacher_playwright_report()), encoding="utf-8")
+        return subprocess.CompletedProcess(arguments, 0)
+
+    real_replace = module.os.replace
+    failed = False
+
+    def fail_receipt_once(source: Path, target: Path) -> None:
+        nonlocal failed
+        if Path(target).resolve() == output.resolve() and not failed:
+            failed = True
+            raise OSError("simulated receipt publication failure")
+        real_replace(source, target)
+
+    monkeypatch.setattr(module.os, "replace", fail_receipt_once)
+    arguments = {
+        "candidate_root": candidate_root,
+        "bundle_root": candidate_root,
+        "release_run": RELEASE_RUN,
+        "evidence": "teacher_flow",
+        "raw_report_path": raw_report,
+        "execution_record_path": execution,
+        "recipe": "teacher_flow",
+        "working_directory": tmp_path,
+        "timeout_seconds": 300,
+        "runner": pass_probe,
+    }
+    with pytest.raises(OSError, match="simulated receipt publication failure"):
+        module.run_probe_receipt(
+            output,
+            observed_at="2026-08-25T00:00:00Z",
+            **arguments,
+        )
+
+    assert not output.exists()
+    assert not raw_report.exists()
+    assert not execution.exists()
+    failure_root = candidate_root / "failures" / "teacher_flow"
+    assert list(failure_root.glob("*/raw.json"))
+    assert list(failure_root.glob("*/execution.json"))
+
+    receipt = module.run_probe_receipt(
+        output,
+        observed_at="2026-08-25T00:01:00Z",
+        **arguments,
+    )
+    assert receipt == json.loads(output.read_text(encoding="utf-8"))
+    assert raw_report.exists()
+    assert execution.exists()
+
+
+def test_manifest_assembler_rejects_tampered_probe_raw_report(tmp_path: Path) -> None:
+    module = _load_evidence_module()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    receipt, raw_report, _execution = _write_teacher_probe_receipt(
+        module,
+        candidate_root=candidate_root,
+        candidate=candidate,
+        working_directory=tmp_path,
+    )
+    raw_report.write_bytes(raw_report.read_bytes() + b"\n")
+
+    with pytest.raises(ValueError, match="raw report"):
+        module.assemble_manifest(
+            candidate_root / "release-evidence.json",
+            candidate_root=candidate_root,
+            release_run=RELEASE_RUN,
+            receipt_paths={"teacher_flow": receipt},
+        )
+
+
+def test_file_runtime_rejects_tampered_probe_raw_report(tmp_path: Path) -> None:
+    module = _load_evidence_module()
+    verifier = _load_verifier()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    receipt, raw_report, _execution = _write_teacher_probe_receipt(
+        module,
+        candidate_root=candidate_root,
+        candidate=candidate,
+        working_directory=tmp_path,
+    )
+    manifest = candidate_root / "release-evidence.json"
+    module.assemble_manifest(
+        manifest,
+        candidate_root=candidate_root,
+        release_run=RELEASE_RUN,
+        receipt_paths={"teacher_flow": receipt},
+    )
+    raw_report.write_bytes(raw_report.read_bytes() + b"\n")
+
+    result = verifier.verify(
+        verifier.FileReleaseRuntime(
+            manifest,
+            expected_source_head=SOURCE_HEAD,
+            candidate_root=candidate_root,
+        )
+    )
+
+    assert result.layers["teacher_flow"].status == "fail"
+    assert "raw report" in result.layers["teacher_flow"].detail
+
+
+def test_file_runtime_rejects_receipt_without_execution_proof(tmp_path: Path) -> None:
+    module = _load_evidence_module()
+    verifier = _load_verifier()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    receipt, _raw_report, _execution = _write_teacher_probe_receipt(
+        module,
+        candidate_root=candidate_root,
+        candidate=candidate,
+        working_directory=tmp_path,
+    )
+    artifact = json.loads(receipt.read_text(encoding="utf-8"))
+    artifact.pop("provenance")
+    receipt.write_text(json.dumps(artifact), encoding="utf-8")
+    manifest = candidate_root / "release-evidence.json"
+    manifest_document = {
+        "schemaVersion": 3,
+        "candidate": candidate,
+        "releaseRun": RELEASE_RUN,
+        "evidence": {
+            "teacher_flow": {
+                "status": "pass",
+                "detail": "teacher_flow verified by playwright",
+                "artifact": "artifacts/teacher_flow.json",
+                "artifactSha256": hashlib.sha256(receipt.read_bytes()).hexdigest(),
+            }
+        },
+    }
+    manifest.write_text(json.dumps(manifest_document), encoding="utf-8")
+
+    result = verifier.verify(
+        verifier.FileReleaseRuntime(
+            manifest,
+            expected_source_head=SOURCE_HEAD,
+            candidate_root=candidate_root,
+        )
+    )
+
+    assert result.layers["teacher_flow"].status == "fail"
+    assert "execution proof" in result.layers["teacher_flow"].detail
+
+
+@pytest.mark.parametrize("consumer", ("assembler", "file-runtime"))
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "command-id",
+        "version",
+        "inner-argv",
+        "live-spec",
+        "project",
+        "grep",
+        "reporter",
+        "workers",
+        "retries",
+        "report-format",
+        "environment-policy",
+        "descriptor-hash",
+        "logical-launcher",
+        "argv-hash",
+        "recipe",
+    ),
+)
+def test_consumers_reject_mutated_canonical_probe_command(
+    tmp_path: Path,
+    mutation: str,
+    consumer: str,
+) -> None:
+    module = _load_evidence_module()
+    verifier = _load_verifier()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    receipt, _raw_report, execution_path = _write_teacher_probe_receipt(
+        module,
+        candidate_root=candidate_root,
+        candidate=candidate,
+        working_directory=tmp_path,
+    )
+    artifact = json.loads(receipt.read_text(encoding="utf-8"))
+    provenance = artifact["provenance"]
+    command = provenance["command"]
+    descriptor = command["descriptor"]
+    descriptor_mutations = {
+        "command-id": ("commandId", "attacker.command"),
+        "version": ("version", 2),
+        "live-spec": ("liveSpec", "tests/e2e/classroom-first-release.spec.ts"),
+        "project": ("project", "teaching-flow"),
+        "grep": ("grep", "attacker"),
+        "reporter": ("reporter", "line"),
+        "workers": ("workers", 2),
+        "retries": ("retries", 1),
+        "report-format": ("reportFormat", "custom-summary"),
+        "environment-policy": ("environmentPolicyVersion", 2),
+    }
+    if mutation == "inner-argv":
+        descriptor["innerNpmArgv"].append("--headed")
+    elif mutation in descriptor_mutations:
+        name, value = descriptor_mutations[mutation]
+        descriptor[name] = value
+    elif mutation == "descriptor-hash":
+        command["descriptorSha256"] = "b" * 64
+    elif mutation == "logical-launcher":
+        command["logicalLauncher"][0] = "pypy"
+        command["argvSha256"] = hashlib.sha256(
+            json.dumps(command["logicalLauncher"], sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    elif mutation == "argv-hash":
+        command["argvSha256"] = "c" * 64
+    else:
+        provenance["recipe"] = "student_micro_flow"
+    if mutation not in {"descriptor-hash", "argv-hash", "recipe"}:
+        command["descriptorSha256"] = hashlib.sha256(
+            json.dumps(descriptor, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    execution = json.loads(execution_path.read_text(encoding="utf-8"))
+    execution["command"] = command
+    execution["recipe"] = provenance["recipe"]
+    execution_path.write_text(json.dumps(execution), encoding="utf-8")
+    provenance["execution"]["sha256"] = hashlib.sha256(execution_path.read_bytes()).hexdigest()
+    receipt.write_text(json.dumps(artifact), encoding="utf-8")
+
+    if consumer == "assembler":
+        with pytest.raises(ValueError, match="execution proof"):
+            module.assemble_manifest(
+                candidate_root / "release-evidence.json",
+                candidate_root=candidate_root,
+                release_run=RELEASE_RUN,
+                receipt_paths={"teacher_flow": receipt},
+            )
+    else:
+        manifest = candidate_root / "release-evidence.json"
+        receipt_body = receipt.read_bytes()
+        manifest.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 3,
+                    "candidate": candidate,
+                    "releaseRun": RELEASE_RUN,
+                    "evidence": {
+                        "teacher_flow": {
+                            "status": "pass",
+                            "detail": "teacher_flow verified by playwright",
+                            "artifact": "artifacts/teacher_flow.json",
+                            "artifactSha256": hashlib.sha256(receipt_body).hexdigest(),
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = verifier.verify(
+            verifier.FileReleaseRuntime(
+                manifest,
+                expected_source_head=SOURCE_HEAD,
+                candidate_root=candidate_root,
+            )
+        )
+        assert result.layers["teacher_flow"].status == "fail"
+        assert "execution proof" in result.layers["teacher_flow"].detail
 
 
 def test_manifest_assembler_hashes_candidate_bound_receipts(tmp_path: Path) -> None:
     module = _load_evidence_module()
     verifier = _load_verifier()
     candidate_root, candidate = _write_candidate_root(tmp_path)
-    artifacts = candidate_root / "artifacts"
-    artifacts.mkdir()
-    receipt_path = artifacts / "teacher_flow.json"
-    module.write_pass_receipt(
-        receipt_path,
+    receipt_path, _raw_report, _execution = _write_teacher_probe_receipt(
+        module,
         candidate_root=candidate_root,
-        release_run=RELEASE_RUN,
-        evidence="teacher_flow",
-        observed_at="2026-08-25T00:00:00Z",
-        native_exit=0,
-        checks={"teacherFlowPassed": True},
+        candidate=candidate,
+        working_directory=tmp_path,
     )
     manifest_path = candidate_root / "release-evidence.json"
 
@@ -185,16 +806,12 @@ def test_manifest_assembler_rejects_mismatched_or_tampered_receipts(
     case: str,
 ) -> None:
     module = _load_evidence_module()
-    candidate_root, _candidate = _write_candidate_root(tmp_path)
-    receipt_path = candidate_root / "teacher_flow.json"
-    module.write_pass_receipt(
-        receipt_path,
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    receipt_path, _raw_report, _execution = _write_teacher_probe_receipt(
+        module,
         candidate_root=candidate_root,
-        release_run=RELEASE_RUN,
-        evidence="teacher_flow",
-        observed_at="2026-08-25T00:00:00Z",
-        native_exit=0,
-        checks={"teacherFlowPassed": True},
+        candidate=candidate,
+        working_directory=tmp_path,
     )
     if case == "body":
         receipt_path.write_bytes(receipt_path.read_bytes() + b"\nnot-json")
@@ -220,16 +837,12 @@ def test_manifest_publish_preserves_existing_file_when_replace_fails(
     monkeypatch,
 ) -> None:
     module = _load_evidence_module()
-    candidate_root, _candidate = _write_candidate_root(tmp_path)
-    receipt_path = candidate_root / "teacher_flow.json"
-    module.write_pass_receipt(
-        receipt_path,
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    receipt_path, _raw_report, _execution = _write_teacher_probe_receipt(
+        module,
         candidate_root=candidate_root,
-        release_run=RELEASE_RUN,
-        evidence="teacher_flow",
-        observed_at="2026-08-25T00:00:00Z",
-        native_exit=0,
-        checks={"teacherFlowPassed": True},
+        candidate=candidate,
+        working_directory=tmp_path,
     )
     manifest_path = candidate_root / "release-evidence.json"
     manifest_path.write_bytes(b"sentinel")
@@ -255,16 +868,12 @@ def test_manifest_rejects_output_path_that_would_overwrite_receipt(
     tmp_path: Path,
 ) -> None:
     module = _load_evidence_module()
-    candidate_root, _candidate = _write_candidate_root(tmp_path)
-    receipt_path = candidate_root / "teacher_flow.json"
-    module.write_pass_receipt(
-        receipt_path,
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    receipt_path, _raw_report, _execution = _write_teacher_probe_receipt(
+        module,
         candidate_root=candidate_root,
-        release_run=RELEASE_RUN,
-        evidence="teacher_flow",
-        observed_at="2026-08-25T00:00:00Z",
-        native_exit=0,
-        checks={"teacherFlowPassed": True},
+        candidate=candidate,
+        working_directory=tmp_path,
     )
     original = receipt_path.read_bytes()
 
@@ -588,3 +1197,96 @@ def test_release_evidence_cli_assembles_named_receipts(
         },
     }
     assert capsys.readouterr().out == f"{output}\n"
+
+
+def test_release_evidence_cli_produces_only_a_fixed_recipe(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    module = _load_evidence_module()
+    bundle_root = tmp_path / "bundle"
+    candidate_root = bundle_root / "candidate"
+    output = bundle_root / "artifacts" / "teacher_flow.json"
+    working_directory = tmp_path / "source"
+    captured: dict[str, object] = {}
+
+    def produce(path: Path, **arguments: object) -> dict[str, object]:
+        captured["path"] = path
+        captured.update(arguments)
+        return {}
+
+    monkeypatch.setattr(module, "run_probe_receipt", produce)
+    assert (
+        module.main(
+            [
+                "produce",
+                "--evidence",
+                "teacher_flow",
+                "--output",
+                str(output),
+                "--candidate-root",
+                str(candidate_root),
+                "--bundle-root",
+                str(bundle_root),
+                "--working-directory",
+                str(working_directory),
+                "--run-id",
+                RELEASE_RUN["runId"],
+                "--environment-id",
+                RELEASE_RUN["environmentId"],
+                "--observed-at",
+                "2026-08-25T00:00:00Z",
+                "--timeout-seconds",
+                "300",
+            ]
+        )
+        == 0
+    )
+    assert captured == {
+        "path": output,
+        "candidate_root": candidate_root,
+        "bundle_root": bundle_root,
+        "release_run": RELEASE_RUN,
+        "evidence": "teacher_flow",
+        "observed_at": "2026-08-25T00:00:00Z",
+        "raw_report_path": bundle_root / "raw" / "teacher_flow.json",
+        "execution_record_path": bundle_root / "executions" / "teacher_flow.json",
+        "recipe": "teacher_flow",
+        "working_directory": working_directory,
+        "timeout_seconds": 300,
+    }
+    assert capsys.readouterr().out == f"{output}\n"
+
+
+@pytest.mark.parametrize("forbidden", ("--command", "--native-exit", "--checks"))
+def test_release_evidence_cli_rejects_self_attestation_inputs(
+    tmp_path: Path,
+    forbidden: str,
+) -> None:
+    module = _load_evidence_module()
+
+    with pytest.raises(SystemExit):
+        module._parse_args(
+            [
+                "produce",
+                "--evidence",
+                "teacher_flow",
+                "--output",
+                str(tmp_path / "receipt.json"),
+                "--candidate-root",
+                str(tmp_path / "candidate"),
+                "--bundle-root",
+                str(tmp_path / "bundle"),
+                "--working-directory",
+                str(tmp_path),
+                "--run-id",
+                RELEASE_RUN["runId"],
+                "--environment-id",
+                RELEASE_RUN["environmentId"],
+                "--observed-at",
+                "2026-08-25T00:00:00Z",
+                forbidden,
+                "attacker-controlled",
+            ]
+        )

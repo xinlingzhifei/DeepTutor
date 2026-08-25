@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import importlib.util
 import json
@@ -41,15 +42,230 @@ def _candidate(source_head: str) -> dict[str, object]:
     }
 
 
+def _playwright_report(
+    evidence: str,
+    *,
+    count: int,
+) -> dict[str, object]:
+    file = "tests/e2e/classroom-first-release.live.spec.ts"
+    specs = []
+    for index in range(count):
+        title = f"[release-evidence:{evidence}] case {index + 1}"
+        specs.append(
+            {
+                "title": title,
+                "ok": True,
+                "tags": [],
+                "tests": [
+                    {
+                        "timeout": 30_000,
+                        "annotations": [],
+                        "expectedStatus": "passed",
+                        "projectId": "first-release-live",
+                        "projectName": "first-release-live",
+                        "results": [
+                            {
+                                "workerIndex": 0,
+                                "parallelIndex": 0,
+                                "status": "passed",
+                                "duration": 10,
+                                "error": None,
+                                "errors": [],
+                                "stdout": [],
+                                "stderr": [],
+                                "retry": 0,
+                                "startTime": "2026-08-25T00:00:00.000Z",
+                                "attachments": [],
+                                "annotations": [],
+                            }
+                        ],
+                        "status": "expected",
+                    }
+                ],
+                "id": f"first-release-live-{index}",
+                "file": file,
+                "line": index + 1,
+                "column": 1,
+            }
+        )
+    return {
+        "config": {
+            "projects": [
+                {
+                    "id": "first-release-live",
+                    "name": "first-release-live",
+                    "retries": 0,
+                }
+            ]
+        },
+        "suites": [
+            {
+                "title": "classroom-first-release.live.spec.ts",
+                "file": file,
+                "column": 0,
+                "line": 0,
+                "specs": specs,
+            }
+        ],
+        "errors": [],
+        "stats": {
+            "startTime": "2026-08-25T00:00:00.000Z",
+            "duration": count * 10,
+            "expected": count,
+            "unexpected": 0,
+            "flaky": 0,
+            "skipped": 0,
+        },
+    }
+
+
+def test_derive_probe_checks_from_native_playwright_json() -> None:
+    module = _load_verifier()
+    candidate = _candidate("a" * 40)
+    raw = json.dumps(_playwright_report("teacher_flow", count=1)).encode()
+
+    checks = module.derive_probe_checks(
+        "teacher_flow",
+        raw_report=raw,
+        candidate=candidate,
+        release_run=_RELEASE_RUN,
+    )
+
+    assert checks == {"teacherFlowPassed": True}
+
+
+def _first_probe_spec(report: dict[str, object]) -> dict[str, object]:
+    suites = report["suites"]
+    assert isinstance(suites, list) and suites
+    suite = suites[0]
+    assert isinstance(suite, dict)
+    specs = suite["specs"]
+    assert isinstance(specs, list) and specs
+    spec = specs[0]
+    assert isinstance(spec, dict)
+    return spec
+
+
+def _first_probe_test(report: dict[str, object]) -> dict[str, object]:
+    spec = _first_probe_spec(report)
+    tests = spec["tests"]
+    assert isinstance(tests, list) and tests
+    test = tests[0]
+    assert isinstance(test, dict)
+    return test
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "tampered-stats",
+        "nan-duration",
+        "extra-spec",
+        "wrong-file",
+        "wrong-project",
+        "retry",
+        "flaky",
+        "skipped",
+        "unexpected",
+        "global-error",
+        "wrong-title",
+    ),
+)
+def test_derive_probe_checks_rejects_tampered_native_playwright_json(case: str) -> None:
+    module = _load_verifier()
+    report = _playwright_report("teacher_flow", count=1)
+    stats = report["stats"]
+    assert isinstance(stats, dict)
+    spec = _first_probe_spec(report)
+    test = _first_probe_test(report)
+    results = test["results"]
+    assert isinstance(results, list) and results
+    result = results[0]
+    assert isinstance(result, dict)
+    if case == "tampered-stats":
+        stats["expected"] = 2
+    elif case == "nan-duration":
+        stats["duration"] = float("nan")
+    elif case == "extra-spec":
+        suites = report["suites"]
+        assert isinstance(suites, list)
+        suite = suites[0]
+        assert isinstance(suite, dict)
+        specs = suite["specs"]
+        assert isinstance(specs, list)
+        specs.append(copy.deepcopy(spec))
+        stats["expected"] = 2
+    elif case == "wrong-file":
+        spec["file"] = "tests/e2e/classroom-first-release.spec.ts"
+    elif case == "wrong-project":
+        test["projectId"] = "teaching-flow"
+        test["projectName"] = "teaching-flow"
+    elif case == "retry":
+        result["retry"] = 1
+    elif case in {"flaky", "skipped", "unexpected"}:
+        test["status"] = case
+        stats["expected"] = 0
+        stats[case] = 1
+    elif case == "global-error":
+        report["errors"] = [{"message": "global setup failed"}]
+    else:
+        spec["title"] = "teacher flow without the fixed evidence marker"
+
+    with pytest.raises(ValueError):
+        module.derive_probe_checks(
+            "teacher_flow",
+            raw_report=json.dumps(report).encode(),
+            candidate=_candidate("a" * 40),
+            release_run=_RELEASE_RUN,
+        )
+
+
+@pytest.mark.parametrize(
+    "case",
+    ("extra-project", "retries-false", "attempt-duration-nan", "attempt-duration-false"),
+)
+def test_derive_probe_checks_rejects_invalid_project_or_attempt_metric(case: str) -> None:
+    module = _load_verifier()
+    report = _playwright_report("teacher_flow", count=1)
+    config = report["config"]
+    assert isinstance(config, dict)
+    projects = config["projects"]
+    assert isinstance(projects, list) and projects
+    project = projects[0]
+    assert isinstance(project, dict)
+    test = _first_probe_test(report)
+    results = test["results"]
+    assert isinstance(results, list) and results
+    result = results[0]
+    assert isinstance(result, dict)
+    if case == "extra-project":
+        projects.append({"id": "other", "name": "other", "retries": 0})
+    elif case == "retries-false":
+        project["retries"] = False
+    elif case == "attempt-duration-nan":
+        result["duration"] = float("nan")
+    else:
+        result["duration"] = False
+
+    with pytest.raises(ValueError):
+        module.derive_probe_checks(
+            "teacher_flow",
+            raw_report=json.dumps(report).encode(),
+            candidate=_candidate("a" * 40),
+            release_run=_RELEASE_RUN,
+        )
+
+
 def _artifact_document(
     module,
     candidate: dict[str, object],
     evidence: str,
     *,
     release_run: dict[str, str] = _RELEASE_RUN,
+    provenance: dict[str, object] | None = None,
 ) -> dict[str, object]:
     producer, required_checks = module.RECEIPT_CONTRACTS[evidence]
-    return {
+    document = {
         "schemaVersion": module.ARTIFACT_SCHEMA_VERSION,
         "candidate": candidate,
         "releaseRun": release_run,
@@ -62,6 +278,53 @@ def _artifact_document(
                 "nativeExit": 0,
                 "checks": {check: True for check in required_checks},
             },
+        },
+    }
+    if provenance is not None:
+        document["provenance"] = provenance
+    return document
+
+
+def _write_probe_proof(
+    tmp_path: Path,
+    module,
+    candidate: dict[str, object],
+    evidence: str,
+) -> dict[str, object] | None:
+    recipe = module.PROBE_RECIPES.get(evidence)
+    if recipe is None:
+        return None
+    recipe_id, expected_count = recipe
+    proof_root = tmp_path / "proof"
+    proof_root.mkdir(exist_ok=True)
+    raw_path = proof_root / f"{evidence}.json"
+    execution_path = proof_root / f"{evidence}.execution.json"
+    raw_document = _playwright_report(evidence, count=expected_count)
+    raw_path.write_text(json.dumps(raw_document), encoding="utf-8")
+    raw_sha256 = hashlib.sha256(raw_path.read_bytes()).hexdigest()
+    command = module.probe_command_record(evidence)
+    execution = {
+        "schemaVersion": 1,
+        "candidate": candidate,
+        "releaseRun": _RELEASE_RUN,
+        "evidence": evidence,
+        "recipe": recipe_id,
+        "command": command,
+        "observedAt": "2026-08-24T00:00:00Z",
+        "nativeExit": 0,
+        "rawReportSha256": raw_sha256,
+    }
+    execution_path.write_text(json.dumps(execution), encoding="utf-8")
+    return {
+        "recipe": recipe_id,
+        "command": command,
+        "rawReport": {
+            "artifact": raw_path.relative_to(tmp_path).as_posix(),
+            "sha256": raw_sha256,
+        },
+        "execution": {
+            "artifact": execution_path.relative_to(tmp_path).as_posix(),
+            "sha256": hashlib.sha256(execution_path.read_bytes()).hexdigest(),
         },
     }
 
@@ -156,8 +419,9 @@ def _write_complete_bundle(
     artifacts.mkdir()
     for name in module.REQUIRED_LAYERS:
         artifact_path = artifacts / f"{name}.json"
+        provenance = _write_probe_proof(tmp_path, module, candidate, name)
         artifact_body = json.dumps(
-            _artifact_document(module, candidate, name),
+            _artifact_document(module, candidate, name, provenance=provenance),
             sort_keys=True,
         ).encode()
         artifact_path.write_bytes(artifact_body)
@@ -185,8 +449,9 @@ def _rewrite_bundle_candidate(
     for name, raw in evidence.items():
         assert isinstance(raw, dict)
         artifact_path = tmp_path / str(raw["artifact"])
+        provenance = _write_probe_proof(tmp_path, module, candidate, name)
         artifact_body = json.dumps(
-            _artifact_document(module, candidate, name),
+            _artifact_document(module, candidate, name, provenance=provenance),
             sort_keys=True,
         ).encode()
         artifact_path.write_bytes(artifact_body)
@@ -317,6 +582,26 @@ def test_file_runtime_requires_the_same_candidate_head(tmp_path: Path) -> None:
     assert result.ok is False
     assert result.failed == ("source_head",)
     assert "does not match" in result.layers["source_head"].detail
+
+
+def test_probe_command_record_is_stable_across_verifier_source_roots(tmp_path: Path) -> None:
+    module = _load_verifier()
+    manifest, _, _ = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    module.SCRIPTS_ROOT = Path("E:/different-verifier-root/scripts")
+
+    result = module.verify(
+        module.FileReleaseRuntime(
+            manifest,
+            expected_source_head="a" * 40,
+            candidate_root=tmp_path,
+        )
+    )
+
+    assert result.ok is True
 
 
 def test_file_runtime_rejects_unproven_or_malformed_passes(tmp_path: Path) -> None:
