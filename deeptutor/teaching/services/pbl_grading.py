@@ -272,7 +272,9 @@ def projection_queue_action(status: str) -> str:
         raise PblGradingConflict("quarantined event cannot be graded")
     if status == "completed":
         return "requeue"
-    if status in {"pending", "failed", "running"}:
+    if status == "failed":
+        return "retry_now"
+    if status in {"pending", "running"}:
         return "preserve"
     raise PblGradingConflict("projection queue state conflicts")
 

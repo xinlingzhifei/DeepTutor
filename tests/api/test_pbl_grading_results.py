@@ -5,16 +5,20 @@ from types import SimpleNamespace
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+import pytest
 
 from deeptutor.teaching.schema_names import tenant_schema_name
 from deeptutor.teaching.tenant_context import TenantContext, require_tenant
 
 
 class _Service:
-    def __init__(self) -> None:
+    def __init__(self, error: Exception | None = None) -> None:
         self.calls: list[tuple[object, str, object]] = []
+        self.error = error
 
     async def record(self, context, *, session_id, command):
+        if self.error is not None:
+            raise self.error
         self.calls.append((context, session_id, command))
         return SimpleNamespace(
             result_id="result-a",
@@ -27,10 +31,14 @@ class _Service:
         )
 
 
-def _client() -> tuple[TestClient, _Service]:
+def _client(
+    service: _Service | None = None,
+    *,
+    raise_server_exceptions: bool = True,
+) -> tuple[TestClient, _Service]:
     from deeptutor.api.routers import classroom_learning
 
-    service = _Service()
+    service = service or _Service()
     context = TenantContext(
         tenant_id="tenant-a",
         schema_name=tenant_schema_name("tenant-a"),
@@ -41,7 +49,7 @@ def _client() -> tuple[TestClient, _Service]:
     application.include_router(classroom_learning.router, prefix="/api/v1")
     application.dependency_overrides[require_tenant] = lambda: context
     application.dependency_overrides[classroom_learning.get_pbl_grading_service] = lambda: service
-    return TestClient(application), service
+    return TestClient(application, raise_server_exceptions=raise_server_exceptions), service
 
 
 def test_teacher_result_api_accepts_only_minimal_request_and_derives_source() -> None:
@@ -137,3 +145,84 @@ def test_teacher_result_api_validates_score_source_and_idempotency_header() -> N
             == 422
         )
     assert service.calls == []
+
+
+def test_teacher_result_api_rejects_blank_event_id_after_trimming() -> None:
+    client, service = _client()
+
+    response = client.post(
+        "/api/v1/classroom-sessions/session-a/pbl-results",
+        headers={"Idempotency-Key": "grade-request-1"},
+        json={
+            "eventId": "   ",
+            "passed": True,
+            "sourceReference": "review-42",
+        },
+    )
+
+    assert response.status_code == 422
+    assert service.calls == []
+
+
+def test_command_validation_is_translated_by_the_same_safe_api_boundary(
+    monkeypatch,
+) -> None:
+    from deeptutor.teaching.services import pbl_grading
+
+    def reject_command(**_values):
+        raise pbl_grading.PblGradingValidationError("invalid command")
+
+    monkeypatch.setattr(pbl_grading, "PblGradingCommand", reject_command)
+    client, service = _client(raise_server_exceptions=False)
+
+    response = client.post(
+        "/api/v1/classroom-sessions/session-a/pbl-results",
+        headers={"Idempotency-Key": "grade-request-1"},
+        json={
+            "eventId": "event-a",
+            "passed": True,
+            "sourceReference": "review-42",
+        },
+    )
+
+    assert response.status_code == 422
+    assert service.calls == []
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_status"),
+    [
+        ("access", 403),
+        ("conflict", 409),
+        ("unavailable", 503),
+    ],
+)
+def test_teacher_result_api_maps_service_errors_without_leaking_details(
+    error: str,
+    expected_status: int,
+) -> None:
+    from deeptutor.teaching.services.pbl_grading import (
+        PblGradingAccessDenied,
+        PblGradingConflict,
+        PblGradingUnavailable,
+    )
+
+    errors = {
+        "access": PblGradingAccessDenied("secret access reason"),
+        "conflict": PblGradingConflict("secret conflict reason"),
+        "unavailable": PblGradingUnavailable("secret database reason"),
+    }
+    client, _service = _client(_Service(errors[error]))
+
+    response = client.post(
+        "/api/v1/classroom-sessions/session-a/pbl-results",
+        headers={"Idempotency-Key": "grade-request-1"},
+        json={
+            "eventId": "event-a",
+            "passed": True,
+            "sourceReference": "review-42",
+        },
+    )
+
+    assert response.status_code == expected_status
+    assert "secret" not in response.text

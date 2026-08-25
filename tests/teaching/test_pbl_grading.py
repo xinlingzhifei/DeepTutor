@@ -237,7 +237,7 @@ def test_queue_transition_requeues_completed_but_never_revives_quarantine() -> N
 
     assert projection_queue_action("completed") == "requeue"
     assert projection_queue_action("pending") == "preserve"
-    assert projection_queue_action("failed") == "preserve"
+    assert projection_queue_action("failed") == "retry_now"
     assert projection_queue_action("running") == "preserve"
     with pytest.raises(PblGradingConflict, match="quarantined"):
         projection_queue_action("quarantined")
@@ -313,6 +313,7 @@ class _RepositorySession:
         }
         self.now = now
         self.fail_backlog = fail_backlog
+        self.executed_tables: list[str] = []
         self.added: list[object] = []
         self.committed = False
         self.rolled_back = False
@@ -328,6 +329,8 @@ class _RepositorySession:
 
     async def execute(self, statement):
         table = getattr(statement, "table", None)
+        if table is not None:
+            self.executed_tables.append(table.name)
         if self.fail_backlog and getattr(table, "name", None) == (
             "teaching_learning_projection_backlog"
         ):
@@ -390,6 +393,33 @@ async def test_sql_repository_atomically_requeues_late_completed_event() -> None
     assert session.committed is True
     assert session.rolled_back is False
     assert len(session.added) == 1
+
+
+@pytest.mark.asyncio
+async def test_sql_repository_makes_failed_event_immediately_claimable_without_new_backlog() -> (
+    None
+):
+    from deeptutor.teaching.repositories.pbl_grading import (
+        SqlAlchemyPblGradingRepository,
+    )
+
+    session = _RepositorySession(queue_status="failed")
+    session.queue.available_at = datetime(2026, 8, 26, 12, 0, tzinfo=UTC)
+    session.queue.last_error_code = "transient_timeout"
+    repository = object.__new__(SqlAlchemyPblGradingRepository)
+    repository._sessions = lambda _tenant_id: _RepositoryFactory(session)
+
+    await repository.record(
+        _context(role_scope=ResourceScope("tenant-a", "course-a", "class-a")),
+        session_id="session-a",
+        command=_grading_command(),
+        documents=_Documents(),
+    )
+
+    assert session.queue.status == "pending"
+    assert session.queue.available_at == session.now
+    assert session.queue.last_error_code is None
+    assert "teaching_learning_projection_backlog" not in session.executed_tables
 
 
 @pytest.mark.asyncio

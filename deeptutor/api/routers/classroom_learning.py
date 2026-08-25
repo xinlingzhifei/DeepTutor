@@ -87,12 +87,16 @@ NonEmptyTrimmedString = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=256),
 ]
+NonEmptyTrimmedId = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=128),
+]
 
 
 class PblGradingRequest(_ApiModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
-    event_id: str = Field(alias="eventId", min_length=1, max_length=128)
+    event_id: NonEmptyTrimmedId = Field(alias="eventId")
     passed: bool = Field(strict=True)
     score: float | None = Field(default=None, strict=True, ge=0, le=1)
     source_reference: NonEmptyTrimmedString = Field(alias="sourceReference")
@@ -368,19 +372,21 @@ async def record_pbl_grading_result(
 ) -> PblGradingResponse:
     from deeptutor.teaching.services.pbl_grading import PblGradingCommand
 
-    result = await _call_pbl_grading(
-        service.record(
+    async def record():
+        command = PblGradingCommand(
+            event_id=request.event_id,
+            passed=request.passed,
+            score=request.score,
+            source_reference=request.source_reference,
+            idempotency_key=idempotency_key,
+        )
+        return await service.record(
             context,
             session_id=session_id,
-            command=PblGradingCommand(
-                event_id=request.event_id,
-                passed=request.passed,
-                score=request.score,
-                source_reference=request.source_reference,
-                idempotency_key=idempotency_key,
-            ),
+            command=command,
         )
-    )
+
+    result = await _call_pbl_grading(record())
     return PblGradingResponse.model_validate(result, from_attributes=True)
 
 

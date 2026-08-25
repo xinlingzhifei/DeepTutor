@@ -515,6 +515,7 @@ def test_migration_runs_from_outside_repository(
         "mastery_evidence",
         "mastery_levels",
         "publications",
+        "pbl_grading_results",
         "quiz_attempts",
         "quota_ledger",
         "source_snapshots",
@@ -676,6 +677,7 @@ def test_packaged_entrypoint_runs_platform_and_tenant_scopes(
         "mastery_evidence",
         "mastery_levels",
         "publications",
+        "pbl_grading_results",
         "quiz_attempts",
         "quota_ledger",
         "source_snapshots",
@@ -980,6 +982,7 @@ def test_foundation_migration_is_isolated_and_repeatable(migration_database):
         "mastery_evidence",
         "mastery_levels",
         "publications",
+        "pbl_grading_results",
         "quiz_attempts",
         "quota_ledger",
         "source_snapshots",
@@ -1025,6 +1028,7 @@ def test_foundation_migration_is_isolated_and_repeatable(migration_database):
         "mastery_evidence",
         "mastery_levels",
         "publications",
+        "pbl_grading_results",
         "quiz_attempts",
         "quota_ledger",
         "source_snapshots",
@@ -4873,10 +4877,14 @@ def test_postgres_finalization_failure_rolls_back_all_activation_records(
             async with database_module.platform_session() as session:
                 async with session.begin():
                     await session.execute(
-                        text(f"DROP TRIGGER IF EXISTS {trigger_name} ON platform.tenants")
+                        text(
+                            f"DROP TRIGGER IF EXISTS {trigger_name} ON platform.tenants"
+                        )
                     )
                     await session.execute(
-                        text(f"DROP FUNCTION IF EXISTS platform.{function_name}()")
+                        text(
+                            f"DROP FUNCTION IF EXISTS platform.{function_name}()"
+                        )
                     )
             await database_module.dispose_platform_engine()
 
@@ -5704,7 +5712,9 @@ def test_classroom_export_migration_preserves_legacy_rows_and_guards_downgrade(
             f"tenant_schema={schema_name}",
         ),
     )
-    alembic_revision, state_revision, legacy, constraints = asyncio.run(inspect_head())
+    alembic_revision, state_revision, legacy, constraints = asyncio.run(
+        inspect_head()
+    )
     assert (alembic_revision, state_revision) == (HEAD_REVISION, HEAD_REVISION)
     assert legacy == (
         None,
@@ -5807,5 +5817,8 @@ def test_classroom_export_migration_preserves_legacy_rows_and_guards_downgrade(
     )
     safe_output = _assert_secret_safe_output(migration_database, refused)
     assert refused.returncode != 0, safe_output
-    assert "cannot downgrade classroom exports: durable task-6 data exists" in safe_output
+    assert (
+        "cannot downgrade classroom exports: durable task-6 data exists"
+        in safe_output
+    )
     assert asyncio.run(inspect_head())[:2] == (HEAD_REVISION, HEAD_REVISION)

@@ -201,7 +201,7 @@ class SqlAlchemyPblGradingRepository:
                 )
                 session.add(model)
                 await session.flush()
-                if queue_action == "requeue":
+                if queue_action in {"requeue", "retry_now"}:
                     queue_item.status = "pending"
                     queue_item.available_at = now
                     queue_item.lease_owner = None
@@ -209,6 +209,7 @@ class SqlAlchemyPblGradingRepository:
                     queue_item.lease_expires_at = None
                     queue_item.heartbeat_at = None
                     queue_item.last_error_code = None
+                if queue_action == "requeue":
                     await insert_learning_projection_backlog(
                         session,
                         tenant_id=context.tenant_id,
