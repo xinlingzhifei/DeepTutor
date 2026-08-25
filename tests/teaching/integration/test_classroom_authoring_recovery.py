@@ -39,9 +39,7 @@ async def test_postgres_authoring_recovery_is_durable_and_atomically_bound(
     schema_name = tenant_schema_name(tenant_id)
     generation_database.migrate_tenant(tenant_id)
     engine = create_async_engine(generation_database.url, poolclass=NullPool)
-    translated = engine.execution_options(
-        schema_translate_map={"tenant": schema_name}
-    )
+    translated = engine.execution_options(schema_translate_map={"tenant": schema_name})
     session_factory = async_sessionmaker(translated, expire_on_commit=False)
     context = TenantContext(
         tenant_id=tenant_id,
@@ -74,29 +72,33 @@ async def test_postgres_authoring_recovery_is_durable_and_atomically_bound(
                     )
                 )
 
-        brief = TeachingBriefBuilder(context, object()).open_creation(
-            TeachingBriefSpec(
-                course_id="course-1",
-                class_id="class-1",
-                objective="Explain motion",
-                grade_band="grade-8",
-                audience="intermediate",
-                duration_minutes=45,
-                classroom_mode="full",
-                web_policy="disabled",
-                template_id="template-1",
-                template_version="1",
-                knowledge_points=(
-                    KnowledgePointSpec(
-                        knowledge_point_id="kp-motion",
-                        title="Motion",
-                        description="Describe velocity and displacement.",
+        brief = (
+            TeachingBriefBuilder(context, object())
+            .open_creation(
+                TeachingBriefSpec(
+                    course_id="course-1",
+                    class_id="class-1",
+                    objective="Explain motion",
+                    grade_band="grade-8",
+                    audience="intermediate",
+                    duration_minutes=45,
+                    classroom_mode="full",
+                    web_policy="disabled",
+                    template_id="template-1",
+                    template_version="1",
+                    knowledge_points=(
+                        KnowledgePointSpec(
+                            knowledge_point_id="kp-motion",
+                            title="Motion",
+                            description="Describe velocity and displacement.",
+                        ),
                     ),
-                ),
-                content_mode="open_creation",
-                open_creation_acknowledged=True,
+                    content_mode="open_creation",
+                    open_creation_acknowledged=True,
+                )
             )
-        ).contract
+            .contract
+        )
         repository = SqlAlchemyClassroomRepository(engine, tenant_id)
         workflow = NewClassroomWorkflow(
             tenant_id=tenant_id,
@@ -116,9 +118,7 @@ async def test_postgres_authoring_recovery_is_durable_and_atomically_bound(
         assert replayed.draft_id == created.draft_id
         assert replayed.creation_idempotency_key == workflow.creation_idempotency_key
         with pytest.raises(ClassroomIdempotencyConflict):
-            await repository.create_workflow(
-                replace(workflow, creation_request_sha256="2" * 64)
-            )
+            await repository.create_workflow(replace(workflow, creation_request_sha256="2" * 64))
 
         second = await repository.create_workflow(
             NewClassroomWorkflow(
@@ -234,7 +234,7 @@ async def test_postgres_authoring_recovery_is_durable_and_atomically_bound(
                     {"schema_name": schema_name},
                 )
             )
-        assert revision == "20260825_0019"
+        assert revision == "20260825_0020"
         assert {
             "creation_idempotency_key",
             "creation_request_sha256",

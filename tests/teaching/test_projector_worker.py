@@ -63,6 +63,53 @@ async def test_worker_projects_one_claim_from_an_active_tenant() -> None:
 
 
 @pytest.mark.asyncio
+async def test_worker_loads_immutable_document_for_pbl_projection() -> None:
+    from deeptutor.teaching.projector_worker import LearningProjectionWorker, ProjectionClaim
+    from deeptutor.teaching.projectors.mastery import ProjectionEvent
+
+    event = ProjectionEvent(
+        event_id="event-pbl",
+        tenant_id="tenant-a",
+        session_id="session-a",
+        user_id="student-a",
+        classroom_version_id="version-a",
+        seq=2,
+        event_type="pbl.milestone_completed",
+        occurred_at=datetime(2026, 8, 25, 12, 0, tzinfo=UTC),
+        scene_id="pbl-scene",
+        knowledge_point_id="kp-1",
+        payload={"milestone_id": "milestone-1"},
+    )
+    claim = ProjectionClaim(event, "worker-a", "token-a")
+
+    class Repository:
+        async def active_tenant_ids(self):
+            return ("tenant-a",)
+
+        async def claim(self, tenant_id, *, owner, lease_seconds):
+            return claim
+
+        async def heartbeat(self, claimed, *, lease_seconds):
+            return None
+
+        async def project(self, claimed, *, document):
+            assert document == "immutable-pbl-document"
+
+    class Documents:
+        async def load_version_document(self, tenant_id, version_id):
+            assert (tenant_id, version_id) == ("tenant-a", "version-a")
+            return "immutable-pbl-document"
+
+    worker = LearningProjectionWorker(
+        repository=Repository(),
+        documents=Documents(),
+        worker_id="worker-a",
+    )
+
+    assert await worker.run_once() is True
+
+
+@pytest.mark.asyncio
 async def test_deterministic_rejection_tolerates_lease_loss_before_quarantine() -> None:
     from deeptutor.teaching.projector_worker import (
         LearningProjectionWorker,

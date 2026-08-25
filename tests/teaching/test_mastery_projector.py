@@ -320,3 +320,152 @@ async def test_pbl_without_trusted_grader_or_teacher_result_is_progress_only() -
 
     assert await projector.apply(event, document=SimpleNamespace()) is False
     assert await projector.mastery("student-a", "kp-1") == 0.4
+
+
+def _pbl_document(*, rubric: str = "Explain the result."):
+    return SimpleNamespace(
+        classroom_version_id="version-a",
+        openmaic=SimpleNamespace(
+            scenes=[
+                SimpleNamespace(
+                    id="pbl-scene",
+                    type="pbl",
+                    content=SimpleNamespace(
+                        milestones=[
+                            SimpleNamespace(id="milestone-1", rubric=rubric),
+                        ]
+                    ),
+                )
+            ]
+        ),
+        knowledge_point_mappings=[
+            SimpleNamespace(knowledge_point_id="kp-1", scene_ids=["pbl-scene"])
+        ],
+    )
+
+
+def _pbl_event():
+    from deeptutor.teaching.projectors.mastery import ProjectionEvent
+
+    return ProjectionEvent(
+        event_id="event-pbl",
+        tenant_id="tenant-a",
+        session_id="session-a",
+        user_id="student-a",
+        classroom_version_id="version-a",
+        seq=2,
+        event_type="pbl.milestone_completed",
+        occurred_at=datetime(2026, 8, 10, 12, 0, tzinfo=UTC),
+        scene_id="pbl-scene",
+        knowledge_point_id="kp-1",
+        payload={"milestone_id": "milestone-1"},
+    )
+
+
+def _pbl_evaluation(*, rubric_sha256: str | None = None):
+    import hashlib
+
+    from deeptutor.teaching.projectors.mastery import PblEvaluation
+
+    return PblEvaluation(
+        event_id="event-pbl",
+        tenant_id="tenant-a",
+        session_id="session-a",
+        user_id="student-a",
+        classroom_version_id="version-a",
+        scene_id="pbl-scene",
+        milestone_id="milestone-1",
+        knowledge_point_id="kp-1",
+        rubric_sha256=rubric_sha256 or hashlib.sha256(b"Explain the result.").hexdigest(),
+        correct=True,
+        score=0.72,
+        grading_source="teacher_review",
+    )
+
+
+@pytest.mark.asyncio
+async def test_trusted_pbl_result_changes_mastery_once_without_quiz_attempt() -> None:
+    from deeptutor.teaching.projectors.mastery import MasteryProjector
+
+    class Repository:
+        def __init__(self) -> None:
+            self.inserted = False
+            self.correctness: list[bool] = []
+            self.level = 0.0
+
+        async def get_pbl_evaluation(self, event):
+            return _pbl_evaluation()
+
+        async def record_pbl_evidence(self, event, evaluation):
+            if self.inserted:
+                return False
+            self.inserted = True
+            self.correctness.append(evaluation.correct)
+            return True
+
+        async def record_quiz_evidence(self, event, evaluation):
+            raise AssertionError("PBL grading must not create QuizAttempt")
+
+        async def list_correctness(self, user_id, knowledge_point_id):
+            return list(self.correctness), "event-pbl"
+
+        async def upsert_mastery(self, **values):
+            self.level = values["level"]
+
+        async def get_mastery(self, user_id, knowledge_point_id):
+            return self.level
+
+        async def evidence_count(self, user_id, knowledge_point_id):
+            return len(self.correctness)
+
+    repository = Repository()
+    projector = MasteryProjector(repository)
+
+    assert await projector.apply(_pbl_event(), document=_pbl_document()) is True
+    assert await projector.apply(_pbl_event(), document=_pbl_document()) is False
+    assert await projector.evidence_count("student-a", "kp-1") == 1
+    assert await projector.mastery("student-a", "kp-1") == compute_mastery([True])
+
+
+def test_projector_revalidates_rubric_hash_before_pbl_mastery() -> None:
+    from deeptutor.teaching.projectors.mastery import (
+        DeterministicProjectionError,
+        validate_pbl_evaluation,
+    )
+
+    with pytest.raises(DeterministicProjectionError, match="pbl_rubric_hash_invalid"):
+        validate_pbl_evaluation(
+            _pbl_event(),
+            _pbl_document(),
+            _pbl_evaluation(rubric_sha256="0" * 64),
+        )
+
+
+@pytest.mark.asyncio
+async def test_quiz_and_pbl_correctness_share_one_stable_mastery_sequence() -> None:
+    from deeptutor.teaching.projectors.mastery import MasteryProjector
+
+    class Repository:
+        def __init__(self) -> None:
+            self.correctness = [False]
+            self.last_values = None
+
+        async def get_pbl_evaluation(self, event):
+            return _pbl_evaluation()
+
+        async def record_pbl_evidence(self, event, evaluation):
+            self.correctness.append(evaluation.correct)
+            return True
+
+        async def list_correctness(self, user_id, knowledge_point_id):
+            return list(self.correctness), "event-pbl"
+
+        async def upsert_mastery(self, **values):
+            self.last_values = values
+
+    repository = Repository()
+    await MasteryProjector(repository).apply(_pbl_event(), document=_pbl_document())
+
+    assert repository.correctness == [False, True]
+    assert repository.last_values["level"] == compute_mastery([False, True])
+    assert repository.last_values["evidence_count"] == 2

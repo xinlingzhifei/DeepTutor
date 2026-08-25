@@ -21,6 +21,7 @@ from deeptutor.teaching.models import (
     LearningSession,
     MasteryEvidence,
     MasteryLevel,
+    PblGradingResult,
     QuizAttempt,
     Tenant,
     TenantSchemaState,
@@ -28,6 +29,7 @@ from deeptutor.teaching.models import (
 from deeptutor.teaching.projectors.mastery import (
     DeterministicProjectionError,
     MasteryProjector,
+    PblEvaluation,
     ProjectionEvent,
     QuizEvaluation,
 )
@@ -39,7 +41,7 @@ from deeptutor.teaching.schema_names import tenant_schema_name
 from deeptutor.teaching.services.classroom_content import ClassroomContentUnavailable
 
 _FINAL_QUEUE_STATUSES = ("completed", "quarantined")
-_MINIMUM_SCHEMA_REVISION = "20260825_0019"
+_MINIMUM_SCHEMA_REVISION = "20260825_0020"
 
 
 class ProjectionLeaseLost(RuntimeError):
@@ -184,6 +186,64 @@ class _SessionMasteryRepository:
             .on_conflict_do_nothing(index_elements=[MasteryEvidence.event_id])
         )
         return True
+
+    async def get_pbl_evaluation(
+        self,
+        event: ProjectionEvent,
+    ) -> PblEvaluation | None:
+        result = await self._session.scalar(
+            select(PblGradingResult).where(
+                PblGradingResult.event_id == event.event_id,
+            )
+        )
+        if result is None:
+            return None
+        return PblEvaluation(
+            event_id=result.event_id,
+            tenant_id=result.tenant_id,
+            session_id=result.session_id,
+            user_id=result.user_id,
+            classroom_version_id=result.classroom_version_id,
+            scene_id=result.scene_id,
+            milestone_id=result.milestone_id,
+            knowledge_point_id=result.knowledge_point_id,
+            rubric_sha256=result.rubric_sha256,
+            correct=bool(result.correctness),
+            score=float(result.score) if result.score is not None else None,
+            grading_source=result.grading_source,
+        )
+
+    async def record_pbl_evidence(
+        self,
+        event: ProjectionEvent,
+        evaluation: PblEvaluation,
+    ) -> bool:
+        lock_key = _mastery_lock_key(
+            self._tenant_id,
+            event.user_id,
+            evaluation.knowledge_point_id,
+        )
+        await self._session.execute(
+            select(func.pg_advisory_xact_lock(func.hashtextextended(lock_key, 0)))
+        )
+        inserted = await self._session.scalar(
+            postgresql_insert(MasteryEvidence)
+            .values(
+                event_id=event.event_id,
+                tenant_id=self._tenant_id,
+                session_id=event.session_id,
+                user_id=event.user_id,
+                classroom_version_id=event.classroom_version_id,
+                knowledge_point_id=evaluation.knowledge_point_id,
+                evidence_type="pbl",
+                correctness=evaluation.correct,
+                score=evaluation.score,
+                grading_source=evaluation.grading_source,
+            )
+            .on_conflict_do_nothing(index_elements=[MasteryEvidence.event_id])
+            .returning(MasteryEvidence.id)
+        )
+        return inserted is not None
 
     async def list_correctness(
         self,
@@ -816,7 +876,10 @@ class LearningProjectionWorker:
                     lease_seconds=self._lease_seconds,
                 )
                 document = None
-                if claim.event.event_type == "quiz.graded":
+                if claim.event.event_type in {
+                    "quiz.graded",
+                    "pbl.milestone_completed",
+                }:
                     document = await self._load_document_with_heartbeat(claim)
                 await self._repository.heartbeat(
                     claim,

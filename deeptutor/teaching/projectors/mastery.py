@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import hashlib
 from typing import Protocol
 
 from deeptutor.learning.mastery import compute_mastery
@@ -43,11 +44,38 @@ class QuizEvaluation:
     grading_source: str = "published_answer"
 
 
+@dataclass(frozen=True, slots=True)
+class PblEvaluation:
+    event_id: str
+    tenant_id: str
+    session_id: str
+    user_id: str
+    classroom_version_id: str
+    scene_id: str
+    milestone_id: str
+    knowledge_point_id: str
+    rubric_sha256: str
+    correct: bool
+    score: float | None
+    grading_source: str = "teacher_review"
+
+
 class MasteryProjectionRepository(Protocol):
     async def record_quiz_evidence(
         self,
         event: ProjectionEvent,
         evaluation: QuizEvaluation,
+    ) -> bool: ...
+
+    async def get_pbl_evaluation(
+        self,
+        event: ProjectionEvent,
+    ) -> PblEvaluation | None: ...
+
+    async def record_pbl_evidence(
+        self,
+        event: ProjectionEvent,
+        evaluation: PblEvaluation,
     ) -> bool: ...
 
     async def list_correctness(
@@ -164,6 +192,67 @@ def evaluate_quiz(event: ProjectionEvent, document: object) -> QuizEvaluation | 
     )
 
 
+def validate_pbl_evaluation(
+    event: ProjectionEvent,
+    document: object,
+    evaluation: PblEvaluation,
+) -> PblEvaluation:
+    """Revalidate a trusted PBL grading row against immutable content."""
+
+    if (
+        evaluation.event_id != event.event_id
+        or evaluation.tenant_id != event.tenant_id
+        or evaluation.session_id != event.session_id
+        or evaluation.user_id != event.user_id
+        or evaluation.classroom_version_id != event.classroom_version_id
+        or evaluation.scene_id != event.scene_id
+        or evaluation.grading_source != "teacher_review"
+    ):
+        raise DeterministicProjectionError("pbl_result_binding_invalid")
+    if event.scene_id is None or event.event_type != "pbl.milestone_completed":
+        raise DeterministicProjectionError("pbl_scene_invalid")
+    if getattr(document, "classroom_version_id", None) != event.classroom_version_id:
+        raise DeterministicProjectionError("pbl_document_binding_invalid")
+    scenes = {
+        scene.id: scene for scene in getattr(getattr(document, "openmaic", None), "scenes", ())
+    }
+    scene = scenes.get(event.scene_id)
+    if scene is None or getattr(scene, "type", None) != "pbl":
+        raise DeterministicProjectionError("pbl_scene_invalid")
+    milestone_id = event.payload.get("milestone_id")
+    if not isinstance(milestone_id, str) or milestone_id != evaluation.milestone_id:
+        raise DeterministicProjectionError("pbl_milestone_invalid")
+    milestones = {
+        milestone.id: milestone
+        for milestone in getattr(getattr(scene, "content", None), "milestones", ())
+    }
+    milestone = milestones.get(milestone_id)
+    if milestone is None:
+        raise DeterministicProjectionError("pbl_milestone_invalid")
+    rubric = getattr(milestone, "rubric", None)
+    normalized_rubric = rubric.strip() if isinstance(rubric, str) else ""
+    if not normalized_rubric:
+        raise DeterministicProjectionError("pbl_rubric_invalid")
+    expected_hash = hashlib.sha256(normalized_rubric.encode("utf-8")).hexdigest()
+    if evaluation.rubric_sha256 != expected_hash:
+        raise DeterministicProjectionError("pbl_rubric_hash_invalid")
+    knowledge_points = {
+        mapping.knowledge_point_id
+        for mapping in getattr(document, "knowledge_point_mappings", ())
+        if event.scene_id in set(mapping.scene_ids)
+    }
+    if len(knowledge_points) != 1:
+        raise DeterministicProjectionError("pbl_knowledge_point_ambiguous")
+    knowledge_point_id = next(iter(knowledge_points))
+    if evaluation.knowledge_point_id != knowledge_point_id or (
+        event.knowledge_point_id is not None and event.knowledge_point_id != knowledge_point_id
+    ):
+        raise DeterministicProjectionError("pbl_knowledge_point_invalid")
+    if evaluation.score is not None and not 0 <= evaluation.score <= 1:
+        raise DeterministicProjectionError("pbl_score_invalid")
+    return evaluation
+
+
 class MasteryProjector:
     """Apply only trusted, idempotent graded facts to learner mastery."""
 
@@ -171,14 +260,24 @@ class MasteryProjector:
         self._repository = repository
 
     async def apply(self, event: ProjectionEvent, *, document: object | None = None) -> bool:
-        if event.event_type != "quiz.graded":
+        if event.event_type not in {"quiz.graded", "pbl.milestone_completed"}:
             return False
         if document is None:
             raise DeterministicProjectionError("classroom_document_unavailable")
-        evaluation = evaluate_quiz(event, document)
-        if evaluation is None:
-            return False
-        inserted = await self._repository.record_quiz_evidence(event, evaluation)
+        if event.event_type == "quiz.graded":
+            evaluation = evaluate_quiz(event, document)
+            if evaluation is None:
+                return False
+            inserted = await self._repository.record_quiz_evidence(event, evaluation)
+        else:
+            loader = getattr(self._repository, "get_pbl_evaluation", None)
+            if loader is None:
+                return False
+            evaluation = await loader(event)
+            if evaluation is None:
+                return False
+            evaluation = validate_pbl_evaluation(event, document, evaluation)
+            inserted = await self._repository.record_pbl_evidence(event, evaluation)
         if not inserted:
             return False
         correctness, last_evidence_event_id = await self._repository.list_correctness(
@@ -204,7 +303,9 @@ class MasteryProjector:
 __all__ = [
     "DeterministicProjectionError",
     "MasteryProjector",
+    "PblEvaluation",
     "ProjectionEvent",
     "QuizEvaluation",
     "evaluate_quiz",
+    "validate_pbl_evaluation",
 ]

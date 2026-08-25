@@ -44,6 +44,7 @@ def test_default_role_templates_are_exact() -> None:
                 "classroom.*",
                 "source.use",
                 "learning_event.read",
+                "learning_event.grade",
             }
         ),
         "content_author": frozenset(
@@ -69,6 +70,7 @@ def test_default_role_templates_are_exact() -> None:
                 "classroom.assign",
                 "source.use",
                 "learning_event.read",
+                "learning_event.grade",
             }
         ),
         "student": frozenset(
@@ -78,6 +80,26 @@ def test_default_role_templates_are_exact() -> None:
             }
         ),
     }
+
+
+def test_only_teacher_roles_receive_learning_event_grade_permission() -> None:
+    from deeptutor.teaching.permissions import permissions_for_roles
+
+    def names(role: str) -> set[str]:
+        return {
+            permission.permission
+            for permission in permissions_for_roles(
+                {role},
+                scope_type="class",
+                scope_id="class-a",
+                tenant_id="tenant-a",
+            )
+        }
+
+    assert "learning_event.grade" in names("teacher")
+    assert "learning_event.grade" in names("org_admin")
+    assert "learning_event.grade" not in names("student")
+    assert "learning_event.grade" not in names("content_reviewer")
 
 
 def test_classroom_wildcard_expands_only_to_known_permissions() -> None:
@@ -95,7 +117,12 @@ def test_classroom_wildcard_expands_only_to_known_permissions() -> None:
     assert "classroom.*" not in names
     assert names == {
         permission for permission in KNOWN_PERMISSIONS if permission.startswith("classroom.")
-    } | {"tenant.manage", "source.use", "learning_event.read"}
+    } | {
+        "tenant.manage",
+        "source.use",
+        "learning_event.read",
+        "learning_event.grade",
+    }
 
 
 def test_unknown_role_and_unknown_permission_fail_closed() -> None:

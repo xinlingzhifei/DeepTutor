@@ -17,7 +17,7 @@ from deeptutor.teaching.schema_names import tenant_schema_name
 def test_projector_scan_requires_metric_backlog_revision() -> None:
     import deeptutor.teaching.projector_worker as worker_module
 
-    assert worker_module._MINIMUM_SCHEMA_REVISION == "20260825_0019"
+    assert worker_module._MINIMUM_SCHEMA_REVISION == "20260825_0020"
 
 
 class _Context:
@@ -100,10 +100,10 @@ def _repository(session: _Session) -> SqlAlchemyProjectionQueueRepository:
 
 
 @pytest.mark.asyncio
-async def test_active_tenant_ids_excludes_0018_and_accepts_0019() -> None:
+async def test_active_tenant_ids_excludes_0019_and_accepts_0020() -> None:
     candidates = (
-        ("tenant-0018", tenant_schema_name("tenant-0018"), "20260824_0018"),
         ("tenant-0019", tenant_schema_name("tenant-0019"), "20260825_0019"),
+        ("tenant-0020", tenant_schema_name("tenant-0020"), "20260825_0020"),
     )
 
     class PlatformSession:
@@ -111,7 +111,7 @@ async def test_active_tenant_ids_excludes_0018_and_accepts_0019() -> None:
             compiled = statement.compile()
             sql = " ".join(str(compiled).lower().split())
             assert "tenant_schema_states.revision >=" in sql
-            minimum = next(value for value in compiled.params.values() if value == "20260825_0019")
+            minimum = next(value for value in compiled.params.values() if value == "20260825_0020")
             rows = [
                 (tenant_id, schema_name)
                 for tenant_id, schema_name, revision in candidates
@@ -127,7 +127,7 @@ async def test_active_tenant_ids_excludes_0018_and_accepts_0019() -> None:
     repository = object.__new__(SqlAlchemyProjectionQueueRepository)
     repository._platform_sessions = _Factory(PlatformSession())
 
-    assert await repository.active_tenant_ids() == ("tenant-0019",)
+    assert await repository.active_tenant_ids() == ("tenant-0020",)
 
 
 @pytest.mark.asyncio

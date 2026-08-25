@@ -43,7 +43,7 @@ async def _seed_classroom(engine: AsyncEngine, tenant_id: str, schema_name: str)
             text(
                 "INSERT INTO platform.tenant_schema_states "
                 "(tenant_id, schema_name, revision, status) "
-                "VALUES (:tenant_id, :schema_name, '20260825_0019', 'active')"
+                "VALUES (:tenant_id, :schema_name, '20260825_0020', 'active')"
             ),
             {"tenant_id": tenant_id, "schema_name": schema_name},
         )

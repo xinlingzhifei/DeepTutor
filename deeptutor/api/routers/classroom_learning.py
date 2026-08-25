@@ -7,7 +7,8 @@ from datetime import datetime
 from typing import Annotated, Any, Protocol
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, StringConstraints, ValidationError
+from sqlalchemy.exc import SQLAlchemyError
 
 from deeptutor.api.routers.classroom_content import get_classroom_content_service
 from deeptutor.services.config import load_platform_settings
@@ -82,6 +83,33 @@ class EventIngestionResponse(_ApiModel):
     quarantined: list[EventQuarantinedResponse]
 
 
+NonEmptyTrimmedString = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=256),
+]
+
+
+class PblGradingRequest(_ApiModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    event_id: str = Field(alias="eventId", min_length=1, max_length=128)
+    passed: bool = Field(strict=True)
+    score: float | None = Field(default=None, strict=True, ge=0, le=1)
+    source_reference: NonEmptyTrimmedString = Field(alias="sourceReference")
+
+
+class PblGradingResponse(_ApiModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    result_id: str = Field(alias="resultId")
+    event_id: str = Field(alias="eventId")
+    passed: bool
+    score: float | None
+    source_reference: str = Field(alias="sourceReference")
+    grading_source: str = Field(alias="gradingSource")
+    graded_at: datetime = Field(alias="gradedAt")
+
+
 class LearningSessionServiceLike(Protocol):
     async def create(
         self,
@@ -123,6 +151,10 @@ class LearningEventIngestionServiceLike(Protocol):
     ): ...
 
 
+class PblGradingServiceLike(Protocol):
+    async def record(self, context: TenantContext, *, session_id: str, command): ...
+
+
 def get_learning_session_service() -> LearningSessionService:
     return LearningSessionService(
         engine=get_platform_engine(),
@@ -145,6 +177,20 @@ def get_learning_event_ingestion_service(
     )
 
 
+def get_pbl_grading_service(
+    document_loader=Depends(get_classroom_content_service),
+):
+    from deeptutor.teaching.repositories.pbl_grading import (
+        SqlAlchemyPblGradingRepository,
+    )
+    from deeptutor.teaching.services.pbl_grading import PblGradingService
+
+    return PblGradingService(
+        SqlAlchemyPblGradingRepository(get_platform_engine()),
+        document_loader,
+    )
+
+
 async def _call(operation: Awaitable[Any]):
     try:
         return await operation
@@ -162,6 +208,28 @@ async def _call(operation: Awaitable[Any]):
         raise HTTPException(status_code=409, detail="Learning session is unavailable") from None
     except LearningSessionError:
         raise HTTPException(status_code=503, detail="Learning session is unavailable") from None
+
+
+async def _call_pbl_grading(operation: Awaitable[Any]):
+    from deeptutor.teaching.projectors.mastery import DeterministicProjectionError
+    from deeptutor.teaching.services.classroom_content import ClassroomContentError
+    from deeptutor.teaching.services.pbl_grading import (
+        PblGradingAccessDenied,
+        PblGradingConflict,
+        PblGradingError,
+        PblGradingValidationError,
+    )
+
+    try:
+        return await operation
+    except PblGradingAccessDenied:
+        raise HTTPException(status_code=403, detail="PBL grading access denied") from None
+    except PblGradingConflict:
+        raise HTTPException(status_code=409, detail="PBL grading result conflicts") from None
+    except (PblGradingValidationError, DeterministicProjectionError):
+        raise HTTPException(status_code=422, detail="PBL grading request is invalid") from None
+    except (PblGradingError, ClassroomContentError, SQLAlchemyError):
+        raise HTTPException(status_code=503, detail="PBL grading is unavailable") from None
 
 
 def _session_response(record: object) -> LearningSessionResponse:
@@ -278,9 +346,48 @@ async def append_learning_events(
     return EventIngestionResponse.model_validate(result, from_attributes=True)
 
 
+@router.post(
+    "/classroom-sessions/{session_id}/pbl-results",
+    response_model=PblGradingResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def record_pbl_grading_result(
+    session_id: str,
+    request: PblGradingRequest,
+    idempotency_key: Annotated[
+        str,
+        Header(
+            alias="Idempotency-Key",
+            min_length=8,
+            max_length=128,
+            pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]+$",
+        ),
+    ],
+    context: TenantContext = Depends(require_tenant),
+    service: PblGradingServiceLike = Depends(get_pbl_grading_service),
+) -> PblGradingResponse:
+    from deeptutor.teaching.services.pbl_grading import PblGradingCommand
+
+    result = await _call_pbl_grading(
+        service.record(
+            context,
+            session_id=session_id,
+            command=PblGradingCommand(
+                event_id=request.event_id,
+                passed=request.passed,
+                score=request.score,
+                source_reference=request.source_reference,
+                idempotency_key=idempotency_key,
+            ),
+        )
+    )
+    return PblGradingResponse.model_validate(result, from_attributes=True)
+
+
 __all__ = [
     "MAX_EVENT_BATCH_BYTES",
     "get_learning_event_ingestion_service",
     "get_learning_session_service",
+    "get_pbl_grading_service",
     "router",
 ]

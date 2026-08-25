@@ -20,7 +20,7 @@ def test_teaching_metrics_migration_is_declared_head_and_dual_scope() -> None:
         / "20260825_0019_teaching_metric_rollups.py"
     )
 
-    assert TEACHING_MIGRATION_HEAD_REVISION == "20260825_0019"
+    assert TEACHING_MIGRATION_HEAD_REVISION == "20260825_0020"
     assert migration.is_file()
     source = migration.read_text(encoding="utf-8")
     assert 'revision: str = "20260825_0019"' in source

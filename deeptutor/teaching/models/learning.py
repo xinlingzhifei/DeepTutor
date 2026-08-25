@@ -279,6 +279,84 @@ class QuizAttempt(TenantBase):
     )
 
 
+class PblGradingResult(TenantBase):
+    """Immutable trusted teacher grading fact for one PBL completion event."""
+
+    __tablename__ = "pbl_grading_results"
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    event_id: Mapped[str] = mapped_column(
+        String(128),
+        ForeignKey("tenant.learning_events.event_id", ondelete="RESTRICT"),
+    )
+    tenant_id: Mapped[str] = mapped_column(String(64))
+    session_id: Mapped[str] = mapped_column(String(128))
+    user_id: Mapped[str] = mapped_column(String(128))
+    classroom_version_id: Mapped[str] = mapped_column(String(128))
+    scene_id: Mapped[str] = mapped_column(String(128))
+    milestone_id: Mapped[str] = mapped_column(String(128))
+    knowledge_point_id: Mapped[str] = mapped_column(String(128))
+    rubric_sha256: Mapped[str] = mapped_column(String(64))
+    correctness: Mapped[bool] = mapped_column(Boolean)
+    score: Mapped[float | None] = mapped_column(Float)
+    grading_source: Mapped[str] = mapped_column(String(32))
+    source_reference: Mapped[str] = mapped_column(String(256))
+    graded_by: Mapped[str] = mapped_column(String(128))
+    graded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(128))
+    request_sha256: Mapped[str] = mapped_column(String(64))
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["classroom_version_id"],
+            ["tenant.classroom_versions.id"],
+            name="fk_pbl_grading_results_classroom_version",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["session_id", "tenant_id"],
+            ["tenant.learning_sessions.id", "tenant.learning_sessions.tenant_id"],
+            name="fk_pbl_grading_results_session_tenant",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint("score IS NULL OR (score >= 0 AND score <= 1)", name="score"),
+        CheckConstraint(
+            "grading_source = 'teacher_review'",
+            name="grading_source",
+        ),
+        CheckConstraint("length(source_reference) > 0", name="source_reference"),
+        CheckConstraint("length(graded_by) > 0", name="graded_by"),
+        CheckConstraint("length(scene_id) > 0", name="scene_id"),
+        CheckConstraint("length(milestone_id) > 0", name="milestone_id"),
+        CheckConstraint("length(knowledge_point_id) > 0", name="knowledge_point_id"),
+        CheckConstraint("length(idempotency_key) > 0", name="idempotency_key"),
+        CheckConstraint(
+            "rubric_sha256 ~ '^[0-9a-f]{64}$'",
+            name="rubric_sha256",
+        ),
+        CheckConstraint(
+            "request_sha256 ~ '^[0-9a-f]{64}$'",
+            name="request_sha256",
+        ),
+        UniqueConstraint("event_id", name="uq_pbl_grading_results_event_id"),
+        UniqueConstraint(
+            "tenant_id",
+            "idempotency_key",
+            name="uq_pbl_grading_results_tenant_idempotency",
+        ),
+        Index(
+            "ix_pbl_grading_results_user_knowledge",
+            "user_id",
+            "knowledge_point_id",
+            "graded_at",
+        ),
+        Index("ix_pbl_grading_results_session", "session_id"),
+    )
+
+
 class MasteryEvidence(TenantBase):
     """Trusted graded evidence eligible to change learner mastery."""
 
@@ -440,5 +518,6 @@ __all__ = [
     "LearningSession",
     "MasteryEvidence",
     "MasteryLevel",
+    "PblGradingResult",
     "QuizAttempt",
 ]

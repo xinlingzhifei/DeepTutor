@@ -20,6 +20,7 @@ KNOWN_PERMISSIONS = frozenset(
         "classroom.generate.full",
         "source.use",
         "learning_event.read",
+        "learning_event.grade",
     }
 )
 
@@ -41,6 +42,7 @@ DEFAULT_ROLE_PERMISSIONS = {
             "classroom.*",
             "source.use",
             "learning_event.read",
+            "learning_event.grade",
         }
     ),
     "content_author": frozenset(
@@ -66,6 +68,7 @@ DEFAULT_ROLE_PERMISSIONS = {
             "classroom.assign",
             "source.use",
             "learning_event.read",
+            "learning_event.grade",
         }
     ),
     "student": frozenset(

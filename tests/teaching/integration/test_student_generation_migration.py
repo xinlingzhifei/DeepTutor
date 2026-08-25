@@ -268,9 +268,7 @@ async def test_real_student_route_uses_exact_current_durable_safety_evidence(
         for drifted in (
             StudentGenerationRequest("course-2", "class-2", "micro", "open_creation", False),
             StudentGenerationRequest("course-1", "class-1", "full", "open_creation", False),
-            StudentGenerationRequest(
-                "course-1", "class-1", "micro", "source_grounded", False
-            ),
+            StudentGenerationRequest("course-1", "class-1", "micro", "source_grounded", False),
             StudentGenerationRequest("course-1", "class-1", "micro", "open_creation", True),
         ):
             assert await evaluator.assess(tenant_id, learner_id, drifted) == (
@@ -318,21 +316,19 @@ async def test_real_student_route_uses_exact_current_durable_safety_evidence(
         application.include_router(student_classrooms.router, prefix="/api/v1")
         selected_context = {"value": context}
         application.dependency_overrides[require_tenant] = lambda: selected_context["value"]
-        application.dependency_overrides[
-            student_classrooms.get_source_repository
-        ] = lambda: object()
-        application.dependency_overrides[
-            student_classrooms.get_source_store_provider
-        ] = lambda: object()
-        application.dependency_overrides[
-            student_classrooms.get_job_repository
-        ] = lambda: job_repository
-        application.dependency_overrides[
-            student_classrooms.get_data_plane_selector
-        ] = Selector
-        application.dependency_overrides[
-            student_classrooms.get_cancellation_gateway
-        ] = lambda: object()
+        application.dependency_overrides[student_classrooms.get_source_repository] = lambda: (
+            object()
+        )
+        application.dependency_overrides[student_classrooms.get_source_store_provider] = lambda: (
+            object()
+        )
+        application.dependency_overrides[student_classrooms.get_job_repository] = lambda: (
+            job_repository
+        )
+        application.dependency_overrides[student_classrooms.get_data_plane_selector] = Selector
+        application.dependency_overrides[student_classrooms.get_cancellation_gateway] = lambda: (
+            object()
+        )
         client = TestClient(application)
         payload = {
             "courseId": "course-1",
@@ -348,9 +344,12 @@ async def test_real_student_route_uses_exact_current_durable_safety_evidence(
         assert accepted.json()["status"] == "awaiting_approval"
         assert accepted.json()["generationJobId"] is None
         async with engine.connect() as connection:
-            assert await connection.scalar(
-                text(f'SELECT count(*) FROM "{schema_name}".generation_jobs')
-            ) == 0
+            assert (
+                await connection.scalar(
+                    text(f'SELECT count(*) FROM "{schema_name}".generation_jobs')
+                )
+                == 0
+            )
         reviewer = TenantContext(
             tenant_id=tenant_id,
             schema_name=schema_name,
@@ -439,8 +438,8 @@ async def test_real_student_route_uses_exact_current_durable_safety_evidence(
             initially_reserved = (
                 await connection.execute(
                     text(
-                        f'SELECT scene_min, scene_max, duration_minutes_min, '
-                        f'duration_minutes_max, estimated_units, quota_state FROM '
+                        f"SELECT scene_min, scene_max, duration_minutes_min, "
+                        f"duration_minutes_max, estimated_units, quota_state FROM "
                         f'"{schema_name}".student_generation_requests '
                         "WHERE id = :request_id"
                     ),
@@ -506,7 +505,7 @@ async def test_real_student_route_uses_exact_current_durable_safety_evidence(
             approved.approval_id
         ]
         recovered = client.post(
-            f'/api/v1/student-generation-approvals/{accepted.json()["approvalId"]}/approve',
+            f"/api/v1/student-generation-approvals/{accepted.json()['approvalId']}/approve",
             json={},
         )
 
@@ -518,8 +517,8 @@ async def test_real_student_route_uses_exact_current_durable_safety_evidence(
             refreshed_reservation = (
                 await connection.execute(
                     text(
-                        f'SELECT scene_min, scene_max, duration_minutes_min, '
-                        f'duration_minutes_max, estimated_units, quota_state FROM '
+                        f"SELECT scene_min, scene_max, duration_minutes_min, "
+                        f"duration_minutes_max, estimated_units, quota_state FROM "
                         f'"{schema_name}".student_generation_requests '
                         "WHERE id = :request_id"
                     ),
@@ -527,10 +526,7 @@ async def test_real_student_route_uses_exact_current_durable_safety_evidence(
                 )
             ).one()
             refreshed_job_units = await connection.scalar(
-                text(
-                    f'SELECT quota_units FROM "{schema_name}".generation_jobs '
-                    "WHERE id = :job_id"
-                ),
+                text(f'SELECT quota_units FROM "{schema_name}".generation_jobs WHERE id = :job_id'),
                 {"job_id": recovered_job_id},
             )
         assert tuple(refreshed_reservation) == (1, 2, 3, 10, 2, "reserved")
@@ -600,24 +596,24 @@ async def test_real_student_route_uses_exact_current_durable_safety_evidence(
                 )
 
         weak_idempotent_repository = FirstReadUnavailableJobRepository(job_repository)
-        application.dependency_overrides[
-            student_classrooms.get_job_repository
-        ] = lambda: weak_idempotent_repository
+        application.dependency_overrides[student_classrooms.get_job_repository] = lambda: (
+            weak_idempotent_repository
+        )
         selected_context["value"] = reviewer
         weak_idempotent_replay = client.post(
             "/api/v1/student-generation-approvals/"
-            f'{weak_idempotent_restart.json()["approvalId"]}/approve',
+            f"{weak_idempotent_restart.json()['approvalId']}/approve",
             json={},
         )
-        application.dependency_overrides[
-            student_classrooms.get_job_repository
-        ] = lambda: job_repository
+        application.dependency_overrides[student_classrooms.get_job_repository] = lambda: (
+            job_repository
+        )
         async with engine.connect() as connection:
             weak_idempotent_state = (
                 await connection.execute(
                     text(
-                        f'SELECT approval.status, request.quota_state, '
-                        f'asset.lifecycle_state, draft.generation_job_id FROM '
+                        f"SELECT approval.status, request.quota_state, "
+                        f"asset.lifecycle_state, draft.generation_job_id FROM "
                         f'"{schema_name}".student_generation_approvals AS approval '
                         f'JOIN "{schema_name}".student_generation_requests AS request '
                         "ON request.id = approval.request_id "
@@ -658,10 +654,7 @@ async def test_real_student_route_uses_exact_current_durable_safety_evidence(
             "canceled",
             None,
         )
-        assert (
-            weak_idempotent_job_state[0] == "canceled"
-            or weak_idempotent_job_state[1] is True
-        )
+        assert weak_idempotent_job_state[0] == "canceled" or weak_idempotent_job_state[1] is True
         assert weak_idempotent_active_jobs == 0
 
         selected_context["value"] = context
@@ -696,15 +689,15 @@ async def test_real_student_route_uses_exact_current_durable_safety_evidence(
         selected_context["value"] = second_reviewer
         failed_restart = client.post(
             "/api/v1/student-generation-approvals/"
-            f'{cross_reviewer_restart.json()["approvalId"]}/approve',
+            f"{cross_reviewer_restart.json()['approvalId']}/approve",
             json={},
         )
         async with engine.begin() as connection:
             failed_restart_state = (
                 await connection.execute(
                     text(
-                        f'SELECT approval.status, request.quota_state, '
-                        f'asset.lifecycle_state, draft.generation_job_id FROM '
+                        f"SELECT approval.status, request.quota_state, "
+                        f"asset.lifecycle_state, draft.generation_job_id FROM "
                         f'"{schema_name}".student_generation_approvals AS approval '
                         f'JOIN "{schema_name}".student_generation_requests AS request '
                         "ON request.id = approval.request_id "
@@ -912,9 +905,9 @@ async def test_real_student_route_uses_exact_current_durable_safety_evidence(
             )
             await connection.execute(
                 text(
-                    f'CREATE TRIGGER hold_student_approval_update BEFORE UPDATE ON '
+                    f"CREATE TRIGGER hold_student_approval_update BEFORE UPDATE ON "
                     f'"{schema_name}".student_generation_requests FOR EACH ROW '
-                    f'WHEN (OLD.id = \'{locked.json()["requestId"]}\') '
+                    f"WHEN (OLD.id = '{locked.json()['requestId']}') "
                     f'EXECUTE FUNCTION "{schema_name}".hold_student_approval_update()'
                 )
             )
@@ -985,15 +978,12 @@ async def test_real_student_route_uses_exact_current_durable_safety_evidence(
             async with engine.begin() as connection:
                 await connection.execute(
                     text(
-                        f'DROP TRIGGER IF EXISTS hold_student_approval_update ON '
+                        f"DROP TRIGGER IF EXISTS hold_student_approval_update ON "
                         f'"{schema_name}".student_generation_requests'
                     )
                 )
                 await connection.execute(
-                    text(
-                        f'DROP FUNCTION IF EXISTS '
-                        f'"{schema_name}".hold_student_approval_update()'
-                    )
+                    text(f'DROP FUNCTION IF EXISTS "{schema_name}".hold_student_approval_update()')
                 )
         assert locked_approved.status == "approved"
         with pytest.raises(StudentGenerationApprovalNotFound):
@@ -1034,20 +1024,22 @@ async def test_real_student_route_uses_exact_current_durable_safety_evidence(
             )
 
         replayed_bound = client.post(
-            f'/api/v1/student-generation-approvals/{accepted.json()["approvalId"]}/approve',
+            f"/api/v1/student-generation-approvals/{accepted.json()['approvalId']}/approve",
             json={},
         )
 
         assert replayed_bound.status_code == 202, replayed_bound.text
         assert replayed_bound.json()["generationJobId"] == recovered_job_id
         async with engine.connect() as connection:
-            assert await connection.scalar(
-                text(
-                    f'SELECT count(*) FROM "{schema_name}".generation_jobs '
-                    "WHERE id = :job_id"
-                ),
-                {"job_id": recovered_job_id},
-            ) == 1
+            assert (
+                await connection.scalar(
+                    text(
+                        f'SELECT count(*) FROM "{schema_name}".generation_jobs WHERE id = :job_id'
+                    ),
+                    {"job_id": recovered_job_id},
+                )
+                == 1
+            )
 
         missing = client.post("/api/v1/student-classrooms", json=payload)
 
@@ -1270,7 +1262,7 @@ async def test_postgres_student_generation_migration_constraints_state_and_downg
             for table_name, table in expected_tables.items()
             for column in table.c
         }
-        assert (revision, state_revision) == ("20260825_0019", "20260825_0019")
+        assert (revision, state_revision) == ("20260825_0020", "20260825_0020")
 
         with pytest.raises(IntegrityError):
             async with engine.begin() as connection:
@@ -1345,7 +1337,7 @@ async def test_postgres_student_generation_migration_constraints_state_and_downg
                 ),
                 {"schema_name": schema_name},
             )
-        assert (revision, state_revision) == ("20260825_0019", "20260825_0019")
+        assert (revision, state_revision) == ("20260825_0020", "20260825_0020")
     finally:
         async with engine.begin() as connection:
             await connection.execute(

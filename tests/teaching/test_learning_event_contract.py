@@ -88,6 +88,31 @@ def test_contract_forbids_client_authority_fields(forged_field: str) -> None:
         LearningEventBatch.model_validate({"events": [event]})
 
 
+@pytest.mark.parametrize(
+    "forged_field",
+    [
+        "score",
+        "passed",
+        "correctness",
+        "grading_source",
+        "grader_id",
+        "graded_by",
+        "tenant_id",
+        "user_id",
+        "session_id",
+        "classroom_version_id",
+    ],
+)
+def test_pbl_completion_forbids_client_grading_and_authority_fields(
+    forged_field: str,
+) -> None:
+    event = deepcopy(valid_events()[4])
+    event[forged_field] = True if forged_field in {"passed", "correctness"} else "forged"
+
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        LearningEventBatch.model_validate({"events": [event]})
+
+
 def test_quiz_event_requires_real_assessment_question_and_knowledge_bindings() -> None:
     quiz = valid_events()[2]
     for field in ("assessment_id", "question_id", "knowledge_point_id", "scene_id"):
