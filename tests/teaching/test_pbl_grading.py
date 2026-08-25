@@ -407,6 +407,7 @@ async def test_sql_repository_atomically_requeues_late_completed_event() -> None
     )
 
     session = _RepositorySession(queue_status="completed")
+    session.queue.attempt_count = session.queue.max_attempts = 8
     repository = object.__new__(SqlAlchemyPblGradingRepository)
     repository._sessions = lambda _tenant_id: _RepositoryFactory(session)
 
@@ -420,6 +421,7 @@ async def test_sql_repository_atomically_requeues_late_completed_event() -> None
     assert result.event_id == "event-a"
     assert result.grading_source == "teacher_review"
     assert session.queue.status == "pending"
+    assert session.queue.attempt_count == 0
     assert session.committed is True
     assert session.rolled_back is False
     assert [type(value).__name__ for value in session.added] == ["PblGradingResult"]
@@ -437,6 +439,8 @@ async def test_sql_repository_makes_failed_event_immediately_claimable_without_n
     session = _RepositorySession(queue_status="failed")
     session.queue.available_at = datetime(2026, 8, 26, 12, 0, tzinfo=UTC)
     session.queue.last_error_code = "transient_timeout"
+    session.queue.attempt_count = 7
+    session.queue.max_attempts = 8
     repository = object.__new__(SqlAlchemyPblGradingRepository)
     repository._sessions = lambda _tenant_id: _RepositoryFactory(session)
 
@@ -450,6 +454,30 @@ async def test_sql_repository_makes_failed_event_immediately_claimable_without_n
     assert session.queue.status == "pending"
     assert session.queue.available_at == session.now
     assert session.queue.last_error_code is None
+    assert session.queue.attempt_count == 7
+    assert "teaching_learning_projection_backlog" not in session.executed_tables
+
+
+@pytest.mark.asyncio
+async def test_sql_repository_preserves_running_event_attempt_budget() -> None:
+    from deeptutor.teaching.repositories.pbl_grading import (
+        SqlAlchemyPblGradingRepository,
+    )
+
+    session = _RepositorySession(queue_status="running")
+    session.queue.attempt_count = session.queue.max_attempts = 8
+    repository = object.__new__(SqlAlchemyPblGradingRepository)
+    repository._sessions = lambda _tenant_id: _RepositoryFactory(session)
+
+    await repository.record(
+        _context(role_scope=ResourceScope("tenant-a", "course-a", "class-a")),
+        session_id="session-a",
+        command=_grading_command(),
+        documents=_Documents(),
+    )
+
+    assert session.queue.status == "running"
+    assert session.queue.attempt_count == session.queue.max_attempts == 8
     assert "teaching_learning_projection_backlog" not in session.executed_tables
 
 

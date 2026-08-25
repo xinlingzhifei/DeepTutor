@@ -1218,6 +1218,8 @@ async def test_postgres_student_generation_migration_constraints_state_and_downg
             "mastery_levels",
             "learning_progress",
             "learning_event_quarantine",
+            "pbl_grading_results",
+            "pbl_grading_idempotency_keys",
         }
         assert tables - tables_before == new_tables | learning_tables
         assert {
@@ -1312,6 +1314,8 @@ async def test_postgres_student_generation_migration_constraints_state_and_downg
         assert "course_generation_policies" not in remaining
         assert "student_generation_requests" not in remaining
         assert "student_generation_approvals" not in remaining
+        assert "pbl_grading_results" not in remaining
+        assert "pbl_grading_idempotency_keys" not in remaining
         assert state_revision == "20260804_0012"
 
         upgraded = run_tenant_migration(generation_database, schema_name, "head")

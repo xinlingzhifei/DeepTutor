@@ -290,6 +290,7 @@ class SqlAlchemyPblGradingRepository:
                     queue_item.heartbeat_at = None
                     queue_item.last_error_code = None
                 if queue_action == "requeue":
+                    queue_item.attempt_count = 0
                     await insert_learning_projection_backlog(
                         session,
                         tenant_id=context.tenant_id,

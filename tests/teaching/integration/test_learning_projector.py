@@ -477,6 +477,114 @@ async def test_postgres_late_pbl_grade_requeues_completed_and_failed_safely(
 
 
 @pytest.mark.asyncio
+async def test_postgres_late_completed_pbl_grade_renews_exhausted_projection_budget(
+    projector_database: ProjectorDatabase,
+) -> None:
+    from deeptutor.teaching.projector_worker import LearningProjectionWorker
+
+    class Documents:
+        def __init__(self) -> None:
+            self.loads: list[tuple[str, str]] = []
+
+        async def load_version_document(self, tenant_id: str, version_id: str):
+            self.loads.append((tenant_id, version_id))
+            return _pbl_document()
+
+    quoted = f'"{projector_database.schema_name}"'
+    await _append_pbl(projector_database, "event-pbl-exhausted-completed")
+    async with projector_database.engine.begin() as connection:
+        await connection.execute(
+            text(
+                f"UPDATE {quoted}.learning_projection_queue SET status = 'completed', "
+                "attempt_count = 1, max_attempts = 1 "
+                "WHERE event_id = 'event-pbl-exhausted-completed'"
+            )
+        )
+        await connection.execute(
+            text(
+                "DELETE FROM platform.teaching_learning_projection_backlog "
+                "WHERE tenant_id = :tenant_id "
+                "AND event_id = 'event-pbl-exhausted-completed'"
+            ),
+            {"tenant_id": projector_database.tenant_id},
+        )
+
+    await _grade_pbl(
+        projector_database,
+        event_id="event-pbl-exhausted-completed",
+        idempotency_key="grade-exhausted-completed",
+        passed=True,
+    )
+    async with projector_database.engine.connect() as connection:
+        requeued = (
+            await connection.execute(
+                text(
+                    f"SELECT status, attempt_count, max_attempts FROM "
+                    f"{quoted}.learning_projection_queue "
+                    "WHERE event_id = 'event-pbl-exhausted-completed'"
+                )
+            )
+        ).one()
+    assert tuple(requeued) == ("pending", 0, 1)
+    assert await _backlog_event_ids(projector_database) == ["event-pbl-exhausted-completed"]
+
+    documents = Documents()
+    worker = LearningProjectionWorker(
+        engine=projector_database.engine,
+        documents=documents,
+        worker_id="projector-exhausted-completed",
+    )
+    assert await worker.run_once(tenant_id=projector_database.tenant_id) is True
+
+    async with projector_database.engine.connect() as connection:
+        queue = (
+            await connection.execute(
+                text(
+                    f"SELECT status, attempt_count, max_attempts, last_error_code "
+                    f"FROM {quoted}.learning_projection_queue "
+                    "WHERE event_id = 'event-pbl-exhausted-completed'"
+                )
+            )
+        ).one()
+        evidence = (
+            await connection.execute(
+                text(
+                    f"SELECT evidence_type, correctness FROM {quoted}.mastery_evidence "
+                    "WHERE event_id = 'event-pbl-exhausted-completed'"
+                )
+            )
+        ).all()
+        quiz_count = await connection.scalar(
+            text(
+                f"SELECT count(*) FROM {quoted}.quiz_attempts "
+                "WHERE event_id = 'event-pbl-exhausted-completed'"
+            )
+        )
+        mastery = (
+            await connection.execute(
+                text(
+                    f"SELECT level, evidence_count FROM {quoted}.mastery_levels "
+                    "WHERE user_id = 'student-1' AND knowledge_point_id = 'kp-1'"
+                )
+            )
+        ).one()
+        quarantine_count = await connection.scalar(
+            text(
+                f"SELECT count(*) FROM {quoted}.learning_event_quarantine "
+                "WHERE event_id = 'event-pbl-exhausted-completed'"
+            )
+        )
+
+    assert tuple(queue) == ("completed", 1, 1, None)
+    assert evidence == [("pbl", True)]
+    assert quiz_count == 0
+    assert tuple(mastery) == (compute_mastery([True]), 1)
+    assert quarantine_count == 0
+    assert await _backlog_event_ids(projector_database) == []
+    assert documents.loads == [(projector_database.tenant_id, "version-1")]
+
+
+@pytest.mark.asyncio
 async def test_postgres_pbl_grading_rolls_back_if_backlog_restore_conflicts(
     projector_database: ProjectorDatabase,
 ) -> None:
