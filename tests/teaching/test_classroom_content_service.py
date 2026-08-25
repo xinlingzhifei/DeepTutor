@@ -401,6 +401,12 @@ async def test_content_service_pins_tickets_and_reads_exact_receipts_without_url
     )
     student = _context("student-a")
 
+    lineage_validated_document = await service.load_version_document(
+        _context("teacher-owner"),
+        "version-a",
+    )
+    assert lineage_validated_document.classroom_version_id == "source-version-a"
+
     issued = await service.issue_read_ticket(
         student,
         session_id="session-a",

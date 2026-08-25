@@ -46,6 +46,7 @@ from .learning import (
     LearningSession,
     MasteryEvidence,
     MasteryLevel,
+    PblGradingIdempotencyKey,
     PblGradingResult,
     QuizAttempt,
 )
@@ -115,6 +116,7 @@ __all__ = [
     "LearningSession",
     "MasteryEvidence",
     "MasteryLevel",
+    "PblGradingIdempotencyKey",
     "PblGradingResult",
     "OutboxMessage",
     "PlatformBase",

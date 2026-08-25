@@ -5,13 +5,16 @@ from __future__ import annotations
 from uuid import uuid4
 
 from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from deeptutor.teaching.models import (
     Assignment,
+    ClassroomVersion,
     LearningEvent,
     LearningProjectionQueueItem,
     LearningSession,
+    PblGradingIdempotencyKey,
     PblGradingResult,
     TeachingClass,
 )
@@ -22,6 +25,7 @@ from deeptutor.teaching.schema_names import tenant_schema_name
 from deeptutor.teaching.services.pbl_grading import (
     PblGradingBinding,
     PblGradingCommand,
+    PblGradingConflict,
     PblGradingDocumentLoader,
     PblGradingRecord,
     PblGradingValidationError,
@@ -59,11 +63,18 @@ class SqlAlchemyPblGradingRepository:
     @staticmethod
     async def _existing(
         session: AsyncSession,
+        tenant_id: str,
         command: PblGradingCommand,
     ) -> PblGradingRecord | None:
         by_key = await session.scalar(
-            select(PblGradingResult).where(
-                PblGradingResult.idempotency_key == command.idempotency_key
+            select(PblGradingResult)
+            .join(
+                PblGradingIdempotencyKey,
+                PblGradingIdempotencyKey.result_id == PblGradingResult.id,
+            )
+            .where(
+                PblGradingIdempotencyKey.tenant_id == tenant_id,
+                PblGradingIdempotencyKey.idempotency_key == command.idempotency_key,
             )
         )
         by_event = await session.scalar(
@@ -74,6 +85,51 @@ class SqlAlchemyPblGradingRepository:
             existing_by_event=_record(by_event) if by_event is not None else None,
             request_sha256=command.request_sha256,
         )
+
+    @staticmethod
+    async def _bind_idempotency_key(
+        session: AsyncSession,
+        *,
+        tenant_id: str,
+        command: PblGradingCommand,
+        result: PblGradingRecord,
+    ) -> None:
+        statement = (
+            postgresql_insert(PblGradingIdempotencyKey)
+            .values(
+                tenant_id=tenant_id,
+                idempotency_key=command.idempotency_key,
+                result_id=result.result_id,
+                event_id=result.event_id,
+                request_sha256=result.request_sha256,
+            )
+            .on_conflict_do_nothing(
+                index_elements=[
+                    PblGradingIdempotencyKey.tenant_id,
+                    PblGradingIdempotencyKey.idempotency_key,
+                ]
+            )
+            .returning(PblGradingIdempotencyKey.result_id)
+        )
+        inserted = await session.scalar(statement)
+        if inserted is not None:
+            return
+        existing = await session.scalar(
+            select(PblGradingIdempotencyKey).where(
+                PblGradingIdempotencyKey.tenant_id == tenant_id,
+                PblGradingIdempotencyKey.idempotency_key == command.idempotency_key,
+            )
+        )
+        if existing is None or (
+            existing.result_id,
+            existing.event_id,
+            existing.request_sha256,
+        ) != (
+            result.result_id,
+            result.event_id,
+            result.request_sha256,
+        ):
+            raise PblGradingConflict("PBL grading result conflicts")
 
     async def record(
         self,
@@ -125,6 +181,13 @@ class SqlAlchemyPblGradingRepository:
                 )
                 if learning_session is None:
                     raise PblGradingValidationError("PBL session binding is invalid")
+                classroom_version = await session.scalar(
+                    select(ClassroomVersion)
+                    .where(ClassroomVersion.id == learning_session.classroom_version_id)
+                    .with_for_update()
+                )
+                if classroom_version is None or classroom_version.tenant_id != context.tenant_id:
+                    raise PblGradingValidationError("PBL classroom version is invalid")
                 assignment = None
                 teaching_class = None
                 if learning_session.assignment_id is not None:
@@ -145,6 +208,9 @@ class SqlAlchemyPblGradingRepository:
                     event_session_id=event.session_id,
                     event_user_id=event.user_id,
                     event_classroom_version_id=event.classroom_version_id,
+                    document_version_id=(
+                        classroom_version.source_version_id or classroom_version.id
+                    ),
                     event_type=event.event_type,
                     event_scene_id=event.scene_id,
                     event_knowledge_point_id=event.knowledge_point_id,
@@ -162,10 +228,16 @@ class SqlAlchemyPblGradingRepository:
                     class_id=(assignment.class_id if assignment is not None else None),
                 )
                 require_grading_permission(context, binding)
-                queue_action = projection_queue_action(queue_item.status)
-                existing = await self._existing(session, command)
+                existing = await self._existing(session, context.tenant_id, command)
                 if existing is not None:
+                    await self._bind_idempotency_key(
+                        session,
+                        tenant_id=context.tenant_id,
+                        command=command,
+                        result=existing,
+                    )
                     return existing
+                queue_action = projection_queue_action(queue_item.status)
                 document = await documents.load_version_document(
                     context,
                     learning_session.classroom_version_id,
@@ -186,6 +258,7 @@ class SqlAlchemyPblGradingRepository:
                     session_id=event.session_id,
                     user_id=event.user_id,
                     classroom_version_id=event.classroom_version_id,
+                    document_version_id=evaluation.document_version_id,
                     scene_id=evaluation.scene_id,
                     milestone_id=evaluation.milestone_id,
                     knowledge_point_id=evaluation.knowledge_point_id,
@@ -201,6 +274,13 @@ class SqlAlchemyPblGradingRepository:
                 )
                 session.add(model)
                 await session.flush()
+                record = _record(model)
+                await self._bind_idempotency_key(
+                    session,
+                    tenant_id=context.tenant_id,
+                    command=command,
+                    result=record,
+                )
                 if queue_action in {"requeue", "retry_now"}:
                     queue_item.status = "pending"
                     queue_item.available_at = now
@@ -216,7 +296,7 @@ class SqlAlchemyPblGradingRepository:
                         event_id=event.event_id,
                         received_at=event.received_at,
                     )
-                return _record(model)
+                return record
 
 
 __all__ = ["SqlAlchemyPblGradingRepository"]

@@ -84,9 +84,12 @@ async def _seed_classroom(engine: AsyncEngine, tenant_id: str, schema_name: str)
             text(
                 f"INSERT INTO {quoted}.classroom_versions ("
                 "id, tenant_id, classroom_id, version_number, generation_job_id, "
-                "document_sha256, media_manifest_sha256, document_object_key"
+                "source_version_id, document_sha256, media_manifest_sha256, "
+                "document_object_key"
                 ") VALUES ("
-                "'version-1', :tenant_id, 'asset-1', 1, 'job-1', :sha, :sha, "
+                "'source-version-1', :tenant_id, 'asset-1', 1, 'job-1', NULL, :sha, :sha, "
+                "'tenants/example/classrooms/asset-1/source-version-1/classroom.json'), ("
+                "'version-1', :tenant_id, 'asset-1', 2, NULL, 'source-version-1', :sha, :sha, "
                 "'tenants/example/classrooms/asset-1/version-1/classroom.json')"
             ),
             {"tenant_id": tenant_id, "sha": sha},
@@ -205,7 +208,7 @@ async def _backlog_event_ids(database: ProjectorDatabase) -> list[str]:
 
 def _pbl_document():
     return SimpleNamespace(
-        classroom_version_id="version-1",
+        classroom_version_id="source-version-1",
         openmaic=SimpleNamespace(
             scenes=[
                 SimpleNamespace(
@@ -317,6 +320,32 @@ async def test_postgres_pbl_grading_idempotency_and_first_terminal_result_wins(
         score=0.7,
     )
     assert same_event_new_key.result_id == first.result_id
+
+    await _append_pbl(projector_database, "event-pbl-alias-conflict")
+    with pytest.raises(PblGradingConflict):
+        await _grade_pbl(
+            projector_database,
+            event_id="event-pbl-alias-conflict",
+            idempotency_key="grade-key-2",
+            passed=True,
+            score=0.7,
+        )
+    quoted = f'"{projector_database.schema_name}"'
+    async with projector_database.engine.connect() as connection:
+        aliases = (
+            await connection.execute(
+                text(
+                    f"SELECT idempotency_key, result_id, event_id, request_sha256 FROM "
+                    f"{quoted}.pbl_grading_idempotency_keys "
+                    "WHERE idempotency_key IN ('grade-key-1', 'grade-key-2') "
+                    "ORDER BY idempotency_key"
+                )
+            )
+        ).all()
+    assert aliases == [
+        ("grade-key-1", first.result_id, "event-pbl-idempotent", first.request_sha256),
+        ("grade-key-2", first.result_id, "event-pbl-idempotent", first.request_sha256),
+    ]
 
     with pytest.raises(PblGradingConflict):
         await _grade_pbl(
@@ -571,6 +600,53 @@ async def test_postgres_pbl_grading_never_revives_quarantined_event(
 
 
 @pytest.mark.asyncio
+async def test_postgres_identical_pbl_replay_survives_later_quarantine_without_queue_mutation(
+    projector_database: ProjectorDatabase,
+) -> None:
+    quoted = f'"{projector_database.schema_name}"'
+    await _append_pbl(projector_database, "event-pbl-quarantined-replay")
+    first = await _grade_pbl(
+        projector_database,
+        event_id="event-pbl-quarantined-replay",
+        idempotency_key="grade-quarantine-replay",
+        passed=True,
+    )
+    async with projector_database.engine.begin() as connection:
+        await connection.execute(
+            text(
+                f"UPDATE {quoted}.learning_projection_queue SET status = 'quarantined' "
+                "WHERE event_id = 'event-pbl-quarantined-replay'"
+            )
+        )
+
+    replay = await _grade_pbl(
+        projector_database,
+        event_id="event-pbl-quarantined-replay",
+        idempotency_key="grade-quarantine-replay",
+        passed=True,
+    )
+
+    async with projector_database.engine.connect() as connection:
+        queue_status = await connection.scalar(
+            text(
+                f"SELECT status FROM {quoted}.learning_projection_queue "
+                "WHERE event_id = 'event-pbl-quarantined-replay'"
+            )
+        )
+        backlog_count = await connection.scalar(
+            text(
+                "SELECT count(*) FROM platform.teaching_learning_projection_backlog "
+                "WHERE tenant_id = :tenant_id "
+                "AND event_id = 'event-pbl-quarantined-replay'"
+            ),
+            {"tenant_id": projector_database.tenant_id},
+        )
+    assert replay.result_id == first.result_id
+    assert queue_status == "quarantined"
+    assert backlog_count == 0
+
+
+@pytest.mark.asyncio
 async def test_postgres_pbl_grading_migration_constraints_are_exact(
     projector_database: ProjectorDatabase,
 ) -> None:
@@ -589,6 +665,20 @@ async def test_postgres_pbl_grading_migration_constraints_are_exact(
                 )
             ).all()
         )
+        alias_constraints = dict(
+            (
+                await connection.execute(
+                    text(
+                        "SELECT constraint_name, pg_get_constraintdef(pg_constraint.oid) "
+                        "FROM information_schema.table_constraints JOIN pg_constraint "
+                        "ON pg_constraint.conname = constraint_name "
+                        "WHERE table_schema = :schema_name "
+                        "AND table_name = 'pbl_grading_idempotency_keys'"
+                    ),
+                    {"schema_name": projector_database.schema_name},
+                )
+            ).all()
+        )
     assert "UNIQUE (event_id)" in constraints["uq_pbl_grading_results_event_id"]
     assert (
         "UNIQUE (tenant_id, idempotency_key)"
@@ -599,6 +689,118 @@ async def test_postgres_pbl_grading_migration_constraints_are_exact(
     assert (
         "FOREIGN KEY (event_id)" in constraints["fk_pbl_grading_results_event_id_learning_events"]
     )
+    assert (
+        "FOREIGN KEY (document_version_id)"
+        in constraints["fk_pbl_grading_results_document_version"]
+    )
+    assert (
+        "UNIQUE (id, tenant_id, event_id, request_sha256)"
+        in constraints["uq_pbl_grading_results_alias_binding"]
+    )
+    assert (
+        "PRIMARY KEY (tenant_id, idempotency_key)"
+        in alias_constraints["pk_pbl_grading_idempotency_keys"]
+    )
+    assert (
+        "FOREIGN KEY (result_id, tenant_id, event_id, request_sha256)"
+        in alias_constraints["fk_pbl_grading_idempotency_keys_result"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_postgres_ungraded_pbl_projects_progress_without_loading_document(
+    projector_database: ProjectorDatabase,
+) -> None:
+    from deeptutor.teaching.projector_worker import LearningProjectionWorker
+
+    class Documents:
+        async def load_version_document(self, tenant_id: str, version_id: str):
+            raise AssertionError("ungraded PBL must not load a classroom document")
+
+    await _append_pbl(projector_database, "event-pbl-progress-only")
+    worker = LearningProjectionWorker(
+        engine=projector_database.engine,
+        documents=Documents(),
+        worker_id="projector-pbl-progress",
+    )
+
+    assert await worker.run_once(tenant_id=projector_database.tenant_id) is True
+
+    quoted = f'"{projector_database.schema_name}"'
+    async with projector_database.engine.connect() as connection:
+        state = (
+            await connection.execute(
+                text(
+                    f"SELECT queue.status, progress.last_event_id FROM "
+                    f"{quoted}.learning_projection_queue AS queue JOIN "
+                    f"{quoted}.learning_progress AS progress "
+                    "ON progress.session_id = queue.session_id "
+                    "WHERE queue.event_id = 'event-pbl-progress-only'"
+                )
+            )
+        ).one()
+        evidence_count = await connection.scalar(
+            text(
+                f"SELECT count(*) FROM {quoted}.mastery_evidence "
+                "WHERE event_id = 'event-pbl-progress-only'"
+            )
+        )
+    assert state == ("completed", "event-pbl-progress-only")
+    assert evidence_count == 0
+
+
+@pytest.mark.asyncio
+async def test_postgres_graded_pbl_uses_published_source_lineage_for_mastery(
+    projector_database: ProjectorDatabase,
+) -> None:
+    from deeptutor.teaching.projector_worker import LearningProjectionWorker
+
+    class Documents:
+        def __init__(self) -> None:
+            self.loads: list[tuple[str, str]] = []
+
+        async def load_version_document(self, tenant_id: str, version_id: str):
+            self.loads.append((tenant_id, version_id))
+            return _pbl_document()
+
+    await _append_pbl(projector_database, "event-pbl-source-lineage")
+    result = await _grade_pbl(
+        projector_database,
+        event_id="event-pbl-source-lineage",
+        idempotency_key="grade-source-lineage",
+        passed=True,
+    )
+    documents = Documents()
+    worker = LearningProjectionWorker(
+        engine=projector_database.engine,
+        documents=documents,
+        worker_id="projector-pbl-source",
+    )
+
+    assert await worker.run_once(tenant_id=projector_database.tenant_id) is True
+
+    quoted = f'"{projector_database.schema_name}"'
+    async with projector_database.engine.connect() as connection:
+        lineage = (
+            await connection.execute(
+                text(
+                    f"SELECT classroom_version_id, document_version_id FROM "
+                    f"{quoted}.pbl_grading_results WHERE id = :result_id"
+                ),
+                {"result_id": result.result_id},
+            )
+        ).one()
+        evidence = (
+            await connection.execute(
+                text(
+                    f"SELECT evidence_type, correctness FROM {quoted}.mastery_evidence "
+                    "WHERE event_id = 'event-pbl-source-lineage'"
+                )
+            )
+        ).one()
+    assert documents.loads == [(projector_database.tenant_id, "version-1")]
+    assert lineage == ("version-1", "source-version-1")
+    assert evidence == ("pbl", True)
 
 
 @pytest.mark.asyncio

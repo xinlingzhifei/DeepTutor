@@ -322,9 +322,13 @@ async def test_pbl_without_trusted_grader_or_teacher_result_is_progress_only() -
     assert await projector.mastery("student-a", "kp-1") == 0.4
 
 
-def _pbl_document(*, rubric: str = "Explain the result."):
+def _pbl_document(
+    *,
+    rubric: str = "Explain the result.",
+    version_id: str = "version-a",
+):
     return SimpleNamespace(
-        classroom_version_id="version-a",
+        classroom_version_id=version_id,
         openmaic=SimpleNamespace(
             scenes=[
                 SimpleNamespace(
@@ -373,6 +377,7 @@ def _pbl_evaluation(*, rubric_sha256: str | None = None):
         session_id="session-a",
         user_id="student-a",
         classroom_version_id="version-a",
+        document_version_id="version-a",
         scene_id="pbl-scene",
         milestone_id="milestone-1",
         knowledge_point_id="kp-1",
@@ -425,6 +430,56 @@ async def test_trusted_pbl_result_changes_mastery_once_without_quiz_attempt() ->
     assert await projector.apply(_pbl_event(), document=_pbl_document()) is False
     assert await projector.evidence_count("student-a", "kp-1") == 1
     assert await projector.mastery("student-a", "kp-1") == compute_mastery([True])
+
+
+@pytest.mark.asyncio
+async def test_ungraded_pbl_needs_no_document_and_remains_progress_only() -> None:
+    from deeptutor.teaching.projectors.mastery import MasteryProjector
+
+    class Repository:
+        async def get_pbl_evaluation(self, event):
+            return None
+
+    assert await MasteryProjector(Repository()).apply(_pbl_event(), document=None) is False
+
+
+@pytest.mark.asyncio
+async def test_pbl_result_appearing_after_document_precheck_requests_transient_handoff() -> None:
+    from deeptutor.teaching.projectors.mastery import (
+        MasteryProjector,
+        PblProjectionDocumentRequired,
+    )
+
+    class Repository:
+        async def get_pbl_evaluation(self, event):
+            return _pbl_evaluation()
+
+    with pytest.raises(PblProjectionDocumentRequired, match="pbl_document_required"):
+        await MasteryProjector(Repository()).apply(_pbl_event(), document=None)
+
+
+@pytest.mark.asyncio
+async def test_pbl_projector_accepts_loader_validated_source_lineage_document() -> None:
+    from deeptutor.teaching.projectors.mastery import MasteryProjector
+
+    evaluation = _pbl_evaluation()
+    object.__setattr__(evaluation, "document_version_id", "source-version-a")
+
+    class Repository:
+        async def get_pbl_evaluation(self, event):
+            return evaluation
+
+        async def record_pbl_evidence(self, event, loaded_evaluation):
+            assert loaded_evaluation is evaluation
+            return False
+
+    assert (
+        await MasteryProjector(Repository()).apply(
+            _pbl_event(),
+            document=_pbl_document(version_id="source-version-a"),
+        )
+        is False
+    )
 
 
 def test_projector_revalidates_rubric_hash_before_pbl_mastery() -> None:

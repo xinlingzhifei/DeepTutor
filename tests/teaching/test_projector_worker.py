@@ -83,6 +83,9 @@ async def test_worker_loads_immutable_document_for_pbl_projection() -> None:
     claim = ProjectionClaim(event, "worker-a", "token-a")
 
     class Repository:
+        def __init__(self) -> None:
+            self.prechecked = False
+
         async def active_tenant_ids(self):
             return ("tenant-a",)
 
@@ -92,6 +95,10 @@ async def test_worker_loads_immutable_document_for_pbl_projection() -> None:
         async def heartbeat(self, claimed, *, lease_seconds):
             return None
 
+        async def has_pbl_evaluation(self, event):
+            self.prechecked = True
+            return True
+
         async def project(self, claimed, *, document):
             assert document == "immutable-pbl-document"
 
@@ -100,13 +107,142 @@ async def test_worker_loads_immutable_document_for_pbl_projection() -> None:
             assert (tenant_id, version_id) == ("tenant-a", "version-a")
             return "immutable-pbl-document"
 
+    repository = Repository()
     worker = LearningProjectionWorker(
-        repository=Repository(),
+        repository=repository,
         documents=Documents(),
         worker_id="worker-a",
     )
 
     assert await worker.run_once() is True
+    assert repository.prechecked is True
+
+
+@pytest.mark.asyncio
+async def test_ungraded_pbl_completes_without_loading_an_unavailable_document() -> None:
+    from deeptutor.teaching.projector_worker import LearningProjectionWorker, ProjectionClaim
+    from deeptutor.teaching.projectors.mastery import ProjectionEvent
+
+    event = ProjectionEvent(
+        event_id="event-pbl-ungraded",
+        tenant_id="tenant-a",
+        session_id="session-a",
+        user_id="student-a",
+        classroom_version_id="version-a",
+        seq=2,
+        event_type="pbl.milestone_completed",
+        occurred_at=datetime(2026, 8, 25, 12, 0, tzinfo=UTC),
+        scene_id="pbl-scene",
+        knowledge_point_id="kp-1",
+        payload={"milestone_id": "milestone-1"},
+    )
+    claim = ProjectionClaim(event, "worker-a", "token-a")
+
+    class Repository:
+        def __init__(self) -> None:
+            self.projected = False
+
+        async def active_tenant_ids(self):
+            return ("tenant-a",)
+
+        async def claim(self, tenant_id, *, owner, lease_seconds):
+            return claim
+
+        async def heartbeat(self, claimed, *, lease_seconds):
+            return None
+
+        async def has_pbl_evaluation(self, loaded_event):
+            assert loaded_event is event
+            return False
+
+        async def project(self, claimed, *, document):
+            assert document is None
+            self.projected = True
+
+    class Documents:
+        async def load_version_document(self, tenant_id, version_id):
+            raise AssertionError("ungraded PBL must not load its classroom document")
+
+    repository = Repository()
+    worker = LearningProjectionWorker(
+        repository=repository,
+        documents=Documents(),
+        worker_id="worker-a",
+    )
+
+    assert await worker.run_once() is True
+    assert repository.projected is True
+
+
+@pytest.mark.asyncio
+async def test_pbl_result_precheck_race_reloads_and_reprojects_with_same_maxed_claim() -> None:
+    from deeptutor.teaching.projector_worker import LearningProjectionWorker, ProjectionClaim
+    from deeptutor.teaching.projectors.mastery import (
+        PblProjectionDocumentRequired,
+        ProjectionEvent,
+    )
+
+    event = ProjectionEvent(
+        event_id="event-pbl-race",
+        tenant_id="tenant-a",
+        session_id="session-a",
+        user_id="student-a",
+        classroom_version_id="version-a",
+        seq=2,
+        event_type="pbl.milestone_completed",
+        occurred_at=datetime(2026, 8, 25, 12, 0, tzinfo=UTC),
+        scene_id="pbl-scene",
+        knowledge_point_id="kp-1",
+        payload={"milestone_id": "milestone-1"},
+    )
+    claim = ProjectionClaim(event, "worker-a", "token-a")
+
+    class Repository:
+        def __init__(self) -> None:
+            self.attempt_count = 5
+            self.max_attempts = 5
+            self.actions: list[str] = []
+            self.projected_documents: list[object | None] = []
+
+        async def active_tenant_ids(self):
+            return ("tenant-a",)
+
+        async def claim(self, tenant_id, *, owner, lease_seconds):
+            return claim
+
+        async def heartbeat(self, claimed, *, lease_seconds):
+            return None
+
+        async def has_pbl_evaluation(self, loaded_event):
+            return False
+
+        async def project(self, claimed, *, document):
+            self.projected_documents.append(document)
+            if document is None:
+                raise PblProjectionDocumentRequired("pbl_document_required")
+
+        async def retry(self, claimed, *, error_code):
+            self.actions.append("retry")
+
+        async def quarantine(self, claimed, *, reason_code):
+            self.actions.append("quarantine")
+
+    class Documents:
+        async def load_version_document(self, tenant_id, version_id):
+            assert (tenant_id, version_id) == ("tenant-a", "version-a")
+            return "lineage-validated-document"
+
+    repository = Repository()
+    worker = LearningProjectionWorker(
+        repository=repository,
+        documents=Documents(),
+        worker_id="worker-a",
+    )
+
+    assert await worker.run_once() is True
+    assert repository.projected_documents == [None, "lineage-validated-document"]
+    assert repository.actions == []
+    assert repository.attempt_count == repository.max_attempts == 5
 
 
 @pytest.mark.asyncio

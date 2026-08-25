@@ -302,7 +302,7 @@ class RuntimeStoreProvider:
 
 
 class RuntimeProjectionDocuments:
-    """Load immutable version documents for the internal projector identity."""
+    """Load immutable documents with requested published-to-source lineage validated."""
 
     def __init__(self, settings: PlatformSettings) -> None:
         from deeptutor.teaching.services.classroom_content import (

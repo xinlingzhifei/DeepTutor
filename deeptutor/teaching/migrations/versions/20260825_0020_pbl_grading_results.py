@@ -72,6 +72,7 @@ def _upgrade_tenant() -> None:
         sa.Column("session_id", sa.String(length=128), nullable=False),
         sa.Column("user_id", sa.String(length=128), nullable=False),
         sa.Column("classroom_version_id", sa.String(length=128), nullable=False),
+        sa.Column("document_version_id", sa.String(length=128), nullable=False),
         sa.Column("scene_id", sa.String(length=128), nullable=False),
         sa.Column("milestone_id", sa.String(length=128), nullable=False),
         sa.Column("knowledge_point_id", sa.String(length=128), nullable=False),
@@ -102,6 +103,12 @@ def _upgrade_tenant() -> None:
             ondelete="RESTRICT",
         ),
         sa.ForeignKeyConstraint(
+            ["document_version_id"],
+            ["tenant.classroom_versions.id"],
+            name="fk_pbl_grading_results_document_version",
+            ondelete="RESTRICT",
+        ),
+        sa.ForeignKeyConstraint(
             ["session_id", "tenant_id"],
             ["tenant.learning_sessions.id", "tenant.learning_sessions.tenant_id"],
             name="fk_pbl_grading_results_session_tenant",
@@ -113,6 +120,13 @@ def _upgrade_tenant() -> None:
             "tenant_id",
             "idempotency_key",
             name="uq_pbl_grading_results_tenant_idempotency",
+        ),
+        sa.UniqueConstraint(
+            "id",
+            "tenant_id",
+            "event_id",
+            "request_sha256",
+            name="uq_pbl_grading_results_alias_binding",
         ),
         sa.CheckConstraint(
             "score IS NULL OR (score >= 0 AND score <= 1)",
@@ -168,6 +182,51 @@ def _upgrade_tenant() -> None:
         ["session_id"],
         schema=tenant_schema,
     )
+    op.create_table(
+        "pbl_grading_idempotency_keys",
+        sa.Column("tenant_id", sa.String(length=64), nullable=False),
+        sa.Column("idempotency_key", sa.String(length=128), nullable=False),
+        sa.Column("result_id", sa.String(length=128), nullable=False),
+        sa.Column("event_id", sa.String(length=128), nullable=False),
+        sa.Column("request_sha256", sa.String(length=64), nullable=False),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.ForeignKeyConstraint(
+            ["result_id", "tenant_id", "event_id", "request_sha256"],
+            [
+                "tenant.pbl_grading_results.id",
+                "tenant.pbl_grading_results.tenant_id",
+                "tenant.pbl_grading_results.event_id",
+                "tenant.pbl_grading_results.request_sha256",
+            ],
+            name="fk_pbl_grading_idempotency_keys_result",
+            ondelete="RESTRICT",
+        ),
+        sa.PrimaryKeyConstraint(
+            "tenant_id",
+            "idempotency_key",
+            name="pk_pbl_grading_idempotency_keys",
+        ),
+        sa.CheckConstraint(
+            "length(idempotency_key) > 0",
+            name="ck_pbl_grading_idempotency_keys_idempotency_key",
+        ),
+        sa.CheckConstraint(
+            "request_sha256 ~ '^[0-9a-f]{64}$'",
+            name="ck_pbl_grading_idempotency_keys_request_sha256",
+        ),
+        schema="tenant",
+    )
+    op.create_index(
+        "ix_pbl_grading_idempotency_keys_result",
+        "pbl_grading_idempotency_keys",
+        ["result_id"],
+        schema=tenant_schema,
+    )
     _sync_tenant_schema_revision("20260825_0019", "20260825_0020")
 
 
@@ -181,13 +240,17 @@ def _downgrade_tenant() -> None:
     quoted_schema = f'"{tenant_schema}"'
     connection = op.get_bind()
     connection.execute(
-        sa.text(f"LOCK TABLE {quoted_schema}.pbl_grading_results IN ACCESS EXCLUSIVE MODE")
+        sa.text(
+            f"LOCK TABLE {quoted_schema}.pbl_grading_results, "
+            f"{quoted_schema}.pbl_grading_idempotency_keys IN ACCESS EXCLUSIVE MODE"
+        )
     )
     has_data = connection.execute(
         sa.text(f"SELECT EXISTS (SELECT 1 FROM {quoted_schema}.pbl_grading_results)")
     ).scalar()
     if has_data:
         raise CommandError("cannot downgrade PBL grading: durable facts exist")
+    op.drop_table("pbl_grading_idempotency_keys", schema=tenant_schema)
     op.drop_table("pbl_grading_results", schema=tenant_schema)
     _sync_tenant_schema_revision("20260825_0020", "20260825_0019")
 

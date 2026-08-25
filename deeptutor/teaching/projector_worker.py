@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
 
 from deeptutor.teaching.models import (
+    ClassroomVersion,
     LearningEvent,
     LearningEventQuarantine,
     LearningProgress,
@@ -30,6 +31,7 @@ from deeptutor.teaching.projectors.mastery import (
     DeterministicProjectionError,
     MasteryProjector,
     PblEvaluation,
+    PblProjectionDocumentRequired,
     ProjectionEvent,
     QuizEvaluation,
 )
@@ -56,6 +58,8 @@ class ProjectionClaim:
 
 
 class ProjectionDocuments(Protocol):
+    """Load a document with requested published-to-source lineage validated."""
+
     async def load_version_document(self, tenant_id: str, version_id: str) -> object: ...
 
 
@@ -76,6 +80,8 @@ class ProjectionQueueRepository(Protocol):
         *,
         lease_seconds: int,
     ) -> None: ...
+
+    async def has_pbl_evaluation(self, event: ProjectionEvent) -> bool: ...
 
     async def project_for_memory(
         self,
@@ -198,12 +204,22 @@ class _SessionMasteryRepository:
         )
         if result is None:
             return None
+        version = await self._session.scalar(
+            select(ClassroomVersion).where(
+                ClassroomVersion.id == result.classroom_version_id,
+            )
+        )
+        if version is None or result.document_version_id != (
+            version.source_version_id or version.id
+        ):
+            raise DeterministicProjectionError("pbl_result_document_binding_invalid")
         return PblEvaluation(
             event_id=result.event_id,
             tenant_id=result.tenant_id,
             session_id=result.session_id,
             user_id=result.user_id,
             classroom_version_id=result.classroom_version_id,
+            document_version_id=result.document_version_id,
             scene_id=result.scene_id,
             milestone_id=result.milestone_id,
             knowledge_point_id=result.knowledge_point_id,
@@ -353,6 +369,16 @@ class SqlAlchemyProjectionQueueRepository:
                 for tenant_id, schema_name in rows
                 if schema_name == tenant_schema_name(tenant_id)
             )
+
+    async def has_pbl_evaluation(self, event: ProjectionEvent) -> bool:
+        session_factory = self._tenant_sessions(event.tenant_id)
+        async with session_factory() as session:
+            result_id = await session.scalar(
+                select(PblGradingResult.id).where(
+                    PblGradingResult.event_id == event.event_id,
+                )
+            )
+            return result_id is not None
 
     @staticmethod
     async def _store_quarantine(
@@ -850,6 +876,33 @@ class LearningProjectionWorker:
                     task.cancel()
             await asyncio.gather(memory_task, heartbeat_task, return_exceptions=True)
 
+    async def _project_claim(
+        self,
+        claim: ProjectionClaim,
+        *,
+        document: object | None,
+    ) -> None:
+        if self._memory_projector is None:
+            await self._repository.project(claim, document=document)
+            return
+        aggregate = await self._repository.project_for_memory(
+            claim,
+            document=document,
+        )
+        await self._repository.heartbeat(
+            claim,
+            lease_seconds=self._lease_seconds,
+        )
+        await self._project_memory_with_heartbeat(
+            claim,
+            aggregate=aggregate,
+        )
+        await self._repository.heartbeat(
+            claim,
+            lease_seconds=self._lease_seconds,
+        )
+        await self._repository.complete(claim)
+
     async def run_once(self, *, tenant_id: str | None = None) -> bool:
         if tenant_id is not None:
             tenant_ids = (tenant_id,)
@@ -876,35 +929,26 @@ class LearningProjectionWorker:
                     lease_seconds=self._lease_seconds,
                 )
                 document = None
-                if claim.event.event_type in {
-                    "quiz.graded",
-                    "pbl.milestone_completed",
-                }:
+                if claim.event.event_type == "quiz.graded" or (
+                    claim.event.event_type == "pbl.milestone_completed"
+                    and await self._repository.has_pbl_evaluation(claim.event)
+                ):
                     document = await self._load_document_with_heartbeat(claim)
                 await self._repository.heartbeat(
                     claim,
                     lease_seconds=self._lease_seconds,
                 )
-                if self._memory_projector is None:
-                    await self._repository.project(claim, document=document)
-                else:
-                    aggregate = await self._repository.project_for_memory(
-                        claim,
-                        document=document,
-                    )
+                try:
+                    await self._project_claim(claim, document=document)
+                except PblProjectionDocumentRequired:
+                    if claim.event.event_type != "pbl.milestone_completed" or document is not None:
+                        raise
+                    document = await self._load_document_with_heartbeat(claim)
                     await self._repository.heartbeat(
                         claim,
                         lease_seconds=self._lease_seconds,
                     )
-                    await self._project_memory_with_heartbeat(
-                        claim,
-                        aggregate=aggregate,
-                    )
-                    await self._repository.heartbeat(
-                        claim,
-                        lease_seconds=self._lease_seconds,
-                    )
-                    await self._repository.complete(claim)
+                    await self._project_claim(claim, document=document)
             except DeterministicProjectionError as exc:
                 try:
                     await self._repository.quarantine(

@@ -115,6 +115,7 @@ class PblGradingBinding:
     event_session_id: str
     event_user_id: str
     event_classroom_version_id: str
+    document_version_id: str
     event_type: str
     event_scene_id: str | None
     event_knowledge_point_id: str | None
@@ -131,6 +132,8 @@ class PblGradingBinding:
 
 
 class PblGradingDocumentLoader(Protocol):
+    """Load a document after validating requested published-to-source lineage."""
+
     async def load_version_document(
         self,
         context: TenantContext,
@@ -185,6 +188,7 @@ def derive_pbl_evaluation(
         raise DeterministicProjectionError("pbl_class_authority_missing")
     if (
         binding.event_id == ""
+        or binding.document_version_id == ""
         or binding.event_tenant_id != binding.session_tenant_id
         or binding.event_session_id != binding.session_id
         or binding.event_user_id != binding.session_user_id
@@ -195,7 +199,7 @@ def derive_pbl_evaluation(
         raise DeterministicProjectionError("pbl_event_binding_invalid")
     if binding.event_type != "pbl.milestone_completed":
         raise DeterministicProjectionError("pbl_event_type_invalid")
-    if getattr(document, "classroom_version_id", None) != binding.event_classroom_version_id:
+    if getattr(document, "classroom_version_id", None) != binding.document_version_id:
         raise DeterministicProjectionError("pbl_document_binding_invalid")
     if not binding.event_scene_id:
         raise DeterministicProjectionError("pbl_scene_invalid")
@@ -239,6 +243,7 @@ def derive_pbl_evaluation(
         session_id=binding.event_session_id,
         user_id=binding.event_user_id,
         classroom_version_id=binding.event_classroom_version_id,
+        document_version_id=binding.document_version_id,
         scene_id=binding.event_scene_id,
         milestone_id=milestone_id,
         knowledge_point_id=knowledge_point_id,

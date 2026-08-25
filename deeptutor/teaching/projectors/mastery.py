@@ -18,6 +18,10 @@ class DeterministicProjectionError(RuntimeError):
         self.reason_code = reason_code
 
 
+class PblProjectionDocumentRequired(RuntimeError):
+    """A trusted PBL result appeared after the worker's document precheck."""
+
+
 @dataclass(frozen=True, slots=True)
 class ProjectionEvent:
     event_id: str
@@ -51,6 +55,7 @@ class PblEvaluation:
     session_id: str
     user_id: str
     classroom_version_id: str
+    document_version_id: str
     scene_id: str
     milestone_id: str
     knowledge_point_id: str
@@ -211,7 +216,7 @@ def validate_pbl_evaluation(
         raise DeterministicProjectionError("pbl_result_binding_invalid")
     if event.scene_id is None or event.event_type != "pbl.milestone_completed":
         raise DeterministicProjectionError("pbl_scene_invalid")
-    if getattr(document, "classroom_version_id", None) != event.classroom_version_id:
+    if getattr(document, "classroom_version_id", None) != evaluation.document_version_id:
         raise DeterministicProjectionError("pbl_document_binding_invalid")
     scenes = {
         scene.id: scene for scene in getattr(getattr(document, "openmaic", None), "scenes", ())
@@ -262,9 +267,9 @@ class MasteryProjector:
     async def apply(self, event: ProjectionEvent, *, document: object | None = None) -> bool:
         if event.event_type not in {"quiz.graded", "pbl.milestone_completed"}:
             return False
-        if document is None:
-            raise DeterministicProjectionError("classroom_document_unavailable")
         if event.event_type == "quiz.graded":
+            if document is None:
+                raise DeterministicProjectionError("classroom_document_unavailable")
             evaluation = evaluate_quiz(event, document)
             if evaluation is None:
                 return False
@@ -276,6 +281,8 @@ class MasteryProjector:
             evaluation = await loader(event)
             if evaluation is None:
                 return False
+            if document is None:
+                raise PblProjectionDocumentRequired("pbl_document_required")
             evaluation = validate_pbl_evaluation(event, document, evaluation)
             inserted = await self._repository.record_pbl_evidence(event, evaluation)
         if not inserted:
@@ -304,6 +311,7 @@ __all__ = [
     "DeterministicProjectionError",
     "MasteryProjector",
     "PblEvaluation",
+    "PblProjectionDocumentRequired",
     "ProjectionEvent",
     "QuizEvaluation",
     "evaluate_quiz",

@@ -49,6 +49,7 @@ def _binding(**changes):
         "event_session_id": "session-a",
         "event_user_id": "student-a",
         "event_classroom_version_id": "version-a",
+        "document_version_id": "version-a",
         "event_type": "pbl.milestone_completed",
         "event_scene_id": "scene-a",
         "event_knowledge_point_id": "kp-a",
@@ -107,6 +108,23 @@ def test_valid_teacher_grading_derives_all_authority_from_bound_facts() -> None:
     assert evaluation.rubric_sha256 == (
         "9c5756e892c873a06a1811c597cae4cb07091d33cf224fb0ef990a536175e80c"
     )
+
+
+def test_teacher_grading_accepts_loader_validated_published_to_source_lineage() -> None:
+    from deeptutor.teaching.services.pbl_grading import derive_pbl_evaluation
+
+    binding = _binding()
+    object.__setattr__(binding, "document_version_id", "source-version-a")
+
+    evaluation = derive_pbl_evaluation(
+        binding,
+        _document(version_id="source-version-a"),
+        passed=True,
+        score=None,
+    )
+
+    assert evaluation.classroom_version_id == "version-a"
+    assert evaluation.document_version_id == "source-version-a"
 
 
 @pytest.mark.parametrize(
@@ -261,6 +279,7 @@ class _RepositorySession:
     def __init__(self, *, queue_status: str, fail_backlog: bool = False) -> None:
         from deeptutor.teaching.models import (
             Assignment,
+            ClassroomVersion,
             LearningEvent,
             LearningProjectionQueueItem,
             LearningSession,
@@ -309,6 +328,11 @@ class _RepositorySession:
                 class_id="class-a",
             ),
             TeachingClass: SimpleNamespace(id="class-a", course_id="course-a"),
+            ClassroomVersion: SimpleNamespace(
+                id="version-a",
+                tenant_id="tenant-a",
+                source_version_id=None,
+            ),
             PblGradingResult: None,
         }
         self.now = now
@@ -322,8 +346,14 @@ class _RepositorySession:
         return _AsyncContext(self, transaction=True)
 
     async def scalar(self, statement):
-        entity = statement.column_descriptions[0].get("entity")
+        descriptions = getattr(statement, "column_descriptions", ())
+        entity = descriptions[0].get("entity") if descriptions else None
         if entity is None:
+            table = getattr(statement, "table", None)
+            if table is not None:
+                self.executed_tables.append(table.name)
+                if table.name == "pbl_grading_idempotency_keys":
+                    return "result-a"
             return self.now
         return self.entities.get(entity)
 
@@ -392,7 +422,8 @@ async def test_sql_repository_atomically_requeues_late_completed_event() -> None
     assert session.queue.status == "pending"
     assert session.committed is True
     assert session.rolled_back is False
-    assert len(session.added) == 1
+    assert [type(value).__name__ for value in session.added] == ["PblGradingResult"]
+    assert "pbl_grading_idempotency_keys" in session.executed_tables
 
 
 @pytest.mark.asyncio
@@ -500,6 +531,83 @@ async def test_sql_repository_returns_same_result_without_requeueing_again() -> 
     assert result.result_id == "result-a"
     assert session.queue.status == "completed"
     assert session.added == []
+
+
+@pytest.mark.asyncio
+async def test_sql_repository_returns_identical_result_from_quarantined_queue() -> None:
+    from deeptutor.teaching.models import PblGradingResult
+    from deeptutor.teaching.repositories.pbl_grading import (
+        SqlAlchemyPblGradingRepository,
+    )
+
+    command = _grading_command()
+    session = _RepositorySession(queue_status="quarantined")
+    session.entities[PblGradingResult] = SimpleNamespace(
+        id="result-a",
+        event_id="event-a",
+        correctness=True,
+        score=0.8,
+        source_reference="review-42",
+        grading_source="teacher_review",
+        graded_at=session.now,
+        request_sha256=command.request_sha256,
+    )
+    repository = object.__new__(SqlAlchemyPblGradingRepository)
+    repository._sessions = lambda _tenant_id: _RepositoryFactory(session)
+
+    result = await repository.record(
+        _context(role_scope=ResourceScope("tenant-a", "course-a", "class-a")),
+        session_id="session-a",
+        command=command,
+        documents=_Documents(),
+    )
+
+    assert result.result_id == "result-a"
+    assert session.queue.status == "quarantined"
+    assert "teaching_learning_projection_backlog" not in session.executed_tables
+
+
+@pytest.mark.asyncio
+async def test_sql_repository_persists_a_new_key_alias_for_identical_event_body() -> None:
+    from deeptutor.teaching.models import PblGradingResult
+    from deeptutor.teaching.repositories.pbl_grading import (
+        SqlAlchemyPblGradingRepository,
+    )
+    from deeptutor.teaching.services.pbl_grading import PblGradingCommand
+
+    original = _grading_command()
+    alias = PblGradingCommand(
+        event_id=original.event_id,
+        passed=original.passed,
+        score=original.score,
+        source_reference=original.source_reference,
+        idempotency_key="grade-request-2",
+    )
+    session = _RepositorySession(queue_status="completed")
+    session.entities[PblGradingResult] = SimpleNamespace(
+        id="result-a",
+        event_id="event-a",
+        correctness=True,
+        score=0.8,
+        source_reference="review-42",
+        grading_source="teacher_review",
+        graded_at=session.now,
+        request_sha256=original.request_sha256,
+    )
+    repository = object.__new__(SqlAlchemyPblGradingRepository)
+    repository._sessions = lambda _tenant_id: _RepositoryFactory(session)
+
+    result = await repository.record(
+        _context(role_scope=ResourceScope("tenant-a", "course-a", "class-a")),
+        session_id="session-a",
+        command=alias,
+        documents=_Documents(),
+    )
+
+    assert result.result_id == "result-a"
+    assert session.added == []
+    assert "pbl_grading_idempotency_keys" in session.executed_tables
+    assert session.queue.status == "completed"
 
 
 @pytest.mark.asyncio

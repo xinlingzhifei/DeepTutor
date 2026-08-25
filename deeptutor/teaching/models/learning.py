@@ -293,6 +293,7 @@ class PblGradingResult(TenantBase):
     session_id: Mapped[str] = mapped_column(String(128))
     user_id: Mapped[str] = mapped_column(String(128))
     classroom_version_id: Mapped[str] = mapped_column(String(128))
+    document_version_id: Mapped[str] = mapped_column(String(128))
     scene_id: Mapped[str] = mapped_column(String(128))
     milestone_id: Mapped[str] = mapped_column(String(128))
     knowledge_point_id: Mapped[str] = mapped_column(String(128))
@@ -314,6 +315,12 @@ class PblGradingResult(TenantBase):
             ["classroom_version_id"],
             ["tenant.classroom_versions.id"],
             name="fk_pbl_grading_results_classroom_version",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["document_version_id"],
+            ["tenant.classroom_versions.id"],
+            name="fk_pbl_grading_results_document_version",
             ondelete="RESTRICT",
         ),
         ForeignKeyConstraint(
@@ -347,6 +354,13 @@ class PblGradingResult(TenantBase):
             "idempotency_key",
             name="uq_pbl_grading_results_tenant_idempotency",
         ),
+        UniqueConstraint(
+            "id",
+            "tenant_id",
+            "event_id",
+            "request_sha256",
+            name="uq_pbl_grading_results_alias_binding",
+        ),
         Index(
             "ix_pbl_grading_results_user_knowledge",
             "user_id",
@@ -354,6 +368,42 @@ class PblGradingResult(TenantBase):
             "graded_at",
         ),
         Index("ix_pbl_grading_results_session", "session_id"),
+    )
+
+
+class PblGradingIdempotencyKey(TenantBase):
+    """Permanent tenant-scoped key alias for one immutable PBL result."""
+
+    __tablename__ = "pbl_grading_idempotency_keys"
+
+    tenant_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    idempotency_key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    result_id: Mapped[str] = mapped_column(String(128))
+    event_id: Mapped[str] = mapped_column(String(128))
+    request_sha256: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["result_id", "tenant_id", "event_id", "request_sha256"],
+            [
+                "tenant.pbl_grading_results.id",
+                "tenant.pbl_grading_results.tenant_id",
+                "tenant.pbl_grading_results.event_id",
+                "tenant.pbl_grading_results.request_sha256",
+            ],
+            name="fk_pbl_grading_idempotency_keys_result",
+            ondelete="RESTRICT",
+        ),
+        CheckConstraint("length(idempotency_key) > 0", name="idempotency_key"),
+        CheckConstraint(
+            "request_sha256 ~ '^[0-9a-f]{64}$'",
+            name="request_sha256",
+        ),
+        Index("ix_pbl_grading_idempotency_keys_result", "result_id"),
     )
 
 
