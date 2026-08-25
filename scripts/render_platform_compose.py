@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -37,6 +38,29 @@ COMPOSE_IMAGE_NAMES = {
     ),
     "docker-compose.data-plane.yml": ("openmaic", "openmaic_render"),
 }
+
+
+@dataclass(frozen=True)
+class CandidateArtifactPaths:
+    root: Path
+    image_lock: Path
+    platform_compose: Path
+    data_plane_compose: Path
+
+
+def candidate_artifact_paths(candidate_root: Path) -> CandidateArtifactPaths:
+    """Resolve the fixed file layout of one immutable release artifact."""
+    root = Path(candidate_root)
+    if not root.is_absolute():
+        raise ValueError("candidate root must be an absolute path")
+    root = root.resolve()
+    return CandidateArtifactPaths(
+        root=root,
+        image_lock=root / "deploy" / "image-lock.json",
+        platform_compose=root / "docker-compose.platform.yml",
+        data_plane_compose=root / "docker-compose.data-plane.yml",
+    )
+
 
 IMAGE_SPECS: dict[str, dict[str, Any]] = {
     "deeptutor": {
@@ -381,11 +405,12 @@ def validate_image_lock_bindings(
     images = lock["images"]
     for compose_path in compose_paths:
         path = Path(compose_path)
+        template_path = PROJECT_ROOT / path.name
         try:
             current = path.read_text(encoding="utf-8")
         except (OSError, UnicodeError) as exc:
             raise ValueError(f"production Compose file could not be read: {path.name}") from exc
-        expected = _render_compose_references(path, images)
+        expected = _render_compose_references(template_path, images)
         if current != expected:
             raise ValueError("production Compose image references do not match image lock")
     return lock

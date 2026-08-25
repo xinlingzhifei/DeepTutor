@@ -195,6 +195,24 @@ def test_compose_command_selects_platform_or_isolated_data_plane(monkeypatch) ->
     ]
 
 
+def test_default_compose_command_does_not_load_candidate_artifacts(monkeypatch) -> None:
+    module = _load_module()
+    monkeypatch.setattr(module.shutil, "which", lambda executable: "docker.exe")
+    monkeypatch.setattr(
+        module,
+        "_candidate_paths",
+        lambda _root: (_ for _ in ()).throw(AssertionError("candidate artifacts loaded")),
+    )
+
+    assert module._compose_command(["config"]) == [
+        "docker.exe",
+        "compose",
+        "--env-file",
+        str(module.DOCKER_ENV_PATH),
+        "config",
+    ]
+
+
 def test_data_plane_env_uses_a_hashed_dedicated_secret_directory(tmp_path: Path) -> None:
     module = _load_module()
     settings_dir = tmp_path / "settings"
@@ -238,7 +256,7 @@ def _isolate_production_wrapper_subprocess(module, monkeypatch):
         subprocess_calls.append((command, kwargs))
         return SimpleNamespace(returncode=0)
 
-    monkeypatch.setattr(module, "_validate_production_image_lock", lambda: None)
+    monkeypatch.setattr(module, "_validate_production_image_lock", lambda _candidate_root: None)
     monkeypatch.setattr(
         module,
         "render_docker_env",
@@ -589,6 +607,161 @@ def test_production_wrapper_rejects_legacy_image_lock_before_subprocess(
 
     assert downstream_calls == []
     assert subprocess_calls == []
+
+
+def _write_external_candidate_root(module, tmp_path: Path) -> Path:
+    source_root = Path(__file__).resolve().parents[2]
+    candidate_root = tmp_path / "candidate"
+    deploy_dir = candidate_root / "deploy"
+    deploy_dir.mkdir(parents=True)
+    compose_paths = (
+        candidate_root / "docker-compose.platform.yml",
+        candidate_root / "docker-compose.data-plane.yml",
+    )
+    for source_name, destination in zip(
+        ("docker-compose.platform.yml", "docker-compose.data-plane.yml"),
+        compose_paths,
+        strict=True,
+    ):
+        destination.write_bytes((source_root / source_name).read_bytes())
+    digest_index = 0
+
+    def resolve_digest(_reference: str) -> str:
+        nonlocal digest_index
+        digest_index += 1
+        return "sha256:" + f"{digest_index:064x}"
+
+    source_head = "a" * 40
+    module._load_platform_renderer().write_image_lock(
+        deploy_dir / "image-lock.json",
+        digest_resolver=resolve_digest,
+        compose_paths=compose_paths,
+        source_repository="xinlingzhifei/DeepTutor",
+        source_head=source_head,
+        release_tag=f"yfeistai-first-release-20260825-{source_head[:8]}",
+        openmaic_head="0cf2a330411681190e89f48e20f305345ff99f87",
+    )
+    return candidate_root
+
+
+@pytest.mark.parametrize(
+    ("topology_arguments", "compose_name"),
+    [
+        pytest.param(["--platform"], "docker-compose.platform.yml", id="platform"),
+        pytest.param(
+            ["--data-plane", "tenant-acme"],
+            "docker-compose.data-plane.yml",
+            id="data-plane",
+        ),
+    ],
+)
+def test_production_wrapper_uses_external_candidate_root_without_source_mutation(
+    tmp_path: Path,
+    monkeypatch,
+    topology_arguments: list[str],
+    compose_name: str,
+) -> None:
+    module = _load_module()
+    candidate_root = _write_external_candidate_root(module, tmp_path)
+    source_root = module.PROJECT_ROOT
+    protected_paths = (
+        source_root / "deploy" / "image-lock.json",
+        source_root / "docker-compose.platform.yml",
+        source_root / "docker-compose.data-plane.yml",
+    )
+    before = {path: path.read_bytes() for path in protected_paths}
+    subprocess_calls: list[tuple[list[str], dict[str, object]]] = []
+
+    monkeypatch.setattr(module, "SETTINGS_DIR", tmp_path / "settings")
+    monkeypatch.setattr(module, "DOCKER_ENV_PATH", tmp_path / "settings" / "docker.env")
+    monkeypatch.setattr(
+        module,
+        "render_docker_env",
+        lambda **_kwargs: {
+            "DEEPTUTOR_DOCKER_BACKEND_PORT": "8001",
+            "DEEPTUTOR_DOCKER_FRONTEND_PORT": "3782",
+            "DEEPTUTOR_DOCKER_POCKETBASE_PORT": "8090",
+        },
+    )
+    monkeypatch.setattr(module.shutil, "which", lambda _executable: "docker.exe")
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda command, **kwargs: (
+            subprocess_calls.append((command, kwargs)) or SimpleNamespace(returncode=0)
+        ),
+    )
+
+    assert (
+        module.main(
+            [
+                *topology_arguments,
+                "--candidate-root",
+                str(candidate_root.resolve()),
+                "config",
+            ]
+        )
+        == 0
+    )
+
+    assert len(subprocess_calls) == 1
+    command, options = subprocess_calls[0]
+    assert str(candidate_root / compose_name) in command
+    assert "--candidate-root" not in command
+    assert options["cwd"] == str(source_root)
+    if compose_name == "docker-compose.data-plane.yml":
+        project_directory_index = command.index("--project-directory")
+        assert command[project_directory_index + 1] == str(source_root)
+    assert {path: path.read_bytes() for path in protected_paths} == before
+
+
+@pytest.mark.parametrize(
+    "topology_arguments",
+    [
+        pytest.param(["--platform"], id="platform"),
+        pytest.param(["--data-plane", "tenant-acme"], id="data-plane"),
+    ],
+)
+def test_production_wrapper_rejects_external_candidate_compose_drift_before_subprocess(
+    tmp_path: Path,
+    monkeypatch,
+    topology_arguments: list[str],
+) -> None:
+    module = _load_module()
+    candidate_root = _write_external_candidate_root(module, tmp_path)
+    compose_path = candidate_root / "docker-compose.platform.yml"
+    compose_path.write_text(
+        compose_path.read_text(encoding="utf-8").replace(
+            "ghcr.io/xinlingzhifei/deeptutor:",
+            "ghcr.io/xinlingzhifei/deeptutor-drifted:",
+            1,
+        ),
+        encoding="utf-8",
+    )
+    downstream_calls: list[str] = []
+
+    monkeypatch.setattr(
+        module,
+        "render_docker_env",
+        lambda **_kwargs: downstream_calls.append("render") or {},
+    )
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: downstream_calls.append("subprocess"),
+    )
+
+    with pytest.raises(ValueError, match="production Compose"):
+        module.main(
+            [
+                *topology_arguments,
+                "--candidate-root",
+                str(candidate_root.resolve()),
+                "config",
+            ]
+        )
+
+    assert downstream_calls == []
 
 
 def _compose_service(root: Path, name: str) -> dict:

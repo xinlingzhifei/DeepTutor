@@ -22,7 +22,11 @@ if str(PROJECT_ROOT) not in sys.path:
 if str(SCRIPTS_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_ROOT))
 
-from render_platform_compose import load_image_lock
+from render_platform_compose import (
+    candidate_artifact_paths,
+    load_image_lock,
+    validate_image_lock_bindings,
+)
 
 from deeptutor.teaching.secret_permissions import secret_file_is_restricted
 
@@ -65,6 +69,7 @@ class RuntimePreflightProbe(Protocol):
         secret_dir: Path,
         image_lock_path: Path,
         project_root: Path,
+        candidate_root: Path,
     ) -> tuple[str, ...]: ...
 
 
@@ -74,6 +79,7 @@ async def run_runtime_preflight(
     secret_dir: Path,
     image_lock_path: Path,
     project_root: Path,
+    candidate_root: Path,
     probe: RuntimePreflightProbe | None = None,
 ) -> tuple[str, ...]:
     runtime_probe = probe or DefaultRuntimePreflightProbe()
@@ -82,6 +88,7 @@ async def run_runtime_preflight(
         secret_dir=Path(secret_dir),
         image_lock_path=Path(image_lock_path),
         project_root=Path(project_root),
+        candidate_root=Path(candidate_root),
     )
     return tuple(dict.fromkeys(errors))
 
@@ -350,6 +357,7 @@ class DefaultRuntimePreflightProbe:
         secret_dir: Path,
         image_lock_path: Path,
         project_root: Path,
+        candidate_root: Path,
     ) -> tuple[str, ...]:
         database = await _inspect_database_runtime(settings)
         errors = list(database.errors)
@@ -364,6 +372,7 @@ class DefaultRuntimePreflightProbe:
         errors.extend(
             _inspect_compose_runtime(
                 project_root,
+                candidate_root=candidate_root,
                 image_lock_path=image_lock_path,
             )
         )
@@ -373,10 +382,19 @@ class DefaultRuntimePreflightProbe:
 def _inspect_compose_runtime(
     project_root: Path,
     *,
+    candidate_root: Path | None = None,
     image_lock_path: Path | None = None,
     runner=subprocess.run,
 ) -> tuple[str, ...]:
     root = Path(project_root)
+    artifact_paths = candidate_artifact_paths(candidate_root or root)
+    effective_image_lock_path = (
+        Path(image_lock_path)
+        if image_lock_path is not None
+        else artifact_paths.image_lock
+        if candidate_root is not None
+        else None
+    )
     environment = os.environ.copy()
     environment.pop("COMPOSE_FILE", None)
     environment.pop("COMPOSE_PROFILES", None)
@@ -409,7 +427,7 @@ def _inspect_compose_runtime(
                 "-f",
                 str(root / "docker-compose.yml"),
                 "-f",
-                str(root / "docker-compose.platform.yml"),
+                str(artifact_paths.platform_compose),
                 "config",
                 "--format",
                 "json",
@@ -437,8 +455,8 @@ def _inspect_compose_runtime(
             or gateway_ports != {"80", "443"}
         ):
             errors.append("gateway-only public ports")
-        if image_lock_path is not None:
-            lock = json.loads(Path(image_lock_path).read_text(encoding="utf-8"))
+        if effective_image_lock_path is not None:
+            lock = json.loads(effective_image_lock_path.read_text(encoding="utf-8"))
             images = lock["images"]
             service_images = {
                 "deeptutor": "deeptutor",
@@ -587,24 +605,45 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Validate the private platform deployment")
     parser.add_argument("--config", type=Path, default=Path("deploy/platform.example.json"))
     parser.add_argument("--secret-dir", type=Path, default=Path("data/system/secrets"))
-    parser.add_argument("--image-lock", type=Path, default=Path("deploy/image-lock.json"))
+    parser.add_argument("--candidate-root", type=Path)
+    parser.add_argument("--image-lock", type=Path)
     parser.add_argument("--hostname")
     parser.add_argument("--offline-contract-check", action="store_true")
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    arguments = _parser().parse_args(argv)
+    parser = _parser()
+    arguments = parser.parse_args(argv)
+    if arguments.candidate_root is not None and arguments.image_lock is not None:
+        parser.error("--candidate-root cannot be combined with --image-lock")
+    candidate_root = arguments.candidate_root or PROJECT_ROOT
+    if not candidate_root.is_absolute():
+        parser.error("--candidate-root must be an absolute path")
+    candidate_root = candidate_root.resolve()
+    artifact_paths = candidate_artifact_paths(candidate_root)
+    image_lock_path = arguments.image_lock or artifact_paths.image_lock
     result = run_preflight(
         secret_dir=arguments.secret_dir,
         required_secret_names=(
             () if arguments.offline_contract_check else DEFAULT_REQUIRED_SECRETS
         ),
         tls_hostname=(None if arguments.offline_contract_check else arguments.hostname),
-        image_lock_path=arguments.image_lock,
+        image_lock_path=image_lock_path,
         platform_config_path=arguments.config,
     )
     errors = list(result.errors)
+    try:
+        validate_image_lock_bindings(
+            image_lock_path,
+            compose_paths=(
+                artifact_paths.platform_compose,
+                artifact_paths.data_plane_compose,
+            ),
+            require_candidate=True,
+        )
+    except ValueError:
+        errors.append("image lock candidate")
     if not arguments.offline_contract_check:
         if arguments.hostname is None:
             errors.append("gateway TLS hostname")
@@ -621,8 +660,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                         run_runtime_preflight(
                             settings=settings,
                             secret_dir=arguments.secret_dir,
-                            image_lock_path=arguments.image_lock,
+                            image_lock_path=image_lock_path,
                             project_root=PROJECT_ROOT,
+                            candidate_root=candidate_root,
                         )
                     )
                 )

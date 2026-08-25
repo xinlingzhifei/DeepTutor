@@ -54,14 +54,20 @@ def _load_platform_renderer() -> Any:
     return module
 
 
-def _validate_production_image_lock() -> None:
+def _candidate_paths(candidate_root: Path) -> Any:
     renderer = _load_platform_renderer()
+    return renderer.candidate_artifact_paths(candidate_root)
+
+
+def _validate_production_image_lock(candidate_root: Path) -> None:
+    renderer = _load_platform_renderer()
+    paths = renderer.candidate_artifact_paths(candidate_root)
     renderer.validate_image_lock_bindings(
-        PROJECT_ROOT / "deploy" / "image-lock.json",
+        paths.image_lock,
         require_candidate=True,
         compose_paths=(
-            PROJECT_ROOT / "docker-compose.platform.yml",
-            PROJECT_ROOT / "docker-compose.data-plane.yml",
+            paths.platform_compose,
+            paths.data_plane_compose,
         ),
     )
 
@@ -254,9 +260,10 @@ def render_docker_env(
 
 def _parse_topology_args(
     args: list[str],
-) -> tuple[bool, str | None, list[str]]:
+) -> tuple[bool, str | None, Path | None, list[str]]:
     platform = False
     data_plane: str | None = None
+    candidate_root: Path | None = None
     compose_args: list[str] = []
     index = 0
     while index < len(args):
@@ -273,17 +280,28 @@ def _parse_topology_args(
             data_plane = _validate_data_plane_id(args[index + 1])
             index += 2
             continue
+        if argument == "--candidate-root":
+            if candidate_root is not None or index + 1 >= len(args):
+                raise SystemExit("--candidate-root requires exactly one path")
+            candidate_root = Path(args[index + 1])
+            if not candidate_root.is_absolute():
+                raise SystemExit("--candidate-root must be an absolute path")
+            candidate_root = candidate_root.resolve()
+            index += 2
+            continue
         compose_args.append(argument)
         index += 1
     if platform and data_plane is not None:
         raise SystemExit("--platform and --data-plane are mutually exclusive")
+    if candidate_root is not None and not (platform or data_plane is not None):
+        raise SystemExit("--candidate-root requires --platform or --data-plane")
     if platform or data_plane is not None:
         _validate_production_compose_args(
             platform=platform,
             data_plane=data_plane,
             compose_args=compose_args,
         )
-    return platform, data_plane, compose_args
+    return platform, data_plane, candidate_root, compose_args
 
 
 def _validate_production_compose_args(
@@ -327,24 +345,28 @@ def _compose_command(args: list[str]) -> list[str]:
     docker = shutil.which("docker")
     if not docker:
         raise SystemExit("docker was not found on PATH")
-    platform, data_plane, compose_args = _parse_topology_args(args)
+    platform, data_plane, candidate_root, compose_args = _parse_topology_args(args)
     command = [docker, "compose", "--env-file", str(DOCKER_ENV_PATH)]
     if platform:
+        artifact_paths = _candidate_paths(candidate_root or PROJECT_ROOT)
         command.extend(
             (
                 "-f",
                 str(PROJECT_ROOT / "docker-compose.yml"),
                 "-f",
-                str(PROJECT_ROOT / "docker-compose.platform.yml"),
+                str(artifact_paths.platform_compose),
             )
         )
     elif data_plane is not None:
+        artifact_paths = _candidate_paths(candidate_root or PROJECT_ROOT)
         command.extend(
             (
+                "--project-directory",
+                str(PROJECT_ROOT),
                 "--project-name",
                 f"yfeistai-{data_plane}",
                 "-f",
-                str(PROJECT_ROOT / "docker-compose.data-plane.yml"),
+                str(artifact_paths.data_plane_compose),
             )
         )
     command.extend(compose_args)
@@ -356,9 +378,9 @@ def main(argv: list[str] | None = None) -> int:
     if not args:
         args = ["up", "-d"]
 
-    platform, data_plane, _ = _parse_topology_args(args)
+    platform, data_plane, candidate_root, _ = _parse_topology_args(args)
     if platform or data_plane is not None:
-        _validate_production_image_lock()
+        _validate_production_image_lock(candidate_root or PROJECT_ROOT)
     values = render_docker_env(data_plane=data_plane)
     print(
         "Docker settings: "

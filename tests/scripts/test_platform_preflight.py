@@ -15,6 +15,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 from pydantic import SecretStr
+import pytest
 
 import deeptutor.services.config as config_module
 from deeptutor.services.config import PlatformSettings
@@ -253,6 +254,254 @@ def test_main_rejects_legacy_image_lock_before_runtime_probes(
     assert runtime_calls == []
 
 
+def _write_preflight_candidate_root(tmp_path: Path) -> Path:
+    renderer_path = ROOT / "scripts" / "render_platform_compose.py"
+    spec = importlib.util.spec_from_file_location(
+        "render_platform_compose_for_preflight_candidate_test",
+        renderer_path,
+    )
+    assert spec and spec.loader
+    renderer = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = renderer
+    try:
+        spec.loader.exec_module(renderer)
+    finally:
+        sys.modules.pop(spec.name, None)
+    candidate_root = tmp_path / "candidate"
+    deploy_dir = candidate_root / "deploy"
+    deploy_dir.mkdir(parents=True)
+    compose_paths = (
+        candidate_root / "docker-compose.platform.yml",
+        candidate_root / "docker-compose.data-plane.yml",
+    )
+    for source_name, destination in zip(
+        ("docker-compose.platform.yml", "docker-compose.data-plane.yml"),
+        compose_paths,
+        strict=True,
+    ):
+        destination.write_bytes((ROOT / source_name).read_bytes())
+    digest_index = 0
+
+    def resolve_digest(_reference: str) -> str:
+        nonlocal digest_index
+        digest_index += 1
+        return "sha256:" + f"{digest_index:064x}"
+
+    source_head = "a" * 40
+    renderer.write_image_lock(
+        deploy_dir / "image-lock.json",
+        digest_resolver=resolve_digest,
+        compose_paths=compose_paths,
+        source_repository="xinlingzhifei/DeepTutor",
+        source_head=source_head,
+        release_tag=f"yfeistai-first-release-20260825-{source_head[:8]}",
+        openmaic_head="0cf2a330411681190e89f48e20f305345ff99f87",
+    )
+    return candidate_root
+
+
+def test_main_uses_external_candidate_root_for_lock_and_runtime_compose(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = _module()
+    candidate_root = _write_preflight_candidate_root(tmp_path)
+    calls: dict[str, dict[str, object]] = {}
+
+    def record_static(**kwargs) -> object:
+        calls["static"] = kwargs
+        return module.PreflightResult(())
+
+    async def record_runtime(**kwargs) -> tuple[str, ...]:
+        calls["runtime"] = kwargs
+        return ()
+
+    monkeypatch.setattr(module, "run_preflight", record_static)
+    monkeypatch.setattr(module, "run_runtime_preflight", record_runtime)
+    monkeypatch.setattr(config_module, "load_platform_settings", lambda _path: object())
+
+    assert (
+        module.main(
+            [
+                "--config",
+                str(ROOT / "deploy" / "platform.example.json"),
+                "--secret-dir",
+                str(tmp_path / "secrets"),
+                "--candidate-root",
+                str(candidate_root.resolve()),
+                "--hostname",
+                "classroom.example.com",
+            ]
+        )
+        == 0
+    )
+
+    expected_lock = candidate_root / "deploy" / "image-lock.json"
+    assert calls["static"]["image_lock_path"] == expected_lock
+    assert calls["runtime"]["image_lock_path"] == expected_lock
+    assert calls["runtime"]["candidate_root"] == candidate_root
+    assert calls["runtime"]["project_root"] == module.PROJECT_ROOT
+
+
+def test_main_rejects_mixed_candidate_root_before_runtime_probes(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    module = _module()
+    candidate_root = _write_preflight_candidate_root(tmp_path)
+    calls: list[str] = []
+    monkeypatch.setattr(
+        module,
+        "run_preflight",
+        lambda **_kwargs: calls.append("static") or module.PreflightResult(()),
+    )
+    monkeypatch.setattr(
+        module,
+        "run_runtime_preflight",
+        lambda **_kwargs: calls.append("runtime") or (),
+    )
+
+    with pytest.raises(SystemExit):
+        module.main(
+            [
+                "--candidate-root",
+                str(candidate_root),
+                "--image-lock",
+                str(tmp_path / "another-lock.json"),
+                "--offline-contract-check",
+            ]
+        )
+
+    assert "--candidate-root cannot be combined with --image-lock" in capsys.readouterr().err
+    assert calls == []
+
+
+def test_main_rejects_external_candidate_compose_drift_before_runtime_probes(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    module = _module()
+    candidate_root = _write_preflight_candidate_root(tmp_path)
+    data_plane_compose = candidate_root / "docker-compose.data-plane.yml"
+    data_plane_compose.write_text(
+        data_plane_compose.read_text(encoding="utf-8").replace(
+            "    restart: unless-stopped",
+            "    restart: always",
+            1,
+        ),
+        encoding="utf-8",
+    )
+    runtime_calls: list[str] = []
+
+    async def record_runtime(**_kwargs) -> tuple[str, ...]:
+        runtime_calls.append("runtime")
+        return ()
+
+    monkeypatch.setattr(
+        module,
+        "run_preflight",
+        lambda **_kwargs: module.PreflightResult(()),
+    )
+    monkeypatch.setattr(
+        module,
+        "run_runtime_preflight",
+        record_runtime,
+    )
+    monkeypatch.setattr(config_module, "load_platform_settings", lambda _path: object())
+
+    assert (
+        module.main(
+            [
+                "--config",
+                str(ROOT / "deploy" / "platform.example.json"),
+                "--secret-dir",
+                str(tmp_path / "secrets"),
+                "--candidate-root",
+                str(candidate_root),
+                "--hostname",
+                "classroom.example.com",
+            ]
+        )
+        == 1
+    )
+
+    assert "image lock candidate" in capsys.readouterr().out
+    assert runtime_calls == []
+
+
+def test_runtime_compose_probe_uses_external_candidate_root(
+    tmp_path: Path,
+) -> None:
+    module = _module()
+    candidate_root = _write_preflight_candidate_root(tmp_path)
+    lock_path = candidate_root / "deploy" / "image-lock.json"
+    images = json.loads(lock_path.read_text(encoding="utf-8"))["images"]
+    commands: list[list[str]] = []
+
+    def runner(command, **_kwargs):
+        commands.append(command)
+        if command[-2:] == ["version", "--short"]:
+            return subprocess.CompletedProcess(command, 0, "2.24.4\n", "")
+        services = {
+            "gateway": {
+                "image": images["nginx"]["reference"],
+                "ports": [{"published": "80"}, {"published": "443"}],
+            },
+            "deeptutor": {"image": images["deeptutor"]["reference"]},
+            "minio": {"image": images["minio"]["reference"]},
+            "minio-bootstrap": {"image": images["minio_client"]["reference"]},
+            "openmaic": {"image": images["openmaic"]["reference"]},
+            "openmaic-render": {"image": images["openmaic_render"]["reference"]},
+            "postgres": {"image": images["postgres"]["reference"]},
+        }
+        return subprocess.CompletedProcess(command, 0, json.dumps({"services": services}), "")
+
+    assert (
+        module._inspect_compose_runtime(
+            ROOT,
+            candidate_root=candidate_root,
+            image_lock_path=lock_path,
+            runner=runner,
+        )
+        == ()
+    )
+    assert str(candidate_root / "docker-compose.platform.yml") in commands[1]
+
+
+def test_runtime_compose_probe_defaults_to_external_candidate_lock(
+    tmp_path: Path,
+) -> None:
+    module = _module()
+    candidate_root = _write_preflight_candidate_root(tmp_path)
+    lock_path = candidate_root / "deploy" / "image-lock.json"
+    images = json.loads(lock_path.read_text(encoding="utf-8"))["images"]
+
+    def runner(command, **_kwargs):
+        if command[-2:] == ["version", "--short"]:
+            return subprocess.CompletedProcess(command, 0, "2.24.4\n", "")
+        services = {
+            "gateway": {
+                "image": images["nginx"]["reference"],
+                "ports": [{"published": "80"}, {"published": "443"}],
+            },
+            "deeptutor": {"image": "ghcr.io/xinlingzhifei/deeptutor@sha256:" + "f" * 64},
+            "minio": {"image": images["minio"]["reference"]},
+            "minio-bootstrap": {"image": images["minio_client"]["reference"]},
+            "openmaic": {"image": images["openmaic"]["reference"]},
+            "openmaic-render": {"image": images["openmaic_render"]["reference"]},
+            "postgres": {"image": images["postgres"]["reference"]},
+        }
+        return subprocess.CompletedProcess(command, 0, json.dumps({"services": services}), "")
+
+    assert module._inspect_compose_runtime(
+        ROOT,
+        candidate_root=candidate_root,
+        runner=runner,
+    ) == ("image lock match",)
+
+
 def test_preflight_rejects_capacity_settings_outside_release_contract(
     tmp_path: Path,
 ) -> None:
@@ -295,7 +544,7 @@ def test_runtime_preflight_fails_closed_for_every_required_dependency(
         "Docker Compose version",
         "gateway-only public ports",
     )
-    calls: list[tuple[Path, Path, Path]] = []
+    calls: list[tuple[Path, Path, Path, Path]] = []
 
     class Probe:
         async def inspect(
@@ -305,9 +554,10 @@ def test_runtime_preflight_fails_closed_for_every_required_dependency(
             secret_dir: Path,
             image_lock_path: Path,
             project_root: Path,
+            candidate_root: Path,
         ) -> tuple[str, ...]:
             assert settings.enabled is True
-            calls.append((secret_dir, image_lock_path, project_root))
+            calls.append((secret_dir, image_lock_path, project_root, candidate_root))
             return expected
 
     settings = PlatformSettings(
@@ -327,12 +577,13 @@ def test_runtime_preflight_fails_closed_for_every_required_dependency(
             secret_dir=tmp_path,
             image_lock_path=lock_path,
             project_root=ROOT,
+            candidate_root=ROOT,
             probe=Probe(),
         )
     )
 
     assert errors == expected
-    assert calls == [(tmp_path, lock_path, ROOT)]
+    assert calls == [(tmp_path, lock_path, ROOT, ROOT)]
 
 
 def test_runtime_compose_probe_rejects_old_cli_and_non_gateway_ports(
