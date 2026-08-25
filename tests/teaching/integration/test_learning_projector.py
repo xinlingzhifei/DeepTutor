@@ -455,6 +455,7 @@ async def test_postgres_pbl_grading_rolls_back_if_backlog_restore_conflicts(
 
     quoted = f'"{projector_database.schema_name}"'
     await _append_pbl(projector_database, "event-pbl-rollback")
+    stale_received_at = datetime(2026, 8, 1, 9, 30, tzinfo=UTC)
     async with projector_database.engine.begin() as connection:
         await connection.execute(
             text(
@@ -462,28 +463,60 @@ async def test_postgres_pbl_grading_rolls_back_if_backlog_restore_conflicts(
                 "WHERE event_id = 'event-pbl-rollback'"
             )
         )
+    async with projector_database.engine.begin() as connection:
+        await connection.execute(
+            text(
+                "INSERT INTO platform.teaching_learning_projection_backlog "
+                "(tenant_id, event_id, received_at) VALUES "
+                "(:tenant_id, 'event-pbl-rollback', :received_at)"
+            ),
+            {
+                "tenant_id": projector_database.tenant_id,
+                "received_at": stale_received_at,
+            },
+        )
 
-    with pytest.raises(IntegrityError):
+    with pytest.raises(IntegrityError) as caught:
         await _grade_pbl(
             projector_database,
             event_id="event-pbl-rollback",
             idempotency_key="grade-rollback",
             passed=True,
         )
+    database_error = caught.value.orig
+    assert getattr(database_error, "sqlstate", None) == "23505"
+    assert "pk_teaching_learning_projection_backlog" in str(database_error)
 
     async with projector_database.engine.connect() as connection:
-        state = (
+        queue_status = await connection.scalar(
+            text(
+                f"SELECT status FROM {quoted}.learning_projection_queue "
+                "WHERE event_id = 'event-pbl-rollback'"
+            )
+        )
+        result_count = await connection.scalar(
+            text(
+                f"SELECT count(*) FROM {quoted}.pbl_grading_results "
+                "WHERE event_id = 'event-pbl-rollback'"
+            )
+        )
+        backlog = (
             await connection.execute(
                 text(
-                    f"SELECT queue.status, count(result.id) FROM "
-                    f"{quoted}.learning_projection_queue AS queue LEFT JOIN "
-                    f"{quoted}.pbl_grading_results AS result "
-                    "ON result.event_id = queue.event_id "
-                    "WHERE queue.event_id = 'event-pbl-rollback' GROUP BY queue.status"
-                )
+                    "SELECT tenant_id, event_id, received_at FROM "
+                    "platform.teaching_learning_projection_backlog "
+                    "WHERE tenant_id = :tenant_id AND event_id = 'event-pbl-rollback'"
+                ),
+                {"tenant_id": projector_database.tenant_id},
             )
         ).one()
-    assert state == ("completed", 0)
+    assert queue_status == "completed"
+    assert result_count == 0
+    assert backlog == (
+        projector_database.tenant_id,
+        "event-pbl-rollback",
+        stale_received_at,
+    )
 
 
 @pytest.mark.asyncio
