@@ -730,6 +730,23 @@ class SqlAlchemyProjectionQueueRepository:
         async with session_factory() as session:
             async with session.begin():
                 item, event = await self._locked_claim(session, claim)
+                if event.event_type == "pbl.milestone_completed":
+                    result_id = await session.scalar(
+                        select(PblGradingResult.id).where(
+                            PblGradingResult.event_id == event.event_id,
+                            PblGradingResult.tenant_id == event.tenant_id,
+                        )
+                    )
+                    if result_id is not None:
+                        evidence_id = await session.scalar(
+                            select(MasteryEvidence.id).where(
+                                MasteryEvidence.event_id == event.event_id,
+                                MasteryEvidence.tenant_id == event.tenant_id,
+                                MasteryEvidence.evidence_type == "pbl",
+                            )
+                        )
+                        if evidence_id is None:
+                            raise PblProjectionDocumentRequired("pbl_document_required")
                 item.status = "completed"
                 item.last_error_code = None
                 _clear_lease(item)

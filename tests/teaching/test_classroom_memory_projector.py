@@ -522,6 +522,111 @@ async def test_learning_worker_projects_database_then_memory_before_completion()
 
 
 @pytest.mark.asyncio
+async def test_learning_worker_reprojects_pbl_on_memory_completion_handoff_same_claim() -> None:
+    from deeptutor.teaching.projector_worker import LearningProjectionWorker, ProjectionClaim
+    from deeptutor.teaching.projectors.mastery import PblProjectionDocumentRequired
+    from deeptutor.teaching.projectors.memory import ClassroomMemoryAggregate
+
+    event = ProjectionEvent(
+        event_id="event-pbl-memory-race",
+        tenant_id="tenant-a",
+        session_id="session-a",
+        user_id="student-a",
+        classroom_version_id="version-a",
+        seq=1,
+        event_type="pbl.milestone_completed",
+        occurred_at=datetime(2026, 8, 25, 8, 0, tzinfo=UTC),
+        payload={"milestone_id": "milestone-1"},
+        scene_id="pbl-scene",
+        knowledge_point_id="kp-1",
+    )
+    claim = ProjectionClaim(event, "worker-a", "token-a")
+    progress_only = ClassroomMemoryAggregate("completed", 1, 0, 0, ())
+    graded = ClassroomMemoryAggregate("completed", 1, 0, 0, ("kp-1",))
+
+    class Repository:
+        def __init__(self) -> None:
+            self.attempt_count = 5
+            self.max_attempts = 5
+            self.projected: list[tuple[ProjectionClaim, object | None]] = []
+            self.completed: list[ProjectionClaim] = []
+            self.actions: list[str] = []
+
+        async def active_tenant_ids(self):
+            return ("tenant-a",)
+
+        async def claim(self, *args, **kwargs):
+            return claim
+
+        async def heartbeat(self, claimed, **kwargs):
+            assert claimed is claim
+
+        async def has_pbl_evaluation(self, loaded_event):
+            assert loaded_event is event
+            return False
+
+        async def project_for_memory(self, claimed, *, document):
+            assert claimed is claim
+            self.projected.append((claimed, document))
+            return progress_only if document is None else graded
+
+        async def complete(self, claimed):
+            assert claimed is claim
+            self.completed.append(claimed)
+            if len(self.completed) == 1:
+                raise PblProjectionDocumentRequired("pbl_document_required")
+
+        async def retry(self, *args, **kwargs):
+            self.actions.append("retry")
+
+        async def quarantine(self, *args, **kwargs):
+            self.actions.append("quarantine")
+
+    class Memory:
+        def __init__(self) -> None:
+            self.aggregates: list[ClassroomMemoryAggregate] = []
+
+        async def project(self, claimed_event, *, aggregate, target_path_service):
+            assert claimed_event is event
+            assert target_path_service == "target-student-a"
+            self.aggregates.append(aggregate)
+
+    class Targets:
+        def path_service_for_user(self, user_id):
+            return f"target-{user_id}"
+
+    class Documents:
+        def __init__(self) -> None:
+            self.loads: list[tuple[str, str]] = []
+
+        async def load_version_document(self, tenant_id, version_id):
+            self.loads.append((tenant_id, version_id))
+            return "lineage-validated-document"
+
+    repository = Repository()
+    memory = Memory()
+    documents = Documents()
+    worker = LearningProjectionWorker(
+        repository=repository,
+        documents=documents,
+        worker_id="worker-a",
+        memory_projector=memory,
+        memory_targets=Targets(),
+    )
+
+    assert await worker.run_once() is True
+    assert repository.projected == [
+        (claim, None),
+        (claim, "lineage-validated-document"),
+    ]
+    assert repository.completed == [claim, claim]
+    assert memory.aggregates == [progress_only, graded]
+    assert documents.loads == [("tenant-a", "version-a")]
+    assert repository.attempt_count == repository.max_attempts == 5
+    assert repository.actions == []
+
+
+@pytest.mark.asyncio
 async def test_learning_worker_retries_memory_failure_without_database_completion() -> None:
     from deeptutor.teaching.projector_worker import LearningProjectionWorker, ProjectionClaim
     from deeptutor.teaching.projectors.memory import ClassroomMemoryAggregate

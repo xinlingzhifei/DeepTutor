@@ -152,7 +152,11 @@ async def test_every_claim_terminal_path_deletes_the_exact_backlog_row(
         session = _Session()
         repository = _repository(session)
         item = _item(attempt_count=2, max_attempts=2)
-        stored_event = SimpleNamespace(tenant_id="tenant-a", event_id=event_id)
+        stored_event = SimpleNamespace(
+            tenant_id="tenant-a",
+            event_id=event_id,
+            event_type="classroom.started",
+        )
 
         async def locked(_session, _claim_value):
             return item, stored_event
@@ -226,6 +230,79 @@ async def test_retry_retains_backlog_and_lost_lease_cannot_delete_it(
     monkeypatch.setattr(repository, "_locked_claim", lease_lost)
     with pytest.raises(ProjectionLeaseLost, match="reclaimed"):
         await repository.complete(_claim("event-stale"))
+
+
+@pytest.mark.asyncio
+async def test_complete_holds_claim_and_requires_pbl_projection_before_terminalizing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import deeptutor.teaching.projector_worker as worker_module
+    from deeptutor.teaching.projectors.mastery import PblProjectionDocumentRequired
+
+    calls: list[str] = []
+
+    class Session(_Session):
+        def __init__(self) -> None:
+            super().__init__()
+            self.scalar_values = iter(("result-pbl", None))
+
+        async def scalar(self, statement):
+            sql = str(statement.compile()).lower()
+            calls.append(
+                "pbl_grading_results" if "pbl_grading_results" in sql else "mastery_evidence"
+            )
+            return next(self.scalar_values)
+
+    async def unexpected_delete(*_args, **_kwargs) -> None:
+        raise AssertionError("unprojected trusted PBL result must retain backlog")
+
+    monkeypatch.setattr(
+        worker_module,
+        "delete_learning_projection_backlog",
+        unexpected_delete,
+        raising=False,
+    )
+    session = Session()
+    repository = _repository(session)
+    item = _item(attempt_count=5, max_attempts=5)
+    event = SimpleNamespace(
+        tenant_id="tenant-a",
+        event_id="event-pbl-race",
+        event_type="pbl.milestone_completed",
+    )
+
+    async def locked(_session, claim_value):
+        assert claim_value.event.event_id == event.event_id
+        calls.append("queue_lock")
+        return item, event
+
+    monkeypatch.setattr(repository, "_locked_claim", locked)
+    claim = ProjectionClaim(
+        event=ProjectionEvent(
+            event_id=event.event_id,
+            tenant_id=event.tenant_id,
+            session_id="session-a",
+            user_id="student-a",
+            classroom_version_id="version-a",
+            seq=1,
+            event_type=event.event_type,
+            occurred_at=datetime(2026, 8, 25, 1, 2, 3, tzinfo=UTC),
+            scene_id="pbl-scene",
+            knowledge_point_id="kp-1",
+            payload={"milestone_id": "milestone-1"},
+        ),
+        lease_owner="worker-a",
+        lease_token="token-a",
+    )
+
+    with pytest.raises(PblProjectionDocumentRequired, match="pbl_document_required"):
+        await repository.complete(claim)
+
+    assert item.status == "running"
+    assert item.attempt_count == item.max_attempts == 5
+    assert item.lease_owner == claim.lease_owner
+    assert item.lease_token == claim.lease_token
+    assert calls == ["queue_lock", "pbl_grading_results", "mastery_evidence"]
 
 
 @pytest.mark.asyncio

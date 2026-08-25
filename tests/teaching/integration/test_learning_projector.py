@@ -804,6 +804,124 @@ async def test_postgres_graded_pbl_uses_published_source_lineage_for_mastery(
 
 
 @pytest.mark.asyncio
+async def test_postgres_memory_projection_closes_late_pbl_grade_race_on_same_maxed_claim(
+    projector_database: ProjectorDatabase,
+) -> None:
+    from deeptutor.teaching.projector_worker import LearningProjectionWorker
+
+    class Documents:
+        def __init__(self) -> None:
+            self.loads: list[tuple[str, str]] = []
+
+        async def load_version_document(self, tenant_id: str, version_id: str):
+            self.loads.append((tenant_id, version_id))
+            return _pbl_document()
+
+    class Memory:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.aggregates: list[object] = []
+
+        async def project(self, event, *, aggregate, target_path_service):
+            assert event.event_id == "event-pbl-memory-race"
+            assert target_path_service == "target-student-1"
+            self.aggregates.append(aggregate)
+            if len(self.aggregates) == 1:
+                self.started.set()
+                await self.release.wait()
+
+    class Targets:
+        def path_service_for_user(self, user_id: str):
+            return f"target-{user_id}"
+
+    await _append_pbl(projector_database, "event-pbl-memory-race")
+    quoted = f'"{projector_database.schema_name}"'
+    async with projector_database.engine.begin() as connection:
+        await connection.execute(
+            text(
+                f"UPDATE {quoted}.learning_projection_queue SET max_attempts = 1 "
+                "WHERE event_id = 'event-pbl-memory-race'"
+            )
+        )
+
+    documents = Documents()
+    memory = Memory()
+    worker = LearningProjectionWorker(
+        engine=projector_database.engine,
+        documents=documents,
+        worker_id="projector-pbl-memory-race",
+        memory_projector=memory,
+        memory_targets=Targets(),
+    )
+    work = asyncio.create_task(worker.run_once(tenant_id=projector_database.tenant_id))
+    try:
+        await asyncio.wait_for(memory.started.wait(), timeout=5)
+        await asyncio.wait_for(
+            _grade_pbl(
+                projector_database,
+                event_id="event-pbl-memory-race",
+                idempotency_key="grade-memory-race",
+                passed=False,
+            ),
+            timeout=5,
+        )
+    finally:
+        memory.release.set()
+    assert await asyncio.wait_for(work, timeout=5) is True
+
+    async with projector_database.engine.connect() as connection:
+        queue = (
+            await connection.execute(
+                text(
+                    f"SELECT status, attempt_count, max_attempts, last_error_code "
+                    f"FROM {quoted}.learning_projection_queue "
+                    "WHERE event_id = 'event-pbl-memory-race'"
+                )
+            )
+        ).one()
+        evidence = (
+            await connection.execute(
+                text(
+                    f"SELECT evidence_type, correctness FROM {quoted}.mastery_evidence "
+                    "WHERE event_id = 'event-pbl-memory-race'"
+                )
+            )
+        ).all()
+        quiz_count = await connection.scalar(
+            text(
+                f"SELECT count(*) FROM {quoted}.quiz_attempts "
+                "WHERE event_id = 'event-pbl-memory-race'"
+            )
+        )
+        mastery = (
+            await connection.execute(
+                text(
+                    f"SELECT level, evidence_count FROM {quoted}.mastery_levels "
+                    "WHERE user_id = 'student-1' AND knowledge_point_id = 'kp-1'"
+                )
+            )
+        ).one()
+        quarantine_count = await connection.scalar(
+            text(
+                f"SELECT count(*) FROM {quoted}.learning_event_quarantine "
+                "WHERE event_id = 'event-pbl-memory-race'"
+            )
+        )
+
+    assert tuple(queue) == ("completed", 1, 1, None)
+    assert evidence == [("pbl", False)]
+    assert quiz_count == 0
+    assert tuple(mastery) == (compute_mastery([False]), 1)
+    assert quarantine_count == 0
+    assert await _backlog_event_ids(projector_database) == []
+    assert documents.loads == [(projector_database.tenant_id, "version-1")]
+    assert len(memory.aggregates) == 2
+    assert memory.aggregates[0].difficult_knowledge_points == ()
+    assert memory.aggregates[1].difficult_knowledge_points == ("kp-1",)
+
+
+@pytest.mark.asyncio
 async def test_worker_projects_distinct_progress_and_server_graded_mastery_atomically(
     projector_database: ProjectorDatabase,
 ) -> None:
