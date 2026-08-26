@@ -178,6 +178,29 @@ test("live URL resolution rejects missing, invalid, and loopback inputs safely",
   }
 });
 
+test("live URL resolution rejects IPv4-mapped IPv6 127/8 candidates", () => {
+  const candidates = [
+    "http://[::ffff:127.0.0.1]",
+    "http://[::ffff:127.42.3.4]",
+  ] as const;
+  const accepted = candidates.filter((candidate) => {
+    try {
+      resolveLiveBaseUrl(true, candidate);
+      return true;
+    } catch (error) {
+      assert.ok(error instanceof Error);
+      assert.equal(
+        error.message,
+        "WEB_BASE_URL must identify a non-loopback HTTP(S) host",
+      );
+      assert.equal(error.message.includes(candidate), false);
+      return false;
+    }
+  });
+
+  assert.deepEqual(accepted, []);
+});
+
 test("live URL resolution accepts a remote HTTPS URL", () => {
   assert.equal(
     resolveLiveBaseUrl(
@@ -185,5 +208,9 @@ test("live URL resolution accepts a remote HTTPS URL", () => {
       "  https://candidate.example.test/release?token=remote-allowed  ",
     ),
     "https://candidate.example.test/release?token=remote-allowed",
+  );
+  assert.equal(
+    resolveLiveBaseUrl(true, "https://[2001:db8::1]/release"),
+    "https://[2001:db8::1]/release",
   );
 });

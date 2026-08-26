@@ -33,6 +33,7 @@ function isLoopbackHostname(hostname: string): boolean {
     normalizedHostname === "localhost" ||
     normalizedHostname.endsWith(".localhost") ||
     /^127(?:\.\d{1,3}){3}$/.test(normalizedHostname) ||
+    /^\[::ffff:7f[0-9a-f]{2}:[0-9a-f]{1,4}\]$/.test(normalizedHostname) ||
     normalizedHostname === "::1" ||
     normalizedHostname === "[::1]"
   );
