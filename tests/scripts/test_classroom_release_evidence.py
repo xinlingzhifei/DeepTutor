@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -17,6 +18,7 @@ RELEASE_RUN = {
     "runId": "first-release-run-20260825",
     "environmentId": "test-environment",
 }
+BASE_URL = "https://candidate.example.test"
 
 
 def _load_path(name: str, path: Path):
@@ -144,7 +146,173 @@ def _write_candidate_root(tmp_path: Path) -> tuple[Path, dict[str, object]]:
         release_tag=RELEASE_TAG,
         openmaic_head=OPENMAIC_HEAD,
     )
+    _write_runtime_attestation(candidate_root, lock)
     return candidate_root, lock["candidate"]
+
+
+def _write_runtime_attestation(candidate_root: Path, lock: dict[str, object]) -> Path:
+    images = lock["images"]
+    assert isinstance(images, dict)
+    references = {
+        name: record["reference"] for name, record in images.items() if isinstance(record, dict)
+    }
+    service_images = {
+        "deeptutor": references["deeptutor"],
+        "gateway": references["nginx"],
+        "postgres": references["postgres"],
+        "minio": references["minio"],
+        "minio-bootstrap": references["minio_client"],
+        "teaching-migrate": references["deeptutor"],
+        "tenant-provisioner": references["deeptutor"],
+        "openmaic": references["openmaic"],
+        "shared-data-plane-bootstrap": references["deeptutor"],
+        "openmaic-render": references["openmaic_render"],
+        "teaching-dispatcher": references["deeptutor"],
+        "teaching-worker": references["deeptutor"],
+        "teaching-export-worker": references["deeptutor"],
+        "teaching-reaper": references["deeptutor"],
+        "learning-projector": references["deeptutor"],
+    }
+    one_shots = {
+        "minio-bootstrap",
+        "teaching-migrate",
+        "shared-data-plane-bootstrap",
+    }
+    healthy = {"deeptutor", "postgres", "minio", "openmaic", "openmaic-render"}
+
+    def repo_digest(reference: str) -> str:
+        tagged, digest = reference.rsplit("@", 1)
+        return f"{tagged.rsplit(':', 1)[0]}@{digest}"
+
+    containers: list[dict[str, object]] = []
+    for service in sorted(service_images):
+        one_shot = service in one_shots
+        reference = service_images[service]
+        image_id = "sha256:local-" + hashlib.sha256(reference.encode()).hexdigest()
+        containers.append(
+            {
+                "containerId": f"container-{service}",
+                "service": service,
+                "project": "yfeistai-platform",
+                "configImage": reference,
+                "localImageId": image_id,
+                "state": "exited" if one_shot else "running",
+                "running": not one_shot,
+                "restarting": False,
+                "health": "healthy" if service in healthy else "none",
+                "exitCode": 0,
+                "imageId": image_id,
+                "repoDigests": [repo_digest(reference)],
+            }
+        )
+    snapshot = [
+        {
+            "containerId": container["containerId"],
+            "service": container["service"],
+            "image": container["configImage"],
+            "state": container["state"],
+            "health": container["health"],
+            "exitCode": container["exitCode"],
+        }
+        for container in containers
+    ]
+    docker_prefix = [
+        "docker",
+        "--config",
+        "<isolated-docker-config>",
+        "--context",
+        "default",
+    ]
+    container_format = (
+        '{"containerId":{{json .Id}},"localImageId":{{json .Image}},'
+        '"configImage":{{json .Config.Image}},'
+        '"project":{{json (index .Config.Labels "com.docker.compose.project")}},'
+        '"service":{{json (index .Config.Labels "com.docker.compose.service")}},'
+        '"state":{{json .State.Status}},"running":{{json .State.Running}},'
+        '"restarting":{{json .State.Restarting}},"exitCode":{{json .State.ExitCode}},'
+        '"health":{{if .State.Health}}{{json .State.Health.Status}}{{else}}"none"{{end}}}'
+    )
+    image_format = '{"imageId":{{json .Id}},"repoDigests":{{json .RepoDigests}}}'
+    ps = [
+        "ps",
+        "-a",
+        "--no-trunc",
+        "--filter",
+        "label=com.docker.compose.project=yfeistai-platform",
+        "--format",
+        "{{json .ID}}",
+    ]
+    containers_by_id = sorted(containers, key=lambda item: str(item["containerId"]))
+    ps_stdout = "\n".join(json.dumps(container["containerId"]) for container in containers_by_id)
+
+    def command(arguments: list[str], stdout: str) -> dict[str, object]:
+        return {
+            "argv": [*docker_prefix, *arguments],
+            "nativeExit": 0,
+            "stdout": stdout,
+            "stdoutSha256": hashlib.sha256(stdout.encode()).hexdigest(),
+        }
+
+    container_records = [
+        command(
+            ["container", "inspect", "--format", container_format, str(container["containerId"])],
+            json.dumps(
+                {
+                    name: container[name]
+                    for name in (
+                        "containerId",
+                        "localImageId",
+                        "configImage",
+                        "project",
+                        "service",
+                        "state",
+                        "running",
+                        "restarting",
+                        "exitCode",
+                        "health",
+                    )
+                }
+            ),
+        )
+        for container in containers_by_id
+    ]
+    image_records = []
+    for reference in sorted(set(service_images.values())):
+        container = next(item for item in containers if item["configImage"] == reference)
+        image_records.append(
+            command(
+                ["image", "inspect", "--format", image_format, reference],
+                json.dumps(
+                    {
+                        "imageId": container["imageId"],
+                        "repoDigests": container["repoDigests"],
+                    }
+                ),
+            )
+        )
+    ps_record = command(ps, ps_stdout)
+    report = {
+        "schemaVersion": 1,
+        "candidate": lock["candidate"],
+        "releaseRun": RELEASE_RUN,
+        "observedAt": "2026-08-25T00:00:00Z",
+        "baseUrl": BASE_URL,
+        "project": "yfeistai-platform",
+        "beforeSnapshot": snapshot,
+        "afterSnapshot": snapshot,
+        "containers": containers,
+        "commands": [
+            ps_record,
+            *container_records,
+            *image_records,
+            ps_record,
+            *container_records,
+        ],
+    }
+    path = candidate_root / "runtime" / "runtime-attestation.json"
+    path.parent.mkdir()
+    path.write_text(json.dumps(report), encoding="utf-8")
+    return path
 
 
 def _write_teacher_probe_receipt(
@@ -179,6 +347,7 @@ def _write_teacher_probe_receipt(
         release_run=RELEASE_RUN,
         evidence="teacher_flow",
         observed_at="2026-08-25T00:00:00Z",
+        base_url=BASE_URL,
         raw_report_path=raw_report,
         execution_record_path=execution_record,
         recipe="teacher_flow",
@@ -269,6 +438,7 @@ def test_probe_receipt_is_derived_from_executed_candidate_bound_report(
         release_run=RELEASE_RUN,
         evidence="teacher_flow",
         observed_at="2026-08-25T00:00:00Z",
+        base_url=BASE_URL,
         raw_report_path=raw_report,
         execution_record_path=execution_record,
         recipe="teacher_flow",
@@ -293,6 +463,7 @@ def test_probe_receipt_is_derived_from_executed_candidate_bound_report(
     assert environment["YFEISTAI_ENVIRONMENT_ID"] == RELEASE_RUN["environmentId"]
     assert environment["YFEISTAI_EVIDENCE"] == "teacher_flow"
     assert environment["YFEISTAI_PROBE_TIMEOUT_SECONDS"] == "270"
+    assert environment["WEB_BASE_URL"] == BASE_URL
     assert not staged_report.exists()
     assert receipt == json.loads(output.read_text(encoding="utf-8"))
     assert receipt["schemaVersion"] == 2
@@ -309,6 +480,11 @@ def test_probe_receipt_is_derived_from_executed_candidate_bound_report(
         },
     }
     expected_command = module.probe_command_record("teacher_flow")
+    attestation_path = candidate_root / "runtime" / "runtime-attestation.json"
+    attestation_proof = {
+        "artifact": "runtime/runtime-attestation.json",
+        "sha256": hashlib.sha256(attestation_path.read_bytes()).hexdigest(),
+    }
     assert receipt["provenance"] == {
         "recipe": "teacher_flow",
         "command": expected_command,
@@ -320,6 +496,7 @@ def test_probe_receipt_is_derived_from_executed_candidate_bound_report(
             "artifact": "raw/teacher_flow.execution.json",
             "sha256": hashlib.sha256(execution_record.read_bytes()).hexdigest(),
         },
+        "runtimeAttestation": attestation_proof,
     }
     execution = json.loads(execution_record.read_text(encoding="utf-8"))
     assert execution == {
@@ -330,9 +507,235 @@ def test_probe_receipt_is_derived_from_executed_candidate_bound_report(
         "recipe": "teacher_flow",
         "command": receipt["provenance"]["command"],
         "observedAt": "2026-08-25T00:00:00Z",
+        "baseUrl": BASE_URL,
         "nativeExit": 0,
         "rawReportSha256": hashlib.sha256(raw_body).hexdigest(),
+        "runtimeAttestation": attestation_proof,
     }
+
+
+def test_probe_receipt_binds_the_fixed_runtime_attestation(tmp_path: Path) -> None:
+    module = _load_evidence_module()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    receipt_path, _raw, execution_path = _write_teacher_probe_receipt(
+        module,
+        candidate_root=candidate_root,
+        candidate=candidate,
+        working_directory=tmp_path,
+    )
+    attestation = candidate_root / "runtime" / "runtime-attestation.json"
+    expected = {
+        "artifact": "runtime/runtime-attestation.json",
+        "sha256": hashlib.sha256(attestation.read_bytes()).hexdigest(),
+    }
+
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    execution = json.loads(execution_path.read_text(encoding="utf-8"))
+    assert receipt["provenance"]["runtimeAttestation"] == expected
+    assert execution["runtimeAttestation"] == expected
+    assert execution["baseUrl"] == BASE_URL
+
+
+def test_probe_reads_runtime_attestation_only_through_anchored_reader(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_evidence_module()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    attestation = candidate_root / "runtime" / "runtime-attestation.json"
+    real_read_bytes = Path.read_bytes
+
+    def reject_path_read(path: Path) -> bytes:
+        if Path(os.path.abspath(path)) == Path(os.path.abspath(attestation)):
+            pytest.fail("runtime attestation must not be read through a path lookup")
+        return real_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", reject_path_read)
+
+    receipt, _raw, _execution = _write_teacher_probe_receipt(
+        module,
+        candidate_root=candidate_root,
+        candidate=candidate,
+        working_directory=tmp_path,
+    )
+
+    assert receipt.is_file()
+
+
+@pytest.mark.parametrize(
+    "case",
+    ("missing", "candidate", "release-run", "base-url", "digest", "state", "symlink"),
+)
+def test_probe_rejects_invalid_fixed_runtime_attestation_before_execution(
+    tmp_path: Path, case: str
+) -> None:
+    module = _load_evidence_module()
+    candidate_root, _candidate = _write_candidate_root(tmp_path)
+    attestation = candidate_root / "runtime" / "runtime-attestation.json"
+    if case == "missing":
+        attestation.replace(attestation.with_name("not-the-fixed-attestation.json"))
+    elif case == "symlink":
+        real = attestation.with_name("runtime-attestation.real.json")
+        attestation.replace(real)
+        try:
+            attestation.symlink_to(real)
+        except OSError:
+            pytest.skip("symlinks are unavailable on this Windows test host")
+    else:
+        document = json.loads(attestation.read_text(encoding="utf-8"))
+        if case == "candidate":
+            document["candidate"]["sourceHead"] = "b" * 40
+        elif case == "release-run":
+            document["releaseRun"]["runId"] = "attacker-run"
+        elif case == "base-url":
+            document["baseUrl"] = "https://attacker.example.test"
+        elif case == "digest":
+            document["containers"][0]["repoDigests"] = [
+                "registry.example/attacker@sha256:" + "f" * 64
+            ]
+        else:
+            document["containers"][0]["restarting"] = True
+        attestation.write_text(json.dumps(document), encoding="utf-8")
+
+    def must_not_run(*_args, **_options):
+        pytest.fail("Playwright must not run before runtime attestation validation")
+
+    output = candidate_root / "artifacts" / "teacher_flow.json"
+    with pytest.raises(ValueError, match="runtime|candidate"):
+        module.run_probe_receipt(
+            output,
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            evidence="teacher_flow",
+            observed_at="2026-08-25T00:00:00Z",
+            base_url=BASE_URL,
+            raw_report_path=candidate_root / "raw" / "teacher_flow.json",
+            execution_record_path=candidate_root / "raw" / "teacher_flow.execution.json",
+            recipe="teacher_flow",
+            working_directory=tmp_path,
+            timeout_seconds=300,
+            runner=must_not_run,
+        )
+
+    assert not output.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="exercises POSIX nonblocking attestation opens")
+def test_probe_rejects_runtime_attestation_fifo_before_execution(tmp_path: Path) -> None:
+    module = _load_evidence_module()
+    candidate_root, _candidate = _write_candidate_root(tmp_path)
+    attestation = candidate_root / "runtime" / "runtime-attestation.json"
+    attestation.replace(attestation.with_name("runtime-attestation.real.json"))
+    os.mkfifo(attestation)
+
+    def must_not_run(*_args, **_options):
+        pytest.fail("Playwright must not run before bounded runtime attestation validation")
+
+    output = candidate_root / "artifacts" / "teacher_flow.json"
+    with pytest.raises(ValueError, match="runtime attestation|fixed boundary|regular"):
+        module.run_probe_receipt(
+            output,
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            evidence="teacher_flow",
+            observed_at="2026-08-25T00:00:00Z",
+            base_url=BASE_URL,
+            raw_report_path=candidate_root / "raw" / "teacher_flow.json",
+            execution_record_path=candidate_root / "raw" / "teacher_flow.execution.json",
+            recipe="teacher_flow",
+            working_directory=tmp_path,
+            timeout_seconds=300,
+            runner=must_not_run,
+        )
+
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("case", ("changed", "missing"))
+def test_probe_rejects_runtime_attestation_drift_after_execution(tmp_path: Path, case: str) -> None:
+    module = _load_evidence_module()
+    candidate_root, _candidate = _write_candidate_root(tmp_path)
+    attestation = candidate_root / "runtime" / "runtime-attestation.json"
+    output = candidate_root / "artifacts" / "teacher_flow.json"
+    raw_report = candidate_root / "raw" / "teacher_flow.json"
+    execution = candidate_root / "raw" / "teacher_flow.execution.json"
+
+    def drift(arguments, *, cwd, env, timeout):
+        del cwd, timeout
+        staged = Path(env["YFEISTAI_EVIDENCE_REPORT"])
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        staged.write_text(json.dumps(_teacher_playwright_report()), encoding="utf-8")
+        if case == "changed":
+            attestation.write_bytes(attestation.read_bytes() + b"\n")
+        else:
+            attestation.replace(attestation.with_name("moved-during-probe.json"))
+        return subprocess.CompletedProcess(arguments, 0)
+
+    with pytest.raises(ValueError, match="changed|unavailable"):
+        module.run_probe_receipt(
+            output,
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            evidence="teacher_flow",
+            observed_at="2026-08-25T00:00:00Z",
+            base_url=BASE_URL,
+            raw_report_path=raw_report,
+            execution_record_path=execution,
+            recipe="teacher_flow",
+            working_directory=tmp_path,
+            timeout_seconds=300,
+            runner=drift,
+        )
+
+    assert not output.exists()
+    assert not raw_report.exists()
+    assert not execution.exists()
+    assert list((candidate_root / "failures" / "teacher_flow").glob("*/raw.json"))
+
+
+@pytest.mark.parametrize("consumer", ("assembler", "file-runtime"))
+def test_consumers_revalidate_runtime_attestation(tmp_path: Path, consumer: str) -> None:
+    module = _load_evidence_module()
+    verifier = _load_verifier()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    receipt, _raw, _execution = _write_teacher_probe_receipt(
+        module,
+        candidate_root=candidate_root,
+        candidate=candidate,
+        working_directory=tmp_path,
+    )
+    manifest = candidate_root / "release-evidence.json"
+    if consumer == "file-runtime":
+        module.assemble_manifest(
+            manifest,
+            candidate_root=candidate_root,
+            release_run=RELEASE_RUN,
+            receipt_paths={"teacher_flow": receipt},
+        )
+    attestation = candidate_root / "runtime" / "runtime-attestation.json"
+    attestation.write_bytes(attestation.read_bytes() + b"\n")
+
+    if consumer == "assembler":
+        with pytest.raises(ValueError, match="attestation.*digest"):
+            module.assemble_manifest(
+                manifest,
+                candidate_root=candidate_root,
+                release_run=RELEASE_RUN,
+                receipt_paths={"teacher_flow": receipt},
+            )
+    else:
+        result = verifier.verify(
+            verifier.FileReleaseRuntime(
+                manifest,
+                expected_source_head=SOURCE_HEAD,
+                candidate_root=candidate_root,
+            )
+        )
+        assert result.layers["teacher_flow"].status == "fail"
+        assert "attestation" in result.layers["teacher_flow"].detail
 
 
 def test_probe_receipt_preserves_existing_output_when_command_fails(
@@ -356,6 +759,7 @@ def test_probe_receipt_preserves_existing_output_when_command_fails(
             release_run=RELEASE_RUN,
             evidence="teacher_flow",
             observed_at="2026-08-25T00:00:00Z",
+            base_url=BASE_URL,
             raw_report_path=raw_report,
             execution_record_path=candidate_root / "raw" / "teacher_flow.execution.json",
             recipe="teacher_flow",
@@ -394,6 +798,7 @@ def test_failed_probe_preserves_diagnostics_and_canonical_paths_are_retryable(
             release_run=RELEASE_RUN,
             evidence="teacher_flow",
             observed_at="2026-08-25T00:00:00Z",
+            base_url=BASE_URL,
             raw_report_path=raw_report,
             execution_record_path=execution,
             recipe="teacher_flow",
@@ -426,6 +831,7 @@ def test_failed_probe_preserves_diagnostics_and_canonical_paths_are_retryable(
         release_run=RELEASE_RUN,
         evidence="teacher_flow",
         observed_at="2026-08-25T00:01:00Z",
+        base_url=BASE_URL,
         raw_report_path=raw_report,
         execution_record_path=execution,
         recipe="teacher_flow",
@@ -469,6 +875,7 @@ def test_invalid_or_timed_out_probe_leaves_only_failure_diagnostics(
             release_run=RELEASE_RUN,
             evidence="teacher_flow",
             observed_at="2026-08-25T00:00:00Z",
+            base_url=BASE_URL,
             raw_report_path=raw_report,
             execution_record_path=execution,
             recipe="teacher_flow",
@@ -516,6 +923,7 @@ def test_receipt_publication_failure_rolls_back_proof_and_allows_retry(
         "bundle_root": candidate_root,
         "release_run": RELEASE_RUN,
         "evidence": "teacher_flow",
+        "base_url": BASE_URL,
         "raw_report_path": raw_report,
         "execution_record_path": execution,
         "recipe": "teacher_flow",
@@ -1239,6 +1647,8 @@ def test_release_evidence_cli_produces_only_a_fixed_recipe(
                 "2026-08-25T00:00:00Z",
                 "--timeout-seconds",
                 "300",
+                "--base-url",
+                BASE_URL,
             ]
         )
         == 0
@@ -1250,6 +1660,7 @@ def test_release_evidence_cli_produces_only_a_fixed_recipe(
         "release_run": RELEASE_RUN,
         "evidence": "teacher_flow",
         "observed_at": "2026-08-25T00:00:00Z",
+        "base_url": BASE_URL,
         "raw_report_path": bundle_root / "raw" / "teacher_flow.json",
         "execution_record_path": bundle_root / "executions" / "teacher_flow.json",
         "recipe": "teacher_flow",
@@ -1286,6 +1697,10 @@ def test_release_evidence_cli_rejects_self_attestation_inputs(
                 RELEASE_RUN["environmentId"],
                 "--observed-at",
                 "2026-08-25T00:00:00Z",
+                "--timeout-seconds",
+                "300",
+                "--base-url",
+                BASE_URL,
                 forbidden,
                 "attacker-controlled",
             ]

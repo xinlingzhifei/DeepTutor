@@ -29,6 +29,8 @@ from verify_classroom_release import (  # noqa: E402
     RECEIPT_CONTRACTS,
     derive_probe_checks,
     probe_provenance_error,
+    read_runtime_attestation_artifact,
+    validate_runtime_attestation,
 )
 
 _RELEASE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -316,6 +318,7 @@ def run_probe_receipt(
     release_run: Mapping[str, object],
     evidence: str,
     observed_at: str,
+    base_url: str,
     raw_report_path: Path,
     execution_record_path: Path,
     recipe: str,
@@ -345,7 +348,9 @@ def run_probe_receipt(
         bundle_root=bundle_root,
         label="probe execution record",
     )
-    if len({resolved_output, resolved_report, resolved_execution}) != 3:
+    resolved_attestation = Path(bundle_root).resolve() / "runtime" / "runtime-attestation.json"
+    attestation_artifact = "runtime/runtime-attestation.json"
+    if len({resolved_output, resolved_report, resolved_execution, resolved_attestation}) != 4:
         raise ValueError("probe proof files must use distinct paths")
     if resolved_output.exists() or resolved_report.exists() or resolved_execution.exists():
         raise ValueError("probe proof files must not already exist")
@@ -355,6 +360,25 @@ def run_probe_receipt(
         or timeout_seconds <= _PROBE_CLEANUP_MARGIN_SECONDS
     ):
         raise ValueError("probe timeout is invalid")
+    attestation_body, attestation_sha256 = read_runtime_attestation_artifact(
+        resolved_attestation,
+        bundle_root=bundle_root,
+    )
+    attestation = validate_runtime_attestation(
+        resolved_attestation,
+        bundle_root=bundle_root,
+        candidate_root=candidate_root,
+        candidate=candidate,
+        release_run=bound_run,
+        expected_base_url=base_url,
+        expected_sha256=attestation_sha256,
+    )
+    base_url = attestation["baseUrl"]
+    assert isinstance(base_url, str)
+    attestation_proof = {
+        "artifact": attestation_artifact,
+        "sha256": attestation_sha256,
+    }
     arguments = _probe_command(evidence, recipe)
     cwd = Path(working_directory).resolve()
     if not cwd.is_dir():
@@ -371,6 +395,7 @@ def run_probe_receipt(
             "YFEISTAI_ENVIRONMENT_ID": bound_run["environmentId"],
             "YFEISTAI_EVIDENCE": evidence,
             "YFEISTAI_PROBE_TIMEOUT_SECONDS": str(timeout_seconds - _PROBE_CLEANUP_MARGIN_SECONDS),
+            "WEB_BASE_URL": base_url,
         }
     )
     try:
@@ -437,6 +462,26 @@ def run_probe_receipt(
         candidate_after = _candidate(candidate_root)
         if candidate_after != candidate:
             raise ValueError("candidate changed while the probe was running")
+        try:
+            attestation_after, attestation_after_sha256 = read_runtime_attestation_artifact(
+                resolved_attestation,
+                bundle_root=bundle_root,
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "runtime attestation became unavailable while the probe was running"
+            ) from exc
+        if attestation_after != attestation_body or attestation_after_sha256 != attestation_sha256:
+            raise ValueError("runtime attestation changed while the probe was running")
+        validate_runtime_attestation(
+            resolved_attestation,
+            bundle_root=bundle_root,
+            candidate_root=candidate_root,
+            candidate=candidate,
+            release_run=bound_run,
+            expected_base_url=base_url,
+            expected_sha256=attestation_sha256,
+        )
     except ValueError:
         _record_probe_failure(
             bundle_root=bundle_root,
@@ -458,8 +503,10 @@ def run_probe_receipt(
         "recipe": recipe,
         "command": command_record,
         "observedAt": observed_at,
+        "baseUrl": base_url,
         "nativeExit": native_exit,
         "rawReportSha256": raw_sha256,
+        "runtimeAttestation": attestation_proof,
     }
     try:
         os.replace(staged_report, resolved_report)
@@ -484,6 +531,7 @@ def run_probe_receipt(
                     "artifact": execution_artifact,
                     "sha256": execution_sha256,
                 },
+                "runtimeAttestation": attestation_proof,
             },
         )
     except Exception:
@@ -637,6 +685,7 @@ def _validated_receipt(
     candidate: Mapping[str, object],
     release_run: Mapping[str, str],
     bundle_root: Path,
+    candidate_root: Path,
 ) -> tuple[dict[str, object], bytes, str]:
     try:
         body = path.read_bytes()
@@ -677,6 +726,7 @@ def _validated_receipt(
         candidate=candidate,
         release_run=release_run,
         bundle_root=bundle_root,
+        candidate_root=candidate_root,
     )
     if provenance_error is not None:
         raise ValueError(provenance_error)
@@ -711,6 +761,7 @@ def assemble_manifest(
             candidate=candidate,
             release_run=bound_run,
             bundle_root=bundle_root,
+            candidate_root=candidate_root,
         )
         evidence_entries[evidence] = {
             "status": "pass",
@@ -753,6 +804,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     produce.add_argument("--bundle-root", type=Path, required=True)
     produce.add_argument("--working-directory", type=Path, required=True)
     produce.add_argument("--timeout-seconds", type=int, required=True)
+    produce.add_argument("--base-url", required=True)
 
     assemble = commands.add_parser("assemble")
     assemble.add_argument("--output", type=Path, required=True)
@@ -803,6 +855,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             release_run=release_run,
             evidence=args.evidence,
             observed_at=args.observed_at,
+            base_url=args.base_url,
             raw_report_path=args.bundle_root / "raw" / f"{args.evidence}.json",
             execution_record_path=args.bundle_root / "executions" / f"{args.evidence}.json",
             recipe=recipe,

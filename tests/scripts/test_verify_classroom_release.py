@@ -303,6 +303,11 @@ def _write_probe_proof(
     raw_path.write_text(json.dumps(raw_document), encoding="utf-8")
     raw_sha256 = hashlib.sha256(raw_path.read_bytes()).hexdigest()
     command = module.probe_command_record(evidence)
+    attestation_path = tmp_path / "runtime" / "runtime-attestation.json"
+    attestation_proof = {
+        "artifact": "runtime/runtime-attestation.json",
+        "sha256": hashlib.sha256(attestation_path.read_bytes()).hexdigest(),
+    }
     execution = {
         "schemaVersion": 1,
         "candidate": candidate,
@@ -311,8 +316,10 @@ def _write_probe_proof(
         "recipe": recipe_id,
         "command": command,
         "observedAt": "2026-08-24T00:00:00Z",
+        "baseUrl": "https://candidate.example.test",
         "nativeExit": 0,
         "rawReportSha256": raw_sha256,
+        "runtimeAttestation": attestation_proof,
     }
     execution_path.write_text(json.dumps(execution), encoding="utf-8")
     return {
@@ -326,6 +333,7 @@ def _write_probe_proof(
             "artifact": execution_path.relative_to(tmp_path).as_posix(),
             "sha256": hashlib.sha256(execution_path.read_bytes()).hexdigest(),
         },
+        "runtimeAttestation": attestation_proof,
     }
 
 
@@ -348,9 +356,33 @@ def _write_candidate_files(tmp_path: Path, candidate: dict[str, object]) -> None
     release_tag = candidate["releaseTag"]
     assert isinstance(release_tag, str)
     specifications = {
-        "deeptutor": "ghcr.io/xinlingzhifei/deeptutor",
-        "openmaic": "ghcr.io/xinlingzhifei/openmaic",
-        "openmaic_render": "ghcr.io/xinlingzhifei/openmaic-render",
+        "deeptutor": (
+            "ghcr.io/xinlingzhifei/deeptutor",
+            release_tag,
+            digests["deeptutor"],
+        ),
+        "openmaic": (
+            "ghcr.io/xinlingzhifei/openmaic",
+            release_tag,
+            digests["openmaic"],
+        ),
+        "openmaic_render": (
+            "ghcr.io/xinlingzhifei/openmaic-render",
+            release_tag,
+            digests["openmaic_render"],
+        ),
+        "nginx": ("nginx", "1.29.8-alpine3.23", "sha256:" + "4" * 64),
+        "postgres": ("postgres", "16.14-alpine3.24", "sha256:" + "5" * 64),
+        "minio": (
+            "minio/minio",
+            "RELEASE.2025-04-22T22-12-26Z",
+            "sha256:" + "6" * 64,
+        ),
+        "minio_client": (
+            "minio/mc",
+            "RELEASE.2025-04-16T18-13-26Z",
+            "sha256:" + "7" * 64,
+        ),
     }
     lock = {
         "schemaVersion": 2,
@@ -358,28 +390,41 @@ def _write_candidate_files(tmp_path: Path, candidate: dict[str, object]) -> None
         "images": {
             name: {
                 "repository": repository,
-                "tag": release_tag,
-                "digest": digests[name],
-                "reference": f"{repository}:{release_tag}@{digests[name]}",
+                "tag": tag,
+                "digest": digest,
+                "reference": f"{repository}:{tag}@{digest}",
             }
-            for name, repository in specifications.items()
+            for name, (repository, tag, digest) in specifications.items()
         },
     }
     deploy = tmp_path / "deploy"
     deploy.mkdir()
     (deploy / "image-lock.json").write_text(json.dumps(lock), encoding="utf-8")
     references = {
-        name: f"{repository}:{release_tag}@{digests[name]}"
-        for name, repository in specifications.items()
+        name: f"{repository}:{tag}@{digest}"
+        for name, (repository, tag, digest) in specifications.items()
     }
     (tmp_path / "docker-compose.platform.yml").write_text(
         json.dumps(
             {
                 "services": {
                     "deeptutor": {"image": references["deeptutor"]},
-                    "teaching-migrate": {"image": references["deeptutor"]},
+                    "gateway": {"image": references["nginx"]},
+                    "postgres": {"image": references["postgres"]},
+                    "minio": {"image": references["minio"]},
+                    "minio-bootstrap": {
+                        "image": references["minio_client"],
+                        "restart": "no",
+                    },
+                    "teaching-migrate": {
+                        "image": references["deeptutor"],
+                        "restart": "no",
+                    },
                     "tenant-provisioner": {"image": references["deeptutor"]},
-                    "shared-data-plane-bootstrap": {"image": references["deeptutor"]},
+                    "shared-data-plane-bootstrap": {
+                        "image": references["deeptutor"],
+                        "restart": "no",
+                    },
                     "teaching-dispatcher": {"image": references["deeptutor"]},
                     "teaching-worker": {"image": references["deeptutor"]},
                     "teaching-export-worker": {"image": references["deeptutor"]},
@@ -403,6 +448,166 @@ def _write_candidate_files(tmp_path: Path, candidate: dict[str, object]) -> None
         ),
         encoding="utf-8",
     )
+    _write_runtime_attestation(tmp_path, candidate, references)
+
+
+def _write_runtime_attestation(
+    root: Path,
+    candidate: dict[str, object],
+    references: dict[str, str],
+) -> None:
+    service_images = {
+        "deeptutor": references["deeptutor"],
+        "gateway": references["nginx"],
+        "postgres": references["postgres"],
+        "minio": references["minio"],
+        "minio-bootstrap": references["minio_client"],
+        "teaching-migrate": references["deeptutor"],
+        "tenant-provisioner": references["deeptutor"],
+        "openmaic": references["openmaic"],
+        "shared-data-plane-bootstrap": references["deeptutor"],
+        "openmaic-render": references["openmaic_render"],
+        "teaching-dispatcher": references["deeptutor"],
+        "teaching-worker": references["deeptutor"],
+        "teaching-export-worker": references["deeptutor"],
+        "teaching-reaper": references["deeptutor"],
+        "learning-projector": references["deeptutor"],
+    }
+    one_shots = {"minio-bootstrap", "teaching-migrate", "shared-data-plane-bootstrap"}
+    healthy = {"deeptutor", "postgres", "minio", "openmaic", "openmaic-render"}
+
+    def repo_digest(reference: str) -> str:
+        tagged, digest = reference.rsplit("@", 1)
+        return f"{tagged.rsplit(':', 1)[0]}@{digest}"
+
+    containers: list[dict[str, object]] = []
+    for service in sorted(service_images):
+        reference = service_images[service]
+        one_shot = service in one_shots
+        image_id = "sha256:local-" + hashlib.sha256(reference.encode()).hexdigest()
+        containers.append(
+            {
+                "containerId": f"container-{service}",
+                "service": service,
+                "project": "yfeistai-platform",
+                "configImage": reference,
+                "localImageId": image_id,
+                "state": "exited" if one_shot else "running",
+                "running": not one_shot,
+                "restarting": False,
+                "health": "healthy" if service in healthy else "none",
+                "exitCode": 0,
+                "imageId": image_id,
+                "repoDigests": [repo_digest(reference)],
+            }
+        )
+    snapshot = [
+        {
+            "containerId": container["containerId"],
+            "service": container["service"],
+            "image": container["configImage"],
+            "state": container["state"],
+            "health": container["health"],
+            "exitCode": container["exitCode"],
+        }
+        for container in containers
+    ]
+    docker_prefix = [
+        "docker",
+        "--config",
+        "<isolated-docker-config>",
+        "--context",
+        "default",
+    ]
+    container_format = (
+        '{"containerId":{{json .Id}},"localImageId":{{json .Image}},'
+        '"configImage":{{json .Config.Image}},'
+        '"project":{{json (index .Config.Labels "com.docker.compose.project")}},'
+        '"service":{{json (index .Config.Labels "com.docker.compose.service")}},'
+        '"state":{{json .State.Status}},"running":{{json .State.Running}},'
+        '"restarting":{{json .State.Restarting}},"exitCode":{{json .State.ExitCode}},'
+        '"health":{{if .State.Health}}{{json .State.Health.Status}}{{else}}"none"{{end}}}'
+    )
+    image_format = '{"imageId":{{json .Id}},"repoDigests":{{json .RepoDigests}}}'
+    ps = [
+        "ps",
+        "-a",
+        "--no-trunc",
+        "--filter",
+        "label=com.docker.compose.project=yfeistai-platform",
+        "--format",
+        "{{json .ID}}",
+    ]
+    containers_by_id = sorted(containers, key=lambda item: str(item["containerId"]))
+    ps_stdout = "\n".join(json.dumps(container["containerId"]) for container in containers_by_id)
+
+    def command(arguments: list[str], stdout: str) -> dict[str, object]:
+        return {
+            "argv": [*docker_prefix, *arguments],
+            "nativeExit": 0,
+            "stdout": stdout,
+            "stdoutSha256": hashlib.sha256(stdout.encode()).hexdigest(),
+        }
+
+    container_records = [
+        command(
+            ["container", "inspect", "--format", container_format, str(container["containerId"])],
+            json.dumps(
+                {
+                    name: container[name]
+                    for name in (
+                        "containerId",
+                        "localImageId",
+                        "configImage",
+                        "project",
+                        "service",
+                        "state",
+                        "running",
+                        "restarting",
+                        "exitCode",
+                        "health",
+                    )
+                }
+            ),
+        )
+        for container in containers_by_id
+    ]
+    image_records = []
+    for reference in sorted(set(service_images.values())):
+        container = next(item for item in containers if item["configImage"] == reference)
+        image_records.append(
+            command(
+                ["image", "inspect", "--format", image_format, reference],
+                json.dumps(
+                    {
+                        "imageId": container["imageId"],
+                        "repoDigests": container["repoDigests"],
+                    }
+                ),
+            )
+        )
+    ps_record = command(ps, ps_stdout)
+    document = {
+        "schemaVersion": 1,
+        "candidate": candidate,
+        "releaseRun": _RELEASE_RUN,
+        "observedAt": "2026-08-24T00:00:00Z",
+        "baseUrl": "https://candidate.example.test",
+        "project": "yfeistai-platform",
+        "beforeSnapshot": snapshot,
+        "afterSnapshot": snapshot,
+        "containers": containers,
+        "commands": [
+            ps_record,
+            *container_records,
+            *image_records,
+            ps_record,
+            *container_records,
+        ],
+    }
+    runtime = root / "runtime"
+    runtime.mkdir()
+    (runtime / "runtime-attestation.json").write_text(json.dumps(document), encoding="utf-8")
 
 
 def _write_complete_bundle(
@@ -860,22 +1065,38 @@ x-images:
   deeptutor: &deeptutor-image {json.dumps(references["deeptutor"])}
   openmaic: &openmaic-image {json.dumps(references["openmaic"])}
   openmaic-render: &openmaic-render-image {json.dumps(references["openmaic_render"])}
+  nginx: &nginx-image {json.dumps(references["nginx"])}
+  postgres: &postgres-image {json.dumps(references["postgres"])}
+  minio: &minio-image {json.dumps(references["minio"])}
+  minio-client: &minio-client-image {json.dumps(references["minio_client"])}
 x-teaching-process: &teaching-process
   image: *deeptutor-image
 services:
   pocketbase:
     ports: !reset []
+    profiles: [legacy]
   deeptutor:
     image: *deeptutor-image
     build: !reset null
     networks: !override
       - platform-internal
+  gateway:
+    image: *nginx-image
+  postgres:
+    image: *postgres-image
+  minio:
+    image: *minio-image
+  minio-bootstrap:
+    image: *minio-client-image
+    restart: "no"
   teaching-migrate:
     image: *deeptutor-image
+    restart: "no"
   tenant-provisioner:
     <<: *teaching-process
   shared-data-plane-bootstrap:
     image: *deeptutor-image
+    restart: "no"
   teaching-dispatcher:
     <<: *teaching-process
   teaching-worker:
@@ -1256,3 +1477,56 @@ def test_missing_evidence_manifest_fails_closed(tmp_path: Path) -> None:
 
     assert result.ok is False
     assert result.missing == module.REQUIRED_LAYERS
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="exercises POSIX directory cleanup")
+def test_open_posix_directory_no_follow_closes_current_on_keyboard_interrupt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_verifier()
+    current_fd = 741
+    closed: list[int] = []
+
+    def open_directory(path, _flags, *args, **kwargs) -> int:
+        if path == "/":
+            assert not args and not kwargs
+            return current_fd
+        assert path == "bundle"
+        assert kwargs == {"dir_fd": current_fd}
+        raise KeyboardInterrupt("injected POSIX directory open interruption")
+
+    monkeypatch.setattr(module.os, "open", open_directory)
+    monkeypatch.setattr(module.os, "close", closed.append)
+
+    with pytest.raises(KeyboardInterrupt, match="injected POSIX directory open interruption"):
+        module._open_posix_directory_no_follow(Path("/bundle/runtime"))
+
+    assert closed == [current_fd]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="exercises Windows directory cleanup")
+def test_open_windows_directory_no_follow_closes_current_on_system_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_verifier()
+    current_handle = object()
+    closed: list[object] = []
+
+    monkeypatch.setattr(
+        module,
+        "_open_windows_directory_handle",
+        lambda _path: (current_handle, (1, 1)),
+    )
+
+    def fail_relative(handle: object, component: str) -> tuple[object, tuple[int, int]]:
+        assert handle is current_handle
+        assert component == "bundle"
+        raise SystemExit("injected Windows directory open interruption")
+
+    monkeypatch.setattr(module, "_open_windows_directory_relative", fail_relative)
+    monkeypatch.setattr(module, "_close_windows_handle", closed.append)
+
+    with pytest.raises(SystemExit, match="injected Windows directory open interruption"):
+        module._open_windows_directory_no_follow(Path("C:/bundle/runtime"))
+
+    assert closed == [current_handle]

@@ -9,11 +9,14 @@ from datetime import datetime
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
 from typing import Protocol
+from urllib.parse import urlsplit
 
 import yaml
 from yaml.nodes import MappingNode, ScalarNode, SequenceNode
@@ -27,6 +30,15 @@ from classroom_release_probe_contract import (  # noqa: E402
     LIVE_SPEC,
     PROBE_RECIPES,
     probe_command_record,
+)
+from classroom_runtime_attestation import (  # noqa: E402
+    _CandidateContractLease,
+    _close_windows_handle,
+    _load_candidate_token,
+    _open_windows_directory_handle,
+    _open_windows_directory_relative,
+    _open_windows_regular_file_relative,
+    _read_windows_file_handle,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -139,6 +151,36 @@ _RELEASE_TAG = re.compile(r"^yfeistai-first-release-[0-9]{8}-([0-9a-f]{8})$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _RELEASE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _OBSERVED_AT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
+_RUNTIME_PROJECT = "yfeistai-platform"
+_RUNTIME_HEALTH_SERVICES = frozenset(
+    ("deeptutor", "postgres", "minio", "openmaic", "openmaic-render")
+)
+_RUNTIME_DOCKER_PREFIX = (
+    "docker",
+    "--config",
+    "<isolated-docker-config>",
+    "--context",
+    "default",
+)
+_RUNTIME_CONTAINER_FORMAT = (
+    '{"containerId":{{json .Id}},"localImageId":{{json .Image}},'
+    '"configImage":{{json .Config.Image}},'
+    '"project":{{json (index .Config.Labels "com.docker.compose.project")}},'
+    '"service":{{json (index .Config.Labels "com.docker.compose.service")}},'
+    '"state":{{json .State.Status}},"running":{{json .State.Running}},'
+    '"restarting":{{json .State.Restarting}},"exitCode":{{json .State.ExitCode}},'
+    '"health":{{if .State.Health}}{{json .State.Health.Status}}{{else}}"none"{{end}}}'
+)
+_RUNTIME_IMAGE_FORMAT = '{"imageId":{{json .Id}},"repoDigests":{{json .RepoDigests}}}'
+_RUNTIME_PS_ARGUMENTS = (
+    "ps",
+    "-a",
+    "--no-trunc",
+    "--filter",
+    f"label=com.docker.compose.project={_RUNTIME_PROJECT}",
+    "--format",
+    "{{json .ID}}",
+)
 
 
 def _valid_observed_at_value(raw: object) -> bool:
@@ -342,6 +384,531 @@ def _proof_bytes(
     return body, artifact
 
 
+def _runtime_base_url(raw: object) -> str | None:
+    if not isinstance(raw, str) or raw != raw.rstrip("/"):
+        return None
+    parsed = urlsplit(raw)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        return None
+    return raw
+
+
+def _runtime_candidate_contract(
+    candidate_root: Path,
+    *,
+    candidate: Mapping[str, object],
+) -> dict[str, dict[str, str]]:
+    root = Path(os.path.abspath(candidate_root))
+    try:
+        with _CandidateContractLease.open(root) as lease:
+            loaded_candidate, expected = _load_candidate_token(
+                lease.token,
+                expected_candidate=candidate,
+            )
+            lease.assert_unchanged()
+    except (OSError, ValueError) as exc:
+        raise ValueError("candidate runtime contract is unavailable or invalid") from exc
+    if loaded_candidate != candidate:
+        raise ValueError("candidate runtime contract is unavailable or invalid")
+    return expected
+
+
+def _normalized_runtime_repo_digest(reference: str) -> str:
+    tagged, separator, digest = reference.rpartition("@")
+    if not separator:
+        raise ValueError("candidate runtime image reference is invalid")
+    last_slash = tagged.rfind("/")
+    tag_separator = tagged.rfind(":")
+    repository = tagged[:tag_separator] if tag_separator > last_slash else tagged
+    return f"{repository}@{digest}"
+
+
+def _read_runtime_artifact_handle(handle: object | int, *, windows: bool) -> bytes:
+    if windows:
+        return _read_windows_file_handle(handle)
+    file_descriptor = int(handle)
+    os.lseek(file_descriptor, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    while True:
+        chunk = os.read(file_descriptor, 1024 * 1024)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
+def _open_posix_directory_no_follow(path: Path) -> int:
+    candidate = Path(path)
+    if not candidate.is_absolute() or not candidate.anchor:
+        raise ValueError("runtime evidence bundle path is invalid")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    current = os.open(candidate.anchor, flags)
+    try:
+        for component in candidate.relative_to(candidate.anchor).parts:
+            opened = os.open(component, flags, dir_fd=current)
+            os.close(current)
+            current = opened
+        return current
+    except BaseException:
+        os.close(current)
+        raise
+
+
+def _open_windows_directory_no_follow(path: Path) -> tuple[object, tuple[int, int]]:
+    candidate = Path(path)
+    if not candidate.is_absolute() or not candidate.anchor:
+        raise ValueError("runtime evidence bundle path is invalid")
+    current, identity = _open_windows_directory_handle(Path(candidate.anchor))
+    try:
+        for component in candidate.relative_to(candidate.anchor).parts:
+            opened, opened_identity = _open_windows_directory_relative(current, component)
+            _close_windows_handle(current)
+            current = opened
+            identity = opened_identity
+        return current, identity
+    except BaseException:
+        _close_windows_handle(current)
+        raise
+
+
+def _runtime_artifact_body(
+    path: Path,
+    *,
+    bundle_root: Path,
+    expected_sha256: str | None,
+) -> bytes:
+    root = Path(os.path.abspath(bundle_root))
+    unresolved = Path(path)
+    if not unresolved.is_absolute():
+        unresolved = root / unresolved
+    unresolved = Path(os.path.abspath(unresolved))
+    expected_path = root / "runtime" / "runtime-attestation.json"
+    if unresolved != expected_path:
+        raise ValueError("runtime attestation is outside the fixed evidence bundle path")
+    directory_handle: object | int | None = None
+    runtime_handle: object | int | None = None
+    artifact_handle: object | int | None = None
+    windows = os.name == "nt"
+    try:
+        if windows:
+            directory_handle, bundle_identity = _open_windows_directory_no_follow(root)
+            runtime_handle, runtime_identity = _open_windows_directory_relative(
+                directory_handle,
+                "runtime",
+            )
+            artifact_handle, artifact_identity = _open_windows_regular_file_relative(
+                runtime_handle,
+                "runtime-attestation.json",
+                share_access=0x00000001,
+            )
+        else:
+            directory_handle = _open_posix_directory_no_follow(root)
+            bundle_details = os.fstat(directory_handle)
+            bundle_identity = (bundle_details.st_dev, bundle_details.st_ino)
+            directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+            runtime_handle = os.open("runtime", directory_flags, dir_fd=directory_handle)
+            runtime_details = os.fstat(runtime_handle)
+            runtime_identity = (runtime_details.st_dev, runtime_details.st_ino)
+            file_flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
+            artifact_handle = os.open(
+                "runtime-attestation.json",
+                file_flags,
+                dir_fd=runtime_handle,
+            )
+            details = os.fstat(artifact_handle)
+            if not stat.S_ISREG(details.st_mode):
+                raise ValueError("runtime attestation is not a regular file")
+            artifact_identity = (details.st_dev, details.st_ino)
+        body = _read_runtime_artifact_handle(artifact_handle, windows=windows)
+        reopened_directory: object | int | None = None
+        reopened_runtime: object | int | None = None
+        reopened_artifact: object | int | None = None
+        try:
+            if windows:
+                reopened_directory, reopened_bundle_identity = _open_windows_directory_no_follow(
+                    root
+                )
+                reopened_runtime, reopened_runtime_identity = _open_windows_directory_relative(
+                    reopened_directory, "runtime"
+                )
+                reopened_artifact, reopened_artifact_identity = _open_windows_regular_file_relative(
+                    reopened_runtime,
+                    "runtime-attestation.json",
+                    share_access=0x00000001,
+                )
+            else:
+                reopened_directory = _open_posix_directory_no_follow(root)
+                reopened_bundle_details = os.fstat(reopened_directory)
+                reopened_bundle_identity = (
+                    reopened_bundle_details.st_dev,
+                    reopened_bundle_details.st_ino,
+                )
+                reopened_runtime = os.open(
+                    "runtime",
+                    directory_flags,
+                    dir_fd=reopened_directory,
+                )
+                reopened_runtime_details = os.fstat(reopened_runtime)
+                reopened_runtime_identity = (
+                    reopened_runtime_details.st_dev,
+                    reopened_runtime_details.st_ino,
+                )
+                reopened_artifact = os.open(
+                    "runtime-attestation.json",
+                    file_flags,
+                    dir_fd=reopened_runtime,
+                )
+                reopened_artifact_details = os.fstat(reopened_artifact)
+                if not stat.S_ISREG(reopened_artifact_details.st_mode):
+                    raise ValueError("runtime attestation replacement is not a regular file")
+                reopened_artifact_identity = (
+                    reopened_artifact_details.st_dev,
+                    reopened_artifact_details.st_ino,
+                )
+            if (
+                reopened_bundle_identity != bundle_identity
+                or reopened_runtime_identity != runtime_identity
+                or reopened_artifact_identity != artifact_identity
+            ):
+                raise ValueError("runtime attestation boundary changed while it was read")
+        finally:
+            for handle in (reopened_artifact, reopened_runtime, reopened_directory):
+                if handle is None:
+                    continue
+                if windows:
+                    _close_windows_handle(handle)
+                else:
+                    os.close(int(handle))
+    except (OSError, ValueError) as exc:
+        raise ValueError("runtime attestation cannot be read from its fixed boundary") from exc
+    finally:
+        for handle in (artifact_handle, runtime_handle, directory_handle):
+            if handle is None:
+                continue
+            if windows:
+                _close_windows_handle(handle)
+            else:
+                os.close(int(handle))
+    actual_sha256 = hashlib.sha256(body).hexdigest()
+    if expected_sha256 is not None and (
+        _SHA256.fullmatch(expected_sha256) is None or actual_sha256 != expected_sha256
+    ):
+        raise ValueError("runtime attestation digest does not match")
+    return body
+
+
+def read_runtime_attestation_artifact(
+    path: Path,
+    *,
+    bundle_root: Path,
+) -> tuple[bytes, str]:
+    """Read the fixed runtime attestation through one stable no-follow boundary."""
+
+    body = _runtime_artifact_body(
+        path,
+        bundle_root=bundle_root,
+        expected_sha256=None,
+    )
+    return body, hashlib.sha256(body).hexdigest()
+
+
+def _runtime_command_stdout(raw: object, *, argv: list[str]) -> str:
+    if (
+        not isinstance(raw, dict)
+        or set(raw) != {"argv", "nativeExit", "stdout", "stdoutSha256"}
+        or raw.get("argv") != argv
+        or raw.get("nativeExit") != 0
+        or isinstance(raw.get("nativeExit"), bool)
+        or not isinstance(raw.get("stdout"), str)
+        or not isinstance(raw.get("stdoutSha256"), str)
+        or _SHA256.fullmatch(raw["stdoutSha256"]) is None
+    ):
+        raise ValueError("runtime attestation command records are invalid")
+    stdout = raw["stdout"]
+    try:
+        stdout_bytes = stdout.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError("runtime attestation command stdout is invalid") from exc
+    if hashlib.sha256(stdout_bytes).hexdigest() != raw["stdoutSha256"]:
+        raise ValueError("runtime attestation command stdout digest does not match")
+    return stdout
+
+
+def _runtime_ps_ids(stdout: str) -> list[str]:
+    ids: list[str] = []
+    try:
+        for line in stdout.splitlines():
+            container_id = json.loads(line)
+            if not isinstance(container_id, str) or not container_id:
+                raise ValueError
+            ids.append(container_id)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise ValueError("runtime attestation Docker ps stdout is invalid") from exc
+    if len(ids) != len(set(ids)):
+        raise ValueError("runtime attestation Docker ps identities are duplicated")
+    return sorted(ids)
+
+
+def _runtime_json_object(stdout: str, *, label: str) -> dict[str, object]:
+    try:
+        raw = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"runtime attestation {label} stdout is invalid") from exc
+    if not isinstance(raw, dict):
+        raise ValueError(f"runtime attestation {label} stdout is invalid")
+    return raw
+
+
+def _runtime_container_fact(stdout: str, *, container_id: str) -> dict[str, object]:
+    raw = _runtime_json_object(stdout, label="container inspect")
+    keys = {
+        "containerId",
+        "localImageId",
+        "configImage",
+        "project",
+        "service",
+        "state",
+        "running",
+        "restarting",
+        "exitCode",
+        "health",
+    }
+    exit_code = raw.get("exitCode")
+    if (
+        set(raw) != keys
+        or raw.get("containerId") != container_id
+        or any(
+            not isinstance(raw.get(name), str) or not raw[name]
+            for name in (
+                "containerId",
+                "localImageId",
+                "configImage",
+                "project",
+                "service",
+                "state",
+                "health",
+            )
+        )
+        or not isinstance(raw.get("running"), bool)
+        or not isinstance(raw.get("restarting"), bool)
+        or not isinstance(exit_code, int)
+        or isinstance(exit_code, bool)
+    ):
+        raise ValueError("runtime attestation container inspect stdout is invalid")
+    return raw
+
+
+def _runtime_image_fact(stdout: str) -> dict[str, object]:
+    raw = _runtime_json_object(stdout, label="image inspect")
+    repo_digests = raw.get("repoDigests")
+    if (
+        set(raw) != {"imageId", "repoDigests"}
+        or not isinstance(raw.get("imageId"), str)
+        or not raw["imageId"]
+        or not isinstance(repo_digests, list)
+        or not all(isinstance(value, str) for value in repo_digests)
+    ):
+        raise ValueError("runtime attestation image inspect stdout is invalid")
+    return raw
+
+
+def _runtime_rebuild_containers(
+    facts: list[dict[str, object]],
+    *,
+    expected_services: Mapping[str, Mapping[str, str]],
+    image_facts: Mapping[str, Mapping[str, object]],
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    services = [fact["service"] for fact in facts]
+    if (
+        any(not isinstance(service, str) for service in services)
+        or len(services) != len(set(services))
+        or set(services) != set(expected_services)
+    ):
+        raise ValueError("runtime attestation service set does not match candidate Compose")
+    containers: list[dict[str, object]] = []
+    for fact in sorted(facts, key=lambda item: str(item["service"])):
+        service = fact["service"]
+        assert isinstance(service, str)
+        expected = expected_services[service]
+        reference = expected["image"]
+        image = image_facts.get(reference)
+        exit_code = fact["exitCode"]
+        if (
+            fact["project"] != _RUNTIME_PROJECT
+            or fact["configImage"] != reference
+            or not isinstance(image, Mapping)
+            or fact["localImageId"] != image.get("imageId")
+            or _normalized_runtime_repo_digest(reference) not in image.get("repoDigests", [])
+        ):
+            raise ValueError("runtime attestation container identity is invalid")
+        one_shot = expected["restart"] == "no"
+        if one_shot:
+            valid_state = (
+                fact["state"] == "exited"
+                and fact["running"] is False
+                and fact["restarting"] is False
+                and exit_code == 0
+            )
+        else:
+            valid_state = (
+                fact["state"] == "running"
+                and fact["running"] is True
+                and fact["restarting"] is False
+            )
+        if not valid_state or (service in _RUNTIME_HEALTH_SERVICES and fact["health"] != "healthy"):
+            raise ValueError("runtime attestation container state is invalid")
+        containers.append(
+            {
+                **fact,
+                "imageId": image["imageId"],
+                "repoDigests": image["repoDigests"],
+            }
+        )
+    snapshot = [
+        {
+            "containerId": container["containerId"],
+            "service": container["service"],
+            "image": container["configImage"],
+            "state": container["state"],
+            "health": container["health"],
+            "exitCode": container["exitCode"],
+        }
+        for container in containers
+    ]
+    return containers, snapshot
+
+
+def validate_runtime_attestation(
+    path: Path,
+    *,
+    bundle_root: Path,
+    candidate_root: Path,
+    candidate: Mapping[str, object],
+    release_run: Mapping[str, str],
+    expected_base_url: str | None = None,
+    expected_sha256: str | None = None,
+) -> dict[str, object]:
+    """Strictly rederive runtime truth from one hashed attestation artifact."""
+    body = _runtime_artifact_body(
+        path,
+        bundle_root=bundle_root,
+        expected_sha256=expected_sha256,
+    )
+    try:
+        document = json.loads(body)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("runtime attestation is not valid JSON") from exc
+    required_keys = {
+        "schemaVersion",
+        "candidate",
+        "releaseRun",
+        "observedAt",
+        "baseUrl",
+        "project",
+        "beforeSnapshot",
+        "afterSnapshot",
+        "containers",
+        "commands",
+    }
+    bound_base_url = _runtime_base_url(
+        document.get("baseUrl") if isinstance(document, dict) else None
+    )
+    if (
+        not isinstance(document, dict)
+        or set(document) != required_keys
+        or document.get("schemaVersion") != 1
+        or document.get("candidate") != candidate
+        or document.get("releaseRun") != release_run
+        or not _valid_observed_at_value(document.get("observedAt"))
+        or bound_base_url is None
+        or (expected_base_url is not None and bound_base_url != expected_base_url)
+        or document.get("project") != _RUNTIME_PROJECT
+    ):
+        raise ValueError("runtime attestation envelope does not match the release")
+    expected_services = _runtime_candidate_contract(candidate_root, candidate=candidate)
+    commands = document.get("commands")
+    if not isinstance(commands, list):
+        raise ValueError("runtime attestation command records are invalid")
+
+    cursor = 0
+
+    def consume(arguments: list[str]) -> str:
+        nonlocal cursor
+        if cursor >= len(commands):
+            raise ValueError("runtime attestation command records are invalid")
+        stdout = _runtime_command_stdout(
+            commands[cursor],
+            argv=[*_RUNTIME_DOCKER_PREFIX, *arguments],
+        )
+        cursor += 1
+        return stdout
+
+    before_ids = _runtime_ps_ids(consume(list(_RUNTIME_PS_ARGUMENTS)))
+    before_facts = [
+        _runtime_container_fact(
+            consume(
+                [
+                    "container",
+                    "inspect",
+                    "--format",
+                    _RUNTIME_CONTAINER_FORMAT,
+                    container_id,
+                ]
+            ),
+            container_id=container_id,
+        )
+        for container_id in before_ids
+    ]
+    image_facts = {
+        reference: _runtime_image_fact(
+            consume(["image", "inspect", "--format", _RUNTIME_IMAGE_FORMAT, reference])
+        )
+        for reference in sorted({service["image"] for service in expected_services.values()})
+    }
+    after_ids = _runtime_ps_ids(consume(list(_RUNTIME_PS_ARGUMENTS)))
+    after_facts = [
+        _runtime_container_fact(
+            consume(
+                [
+                    "container",
+                    "inspect",
+                    "--format",
+                    _RUNTIME_CONTAINER_FORMAT,
+                    container_id,
+                ]
+            ),
+            container_id=container_id,
+        )
+        for container_id in after_ids
+    ]
+    if cursor != len(commands):
+        raise ValueError("runtime attestation command records are invalid")
+    before_containers, before_snapshot = _runtime_rebuild_containers(
+        before_facts,
+        expected_services=expected_services,
+        image_facts=image_facts,
+    )
+    after_containers, after_snapshot = _runtime_rebuild_containers(
+        after_facts,
+        expected_services=expected_services,
+        image_facts=image_facts,
+    )
+    if (
+        before_containers != after_containers
+        or document.get("beforeSnapshot") != before_snapshot
+        or document.get("afterSnapshot") != after_snapshot
+        or document.get("containers") != after_containers
+    ):
+        raise ValueError("runtime attestation summaries do not match replayed Docker stdout")
+    return document
+
+
 def probe_provenance_error(
     document: Mapping[str, object],
     *,
@@ -349,6 +916,7 @@ def probe_provenance_error(
     candidate: Mapping[str, object],
     release_run: Mapping[str, str],
     bundle_root: Path,
+    candidate_root: Path,
 ) -> str | None:
     """Revalidate raw/execution proof for evidence backed by a fixed probe."""
     recipe = PROBE_RECIPES.get(evidence)
@@ -360,6 +928,7 @@ def probe_provenance_error(
         "command",
         "rawReport",
         "execution",
+        "runtimeAttestation",
     }:
         return "evidence execution proof is missing or invalid"
     recipe_id, _expected_count = recipe
@@ -398,8 +967,10 @@ def probe_provenance_error(
             "recipe",
             "command",
             "observedAt",
+            "baseUrl",
             "nativeExit",
             "rawReportSha256",
+            "runtimeAttestation",
         }
         or execution.get("schemaVersion") != 1
         or execution.get("candidate") != candidate
@@ -408,12 +979,34 @@ def probe_provenance_error(
         or execution.get("recipe") != recipe_id
         or execution.get("command") != command
         or not _valid_observed_at_value(execution.get("observedAt"))
+        or _runtime_base_url(execution.get("baseUrl")) is None
         or not isinstance(execution.get("nativeExit"), int)
         or isinstance(execution.get("nativeExit"), bool)
         or execution.get("nativeExit") != 0
         or execution.get("rawReportSha256") != hashlib.sha256(raw_body).hexdigest()
+        or execution.get("runtimeAttestation") != provenance.get("runtimeAttestation")
     ):
         return "probe execution record is invalid"
+    attestation_proof = provenance.get("runtimeAttestation")
+    if (
+        not isinstance(attestation_proof, dict)
+        or set(attestation_proof) != {"artifact", "sha256"}
+        or attestation_proof.get("artifact") != "runtime/runtime-attestation.json"
+        or not isinstance(attestation_proof.get("sha256"), str)
+    ):
+        return "runtime attestation proof is invalid"
+    try:
+        validate_runtime_attestation(
+            Path(attestation_proof["artifact"]),
+            bundle_root=bundle_root,
+            candidate_root=candidate_root,
+            candidate=candidate,
+            release_run=release_run,
+            expected_base_url=execution["baseUrl"],
+            expected_sha256=attestation_proof["sha256"],
+        )
+    except ValueError as exc:
+        return str(exc)
     try:
         derived_checks = derive_probe_checks(
             evidence,
@@ -783,6 +1376,7 @@ class FileReleaseRuntime:
             candidate=self._candidate,
             release_run=self._release_run,
             bundle_root=self._path.parent,
+            candidate_root=self._candidate_root,
         )
         if provenance_error is not None:
             return LayerEvidence("fail", provenance_error)
