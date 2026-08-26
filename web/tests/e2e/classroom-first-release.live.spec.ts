@@ -1,5 +1,6 @@
 import { test } from "@playwright/test";
 import {
+  ensureLiveCourseGenerationPolicy,
   LiveFixtureContext,
   provisionLiveFixture,
   type LiveApiRequestContext,
@@ -7,6 +8,8 @@ import {
 } from "./support/classroom-first-release-live-fixture";
 import {
   runLiveContentOperationsRecipe,
+  runLiveStudentFullRecipe,
+  runLiveStudentMicroRecipe,
   runLiveTeacherRecipe,
 } from "./support/classroom-first-release-live-flows";
 
@@ -77,6 +80,42 @@ test(
       },
     );
     await runLiveTeacherRecipe(browser, baseUrl, fixture);
+  },
+);
+
+test(
+  "[release-evidence:student_micro_flow] generates and opens a real micro classroom",
+  async ({ browser, request }) => {
+    const baseUrl = liveBaseUrl();
+    const fixtureContext = liveFixtureContext(request, "student_micro_flow");
+    const fixture = await provisionLiveFixture(fixtureContext, {
+      roles: ["student"],
+      catalog: { controlledSource: false, enrollRoles: ["student"] },
+    });
+    if (!fixture.catalog) throw new Error("live student catalog is incomplete");
+    await ensureLiveCourseGenerationPolicy(
+      fixtureContext,
+      fixture.catalog.course,
+    );
+    await runLiveStudentMicroRecipe(browser, baseUrl, fixture);
+  },
+);
+
+test(
+  "[release-evidence:student_full_flow] edits confirms and opens a real full classroom",
+  async ({ browser, request }) => {
+    const baseUrl = liveBaseUrl();
+    const fixtureContext = liveFixtureContext(request, "student_full_flow");
+    const fixture = await provisionLiveFixture(fixtureContext, {
+      roles: ["student"],
+      catalog: { controlledSource: false, enrollRoles: ["student"] },
+    });
+    if (!fixture.catalog) throw new Error("live student catalog is incomplete");
+    await ensureLiveCourseGenerationPolicy(
+      fixtureContext,
+      fixture.catalog.course,
+    );
+    await runLiveStudentFullRecipe(browser, baseUrl, fixture);
   },
 );
 

@@ -54,6 +54,214 @@ export interface LivePage {
   waitForURL(url: string): Promise<unknown>;
 }
 
+export type LiveStudentClassroomMode = "micro" | "full";
+
+export interface LiveStudentClassroomPollState {
+  assetId: string;
+  generationJobId: string;
+  status: string;
+  courseId: string;
+  classId: string;
+  mode: LiveStudentClassroomMode;
+  ownerId: string;
+  classroomVersionId: string | null;
+}
+
+export interface LiveStudentGenerationJobPollState {
+  jobId: string;
+  jobKind: string;
+  phase: "outline" | "content";
+  status: string;
+  progressPercent: number;
+}
+
+export interface PollLiveStudentClassroomOptions {
+  expected: {
+    assetId: string;
+    generationJobId: string;
+    courseId: string;
+    classId: string;
+    mode: LiveStudentClassroomMode;
+    ownerId: string;
+  };
+  pollAttempts: number;
+  pollIntervalMs: number;
+  pause: (milliseconds: number) => Promise<void>;
+  readClassroom: () => Promise<LiveStudentClassroomPollState>;
+  readGenerationJob: (
+    jobId: string,
+  ) => Promise<LiveStudentGenerationJobPollState>;
+  onAwaitingConfirmation?: (
+    classroom: LiveStudentClassroomPollState,
+  ) => Promise<void>;
+}
+
+export interface PollLiveStudentClassroomResult {
+  classroom: LiveStudentClassroomPollState & { classroomVersionId: string };
+  generationJob: LiveStudentGenerationJobPollState;
+}
+
+const STUDENT_CLASSROOM_FAILURE_STATUSES = new Set([
+  "failed",
+  "canceled",
+  "rejected",
+  "expired",
+]);
+
+function requiredStudentPollValue(value: string): string {
+  const normalized = value.trim();
+  if (!normalized) {
+    throw new Error("live student classroom binding is invalid");
+  }
+  return normalized;
+}
+
+export async function pollLiveStudentClassroom(
+  options: PollLiveStudentClassroomOptions,
+): Promise<PollLiveStudentClassroomResult> {
+  const expected = {
+    assetId: requiredStudentPollValue(options.expected.assetId),
+    generationJobId: requiredStudentPollValue(
+      options.expected.generationJobId,
+    ),
+    courseId: requiredStudentPollValue(options.expected.courseId),
+    classId: requiredStudentPollValue(options.expected.classId),
+    mode: options.expected.mode,
+    ownerId: requiredStudentPollValue(options.expected.ownerId),
+  };
+  if (!(["micro", "full"] as const).includes(expected.mode)) {
+    throw new Error("live student classroom binding is invalid");
+  }
+  if (
+    !Number.isInteger(options.pollAttempts) ||
+    options.pollAttempts < 1 ||
+    options.pollAttempts > 300 ||
+    !Number.isInteger(options.pollIntervalMs) ||
+    options.pollIntervalMs < 0 ||
+    options.pollIntervalMs > 30_000
+  ) {
+    throw new Error("live student classroom poll bound is invalid");
+  }
+
+  let awaitingConfirmationObserved = false;
+  let confirmationHandled = false;
+
+  for (let attempt = 0; attempt < options.pollAttempts; attempt += 1) {
+    let classroom: LiveStudentClassroomPollState;
+    try {
+      classroom = await options.readClassroom();
+    } catch {
+      throw new Error("live student classroom synchronization failed");
+    }
+
+    if (
+      classroom.assetId !== expected.assetId ||
+      classroom.courseId !== expected.courseId ||
+      classroom.classId !== expected.classId ||
+      classroom.mode !== expected.mode ||
+      classroom.ownerId !== expected.ownerId
+    ) {
+      throw new Error("live student classroom binding is invalid");
+    }
+    if (STUDENT_CLASSROOM_FAILURE_STATUSES.has(classroom.status)) {
+      throw new Error("live student classroom failed");
+    }
+    if (classroom.generationJobId !== expected.generationJobId) {
+      throw new Error("live student classroom job binding is invalid");
+    }
+
+    if (expected.mode === "full") {
+      if (classroom.status === "awaiting_confirmation") {
+        if (classroom.classroomVersionId !== null) {
+          throw new Error("live student classroom version is invalid");
+        }
+        awaitingConfirmationObserved = true;
+      } else {
+        if (classroom.status === "succeeded" && !awaitingConfirmationObserved) {
+          throw new Error(
+            "live student classroom awaiting_confirmation was not observed",
+          );
+        }
+      }
+    }
+
+    let generationJob: LiveStudentGenerationJobPollState;
+    try {
+      generationJob = await options.readGenerationJob(expected.generationJobId);
+    } catch {
+      throw new Error("live student classroom generation synchronization failed");
+    }
+    if (generationJob.jobId !== expected.generationJobId) {
+      throw new Error("live student classroom job binding is invalid");
+    }
+    if (generationJob.jobKind !== "generation") {
+      throw new Error("live student classroom generation job is invalid");
+    }
+    if (
+      !Number.isInteger(generationJob.progressPercent) ||
+      generationJob.progressPercent < 0 ||
+      generationJob.progressPercent > 100
+    ) {
+      throw new Error("live student classroom generation job is invalid");
+    }
+    if (STUDENT_CLASSROOM_FAILURE_STATUSES.has(generationJob.status)) {
+      throw new Error("live student classroom generation failed");
+    }
+    const expectedPhase =
+      expected.mode === "micro" || confirmationHandled ? "content" : "outline";
+    if (generationJob.phase !== expectedPhase) {
+      throw new Error("live student classroom generation job phase is invalid");
+    }
+
+    if (
+      expected.mode === "full" &&
+      classroom.status === "awaiting_confirmation" &&
+      !confirmationHandled
+    ) {
+      if (!options.onAwaitingConfirmation) {
+        throw new Error(
+          "live student classroom awaiting_confirmation handler is required",
+        );
+      }
+      try {
+        const result = await options.onAwaitingConfirmation(classroom);
+        if (result !== undefined) {
+          throw new Error("invalid confirmation result");
+        }
+      } catch {
+        throw new Error("live student classroom confirmation failed");
+      }
+      confirmationHandled = true;
+    }
+
+    if (classroom.status === "succeeded") {
+      const versionId = classroom.classroomVersionId?.trim();
+      if (!versionId) {
+        throw new Error("live student classroom version is invalid");
+      }
+      if (
+        generationJob.status === "succeeded" &&
+        generationJob.progressPercent === 100
+      ) {
+        return {
+          classroom: { ...classroom, classroomVersionId: versionId },
+          generationJob,
+        };
+      }
+    }
+
+    if (attempt + 1 < options.pollAttempts) {
+      try {
+        await options.pause(options.pollIntervalMs);
+      } catch {
+        throw new Error("live student classroom synchronization failed");
+      }
+    }
+  }
+
+  throw new Error("live student classroom completion timed out");
+}
+
 export interface LiveTenantRecord {
   tenantId: string;
   name: string;
@@ -74,6 +282,23 @@ export interface LiveCourseRecord {
   id: string;
   title: string;
   status: "active";
+}
+
+export interface LiveCourseGenerationPolicyRecord {
+  tenantId: string;
+  courseId: string;
+  allowStudentMicro: boolean;
+  allowStudentFull: boolean;
+  allowedContentModes: readonly ["open_creation"];
+  allowWebSearch: boolean;
+  requireApprovalForRestrictedTopics: boolean;
+  minorSafetyMode: boolean;
+  microSceneLimit: number;
+  fullSceneLimit: number;
+  dailyStudentUnits: number;
+  monthlyStudentUnits: number;
+  updatedBy: string;
+  updatedAt: string;
 }
 
 export interface LiveClassRecord {
@@ -695,6 +920,119 @@ function verifyCourse(
   }
 }
 
+const RETAINED_COURSE_GENERATION_POLICY_MISMATCH =
+  "live fixture retained course generation policy mismatch";
+
+const STUDENT_COURSE_GENERATION_POLICY = {
+  allowStudentMicro: true,
+  allowStudentFull: true,
+  allowedContentModes: ["open_creation"],
+  allowWebSearch: false,
+  requireApprovalForRestrictedTopics: true,
+  minorSafetyMode: true,
+  microSceneLimit: 5,
+  fullSceneLimit: 24,
+  dailyStudentUnits: 40,
+  monthlyStudentUnits: 400,
+} as const;
+
+function retainedCourseGenerationPolicyMismatch(): never {
+  throw new Error(RETAINED_COURSE_GENERATION_POLICY_MISMATCH);
+}
+
+function verifyCourseGenerationPolicy(
+  payload: unknown,
+  course: Pick<LiveCourseRecord, "tenantId" | "id">,
+): LiveCourseGenerationPolicyRecord {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return retainedCourseGenerationPolicyMismatch();
+  }
+  const record = payload as Record<string, unknown>;
+  const modes = record.allowedContentModes;
+  const updatedBy = record.updatedBy;
+  const updatedAt = record.updatedAt;
+  if (
+    record.tenantId !== course.tenantId ||
+    record.courseId !== course.id ||
+    record.allowStudentMicro !==
+      STUDENT_COURSE_GENERATION_POLICY.allowStudentMicro ||
+    record.allowStudentFull !==
+      STUDENT_COURSE_GENERATION_POLICY.allowStudentFull ||
+    !Array.isArray(modes) ||
+    modes.length !== 1 ||
+    modes[0] !== "open_creation" ||
+    record.allowWebSearch !==
+      STUDENT_COURSE_GENERATION_POLICY.allowWebSearch ||
+    record.requireApprovalForRestrictedTopics !==
+      STUDENT_COURSE_GENERATION_POLICY.requireApprovalForRestrictedTopics ||
+    record.minorSafetyMode !==
+      STUDENT_COURSE_GENERATION_POLICY.minorSafetyMode ||
+    record.microSceneLimit !==
+      STUDENT_COURSE_GENERATION_POLICY.microSceneLimit ||
+    record.fullSceneLimit !==
+      STUDENT_COURSE_GENERATION_POLICY.fullSceneLimit ||
+    record.dailyStudentUnits !==
+      STUDENT_COURSE_GENERATION_POLICY.dailyStudentUnits ||
+    record.monthlyStudentUnits !==
+      STUDENT_COURSE_GENERATION_POLICY.monthlyStudentUnits ||
+    typeof updatedBy !== "string" ||
+    !updatedBy.trim() ||
+    typeof updatedAt !== "string" ||
+    !updatedAt.trim() ||
+    Number.isNaN(Date.parse(updatedAt))
+  ) {
+    return retainedCourseGenerationPolicyMismatch();
+  }
+  return {
+    tenantId: course.tenantId,
+    courseId: course.id,
+    ...STUDENT_COURSE_GENERATION_POLICY,
+    updatedBy,
+    updatedAt,
+  };
+}
+
+async function requestCourseGenerationPolicy(
+  operation: () => Promise<LiveApiResponse>,
+  course: Pick<LiveCourseRecord, "tenantId" | "id">,
+): Promise<LiveCourseGenerationPolicyRecord> {
+  try {
+    const response = await operation();
+    if (response.status() !== 200) {
+      return retainedCourseGenerationPolicyMismatch();
+    }
+    return verifyCourseGenerationPolicy(await response.json(), course);
+  } catch {
+    return retainedCourseGenerationPolicyMismatch();
+  }
+}
+
+function sameCourseGenerationPolicy(
+  left: LiveCourseGenerationPolicyRecord,
+  right: LiveCourseGenerationPolicyRecord,
+): boolean {
+  return (
+    left.tenantId === right.tenantId &&
+    left.courseId === right.courseId &&
+    left.allowStudentMicro === right.allowStudentMicro &&
+    left.allowStudentFull === right.allowStudentFull &&
+    left.allowedContentModes.length === right.allowedContentModes.length &&
+    left.allowedContentModes.every(
+      (mode, index) => mode === right.allowedContentModes[index],
+    ) &&
+    left.allowWebSearch === right.allowWebSearch &&
+    left.requireApprovalForRestrictedTopics ===
+      right.requireApprovalForRestrictedTopics &&
+    left.minorSafetyMode === right.minorSafetyMode &&
+    left.microSceneLimit === right.microSceneLimit &&
+    left.fullSceneLimit === right.fullSceneLimit &&
+    left.dailyStudentUnits === right.dailyStudentUnits &&
+    left.monthlyStudentUnits === right.monthlyStudentUnits &&
+    left.updatedBy === right.updatedBy &&
+    left.updatedAt === right.updatedAt
+  );
+}
+
 function verifyClass(
   payload: Record<string, unknown>,
   expected: LiveClassRecord,
@@ -776,6 +1114,30 @@ async function ensureCourse(
   verifyCourse(payload, expected);
   retainByKey(context.records.courses, (item) => `${item.tenantId}\0${item.id}`, expected);
   return expected;
+}
+
+export async function ensureLiveCourseGenerationPolicy(
+  context: LiveFixtureContext,
+  course: Pick<LiveCourseRecord, "tenantId" | "id">,
+): Promise<LiveCourseGenerationPolicyRecord> {
+  const secret = privateContext(context);
+  const path = `/api/v1/teaching/courses/${encodeURIComponent(course.id)}/generation-policy`;
+  const written = await requestCourseGenerationPolicy(
+    () =>
+      secret.request.put(path, {
+        headers: adminHeaders(context),
+        data: STUDENT_COURSE_GENERATION_POLICY,
+      }),
+    course,
+  );
+  const retained = await requestCourseGenerationPolicy(
+    () => secret.request.get(path, { headers: adminHeaders(context) }),
+    course,
+  );
+  if (!sameCourseGenerationPolicy(written, retained)) {
+    return retainedCourseGenerationPolicyMismatch();
+  }
+  return retained;
 }
 
 async function ensureClass(

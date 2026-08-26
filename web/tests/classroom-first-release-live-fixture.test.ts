@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import * as liveFixtureModule from "./e2e/support/classroom-first-release-live-fixture";
 import {
   LIVE_FIXTURE_POLICY_VERSION,
   LiveFixtureContext,
@@ -21,6 +22,167 @@ import {
 } from "./e2e/support/classroom-first-release-live-fixture";
 
 const ADMIN_TOKEN = "admin-token-never-serialize";
+
+type StudentClassroomPollState = {
+  assetId: string;
+  generationJobId: string;
+  status: string;
+  courseId: string;
+  classId: string;
+  mode: "micro" | "full";
+  ownerId: string;
+  classroomVersionId: string | null;
+};
+
+type StudentGenerationJobPollState = {
+  jobId: string;
+  jobKind: string;
+  phase: "outline" | "content";
+  status: string;
+  progressPercent: number;
+};
+
+type PollLiveStudentClassroomOptions = {
+  expected: {
+    assetId: string;
+    generationJobId: string;
+    courseId: string;
+    classId: string;
+    mode: "micro" | "full";
+    ownerId: string;
+  };
+  pollAttempts: number;
+  pollIntervalMs: number;
+  pause: (milliseconds: number) => Promise<void>;
+  readClassroom: () => Promise<StudentClassroomPollState>;
+  readGenerationJob: (
+    jobId: string,
+  ) => Promise<StudentGenerationJobPollState>;
+  onAwaitingConfirmation?: (
+    classroom: StudentClassroomPollState,
+  ) => Promise<void>;
+};
+
+type PollLiveStudentClassroom = (
+  options: PollLiveStudentClassroomOptions,
+) => Promise<{
+  classroom: StudentClassroomPollState & { classroomVersionId: string };
+  generationJob: StudentGenerationJobPollState;
+}>;
+
+type StudentCourseGenerationPolicyRecord = {
+  tenantId: string;
+  courseId: string;
+  allowStudentMicro: boolean;
+  allowStudentFull: boolean;
+  allowedContentModes: readonly ["open_creation"];
+  allowWebSearch: boolean;
+  requireApprovalForRestrictedTopics: boolean;
+  minorSafetyMode: boolean;
+  microSceneLimit: number;
+  fullSceneLimit: number;
+  dailyStudentUnits: number;
+  monthlyStudentUnits: number;
+  updatedBy: string;
+  updatedAt: string;
+};
+
+type EnsureLiveCourseGenerationPolicy = (
+  context: LiveFixtureContext,
+  course: { tenantId: string; id: string },
+) => Promise<StudentCourseGenerationPolicyRecord>;
+
+type ActualPollLiveStudentClassroom = typeof liveFixtureModule extends {
+  pollLiveStudentClassroom: infer Candidate;
+}
+  ? Candidate extends (...args: never[]) => unknown
+    ? Candidate
+    : PollLiveStudentClassroom
+  : PollLiveStudentClassroom;
+
+type ActualPollLiveStudentClassroomOptions =
+  Parameters<ActualPollLiveStudentClassroom>[0];
+
+const POLLER_OPTIONS_REJECT_CALLER_VERSION_ID: "versionId" extends keyof ActualPollLiveStudentClassroomOptions
+  ? never
+  : true = true;
+
+function studentPoller(): PollLiveStudentClassroom {
+  const candidate = (
+    liveFixtureModule as unknown as Record<string, unknown>
+  ).pollLiveStudentClassroom;
+  assert.equal(
+    typeof candidate,
+    "function",
+    "pollLiveStudentClassroom must be implemented",
+  );
+  return candidate as PollLiveStudentClassroom;
+}
+
+function classroomState(
+  overrides: Partial<StudentClassroomPollState> = {},
+): StudentClassroomPollState {
+  return {
+    assetId: "asset-student-live",
+    generationJobId: "job-student-live",
+    status: "queued",
+    courseId: "course-student-live",
+    classId: "class-student-live",
+    mode: "micro",
+    ownerId: "student-live",
+    classroomVersionId: null,
+    ...overrides,
+  };
+}
+
+function generationJobState(
+  overrides: Partial<StudentGenerationJobPollState> = {},
+): StudentGenerationJobPollState {
+  return {
+    jobId: "job-student-live",
+    jobKind: "generation",
+    phase: "content",
+    status: "running",
+    progressPercent: 50,
+    ...overrides,
+  };
+}
+
+function fakeSequence<T>(values: readonly T[]) {
+  assert.ok(values.length > 0);
+  let calls = 0;
+  return {
+    async read(): Promise<T> {
+      const value = values[Math.min(calls, values.length - 1)];
+      calls += 1;
+      return value;
+    },
+    calls(): number {
+      return calls;
+    },
+  };
+}
+
+function studentPollOptions(
+  overrides: Partial<PollLiveStudentClassroomOptions> = {},
+): PollLiveStudentClassroomOptions {
+  return {
+    expected: {
+      assetId: "asset-student-live",
+      generationJobId: "job-student-live",
+      courseId: "course-student-live",
+      classId: "class-student-live",
+      mode: "micro",
+      ownerId: "student-live",
+    },
+    pollAttempts: 4,
+    pollIntervalMs: 0,
+    pause: async () => undefined,
+    readClassroom: async () => classroomState(),
+    readGenerationJob: async () => generationJobState(),
+    ...overrides,
+  };
+}
 
 type Call = {
   method: "GET" | "POST" | "PUT";
@@ -492,6 +654,136 @@ test("catalog setup creates and verifies course, class, PDF source, and enrollme
   assert.equal(file.mimeType, "application/pdf");
 });
 
+test("student fixture PUTs and GETs the exact retained generation policy with the platform-admin token", async () => {
+  const course = { tenantId: "t-student-live", id: "course-student-live" };
+  const path = `/api/v1/teaching/courses/${course.id}/generation-policy`;
+  const policy = {
+    allowStudentMicro: true,
+    allowStudentFull: true,
+    allowedContentModes: ["open_creation"],
+    allowWebSearch: false,
+    requireApprovalForRestrictedTopics: true,
+    minorSafetyMode: true,
+    microSceneLimit: 5,
+    fullSceneLimit: 24,
+    dailyStudentUnits: 40,
+    monthlyStudentUnits: 400,
+  } as const;
+  const retainedPolicy = {
+    tenantId: course.tenantId,
+    courseId: course.id,
+    ...policy,
+    updatedBy: "platform-admin-live",
+    updatedAt: "2026-08-26T08:00:00Z",
+  } as const;
+  const expectedMethods = ["PUT", "GET"] as const;
+  let callIndex = 0;
+  const request = new FakeRequest((call) => {
+    assert.ok(callIndex < expectedMethods.length, "unexpected policy request");
+    assert.equal(call.method, expectedMethods[callIndex]);
+    assert.equal(call.url, path);
+    assert.equal(header(call, "Authorization"), `Bearer ${ADMIN_TOKEN}`);
+    if (call.method === "PUT") {
+      assert.deepEqual(data(call), policy);
+    } else {
+      assert.equal(call.options?.data, undefined);
+    }
+    callIndex += 1;
+    return response(200, retainedPolicy);
+  });
+  const candidate = (
+    liveFixtureModule as unknown as Record<string, unknown>
+  ).ensureLiveCourseGenerationPolicy;
+  assert.equal(
+    typeof candidate,
+    "function",
+    "ensureLiveCourseGenerationPolicy must be implemented",
+  );
+  const ensurePolicy = candidate as EnsureLiveCourseGenerationPolicy;
+
+  const result = await ensurePolicy(
+    makeContext(request, { evidence: "student_micro_flow" }),
+    course,
+  );
+
+  assert.equal(callIndex, 2);
+  assert.ok(result.updatedBy.trim());
+  assert.equal(Number.isNaN(Date.parse(result.updatedAt)), false);
+  assert.deepEqual(result, retainedPolicy);
+
+  const isStaticPolicyMismatch = (error: unknown): boolean => {
+    assert.ok(error instanceof Error);
+    assert.equal(
+      error.message,
+      "live fixture retained course generation policy mismatch",
+    );
+    assert.equal(error.message.includes(ADMIN_TOKEN), false);
+    return true;
+  };
+
+  let mismatchedPutCallIndex = 0;
+  const mismatchedPutRequest = new FakeRequest((call) => {
+    assert.equal(call.method, expectedMethods[mismatchedPutCallIndex]);
+    assert.equal(call.url, path);
+    assert.equal(header(call, "Authorization"), `Bearer ${ADMIN_TOKEN}`);
+    if (call.method === "PUT") {
+      assert.deepEqual(data(call), policy);
+      mismatchedPutCallIndex += 1;
+      return response(200, {
+        ...retainedPolicy,
+        tenantId: `${course.tenantId}:${ADMIN_TOKEN}`,
+      });
+    }
+    assert.equal(call.options?.data, undefined);
+    mismatchedPutCallIndex += 1;
+    return response(200, retainedPolicy);
+  });
+
+  await assert.rejects(
+    ensurePolicy(
+      makeContext(mismatchedPutRequest, { evidence: "student_micro_flow" }),
+      course,
+    ),
+    isStaticPolicyMismatch,
+  );
+  assert.equal(mismatchedPutCallIndex, 1);
+  assert.deepEqual(
+    mismatchedPutRequest.calls.map((call) => call.method),
+    ["PUT"],
+  );
+
+  let driftedGetCallIndex = 0;
+  const driftedGetRequest = new FakeRequest((call) => {
+    assert.equal(call.method, expectedMethods[driftedGetCallIndex]);
+    assert.equal(call.url, path);
+    assert.equal(header(call, "Authorization"), `Bearer ${ADMIN_TOKEN}`);
+    if (call.method === "PUT") {
+      assert.deepEqual(data(call), policy);
+      driftedGetCallIndex += 1;
+      return response(200, retainedPolicy);
+    }
+    assert.equal(call.options?.data, undefined);
+    driftedGetCallIndex += 1;
+    return response(200, {
+      ...retainedPolicy,
+      updatedAt: "2026-08-26T08:00:01Z",
+    });
+  });
+
+  await assert.rejects(
+    ensurePolicy(
+      makeContext(driftedGetRequest, { evidence: "student_micro_flow" }),
+      course,
+    ),
+    isStaticPolicyMismatch,
+  );
+  assert.equal(driftedGetCallIndex, 2);
+  assert.deepEqual(
+    driftedGetRequest.calls.map((call) => call.method),
+    ["PUT", "GET"],
+  );
+});
+
 test("retained conflicts select exact deterministic records instead of the first list item", async () => {
   const tenant = tenantRecord();
   let expectedSource: ReturnType<typeof sourceFromUpload> | undefined;
@@ -772,4 +1064,460 @@ test("malformed API errors stay static and redact the admin token and password",
       return true;
     },
   );
+});
+
+test("bounded student poller requires awaiting_confirmation before completing a full flow", async () => {
+  const poll = studentPoller();
+  const skippedConfirmation = fakeSequence([
+    classroomState({
+      mode: "full",
+      status: "succeeded",
+      classroomVersionId: "version-too-early",
+    }),
+  ]);
+  let confirmations = 0;
+
+  await assert.rejects(
+    poll(
+      studentPollOptions({
+        expected: {
+          assetId: "asset-student-live",
+          generationJobId: "job-student-live",
+          courseId: "course-student-live",
+          classId: "class-student-live",
+          mode: "full",
+          ownerId: "student-live",
+        },
+        readClassroom: skippedConfirmation.read,
+        readGenerationJob: async () =>
+          generationJobState({ status: "succeeded", progressPercent: 100 }),
+        onAwaitingConfirmation: async () => {
+          confirmations += 1;
+        },
+      }),
+    ),
+    /awaiting_confirmation/i,
+  );
+  assert.equal(confirmations, 0);
+
+  const unauthorizedDrift = fakeSequence([
+    classroomState({ mode: "full", status: "awaiting_confirmation" }),
+    classroomState({
+      generationJobId: "job-student-content-drifted",
+      mode: "full",
+      status: "generating",
+    }),
+  ]);
+  const unauthorizedJobReads: string[] = [];
+  await assert.rejects(
+    poll(
+      studentPollOptions({
+        expected: {
+          assetId: "asset-student-live",
+          generationJobId: "job-student-live",
+          courseId: "course-student-live",
+          classId: "class-student-live",
+          mode: "full",
+          ownerId: "student-live",
+        },
+        readClassroom: unauthorizedDrift.read,
+        readGenerationJob: async (jobId) => {
+          unauthorizedJobReads.push(jobId);
+          return generationJobState({
+            jobId,
+            phase: "outline",
+            status: "awaiting_confirmation",
+            progressPercent: 100,
+          });
+        },
+        onAwaitingConfirmation: async () => {
+          confirmations += 1;
+        },
+      }),
+    ),
+    /job|binding/i,
+  );
+  assert.equal(confirmations, 1);
+  assert.deepEqual(unauthorizedJobReads, ["job-student-live"]);
+  confirmations = 0;
+
+  await assert.rejects(
+    poll(
+      studentPollOptions({
+        expected: {
+          assetId: "asset-student-live",
+          generationJobId: "job-student-live",
+          courseId: "course-student-live",
+          classId: "class-student-live",
+          mode: "full",
+          ownerId: "student-live",
+        },
+        readClassroom: async () =>
+          classroomState({ mode: "full", status: "awaiting_confirmation" }),
+        readGenerationJob: async () =>
+          generationJobState({ phase: "content", status: "generating_content" }),
+        onAwaitingConfirmation: async () => {
+          confirmations += 1;
+        },
+      }),
+    ),
+    /phase|generation job/i,
+  );
+  assert.equal(confirmations, 0);
+  confirmations = 0;
+
+  const stalledAfterConfirmation = fakeSequence([
+    classroomState({ mode: "full", status: "awaiting_confirmation" }),
+    classroomState({ mode: "full", status: "generating" }),
+  ]);
+  await assert.rejects(
+    poll(
+      studentPollOptions({
+        expected: {
+          assetId: "asset-student-live",
+          generationJobId: "job-student-live",
+          courseId: "course-student-live",
+          classId: "class-student-live",
+          mode: "full",
+          ownerId: "student-live",
+        },
+        pollAttempts: 2,
+        readClassroom: stalledAfterConfirmation.read,
+        readGenerationJob: async () =>
+          generationJobState({
+            phase: "outline",
+            status: "awaiting_confirmation",
+            progressPercent: 100,
+          }),
+        onAwaitingConfirmation: async () => {
+          confirmations += 1;
+        },
+      }),
+    ),
+    /phase|generation job/i,
+  );
+  assert.equal(confirmations, 1);
+  confirmations = 0;
+
+  const finalClassroom = classroomState({
+    generationJobId: "job-student-live",
+    mode: "full",
+    status: "succeeded",
+    classroomVersionId: "version-full-live",
+  });
+  const finalJob = generationJobState({
+    jobId: "job-student-live",
+    phase: "content",
+    status: "succeeded",
+    progressPercent: 100,
+  });
+  const classrooms = fakeSequence([
+    classroomState({ mode: "full", status: "awaiting_confirmation" }),
+    classroomState({
+      generationJobId: "job-student-live",
+      mode: "full",
+      status: "generating",
+    }),
+    finalClassroom,
+  ]);
+  const jobs = fakeSequence([
+    generationJobState({
+      jobId: "job-student-live",
+      phase: "outline",
+      status: "awaiting_confirmation",
+      progressPercent: 100,
+    }),
+    generationJobState({
+      jobId: "job-student-live",
+      phase: "content",
+      progressPercent: 80,
+    }),
+    finalJob,
+  ]);
+
+  const result = await poll(
+    studentPollOptions({
+      expected: {
+        assetId: "asset-student-live",
+        generationJobId: "job-student-live",
+        courseId: "course-student-live",
+        classId: "class-student-live",
+        mode: "full",
+        ownerId: "student-live",
+      },
+      readClassroom: classrooms.read,
+      readGenerationJob: async (jobId) => {
+        assert.equal(jobId, "job-student-live");
+        return jobs.read();
+      },
+      onAwaitingConfirmation: async (classroom) => {
+        assert.equal(classroom.status, "awaiting_confirmation");
+        assert.equal(classroom.classroomVersionId, null);
+        assert.equal(classroom.generationJobId, "job-student-live");
+        confirmations += 1;
+      },
+    }),
+  );
+
+  assert.equal(confirmations, 1);
+  assert.deepEqual(result, {
+    classroom: finalClassroom,
+    generationJob: finalJob,
+  });
+});
+
+test("bounded student poller rejects a pre-seeded immutable version", async () => {
+  assert.equal(POLLER_OPTIONS_REJECT_CALLER_VERSION_ID, true);
+
+  await assert.rejects(
+    studentPoller()(
+      studentPollOptions({
+        expected: {
+          assetId: "asset-student-live",
+          generationJobId: "job-student-live",
+          courseId: "course-student-live",
+          classId: "class-student-live",
+          mode: "full",
+          ownerId: "student-live",
+        },
+        readClassroom: async () =>
+          classroomState({
+            mode: "full",
+            status: "awaiting_confirmation",
+            classroomVersionId: "version-before-confirmation",
+          }),
+        onAwaitingConfirmation: async () => undefined,
+      }),
+    ),
+    /version/i,
+  );
+});
+
+test("bounded student poller redacts timeout diagnostics", async () => {
+  const secret = `${ADMIN_TOKEN}:student-password-never-log`;
+  const classrooms = fakeSequence([
+    { ...classroomState(), diagnostic: secret },
+  ]);
+  const jobs = fakeSequence([
+    { ...generationJobState(), diagnostic: secret },
+  ]);
+  let pauses = 0;
+
+  await assert.rejects(
+    studentPoller()(
+      studentPollOptions({
+        pollAttempts: 2,
+        readClassroom: classrooms.read,
+        readGenerationJob: jobs.read,
+        pause: async () => {
+          pauses += 1;
+        },
+      }),
+    ),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal(error.message, "live student classroom completion timed out");
+      assert.equal(error.message.includes(secret), false);
+      return true;
+    },
+  );
+  assert.equal(classrooms.calls(), 2);
+  assert.equal(jobs.calls(), 2);
+  assert.equal(pauses, 1);
+
+  const assertStaticFailure =
+    (message: string) =>
+    (error: unknown): boolean => {
+      assert.ok(error instanceof Error);
+      assert.equal(error.message, message);
+      assert.equal(error.message.includes(secret), false);
+      return true;
+    };
+  await assert.rejects(
+    studentPoller()(
+      studentPollOptions({
+        readClassroom: async () => {
+          throw new Error(secret);
+        },
+      }),
+    ),
+    assertStaticFailure("live student classroom synchronization failed"),
+  );
+  await assert.rejects(
+    studentPoller()(
+      studentPollOptions({
+        readGenerationJob: async () => {
+          throw new Error(secret);
+        },
+      }),
+    ),
+    assertStaticFailure(
+      "live student classroom generation synchronization failed",
+    ),
+  );
+  await assert.rejects(
+    studentPoller()(
+      studentPollOptions({
+        expected: {
+          ...studentPollOptions().expected,
+          mode: "full",
+        },
+        readClassroom: async () =>
+          classroomState({ mode: "full", status: "awaiting_confirmation" }),
+        readGenerationJob: async () =>
+          generationJobState({
+            phase: "outline",
+            status: "awaiting_confirmation",
+            progressPercent: 100,
+          }),
+        onAwaitingConfirmation: async () => {
+          throw new Error(secret);
+        },
+      }),
+    ),
+    assertStaticFailure("live student classroom confirmation failed"),
+  );
+});
+
+test("bounded student poller returns only after the expected generation job and immutable version", async () => {
+  const poll = studentPoller();
+  const expected = studentPollOptions().expected;
+
+  for (const mismatch of [
+    { assetId: "other-asset" },
+    { ownerId: "other-student" },
+    { courseId: "other-course" },
+    { classId: "other-class" },
+    { mode: "full" as const },
+    { generationJobId: "other-job" },
+  ]) {
+    await assert.rejects(
+      poll(
+        studentPollOptions({
+          readClassroom: async () =>
+            classroomState({
+              ...mismatch,
+              status: "succeeded",
+              classroomVersionId: "version-mismatched",
+            }),
+          readGenerationJob: async () =>
+            generationJobState({ status: "succeeded", progressPercent: 100 }),
+        }),
+      ),
+      /binding/i,
+    );
+  }
+
+  await assert.rejects(
+    poll(
+      studentPollOptions({
+        readClassroom: async () => classroomState({ status: "failed" }),
+        readGenerationJob: async () => generationJobState({ status: "failed" }),
+      }),
+    ),
+    /failed/i,
+  );
+
+  await assert.rejects(
+    poll(
+      studentPollOptions({
+        readClassroom: async () =>
+          classroomState({
+            status: "succeeded",
+            classroomVersionId: "version-wrong-job",
+          }),
+        readGenerationJob: async () =>
+          generationJobState({
+            jobId: "other-job",
+            status: "succeeded",
+            progressPercent: 100,
+          }),
+      }),
+    ),
+    /job|binding/i,
+  );
+
+  await assert.rejects(
+    poll(
+      studentPollOptions({
+        readClassroom: async () =>
+          classroomState({
+            status: "succeeded",
+            classroomVersionId: "version-from-non-generation-job",
+          }),
+        readGenerationJob: async () =>
+          generationJobState({
+            jobKind: "export",
+            status: "succeeded",
+            progressPercent: 100,
+          }),
+      }),
+    ),
+    /generation/i,
+  );
+
+  await assert.rejects(
+    poll(
+      studentPollOptions({
+        readClassroom: async () =>
+          classroomState({
+            status: "succeeded",
+            classroomVersionId: "version-from-outline-job",
+          }),
+        readGenerationJob: async () =>
+          generationJobState({
+            phase: "outline",
+            status: "succeeded",
+            progressPercent: 100,
+          }),
+      }),
+    ),
+    /phase|generation job/i,
+  );
+
+  for (const classroomVersionId of ["", "   "]) {
+    await assert.rejects(
+      poll(
+        studentPollOptions({
+          readClassroom: async () =>
+            classroomState({ status: "succeeded", classroomVersionId }),
+          readGenerationJob: async () =>
+            generationJobState({ status: "succeeded", progressPercent: 100 }),
+        }),
+      ),
+      /version/i,
+    );
+  }
+
+  const finalClassroom = classroomState({
+    status: "succeeded",
+    classroomVersionId: "version-student-live",
+  });
+  const finalJob = generationJobState({
+    status: "succeeded",
+    progressPercent: 100,
+  });
+  const classrooms = fakeSequence([finalClassroom, finalClassroom]);
+  const jobs = fakeSequence([
+    generationJobState({ progressPercent: 99 }),
+    finalJob,
+  ]);
+
+  const result = await poll(
+    studentPollOptions({
+      expected,
+      readClassroom: classrooms.read,
+      readGenerationJob: async (jobId) => {
+        assert.equal(jobId, expected.generationJobId);
+        return jobs.read();
+      },
+    }),
+  );
+
+  assert.deepEqual(result, {
+    classroom: finalClassroom,
+    generationJob: finalJob,
+  });
+  assert.ok(classrooms.calls() >= 2);
+  assert.ok(jobs.calls() >= 2);
 });
