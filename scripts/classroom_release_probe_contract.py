@@ -7,7 +7,7 @@ import json
 
 COMMAND_ID = "yfeistai.classroom-release.playwright"
 COMMAND_VERSION = 1
-ENVIRONMENT_POLICY_VERSION = 1
+ENVIRONMENT_POLICY_VERSION = 2
 LIVE_SPEC = "tests/e2e/classroom-first-release.live.spec.ts"
 LIVE_PROJECT = "first-release-live"
 REPORTER = "json"

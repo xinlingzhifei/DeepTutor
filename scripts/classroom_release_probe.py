@@ -27,7 +27,7 @@ TIMEOUT_EXIT = 124
 TERMINATION_WAIT_SECONDS = 5
 
 _IDENTITY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
-_LIVE_ENVIRONMENT = re.compile(r"^YFEISTAI_LIVE_[A-Z0-9_]+$")
+_LIVE_SECRET_ENVIRONMENT = ("YFEISTAI_LIVE_FIXTURE_TOKEN",)
 _OS_ENVIRONMENT = (
     "SYSTEMROOT",
     "WINDIR",
@@ -138,10 +138,14 @@ def _required_environment(environ: Mapping[str, str], evidence: str) -> dict[str
             "YFEISTAI_ENVIRONMENT_ID",
             "YFEISTAI_EVIDENCE",
             "YFEISTAI_PROBE_TIMEOUT_SECONDS",
+            "YFEISTAI_LIVE_FIXTURE_TOKEN",
             "WEB_BASE_URL",
         )
     }
-    if any(not value for value in required.values()):
+    if (
+        any(not value for value in required.values())
+        or not required["YFEISTAI_LIVE_FIXTURE_TOKEN"].strip()
+    ):
         raise ValueError("probe environment is incomplete")
     report = Path(required["YFEISTAI_EVIDENCE_REPORT"])
     candidate_root = Path(required["YFEISTAI_CANDIDATE_ROOT"])
@@ -209,13 +213,7 @@ def _child_environment(environ: Mapping[str, str], *, runtime: Path) -> dict[str
         name: by_upper[name] for name in _OS_ENVIRONMENT if name in by_upper and by_upper[name]
     }
     child.update({name: environ[name] for name in _FIXED_CHILD_ENVIRONMENT})
-    child.update(
-        {
-            name: value
-            for name, value in environ.items()
-            if _LIVE_ENVIRONMENT.fullmatch(name) is not None
-        }
-    )
+    child.update({name: environ[name] for name in _LIVE_SECRET_ENVIRONMENT})
     child["PATH"] = str(runtime)
     return child
 

@@ -1096,7 +1096,7 @@ def test_consumers_reject_mutated_canonical_probe_command(
         "workers": ("workers", 2),
         "retries": ("retries", 1),
         "report-format": ("reportFormat", "custom-summary"),
-        "environment-policy": ("environmentPolicyVersion", 2),
+        "environment-policy": ("environmentPolicyVersion", 3),
     }
     if mutation == "inner-argv":
         descriptor["innerNpmArgv"].append("--headed")

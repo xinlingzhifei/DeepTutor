@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 import subprocess
 import sys
@@ -38,6 +39,7 @@ def _probe_environment(tmp_path: Path, report: Path, evidence: str) -> dict[str,
         "YFEISTAI_ENVIRONMENT_ID": "staging-1",
         "YFEISTAI_EVIDENCE": evidence,
         "YFEISTAI_PROBE_TIMEOUT_SECONDS": "20",
+        "YFEISTAI_LIVE_FIXTURE_TOKEN": "test-fixture-token-placeholder",
         "WEB_BASE_URL": "https://candidate.example.test",
     }
 
@@ -111,8 +113,89 @@ def test_probe_command_is_built_from_the_canonical_descriptor(tmp_path: Path) ->
         "workers": 1,
         "retries": 0,
         "reportFormat": "playwright-json-reporter",
-        "environmentPolicyVersion": 1,
+        "environmentPolicyVersion": 2,
     }
+
+
+@pytest.mark.parametrize(
+    "fixture_token",
+    (
+        pytest.param(None, id="missing"),
+        pytest.param("", id="empty"),
+        pytest.param(" \t ", id="blank"),
+    ),
+)
+def test_probe_rejects_missing_or_blank_fixture_token_before_execution(
+    tmp_path: Path,
+    fixture_token: str | None,
+) -> None:
+    module = _load_probe()
+    report = tmp_path / "probe.json"
+    environment = _probe_environment(tmp_path, report, "teacher_flow")
+    if fixture_token is None:
+        environment.pop("YFEISTAI_LIVE_FIXTURE_TOKEN")
+    else:
+        environment["YFEISTAI_LIVE_FIXTURE_TOKEN"] = fixture_token
+    calls: list[str] = []
+
+    def resolve_runtime() -> tuple[str, Path]:
+        calls.append("runtime_resolver")
+        return "C:/trusted/npm.cmd", Path("C:/trusted")
+
+    def run(arguments: list[str], **_options: object) -> subprocess.CompletedProcess[bytes]:
+        calls.append("runner")
+        return subprocess.CompletedProcess(arguments, 0, stdout=b"{}")
+
+    error: ValueError | None = None
+    try:
+        module.main(
+            ["teacher_flow"],
+            environ=environment,
+            runner=run,
+            runtime_resolver=resolve_runtime,
+        )
+    except ValueError as exc:
+        error = exc
+
+    assert calls == []
+    assert error is not None
+    assert str(error) == "probe environment is incomplete"
+
+
+def test_probe_forwards_only_the_exact_live_fixture_secret(tmp_path: Path) -> None:
+    module = _load_probe()
+    npm = _trusted_node_runtime(tmp_path)
+    report = tmp_path / "probe.json"
+    fixture_token = "focused-test-fixture-token"
+    captured: dict[str, object] = {}
+
+    def run(arguments: list[str], **options: object) -> subprocess.CompletedProcess[bytes]:
+        captured.update(arguments=arguments, environment=options["env"])
+        return subprocess.CompletedProcess(arguments, 0, stdout=b"{}")
+
+    module.main(
+        ["teacher_flow"],
+        environ={
+            **_probe_environment(tmp_path, report, "teacher_flow"),
+            "YFEISTAI_LIVE_FIXTURE_TOKEN": fixture_token,
+            "YFEISTAI_LIVE_PLATFORM_ADMIN_TOKEN": "must-not-pass",
+            "YFEISTAI_LIVE_FIXTURE_TOKEN_BACKUP": "must-not-pass",
+        },
+        runner=run,
+        runtime_resolver=lambda: module.resolve_fixed_node_runtime(
+            platform="win32", trusted_roots=(npm.parent,)
+        ),
+    )
+
+    child_environment = captured["environment"]
+    arguments = captured["arguments"]
+    assert isinstance(child_environment, dict)
+    assert isinstance(arguments, list)
+    assert child_environment["YFEISTAI_LIVE_FIXTURE_TOKEN"] == fixture_token
+    assert "YFEISTAI_LIVE_PLATFORM_ADMIN_TOKEN" not in child_environment
+    assert "YFEISTAI_LIVE_FIXTURE_TOKEN_BACKUP" not in child_environment
+    assert all(fixture_token not in argument for argument in arguments)
+    assert fixture_token not in json.dumps(module.probe_command_descriptor("teacher_flow"))
 
 
 @pytest.mark.parametrize(
