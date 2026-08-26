@@ -5,8 +5,10 @@ from __future__ import annotations
 from typing import Protocol
 
 from deeptutor.teaching.permissions import ResourceScope
+from deeptutor.teaching.policies.student_generation import ContentMode, CourseGenerationPolicy
 from deeptutor.teaching.repositories.catalog import (
     ClassRecord,
+    CourseGenerationPolicyView,
     CourseRecord,
     EnrollmentRecord,
 )
@@ -25,6 +27,18 @@ class CatalogRepository(Protocol):
     async def get_course(self, course_id: str) -> CourseRecord: ...
 
     async def create_course(self, course_id: str, title: str) -> CourseRecord: ...
+
+    async def get_course_generation_policy(
+        self,
+        course_id: str,
+    ) -> CourseGenerationPolicyView: ...
+
+    async def replace_course_generation_policy(
+        self,
+        course_id: str,
+        policy: CourseGenerationPolicy,
+        updated_by: str,
+    ) -> CourseGenerationPolicyView: ...
 
     async def list_classes(
         self, course_id: str, class_ids: frozenset[str] | None
@@ -102,6 +116,52 @@ class CatalogService:
         if not _is_admin(context):
             raise CatalogAccessDeniedError("course management denied")
         return await self._repository.create_course(course_id, title)
+
+    async def get_course_generation_policy(
+        self,
+        context: TenantContext,
+        *,
+        course_id: str,
+    ) -> CourseGenerationPolicyView:
+        if not _has_permission(context, "policy.manage", course_id=course_id):
+            raise CatalogAccessDeniedError("course policy management denied")
+        return await self._repository.get_course_generation_policy(course_id)
+
+    async def replace_course_generation_policy(
+        self,
+        context: TenantContext,
+        *,
+        course_id: str,
+        allow_student_micro: bool,
+        allow_student_full: bool,
+        allowed_content_modes: frozenset[ContentMode],
+        allow_web_search: bool,
+        require_approval_for_restricted_topics: bool,
+        minor_safety_mode: bool,
+        micro_scene_limit: int,
+        full_scene_limit: int,
+        daily_student_units: int,
+        monthly_student_units: int,
+    ) -> CourseGenerationPolicyView:
+        if not _has_permission(context, "policy.manage", course_id=course_id):
+            raise CatalogAccessDeniedError("course policy management denied")
+        policy = CourseGenerationPolicy(
+            allow_student_micro=allow_student_micro,
+            allow_student_full=allow_student_full,
+            allowed_content_modes=allowed_content_modes,
+            allow_web_search=allow_web_search,
+            require_approval_for_restricted_topics=require_approval_for_restricted_topics,
+            minor_safety_mode=minor_safety_mode,
+            micro_scene_limit=micro_scene_limit,
+            full_scene_limit=full_scene_limit,
+            daily_student_units=daily_student_units,
+            monthly_student_units=monthly_student_units,
+        )
+        return await self._repository.replace_course_generation_policy(
+            course_id,
+            policy,
+            context.user_id,
+        )
 
     async def list_classes(
         self, context: TenantContext, *, course_id: str

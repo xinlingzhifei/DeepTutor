@@ -7,17 +7,19 @@ from datetime import datetime
 from typing import Annotated, TypeVar
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.exc import SQLAlchemyError
 
 from deeptutor.multi_user.knowledge_access import resolve_kb
 from deeptutor.services.config import load_platform_settings
 from deeptutor.teaching.object_store import ObjectStoreError
+from deeptutor.teaching.policies.student_generation import ContentMode
 from deeptutor.teaching.processes import RuntimeStoreProvider
 from deeptutor.teaching.repositories.catalog import (
     CatalogConflictError,
     CatalogNotFoundError,
     ClassRecord,
+    CourseGenerationPolicyView,
     CourseRecord,
     EnrollmentRecord,
     SqlAlchemyCatalogRepository,
@@ -42,6 +44,7 @@ from deeptutor.teaching.tenant_context import TenantContext, require_tenant
 
 router = APIRouter()
 _T = TypeVar("_T")
+_CONTENT_MODE_ORDER: tuple[ContentMode, ...] = ("source_grounded", "open_creation")
 
 
 def _to_camel(value: str) -> str:
@@ -71,6 +74,26 @@ class EnrollmentRequest(_ApiModel):
     user_id: str = Field(min_length=1, max_length=128)
 
 
+class ReplaceCourseGenerationPolicyRequest(_ApiModel):
+    allow_student_micro: bool = Field(strict=True)
+    allow_student_full: bool = Field(strict=True)
+    allowed_content_modes: list[ContentMode] = Field(min_length=1)
+    allow_web_search: bool = Field(strict=True)
+    require_approval_for_restricted_topics: bool = Field(strict=True)
+    minor_safety_mode: bool = Field(strict=True)
+    micro_scene_limit: int = Field(ge=1, le=5, strict=True)
+    full_scene_limit: int = Field(ge=1, le=24, strict=True)
+    daily_student_units: int = Field(ge=0, strict=True)
+    monthly_student_units: int = Field(ge=0, strict=True)
+
+    @field_validator("allowed_content_modes")
+    @classmethod
+    def _content_modes_are_unique(cls, value: list[ContentMode]) -> list[ContentMode]:
+        if len(value) != len(set(value)):
+            raise ValueError("allowedContentModes must contain unique values")
+        return value
+
+
 class BindKnowledgeRequest(_ApiModel):
     knowledge_resource_id: str = Field(min_length=1, max_length=256)
     course_id: str = Field(min_length=1, max_length=64)
@@ -97,6 +120,23 @@ class EnrollmentResponse(_ApiModel):
     user_id: str
     status: str
     created_at: datetime | None = None
+
+
+class CourseGenerationPolicyResponse(_ApiModel):
+    tenant_id: str
+    course_id: str
+    allow_student_micro: bool
+    allow_student_full: bool
+    allowed_content_modes: list[ContentMode]
+    allow_web_search: bool
+    require_approval_for_restricted_topics: bool
+    minor_safety_mode: bool
+    micro_scene_limit: int
+    full_scene_limit: int
+    daily_student_units: int
+    monthly_student_units: int
+    updated_by: str
+    updated_at: datetime
 
 
 class SourceResponse(_ApiModel):
@@ -183,6 +223,29 @@ def _enrollment_response(record: EnrollmentRecord) -> EnrollmentResponse:
     )
 
 
+def _course_generation_policy_response(
+    record: CourseGenerationPolicyView,
+) -> CourseGenerationPolicyResponse:
+    return CourseGenerationPolicyResponse(
+        tenant_id=record.tenant_id,
+        course_id=record.course_id,
+        allow_student_micro=record.allow_student_micro,
+        allow_student_full=record.allow_student_full,
+        allowed_content_modes=[
+            mode for mode in _CONTENT_MODE_ORDER if mode in record.allowed_content_modes
+        ],
+        allow_web_search=record.allow_web_search,
+        require_approval_for_restricted_topics=record.require_approval_for_restricted_topics,
+        minor_safety_mode=record.minor_safety_mode,
+        micro_scene_limit=record.micro_scene_limit,
+        full_scene_limit=record.full_scene_limit,
+        daily_student_units=record.daily_student_units,
+        monthly_student_units=record.monthly_student_units,
+        updated_by=record.updated_by,
+        updated_at=record.updated_at,
+    )
+
+
 def _source_response(record: SourceRecord) -> SourceResponse:
     return SourceResponse.model_validate(record, from_attributes=True)
 
@@ -260,6 +323,50 @@ async def create_course(
         )
     )
     return _course_response(record)
+
+
+@router.get(
+    "/courses/{course_id}/generation-policy",
+    response_model=CourseGenerationPolicyResponse,
+)
+async def get_course_generation_policy(
+    course_id: str,
+    context: TenantContext = Depends(require_tenant),
+    service: CatalogService = Depends(get_catalog_service),
+) -> CourseGenerationPolicyResponse:
+    record = await _catalog_result(
+        service.get_course_generation_policy(context, course_id=course_id)
+    )
+    return _course_generation_policy_response(record)
+
+
+@router.put(
+    "/courses/{course_id}/generation-policy",
+    response_model=CourseGenerationPolicyResponse,
+)
+async def replace_course_generation_policy(
+    course_id: str,
+    request: ReplaceCourseGenerationPolicyRequest,
+    context: TenantContext = Depends(require_tenant),
+    service: CatalogService = Depends(get_catalog_service),
+) -> CourseGenerationPolicyResponse:
+    record = await _catalog_result(
+        service.replace_course_generation_policy(
+            context,
+            course_id=course_id,
+            allow_student_micro=request.allow_student_micro,
+            allow_student_full=request.allow_student_full,
+            allowed_content_modes=frozenset(request.allowed_content_modes),
+            allow_web_search=request.allow_web_search,
+            require_approval_for_restricted_topics=(request.require_approval_for_restricted_topics),
+            minor_safety_mode=request.minor_safety_mode,
+            micro_scene_limit=request.micro_scene_limit,
+            full_scene_limit=request.full_scene_limit,
+            daily_student_units=request.daily_student_units,
+            monthly_student_units=request.monthly_student_units,
+        )
+    )
+    return _course_generation_policy_response(record)
 
 
 @router.get("/courses/{course_id}/classes", response_model=ClassListResponse)

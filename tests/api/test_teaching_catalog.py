@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from deeptutor.api.routers import teaching_catalog as teaching_router
 from deeptutor.teaching.permissions import permissions_for_roles
+from deeptutor.teaching.policies.student_generation import CourseGenerationPolicy
 from deeptutor.teaching.tenant_context import TenantContext, require_tenant
 
 
@@ -35,6 +37,24 @@ class _Enrollment:
     created_at: object | None = None
 
 
+@dataclass(frozen=True)
+class _CourseGenerationPolicy:
+    tenant_id: str
+    course_id: str
+    allow_student_micro: bool
+    allow_student_full: bool
+    allowed_content_modes: frozenset[str]
+    allow_web_search: bool
+    require_approval_for_restricted_topics: bool
+    minor_safety_mode: bool
+    micro_scene_limit: int
+    full_scene_limit: int
+    daily_student_units: int
+    monthly_student_units: int
+    updated_by: str
+    updated_at: datetime
+
+
 class _CatalogRepository:
     def __init__(self) -> None:
         self.courses = {
@@ -50,6 +70,7 @@ class _CatalogRepository:
             ("class-a", "student-a"): _Enrollment("class-a", "student-a"),
             ("class-a", "student-b"): _Enrollment("class-a", "student-b"),
         }
+        self.course_generation_policies: dict[str, _CourseGenerationPolicy] = {}
         self.ineligible_learners: set[str] = set()
 
     async def list_courses(self, course_ids):
@@ -81,6 +102,69 @@ class _CatalogRepository:
             raise CatalogConflictError("course already exists")
         record = _Course(course_id, title)
         self.courses[course_id] = record
+        return record
+
+    async def get_course_generation_policy(self, course_id: str) -> _CourseGenerationPolicy:
+        from deeptutor.teaching.repositories.catalog import CatalogNotFoundError
+
+        course = self.courses.get(course_id)
+        if course is None or course.status != "active":
+            raise CatalogNotFoundError("course not found")
+        try:
+            return self.course_generation_policies[course_id]
+        except KeyError as exc:
+            raise CatalogNotFoundError("course generation policy not found") from exc
+
+    async def replace_course_generation_policy(
+        self,
+        course_id: str,
+        policy: CourseGenerationPolicy,
+        updated_by: str,
+    ) -> _CourseGenerationPolicy:
+        from deeptutor.teaching.repositories.catalog import CatalogNotFoundError
+
+        assert type(policy) is CourseGenerationPolicy
+        course = self.courses.get(course_id)
+        if course is None or course.status != "active":
+            raise CatalogNotFoundError("course not found")
+        existing = self.course_generation_policies.get(course_id)
+        if (
+            existing is not None
+            and existing.allow_student_micro == policy.allow_student_micro
+            and existing.allow_student_full == policy.allow_student_full
+            and existing.allowed_content_modes == policy.allowed_content_modes
+            and existing.allow_web_search == policy.allow_web_search
+            and existing.require_approval_for_restricted_topics
+            == policy.require_approval_for_restricted_topics
+            and existing.minor_safety_mode == policy.minor_safety_mode
+            and existing.micro_scene_limit == policy.micro_scene_limit
+            and existing.full_scene_limit == policy.full_scene_limit
+            and existing.daily_student_units == policy.daily_student_units
+            and existing.monthly_student_units == policy.monthly_student_units
+            and existing.updated_by == updated_by
+        ):
+            return existing
+        record = _CourseGenerationPolicy(
+            tenant_id="tenant-a",
+            course_id=course_id,
+            allow_student_micro=policy.allow_student_micro,
+            allow_student_full=policy.allow_student_full,
+            allowed_content_modes=policy.allowed_content_modes,
+            allow_web_search=policy.allow_web_search,
+            require_approval_for_restricted_topics=(policy.require_approval_for_restricted_topics),
+            minor_safety_mode=policy.minor_safety_mode,
+            micro_scene_limit=policy.micro_scene_limit,
+            full_scene_limit=policy.full_scene_limit,
+            daily_student_units=policy.daily_student_units,
+            monthly_student_units=policy.monthly_student_units,
+            updated_by=updated_by,
+            updated_at=(
+                existing.updated_at + timedelta(microseconds=1)
+                if existing is not None
+                else datetime(2026, 8, 26, 0, 0, tzinfo=timezone.utc)
+            ),
+        )
+        self.course_generation_policies[course_id] = record
         return record
 
     async def list_classes(self, course_id, class_ids):
@@ -159,6 +243,23 @@ def _client(context: TenantContext, repository: object) -> TestClient:
     app.dependency_overrides[require_tenant] = lambda: context
     app.dependency_overrides[teaching_router.get_catalog_repository] = lambda: repository
     return TestClient(app)
+
+
+def _course_generation_policy_payload(**changes: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "allowStudentMicro": True,
+        "allowStudentFull": True,
+        "allowedContentModes": ["open_creation", "source_grounded"],
+        "allowWebSearch": True,
+        "requireApprovalForRestrictedTopics": True,
+        "minorSafetyMode": True,
+        "microSceneLimit": 4,
+        "fullSceneLimit": 18,
+        "dailyStudentUnits": 40,
+        "monthlyStudentUnits": 400,
+    }
+    payload.update(changes)
+    return payload
 
 
 def test_teacher_course_list_contains_only_granted_course() -> None:
@@ -418,6 +519,146 @@ def test_catalog_conflicts_and_missing_resources_have_stable_statuses() -> None:
 
     assert conflict.status_code == 409
     assert missing.status_code == 404
+
+
+def test_platform_admin_replaces_and_reads_course_generation_policy() -> None:
+    repository = _CatalogRepository()
+    context = _context(
+        "platform-admin-a",
+        "platform_admin",
+        scope_type="tenant",
+        scope_id="tenant-a",
+    )
+    client = _client(context, repository)
+    payload = _course_generation_policy_payload()
+    path = "/api/v1/teaching/courses/course-a/generation-policy"
+
+    created = client.put(path, json=payload)
+    read = client.get(path)
+    repeated = client.put(path, json=payload)
+
+    assert [created.status_code, read.status_code, repeated.status_code] == [200, 200, 200]
+    expected = {
+        **payload,
+        "allowedContentModes": ["source_grounded", "open_creation"],
+        "tenantId": "tenant-a",
+        "courseId": "course-a",
+        "updatedBy": "platform-admin-a",
+    }
+    expected_fields = set(expected) | {"updatedAt"}
+    bodies = [created.json(), read.json(), repeated.json()]
+    for body in bodies:
+        assert set(body) == expected_fields
+        assert {key: value for key, value in body.items() if key != "updatedAt"} == expected
+        assert datetime.fromisoformat(body["updatedAt"].replace("Z", "+00:00")).tzinfo
+    assert created.json() == read.json() == repeated.json()
+
+    second_admin = _client(
+        _context(
+            "platform-admin-b",
+            "platform_admin",
+            scope_type="tenant",
+            scope_id="tenant-a",
+        ),
+        repository,
+    )
+    reassigned = second_admin.put(path, json=payload)
+    reread = second_admin.get(path)
+
+    assert reassigned.status_code == 200
+    assert reread.status_code == 200
+    assert reassigned.json()["updatedBy"] == "platform-admin-b"
+    assert reassigned.json()["updatedAt"] != repeated.json()["updatedAt"]
+    assert reread.json() == reassigned.json()
+
+
+def test_course_generation_policy_requires_policy_manage() -> None:
+    repository = _CatalogRepository()
+    path = "/api/v1/teaching/courses/course-missing/generation-policy"
+    denied_contexts = (
+        _context("org-admin-a", "org_admin", scope_type="tenant", scope_id="tenant-a"),
+        _context("teacher-a", "teacher", scope_type="course", scope_id="course-a"),
+        _context("student-a", "student", scope_type="class", scope_id="class-a"),
+    )
+
+    for context in denied_contexts:
+        client = _client(context, repository)
+        responses = (
+            client.get(path),
+            client.put(path, json=_course_generation_policy_payload()),
+        )
+
+        assert [response.status_code for response in responses] == [403, 403]
+        assert {response.json()["detail"] for response in responses} == {"Catalog access denied"}
+
+
+def test_course_generation_policy_rejects_untrusted_and_invalid_fields() -> None:
+    repository = _CatalogRepository()
+    context = _context(
+        "platform-admin-a",
+        "platform_admin",
+        scope_type="tenant",
+        scope_id="tenant-a",
+    )
+    client = _client(context, repository)
+    path = "/api/v1/teaching/courses/course-a/generation-policy"
+    invalid_changes: tuple[dict[str, object], ...] = (
+        {"tenantId": "tenant-b"},
+        {"updatedBy": "attacker"},
+        {"updatedAt": "2026-08-26T00:00:00Z"},
+        {"unexpectedPolicyField": "forbidden"},
+        {"allowedContentModes": []},
+        {"allowedContentModes": ["source_grounded", "source_grounded"]},
+        {"allowedContentModes": ["source_grounded", "untrusted"]},
+        {"microSceneLimit": 0},
+        {"microSceneLimit": 6},
+        {"fullSceneLimit": 0},
+        {"fullSceneLimit": 25},
+        {"dailyStudentUnits": -1},
+        {"monthlyStudentUnits": -1},
+    )
+
+    for changes in invalid_changes:
+        response = client.put(
+            path,
+            json=_course_generation_policy_payload(**changes),
+        )
+
+        assert response.status_code == 422, (changes, response.text)
+    assert repository.course_generation_policies == {}
+
+
+def test_course_generation_policy_missing_resources_have_stable_statuses() -> None:
+    repository = _CatalogRepository()
+    repository.courses["course-inactive"] = _Course(
+        "course-inactive",
+        "Inactive Course",
+        status="inactive",
+    )
+    context = _context(
+        "platform-admin-a",
+        "platform_admin",
+        scope_type="tenant",
+        scope_id="tenant-a",
+    )
+    client = _client(context, repository)
+    inactive_path = "/api/v1/teaching/courses/course-inactive/generation-policy"
+    missing_course_path = "/api/v1/teaching/courses/course-missing/generation-policy"
+
+    missing_course_responses = (
+        client.get(inactive_path),
+        client.put(inactive_path, json=_course_generation_policy_payload()),
+        client.get(missing_course_path),
+        client.put(missing_course_path, json=_course_generation_policy_payload()),
+    )
+    missing_policy = client.get("/api/v1/teaching/courses/course-a/generation-policy")
+
+    assert [response.status_code for response in missing_course_responses] == [404, 404, 404, 404]
+    assert {response.json()["detail"] for response in missing_course_responses} == {
+        "course not found"
+    }
+    assert missing_policy.status_code == 404
+    assert missing_policy.json()["detail"] == "course generation policy not found"
 
 
 def test_teaching_routes_are_not_registered_when_platform_is_disabled() -> None:
