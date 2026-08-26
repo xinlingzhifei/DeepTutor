@@ -71,29 +71,41 @@ git commit -m "fix(release): isolate live browser credentials"
 **Files:**
 
 - Modify: `web/playwright.config.ts`
+- Create: `web/playwright.live-policy.ts`
+- Create: `web/tests/classroom-release-live-policy.test.ts`
 - Modify: `tests/scripts/test_classroom_release_probe.py`
 
-- [ ] **Step 1: Add source-contract RED tests**
+- [ ] **Step 1: Add source and runtime contract RED tests**
 
 Add Python source-contract assertions proving that `web/playwright.config.ts`:
 
 - declares exactly one `first-release-live` project for `classroom-first-release.live.spec.ts`;
-- selects live mode when that project is in argv or fixed evidence is requested;
-- requires an absolute HTTP(S) `WEB_BASE_URL` with a hostname;
+- conditionally excludes that spec from default all-project runs;
 - never starts or falls back to a managed localhost server in live mode;
 - fixes `workers: 1`, `retries: 0`, `fullyParallel: false`, Desktop Chromium, `en-US`, UTC, and `trace`/`screenshot`/`video` off.
+
+Add runtime Node tests for a Playwright-independent policy module proving that it:
+
+- selects live mode for both `--project=first-release-live` and `--project first-release-live`, or for one of the five fixed evidence names;
+- ignores project-like values after the `--` option terminator;
+- requires an absolute HTTP(S) `WEB_BASE_URL` with a hostname;
+- rejects `localhost`, `*.localhost`, IPv4 `127/8`, and IPv6 `::1` loopback targets without echoing the input URL.
 
 Run:
 
 ```powershell
 python -m pytest tests/scripts/test_classroom_release_probe.py -q -k "live_project or live_base_url"
+node web/node_modules/typescript/bin/tsc -p web/tsconfig.node-tests.json
+Push-Location web
+node --import ./scripts/register-node-test-esm.mjs --test dist/node-tests/tests/classroom-release-live-policy.test.js
+Pop-Location
 ```
 
-Expected: RED because the live project does not exist.
+Expected: RED because the live project and its isolated runtime policy do not exist.
 
 - [ ] **Step 2: Implement live project selection and validation**
 
-Introduce a small `LIVE_PROJECT_SELECTED` decision derived from `YFEISTAI_EVIDENCE` or `process.argv`. Validate `WEB_BASE_URL` before exporting the config. Preserve the existing mocked projects and managed server behavior when live mode is not selected.
+Implement the selection and URL rules in the pure policy module, then let the Playwright config consume those decisions. Preserve the existing mocked projects and managed server behavior when live mode is not selected, and keep the live project's `testMatch` empty unless live mode was explicitly selected.
 
 - [ ] **Step 3: Verify the config without opening a browser**
 
@@ -101,17 +113,20 @@ Run:
 
 ```powershell
 python -m pytest tests/scripts/test_classroom_release_probe.py -q
-pnpm --dir web exec playwright test --project=first-release-live --list
-pnpm --dir web exec tsc --noEmit
+node web/node_modules/typescript/bin/tsc -p web/tsconfig.node-tests.json
+Push-Location web
+node --import ./scripts/register-node-test-esm.mjs --test dist/node-tests/tests/classroom-release-live-policy.test.js
+Pop-Location
+node web/node_modules/typescript/bin/tsc --noEmit -p web/tsconfig.json
 git diff --check
 ```
 
-For `--list`, provide synthetic non-secret environment values and an absolute HTTPS base URL. At this stage collection may still fail because the live spec is intentionally absent; the config-specific Python tests must be green. Do not start a browser or local server.
+The live spec is intentionally absent at this stage, so do not run Playwright collection, a browser, or a local server. All commands must use the existing local dependencies without invoking a package-manager install path.
 
 - [ ] **Step 4: Commit**
 
 ```powershell
-git add web/playwright.config.ts tests/scripts/test_classroom_release_probe.py
+git add web/playwright.config.ts web/playwright.live-policy.ts web/tests/classroom-release-live-policy.test.ts tests/scripts/test_classroom_release_probe.py
 git commit -m "test(release): declare live browser project"
 ```
 
