@@ -11,6 +11,39 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 PLAYWRIGHT_CONFIG = ROOT / "web" / "playwright.config.ts"
+LIVE_SPEC = ROOT / "web" / "tests" / "e2e" / "classroom-first-release.live.spec.ts"
+LIVE_FIXTURE = (
+    ROOT
+    / "web"
+    / "tests"
+    / "e2e"
+    / "support"
+    / "classroom-first-release-live-fixture.ts"
+)
+LIVE_FLOWS = (
+    ROOT
+    / "web"
+    / "tests"
+    / "e2e"
+    / "support"
+    / "classroom-first-release-live-flows.ts"
+)
+LIVE_SOURCE_IMPORT_ALLOWLIST = {
+    LIVE_SPEC: frozenset(
+        {
+            "@playwright/test",
+            "./support/classroom-first-release-live-fixture",
+            "./support/classroom-first-release-live-flows",
+        }
+    ),
+    LIVE_FIXTURE: frozenset({"node:crypto"}),
+    LIVE_FLOWS: frozenset(
+        {
+            "@playwright/test",
+            "./classroom-first-release-live-fixture",
+        }
+    ),
+}
 
 
 def _playwright_config_source() -> str:
@@ -19,6 +52,22 @@ def _playwright_config_source() -> str:
 
 def _compact_typescript(source: str) -> str:
     return re.sub(r"\s+", "", source)
+
+
+def _typescript_static_module_sources(source: str) -> list[str]:
+    statements = re.findall(r"(?m)^\s*import\b[^;]*;", source)
+    modules: list[str] = []
+    for statement in statements:
+        match = re.search(r'(?:\bfrom\s+)?["\']([^"\']+)["\']\s*;', statement)
+        assert match is not None, f"unrecognized TypeScript module statement: {statement}"
+        modules.append(match.group(1))
+    modules.extend(
+        re.findall(
+            r'(?m)^\s*export\b[^;]*\bfrom\s+["\']([^"\']+)["\']\s*;',
+            source,
+        )
+    )
+    return modules
 
 
 def _balanced_brace_segment(source: str, opening: int) -> str:
@@ -131,6 +180,68 @@ def test_playwright_live_project_is_fixed_serial_chromium_without_artifacts() ->
     assert 'trace:"off",' in use_compact
     assert 'screenshot:"off",' in use_compact
     assert 'video:"off",' in use_compact
+
+
+def test_live_spec_uses_only_real_sources_and_declares_task4_markers_once() -> None:
+    live_sources: dict[Path, str] = {}
+    for path in LIVE_SOURCE_IMPORT_ALLOWLIST:
+        relative = path.relative_to(ROOT).as_posix()
+        assert path.is_file(), f"fixed live source is missing: {relative}"
+        live_sources[path] = path.read_text(encoding="utf-8")
+
+    for path, allowed_imports in LIVE_SOURCE_IMPORT_ALLOWLIST.items():
+        source = live_sources[path]
+        imports = _typescript_static_module_sources(source)
+        relative = path.relative_to(ROOT).as_posix()
+        assert len(imports) == len(set(imports)), f"duplicate imports in {relative}"
+        assert set(imports) == allowed_imports, (
+            f"unexpected live import boundary in {relative}: {sorted(imports)}"
+        )
+        assert not re.search(r"\b(?:import|require)\s*\(", source)
+        for forbidden_import in (
+            "teaching-flow-test",
+            "baseline",
+            "teacher-classroom-flow",
+            "content-operations-flow",
+            "student-classroom-flow",
+            "classroom-learning-loop",
+            "classroom-visual-support",
+        ):
+            assert all(forbidden_import not in imported for imported in imports)
+        for forbidden_source_path in (
+            r"\bpage\s*\.\s*route\s*\(",
+            r"\bbrowserContext\s*\.\s*route\s*\(",
+            r"\broute\s*\.\s*fulfill\s*\(",
+            r"\bscreenshots?\b",
+            r"\btrace\b",
+            r"\bvideos?\b",
+            r"\battachments?\b",
+            r"\bJSON\s*\.\s*stringify\s*\(",
+            r"\bserialize\w*\s*\(",
+            r"\btoJSON\s*\(",
+        ):
+            assert not re.search(forbidden_source_path, source, flags=re.IGNORECASE), (
+                f"forbidden live source path in {relative}: {forbidden_source_path}"
+            )
+
+    for path in (LIVE_SPEC, LIVE_FLOWS):
+        source = live_sources[path]
+        relative = path.relative_to(ROOT).as_posix()
+        for forbidden_live_operation in (
+            r"\.\s*route(?:FromHAR)?\s*\(",
+            r"\.\s*(?:post|put|patch|delete)\s*\(",
+        ):
+            assert not re.search(
+                forbidden_live_operation,
+                source,
+                flags=re.IGNORECASE,
+            ), f"forbidden live operation in {relative}: {forbidden_live_operation}"
+
+    spec_imports = _typescript_static_module_sources(live_sources[LIVE_SPEC])
+    assert "@playwright/test" in spec_imports
+    combined_source = "\n".join(live_sources.values())
+    assert combined_source.count("[release-evidence:teacher_flow]") == 1
+    assert combined_source.count("[release-evidence:content_operations_flow]") == 1
 
 
 def _load_probe():
