@@ -78,7 +78,7 @@ def _function_body(source: str, name: str) -> str:
     return _balanced_brace_segment(source, opening)
 
 
-def test_playwright_live_project_has_one_exact_spec_contract() -> None:
+def test_playwright_live_project_exposes_one_exact_spec_only_in_live_mode() -> None:
     source = _playwright_config_source()
     marker = 'name: "first-release-live"'
     live_project = _object_containing(source, marker)
@@ -86,12 +86,14 @@ def test_playwright_live_project_has_one_exact_spec_contract() -> None:
     assert source.count(marker) == 1
     assert len(re.findall(r"\btestMatch\s*:", live_project)) == 1
     assert re.search(
-        r'\btestMatch:\s*"\*\*/e2e/classroom-first-release\.live\.spec\.ts"\s*,',
+        r'\btestMatch:\s*LIVE_PROJECT_SELECTED\s*\?\s*'
+        r'"\*\*/e2e/classroom-first-release\.live\.spec\.ts"\s*:\s*\[\]\s*,',
         live_project,
     )
+    assert live_project.count("classroom-first-release.live.spec.ts") == 1
 
 
-def test_playwright_live_mode_is_selected_only_by_fixed_inputs() -> None:
+def test_playwright_live_evidence_selection_is_fixed() -> None:
     source = _playwright_config_source()
     compact = _compact_typescript(source)
     evidence_set = re.search(
@@ -105,9 +107,25 @@ def test_playwright_live_mode_is_selected_only_by_fixed_inputs() -> None:
     assert tuple(re.findall(r'"([^"]+)"', evidence_body)) == LIVE_EVIDENCE_TYPES
     assert re.sub(r'"[^"]+"|[\s,]', "", evidence_body) == ""
     assert (
-        'constLIVE_PROJECT_SELECTED=process.argv.includes("--project=first-release-live")'
-        '||LIVE_EVIDENCE.has(process.env.YFEISTAI_EVIDENCE??"");'
-        in compact
+        'LIVE_EVIDENCE.has(process.env.YFEISTAI_EVIDENCE??"")' in compact
+    )
+
+
+def test_playwright_live_project_selection_accepts_both_long_argument_forms() -> None:
+    source = _playwright_config_source()
+    selection_match = re.search(
+        r"const\s+LIVE_PROJECT_SELECTED\s*=\s*(?P<body>.*?);",
+        source,
+        re.DOTALL,
+    )
+
+    assert selection_match is not None
+    selection = _compact_typescript(selection_match.group("body"))
+    assert (
+        selection
+        == 'process.argv.some((argument,index)=>argument==="--project=first-release-live"'
+        '||(argument==="--project"&&process.argv[index+1]==="first-release-live"),)'
+        '||LIVE_EVIDENCE.has(process.env.YFEISTAI_EVIDENCE??"")'
     )
 
 

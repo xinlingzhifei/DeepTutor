@@ -12,7 +12,12 @@ const LIVE_EVIDENCE = new Set([
   "tailwind4_visual_matrix",
 ]);
 const LIVE_PROJECT_SELECTED =
-  process.argv.includes("--project=first-release-live") ||
+  process.argv.some(
+    (argument, index) =>
+      argument === "--project=first-release-live" ||
+      (argument === "--project" &&
+        process.argv[index + 1] === "first-release-live"),
+  ) ||
   LIVE_EVIDENCE.has(process.env.YFEISTAI_EVIDENCE ?? "");
 
 function resolveLiveBaseUrl(): string | undefined {
@@ -80,7 +85,9 @@ export default defineConfig({
   projects: [
     {
       name: "first-release-live",
-      testMatch: "**/e2e/classroom-first-release.live.spec.ts",
+      testMatch: LIVE_PROJECT_SELECTED
+        ? "**/e2e/classroom-first-release.live.spec.ts"
+        : [],
       fullyParallel: false,
       workers: 1,
       retries: 0,
