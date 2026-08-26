@@ -195,6 +195,26 @@ def test_compose_command_selects_platform_or_isolated_data_plane(monkeypatch) ->
     ]
 
 
+def test_platform_compose_command_pins_attested_project_name(monkeypatch) -> None:
+    module = _load_module()
+    monkeypatch.setattr(module.shutil, "which", lambda executable: "docker.exe")
+    monkeypatch.setenv("COMPOSE_PROJECT_NAME", "attacker-project")
+
+    assert module._compose_command(["--platform", "config"]) == [
+        "docker.exe",
+        "compose",
+        "--env-file",
+        str(module.DOCKER_ENV_PATH),
+        "--project-name",
+        "yfeistai-platform",
+        "-f",
+        str(module.PROJECT_ROOT / "docker-compose.yml"),
+        "-f",
+        str(module.PROJECT_ROOT / "docker-compose.platform.yml"),
+        "config",
+    ]
+
+
 def test_default_compose_command_does_not_load_candidate_artifacts(monkeypatch) -> None:
     module = _load_module()
     monkeypatch.setattr(module.shutil, "which", lambda executable: "docker.exe")
@@ -269,6 +289,18 @@ def _isolate_production_wrapper_subprocess(module, monkeypatch):
     monkeypatch.setattr(module.shutil, "which", lambda executable: "docker.exe")
     monkeypatch.setattr(module.subprocess, "run", record_subprocess)
     return subprocess_calls
+
+
+def test_platform_wrapper_removes_ambient_compose_project_name(monkeypatch) -> None:
+    module = _load_module()
+    subprocess_calls = _isolate_production_wrapper_subprocess(module, monkeypatch)
+    monkeypatch.setenv("COMPOSE_PROJECT_NAME", "attacker-project")
+
+    assert module.main(["--platform", "config"]) == 0
+
+    assert len(subprocess_calls) == 1
+    _command, options = subprocess_calls[0]
+    assert "COMPOSE_PROJECT_NAME" not in options["env"]
 
 
 @pytest.mark.parametrize(

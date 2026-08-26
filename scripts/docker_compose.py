@@ -351,6 +351,8 @@ def _compose_command(args: list[str]) -> list[str]:
         artifact_paths = _candidate_paths(candidate_root or PROJECT_ROOT)
         command.extend(
             (
+                "--project-name",
+                "yfeistai-platform",
                 "-f",
                 str(PROJECT_ROOT / "docker-compose.yml"),
                 "-f",
@@ -396,6 +398,7 @@ def main(argv: list[str] | None = None) -> int:
         "BACKEND_PORT",
         "COMPOSE_FILE",
         "COMPOSE_PROFILES",
+        "COMPOSE_PROJECT_NAME",
         "FRONTEND_PORT",
         "POCKETBASE_PORT",
         "AUTH_ENABLED",
