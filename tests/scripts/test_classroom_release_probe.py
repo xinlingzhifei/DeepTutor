@@ -11,13 +11,6 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 PLAYWRIGHT_CONFIG = ROOT / "web" / "playwright.config.ts"
-LIVE_EVIDENCE_TYPES = (
-    "teacher_flow",
-    "student_micro_flow",
-    "student_full_flow",
-    "content_operations_flow",
-    "tailwind4_visual_matrix",
-)
 
 
 def _playwright_config_source() -> str:
@@ -69,15 +62,6 @@ def _object_after(source: str, marker: str) -> str:
     return _balanced_brace_segment(source, opening)
 
 
-def _function_body(source: str, name: str) -> str:
-    marker = f"function {name}("
-    marker_index = source.find(marker)
-    assert marker_index >= 0, f"missing TypeScript function: {name}"
-    opening = source.find("{", marker_index)
-    assert opening >= 0, f"missing body for TypeScript function: {name}"
-    return _balanced_brace_segment(source, opening)
-
-
 def test_playwright_live_project_exposes_one_exact_spec_only_in_live_mode() -> None:
     source = _playwright_config_source()
     marker = 'name: "first-release-live"'
@@ -93,63 +77,26 @@ def test_playwright_live_project_exposes_one_exact_spec_only_in_live_mode() -> N
     assert live_project.count("classroom-first-release.live.spec.ts") == 1
 
 
-def test_playwright_live_evidence_selection_is_fixed() -> None:
+def test_playwright_config_wires_live_policy_and_server_boundary() -> None:
     source = _playwright_config_source()
     compact = _compact_typescript(source)
-    evidence_set = re.search(
-        r"const\s+LIVE_EVIDENCE\s*=\s*new\s+Set\s*\(\s*\[(?P<body>.*?)\]\s*\)\s*;",
-        source,
-        re.DOTALL,
-    )
 
-    assert evidence_set is not None
-    evidence_body = evidence_set.group("body")
-    assert tuple(re.findall(r'"([^"]+)"', evidence_body)) == LIVE_EVIDENCE_TYPES
-    assert re.sub(r'"[^"]+"|[\s,]', "", evidence_body) == ""
-    assert (
-        'LIVE_EVIDENCE.has(process.env.YFEISTAI_EVIDENCE??"")' in compact
-    )
-
-
-def test_playwright_live_project_selection_accepts_both_long_argument_forms() -> None:
-    source = _playwright_config_source()
-    selection_match = re.search(
-        r"const\s+LIVE_PROJECT_SELECTED\s*=\s*(?P<body>.*?);",
-        source,
-        re.DOTALL,
-    )
-
-    assert selection_match is not None
-    selection = _compact_typescript(selection_match.group("body"))
-    assert (
-        selection
-        == 'process.argv.some((argument,index)=>argument==="--project=first-release-live"'
-        '||(argument==="--project"&&process.argv[index+1]==="first-release-live"),)'
-        '||LIVE_EVIDENCE.has(process.env.YFEISTAI_EVIDENCE??"")'
-    )
-
-
-def test_playwright_live_base_url_and_server_policy_fail_closed() -> None:
-    source = _playwright_config_source()
-    resolver = _compact_typescript(_function_body(source, "resolveLiveBaseUrl"))
-    compact = _compact_typescript(source)
-
-    assert "if(!LIVE_PROJECT_SELECTED){returnundefined;}" in resolver
-    assert "constrawBaseUrl=process.env.WEB_BASE_URL?.trim();" in resolver
-    assert re.search(r'if\(!rawBaseUrl\)\{thrownewError\("[^"]+"\);\}', resolver)
     assert re.search(
-        r'try\{baseUrl=newURL\(rawBaseUrl\);\}catch\{thrownewError\("[^"]+"\);\}',
-        resolver,
+        r'import\s*\{\s*isLivePlaywrightSelected\s*,\s*resolveLiveBaseUrl\s*,?\s*\}'
+        r'\s*from\s*"\./playwright\.live-policy"\s*;',
+        source,
     )
-    assert (
-        'if((baseUrl.protocol!=="http:"&&baseUrl.protocol!=="https:")'
-        '||!baseUrl.hostname||baseUrl.hostname==="127.0.0.1")'
-        in resolver
+    assert re.search(
+        r"\bconst\s+LIVE_PROJECT_SELECTED\s*=\s*isLivePlaywrightSelected\("
+        r"\s*process\.argv\s*,\s*process\.env\.YFEISTAI_EVIDENCE\s*,?\s*\)\s*;",
+        source,
     )
-    assert resolver.count("thrownewError(") == 3
-    assert "returnbaseUrl.toString();" in resolver
-    assert "LOCAL_BASE_URL" not in resolver
-    assert "constLIVE_BASE_URL=resolveLiveBaseUrl();" in compact
+    assert re.search(
+        r"\bconst\s+LIVE_BASE_URL\s*=\s*resolveLiveBaseUrl\("
+        r"\s*LIVE_PROJECT_SELECTED\s*,\s*process\.env\.WEB_BASE_URL\s*,?\s*\)\s*;",
+        source,
+    )
+    assert "functionresolveLiveBaseUrl(" not in compact
     assert (
         "constBASE_URL=LIVE_PROJECT_SELECTED?LIVE_BASE_URL:"
         "process.env.WEB_BASE_URL||LOCAL_BASE_URL;"

@@ -1,50 +1,21 @@
 import { defineConfig, devices } from "@playwright/test";
 import path from "node:path";
+import {
+  isLivePlaywrightSelected,
+  resolveLiveBaseUrl,
+} from "./playwright.live-policy";
 
 const WEB_ROOT = __dirname;
 const LOCAL_WEB_PORT = process.env.PW_WEB_PORT || "3000";
 const LOCAL_BASE_URL = `http://127.0.0.1:${LOCAL_WEB_PORT}`;
-const LIVE_EVIDENCE = new Set([
-  "teacher_flow",
-  "student_micro_flow",
-  "student_full_flow",
-  "content_operations_flow",
-  "tailwind4_visual_matrix",
-]);
-const LIVE_PROJECT_SELECTED =
-  process.argv.some(
-    (argument, index) =>
-      argument === "--project=first-release-live" ||
-      (argument === "--project" &&
-        process.argv[index + 1] === "first-release-live"),
-  ) ||
-  LIVE_EVIDENCE.has(process.env.YFEISTAI_EVIDENCE ?? "");
-
-function resolveLiveBaseUrl(): string | undefined {
-  if (!LIVE_PROJECT_SELECTED) {
-    return undefined;
-  }
-  const rawBaseUrl = process.env.WEB_BASE_URL?.trim();
-  if (!rawBaseUrl) {
-    throw new Error("WEB_BASE_URL is required for live release evidence");
-  }
-  let baseUrl: URL;
-  try {
-    baseUrl = new URL(rawBaseUrl);
-  } catch {
-    throw new Error("WEB_BASE_URL must be an absolute HTTP(S) URL");
-  }
-  if (
-    (baseUrl.protocol !== "http:" && baseUrl.protocol !== "https:") ||
-    !baseUrl.hostname ||
-    baseUrl.hostname === "127.0.0.1"
-  ) {
-    throw new Error("WEB_BASE_URL must identify a non-loopback HTTP(S) host");
-  }
-  return baseUrl.toString();
-}
-
-const LIVE_BASE_URL = resolveLiveBaseUrl();
+const LIVE_PROJECT_SELECTED = isLivePlaywrightSelected(
+  process.argv,
+  process.env.YFEISTAI_EVIDENCE,
+);
+const LIVE_BASE_URL = resolveLiveBaseUrl(
+  LIVE_PROJECT_SELECTED,
+  process.env.WEB_BASE_URL,
+);
 const BASE_URL = LIVE_PROJECT_SELECTED
   ? LIVE_BASE_URL
   : process.env.WEB_BASE_URL || LOCAL_BASE_URL;
