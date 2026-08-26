@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import {
   LIVE_FIXTURE_POLICY_VERSION,
@@ -705,19 +706,21 @@ test("real login helper drives the /login UI through a fake Page without interce
     async goto(url: string) {
       actions.push(`goto:${url}`);
     },
-    getByLabel(label: string) {
+    locator(selector: string) {
       return {
         async fill(value: string) {
-          filled[label] = value;
+          filled[selector] = value;
+        },
+        async click() {
+          actions.push(`click:${selector}`);
         },
       };
     },
-    getByRole(role: "button", options: { name: string }) {
-      return {
-        async click() {
-          actions.push(`click:${role}:${options.name}`);
-        },
-      };
+    getByLabel(): never {
+      throw new Error("locale-dependent getByLabel must not be used");
+    },
+    getByRole(): never {
+      throw new Error("locale-dependent getByRole must not be used");
     },
     async waitForURL(url: string) {
       actions.push(`wait:${url}`);
@@ -726,15 +729,30 @@ test("real login helper drives the /login UI through a fake Page without interce
 
   await loginLiveIdentity(page, identity, "/teaching/classrooms/new");
 
-  assert.equal(filled["Email or username"], identity.username);
-  assert.notEqual(filled.Password, "");
-  assert.equal(JSON.stringify(identity).includes(filled.Password), false);
+  assert.equal(filled["#username"], identity.username);
+  assert.notEqual(filled["#password"], "");
+  assert.equal(JSON.stringify(identity).includes(filled["#password"]), false);
   assert.deepEqual(actions, [
     "goto:/login?next=%2Fteaching%2Fclassrooms%2Fnew",
     "wait:/teaching/classrooms/new",
-    "click:button:Sign in",
+    'click:button[type="submit"]',
   ]);
   assert.equal("route" in page, false);
+});
+
+test("live fixture keeps resource-specific API setup explicit", () => {
+  const source = readFileSync(
+    "tests/e2e/support/classroom-first-release-live-fixture.ts",
+    "utf8",
+  );
+
+  assert.deepEqual(
+    {
+      genericOptionsType: source.includes("type CreateOrReadOptions<T>"),
+      genericCreateOrRead: source.includes("async function createOrRead<T>"),
+    },
+    { genericOptionsType: false, genericCreateOrRead: false },
+  );
 });
 
 test("malformed API errors stay static and redact the admin token and password", async () => {

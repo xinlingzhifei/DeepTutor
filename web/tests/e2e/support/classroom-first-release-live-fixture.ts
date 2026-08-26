@@ -47,11 +47,10 @@ export interface LiveApiRequestContext {
 
 export interface LivePage {
   goto(url: string): Promise<unknown>;
-  getByLabel(label: string): { fill(value: string): Promise<unknown> };
-  getByRole(
-    role: "button",
-    options: { name: string },
-  ): { click(): Promise<unknown> };
+  locator(selector: string): {
+    fill(value: string): Promise<unknown>;
+    click(): Promise<unknown>;
+  };
   waitForURL(url: string): Promise<unknown>;
 }
 
@@ -741,65 +740,42 @@ function verifyEnrollment(
   }
 }
 
-type CreateOrReadOptions<T> = {
-  label: string;
-  expected: T;
-  expectedId: string;
-  idKey: string;
-  create: () => Promise<LiveApiResponse>;
-  read: () => Promise<LiveApiResponse>;
-  verify: (payload: Record<string, unknown>, expected: T) => void;
-  retain: (expected: T) => void;
-};
-
-async function createOrRead<T>(options: CreateOrReadOptions<T>): Promise<T> {
-  const response = await guardedRequest(`${options.label} creation`, options.create);
-  let payload: Record<string, unknown>;
-  if (response.status() === 201) {
-    payload = await responseRecord(response, `${options.label} creation`);
-  } else if (response.status() === 409) {
-    const read = await guardedRequest(`retained ${options.label}`, options.read);
-    if (read.status() !== 200) {
-      throw new Error(`live fixture retained ${options.label} read failed`);
-    }
-    const body = await responseRecord(read, `retained ${options.label}`);
-    const items = requiredArray(body, "items", `retained ${options.label}`);
-    const exact = items
-      .map((item) => objectItem(item, `retained ${options.label}`))
-      .find((item) => item[options.idKey] === options.expectedId);
-    if (!exact) throw new Error(`live fixture retained ${options.label} mismatch`);
-    payload = exact;
-  } else {
-    throw new Error(`live fixture ${options.label} creation failed`);
-  }
-  options.verify(payload, options.expected);
-  options.retain(options.expected);
-  return options.expected;
-}
-
 async function ensureCourse(
   context: LiveFixtureContext,
   expected: LiveCourseRecord,
 ): Promise<LiveCourseRecord> {
   const secret = privateContext(context);
-  return createOrRead({
-    label: "course",
-    expected,
-    expectedId: expected.id,
-    idKey: "id",
-    create: () =>
-      secret.request.post("/api/v1/teaching/courses", {
-        headers: adminHeaders(context),
-        data: { id: expected.id, title: expected.title },
-      }),
-    read: () =>
+  const response = await guardedRequest("course creation", () =>
+    secret.request.post("/api/v1/teaching/courses", {
+      headers: adminHeaders(context),
+      data: { id: expected.id, title: expected.title },
+    }),
+  );
+  let payload: Record<string, unknown>;
+  if (response.status() === 201) {
+    payload = await responseRecord(response, "course creation");
+  } else if (response.status() === 409) {
+    const read = await guardedRequest("retained course", () =>
       secret.request.get("/api/v1/teaching/courses", {
         headers: adminHeaders(context),
       }),
-    verify: verifyCourse,
-    retain: (record) =>
-      retainByKey(context.records.courses, (item) => `${item.tenantId}\0${item.id}`, record),
-  });
+    );
+    if (read.status() !== 200) {
+      throw new Error("live fixture retained course read failed");
+    }
+    const body = await responseRecord(read, "retained course");
+    const items = requiredArray(body, "items", "retained course");
+    const exact = items
+      .map((item) => objectItem(item, "retained course"))
+      .find((item) => item.id === expected.id);
+    if (!exact) throw new Error("live fixture retained course mismatch");
+    payload = exact;
+  } else {
+    throw new Error("live fixture course creation failed");
+  }
+  verifyCourse(payload, expected);
+  retainByKey(context.records.courses, (item) => `${item.tenantId}\0${item.id}`, expected);
+  return expected;
 }
 
 async function ensureClass(
@@ -808,21 +784,35 @@ async function ensureClass(
 ): Promise<LiveClassRecord> {
   const secret = privateContext(context);
   const base = `/api/v1/teaching/courses/${encodeURIComponent(expected.courseId)}/classes`;
-  return createOrRead({
-    label: "class",
-    expected,
-    expectedId: expected.id,
-    idKey: "id",
-    create: () =>
-      secret.request.post(base, {
-        headers: adminHeaders(context),
-        data: { id: expected.id, name: expected.name },
-      }),
-    read: () => secret.request.get(base, { headers: adminHeaders(context) }),
-    verify: verifyClass,
-    retain: (record) =>
-      retainByKey(context.records.classes, (item) => `${item.tenantId}\0${item.id}`, record),
-  });
+  const response = await guardedRequest("class creation", () =>
+    secret.request.post(base, {
+      headers: adminHeaders(context),
+      data: { id: expected.id, name: expected.name },
+    }),
+  );
+  let payload: Record<string, unknown>;
+  if (response.status() === 201) {
+    payload = await responseRecord(response, "class creation");
+  } else if (response.status() === 409) {
+    const read = await guardedRequest("retained class", () =>
+      secret.request.get(base, { headers: adminHeaders(context) }),
+    );
+    if (read.status() !== 200) {
+      throw new Error("live fixture retained class read failed");
+    }
+    const body = await responseRecord(read, "retained class");
+    const items = requiredArray(body, "items", "retained class");
+    const exact = items
+      .map((item) => objectItem(item, "retained class"))
+      .find((item) => item.id === expected.id);
+    if (!exact) throw new Error("live fixture retained class mismatch");
+    payload = exact;
+  } else {
+    throw new Error("live fixture class creation failed");
+  }
+  verifyClass(payload, expected);
+  retainByKey(context.records.classes, (item) => `${item.tenantId}\0${item.id}`, expected);
+  return expected;
 }
 
 async function ensureSource(
@@ -831,32 +821,45 @@ async function ensureSource(
   pdf: Buffer,
 ): Promise<LiveSourceRecord> {
   const secret = privateContext(context);
-  return createOrRead({
-    label: "source",
-    expected,
-    expectedId: expected.bindingId,
-    idKey: "bindingId",
-    create: () =>
-      secret.request.post("/api/v1/teaching/sources/pdf", {
-        headers: adminHeaders(context),
-        multipart: {
-          file: { name: expected.filename, mimeType: "application/pdf", buffer: pdf },
-          courseId: expected.courseId,
-          classId: expected.classId,
-        },
-      }),
-    read: () =>
+  const response = await guardedRequest("source creation", () =>
+    secret.request.post("/api/v1/teaching/sources/pdf", {
+      headers: adminHeaders(context),
+      multipart: {
+        file: { name: expected.filename, mimeType: "application/pdf", buffer: pdf },
+        courseId: expected.courseId,
+        classId: expected.classId,
+      },
+    }),
+  );
+  let payload: Record<string, unknown>;
+  if (response.status() === 201) {
+    payload = await responseRecord(response, "source creation");
+  } else if (response.status() === 409) {
+    const read = await guardedRequest("retained source", () =>
       secret.request.get("/api/v1/teaching/sources", {
         headers: adminHeaders(context),
       }),
-    verify: verifySource,
-    retain: (record) =>
-      retainByKey(
-        context.records.sources,
-        (item) => `${item.tenantId}\0${item.bindingId}`,
-        record,
-      ),
-  });
+    );
+    if (read.status() !== 200) {
+      throw new Error("live fixture retained source read failed");
+    }
+    const body = await responseRecord(read, "retained source");
+    const items = requiredArray(body, "items", "retained source");
+    const exact = items
+      .map((item) => objectItem(item, "retained source"))
+      .find((item) => item.bindingId === expected.bindingId);
+    if (!exact) throw new Error("live fixture retained source mismatch");
+    payload = exact;
+  } else {
+    throw new Error("live fixture source creation failed");
+  }
+  verifySource(payload, expected);
+  retainByKey(
+    context.records.sources,
+    (item) => `${item.tenantId}\0${item.bindingId}`,
+    expected,
+  );
+  return expected;
 }
 
 async function ensureEnrollment(
@@ -865,25 +868,39 @@ async function ensureEnrollment(
 ): Promise<LiveEnrollmentRecord> {
   const secret = privateContext(context);
   const base = `/api/v1/teaching/classes/${encodeURIComponent(expected.classId)}/enrollments`;
-  return createOrRead({
-    label: "enrollment",
+  const response = await guardedRequest("enrollment creation", () =>
+    secret.request.post(base, {
+      headers: adminHeaders(context),
+      data: { userId: expected.userId },
+    }),
+  );
+  let payload: Record<string, unknown>;
+  if (response.status() === 201) {
+    payload = await responseRecord(response, "enrollment creation");
+  } else if (response.status() === 409) {
+    const read = await guardedRequest("retained enrollment", () =>
+      secret.request.get(base, { headers: adminHeaders(context) }),
+    );
+    if (read.status() !== 200) {
+      throw new Error("live fixture retained enrollment read failed");
+    }
+    const body = await responseRecord(read, "retained enrollment");
+    const items = requiredArray(body, "items", "retained enrollment");
+    const exact = items
+      .map((item) => objectItem(item, "retained enrollment"))
+      .find((item) => item.userId === expected.userId);
+    if (!exact) throw new Error("live fixture retained enrollment mismatch");
+    payload = exact;
+  } else {
+    throw new Error("live fixture enrollment creation failed");
+  }
+  verifyEnrollment(payload, expected);
+  retainByKey(
+    context.records.enrollments,
+    (item) => `${item.tenantId}\0${item.classId}\0${item.userId}`,
     expected,
-    expectedId: expected.userId,
-    idKey: "userId",
-    create: () =>
-      secret.request.post(base, {
-        headers: adminHeaders(context),
-        data: { userId: expected.userId },
-      }),
-    read: () => secret.request.get(base, { headers: adminHeaders(context) }),
-    verify: verifyEnrollment,
-    retain: (record) =>
-      retainByKey(
-        context.records.enrollments,
-        (item) => `${item.tenantId}\0${item.classId}\0${item.userId}`,
-        record,
-      ),
-  });
+  );
+  return expected;
 }
 
 export type EnsureLiveCatalogOptions = {
@@ -1005,11 +1022,11 @@ export async function loginLiveIdentity(
   const password = identityPassword(identity);
   try {
     await page.goto(`/login?next=${encodeURIComponent(nextPath)}`);
-    await page.getByLabel("Email or username").fill(identity.username);
-    await page.getByLabel("Password").fill(password);
+    await page.locator("#username").fill(identity.username);
+    await page.locator("#password").fill(password);
     await Promise.all([
       page.waitForURL(nextPath),
-      page.getByRole("button", { name: "Sign in" }).click(),
+      page.locator('button[type="submit"]').click(),
     ]);
   } catch {
     throw new Error("live fixture browser login failed");
