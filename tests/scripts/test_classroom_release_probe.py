@@ -3,12 +3,169 @@ from __future__ import annotations
 import importlib.util
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
+PLAYWRIGHT_CONFIG = ROOT / "web" / "playwright.config.ts"
+LIVE_EVIDENCE_TYPES = (
+    "teacher_flow",
+    "student_micro_flow",
+    "student_full_flow",
+    "content_operations_flow",
+    "tailwind4_visual_matrix",
+)
+
+
+def _playwright_config_source() -> str:
+    return PLAYWRIGHT_CONFIG.read_text(encoding="utf-8")
+
+
+def _compact_typescript(source: str) -> str:
+    return re.sub(r"\s+", "", source)
+
+
+def _balanced_brace_segment(source: str, opening: int) -> str:
+    depth = 0
+    quote: str | None = None
+    escaped = False
+    for index in range(opening, len(source)):
+        character = source[index]
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == quote:
+                quote = None
+            continue
+        if character in {'"', "'", "`"}:
+            quote = character
+        elif character == "{":
+            depth += 1
+        elif character == "}":
+            depth -= 1
+            if depth == 0:
+                return source[opening : index + 1]
+    raise AssertionError("TypeScript brace segment is not balanced")
+
+
+def _object_containing(source: str, marker: str) -> str:
+    marker_index = source.find(marker)
+    assert marker_index >= 0, f"missing TypeScript marker: {marker}"
+    opening = source.rfind("{", 0, marker_index)
+    assert opening >= 0, f"missing object for TypeScript marker: {marker}"
+    return _balanced_brace_segment(source, opening)
+
+
+def _object_after(source: str, marker: str) -> str:
+    marker_index = source.find(marker)
+    assert marker_index >= 0, f"missing TypeScript marker: {marker}"
+    opening = source.find("{", marker_index)
+    assert opening >= 0, f"missing object after TypeScript marker: {marker}"
+    return _balanced_brace_segment(source, opening)
+
+
+def _function_body(source: str, name: str) -> str:
+    marker = f"function {name}("
+    marker_index = source.find(marker)
+    assert marker_index >= 0, f"missing TypeScript function: {name}"
+    opening = source.find("{", marker_index)
+    assert opening >= 0, f"missing body for TypeScript function: {name}"
+    return _balanced_brace_segment(source, opening)
+
+
+def test_playwright_live_project_has_one_exact_spec_contract() -> None:
+    source = _playwright_config_source()
+    marker = 'name: "first-release-live"'
+    live_project = _object_containing(source, marker)
+
+    assert source.count(marker) == 1
+    assert len(re.findall(r"\btestMatch\s*:", live_project)) == 1
+    assert re.search(
+        r'\btestMatch:\s*"\*\*/e2e/classroom-first-release\.live\.spec\.ts"\s*,',
+        live_project,
+    )
+
+
+def test_playwright_live_mode_is_selected_only_by_fixed_inputs() -> None:
+    source = _playwright_config_source()
+    compact = _compact_typescript(source)
+    evidence_set = re.search(
+        r"const\s+LIVE_EVIDENCE\s*=\s*new\s+Set\s*\(\s*\[(?P<body>.*?)\]\s*\)\s*;",
+        source,
+        re.DOTALL,
+    )
+
+    assert evidence_set is not None
+    evidence_body = evidence_set.group("body")
+    assert tuple(re.findall(r'"([^"]+)"', evidence_body)) == LIVE_EVIDENCE_TYPES
+    assert re.sub(r'"[^"]+"|[\s,]', "", evidence_body) == ""
+    assert (
+        'constLIVE_PROJECT_SELECTED=process.argv.includes("--project=first-release-live")'
+        '||LIVE_EVIDENCE.has(process.env.YFEISTAI_EVIDENCE??"");'
+        in compact
+    )
+
+
+def test_playwright_live_base_url_and_server_policy_fail_closed() -> None:
+    source = _playwright_config_source()
+    resolver = _compact_typescript(_function_body(source, "resolveLiveBaseUrl"))
+    compact = _compact_typescript(source)
+
+    assert "if(!LIVE_PROJECT_SELECTED){returnundefined;}" in resolver
+    assert "constrawBaseUrl=process.env.WEB_BASE_URL?.trim();" in resolver
+    assert re.search(r'if\(!rawBaseUrl\)\{thrownewError\("[^"]+"\);\}', resolver)
+    assert re.search(
+        r'try\{baseUrl=newURL\(rawBaseUrl\);\}catch\{thrownewError\("[^"]+"\);\}',
+        resolver,
+    )
+    assert (
+        'if((baseUrl.protocol!=="http:"&&baseUrl.protocol!=="https:")'
+        '||!baseUrl.hostname||baseUrl.hostname==="127.0.0.1")'
+        in resolver
+    )
+    assert resolver.count("thrownewError(") == 3
+    assert "returnbaseUrl.toString();" in resolver
+    assert "LOCAL_BASE_URL" not in resolver
+    assert "constLIVE_BASE_URL=resolveLiveBaseUrl();" in compact
+    assert (
+        "constBASE_URL=LIVE_PROJECT_SELECTED?LIVE_BASE_URL:"
+        "process.env.WEB_BASE_URL||LOCAL_BASE_URL;"
+        in compact
+    )
+    assert (
+        "constSTART_LOCAL_WEB_SERVER=!LIVE_PROJECT_SELECTED&&"
+        "!process.env.WEB_BASE_URL;"
+        in compact
+    )
+    assert (
+        "globalSetup:START_LOCAL_WEB_SERVER?path.join(WEB_ROOT,"
+        '"tests","e2e","support","managed-web-server.ts"):undefined,'
+        in compact
+    )
+
+
+def test_playwright_live_project_is_fixed_serial_chromium_without_artifacts() -> None:
+    source = _playwright_config_source()
+    live_project = _object_containing(source, 'name: "first-release-live"')
+    live_use = _object_after(live_project, 'use:')
+    project_compact = _compact_typescript(live_project)
+    use_compact = _compact_typescript(live_use)
+
+    assert "fullyParallel:false," in project_compact
+    assert "workers:1," in project_compact
+    assert "retries:0," in project_compact
+    assert re.search(r'\.\.\.devices\["Desktop Chrome"\]\s*,', live_use)
+    assert 'channel:"chromium",' in use_compact
+    assert 'locale:"en-US",' in use_compact
+    assert 'timezoneId:"UTC",' in use_compact
+    assert 'trace:"off",' in use_compact
+    assert 'screenshot:"off",' in use_compact
+    assert 'video:"off",' in use_compact
 
 
 def _load_probe():
