@@ -37,6 +37,7 @@ from capacity_profile_contract import (  # noqa: E402
     CAPACITY_WORKLOAD,
     canonical_capacity_profile_report,
     derive_capacity_profile_summary,
+    derive_learning_event_idempotency_checks,
     parse_capacity_profile_report,
 )
 from render_platform_compose import validate_image_lock_bindings  # noqa: E402
@@ -1940,10 +1941,12 @@ def _learning_events(
     session: SessionFixture,
     quiz: QuizEvidence,
 ) -> tuple[list[dict[str, object]], tuple[str, str, str]]:
+    del material
+    binding = hashlib.sha256(session.session_id.encode("utf-8")).hexdigest()
     event_ids = (
-        f"{material.run_key}-event-{session.sequence:03d}-started",
-        f"{material.run_key}-event-{session.sequence:03d}-quiz",
-        f"{material.run_key}-event-{session.sequence:03d}-completed",
+        f"session-{binding}-started",
+        f"session-{binding}-quiz",
+        f"session-{binding}-completed",
     )
     occurred_at = _observed_at()
     return (
@@ -2006,6 +2009,62 @@ def _validate_event_ingestion(raw: object, event_ids: tuple[str, str, str]) -> t
     return sequences[0], sequences[1], sequences[2]
 
 
+def _validate_duplicate_event_ingestion(
+    raw: object,
+    event_ids: tuple[str, str, str],
+    expected_sequences: tuple[int, int, int],
+) -> None:
+    body = _exact_keys(
+        raw,
+        frozenset({"accepted", "duplicate", "quarantined"}),
+        "learning_event_idempotency_invalid",
+    )
+    if body.get("accepted") != [] or body.get("quarantined") != []:
+        raise CapacityProbeError("learning_event_idempotency_invalid")
+    duplicate = body.get("duplicate")
+    if not isinstance(duplicate, list) or len(duplicate) != 3:
+        raise CapacityProbeError("learning_event_idempotency_invalid")
+    normalized: list[tuple[str, int]] = []
+    for item in duplicate:
+        row = _exact_keys(
+            item,
+            frozenset({"event_id", "seq"}),
+            "learning_event_idempotency_invalid",
+        )
+        normalized.append(
+            (
+                _public_id(row.get("event_id"), "learning_event_idempotency_invalid"),
+                _nonnegative_int(row.get("seq"), "learning_event_idempotency_invalid"),
+            )
+        )
+    if normalized != list(zip(event_ids, expected_sequences, strict=True)):
+        raise CapacityProbeError("learning_event_idempotency_invalid")
+
+
+def _event_rows(
+    event_ids: tuple[str, str, str],
+    sequences: tuple[int, int, int],
+) -> list[dict[str, object]]:
+    return [
+        {"eventId": event_id, "seq": sequence}
+        for event_id, sequence in zip(event_ids, sequences, strict=True)
+    ]
+
+
+def _ticket_sha256(ticket: str) -> str:
+    return hashlib.sha256(ticket.encode("utf-8")).hexdigest()
+
+
+def _request_sha256(body: Mapping[str, object]) -> str:
+    canonical = json.dumps(
+        body,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
 async def _ingest_session_events(
     api: CapacityApi,
     *,
@@ -2014,7 +2073,7 @@ async def _ingest_session_events(
     quiz: QuizEvidence,
     student: IdentityCredential,
     start_gate: _StartGate,
-) -> dict[str, object]:
+) -> tuple[dict[str, object], dict[str, object] | None]:
     ticket = _validate_ticket(
         await api.tenant_identity_json(
             "POST",
@@ -2026,6 +2085,7 @@ async def _ingest_session_events(
         "learning_event_ticket_invalid",
     )
     events, event_ids = _learning_events(material=material, session=session, quiz=quiz)
+    request_body: dict[str, object] = {"events": events}
     await start_gate.wait()
     started = time.perf_counter()
     result = await api.tenant_identity_json(
@@ -2034,11 +2094,76 @@ async def _ingest_session_events(
         identity=student,
         tenant_id=session.tenant_id,
         headers={"X-Classroom-Ticket": ticket},
-        json_body={"events": events},
+        json_body=request_body,
         expected_statuses=frozenset({202}),
     )
     latency_ms = round((time.perf_counter() - started) * 1000, 3)
-    _validate_event_ingestion(result, event_ids)
+    accepted_sequences = _validate_event_ingestion(result, event_ids)
+    observation: dict[str, object] | None = None
+    if session.sequence == 0:
+        replay = await api.tenant_identity_json(
+            "POST",
+            f"/api/v1/classroom-sessions/{session.session_id}/events",
+            identity=student,
+            tenant_id=session.tenant_id,
+            headers={"X-Classroom-Ticket": ticket},
+            json_body=request_body,
+            expected_statuses=frozenset({409}),
+        )
+        if replay != {"detail": "Classroom ticket already used"}:
+            raise CapacityProbeError("learning_event_idempotency_invalid")
+        fresh_ticket = _validate_ticket(
+            await api.tenant_identity_json(
+                "POST",
+                f"/api/v1/classroom-sessions/{session.session_id}/event-ticket",
+                identity=student,
+                tenant_id=session.tenant_id,
+                expected_statuses=frozenset({200}),
+            ),
+            "learning_event_ticket_invalid",
+        )
+        if hmac.compare_digest(ticket, fresh_ticket):
+            raise CapacityProbeError("learning_event_idempotency_invalid")
+        duplicate = await api.tenant_identity_json(
+            "POST",
+            f"/api/v1/classroom-sessions/{session.session_id}/events",
+            identity=student,
+            tenant_id=session.tenant_id,
+            headers={"X-Classroom-Ticket": fresh_ticket},
+            json_body=request_body,
+            expected_statuses=frozenset({202}),
+        )
+        _validate_duplicate_event_ingestion(duplicate, event_ids, accepted_sequences)
+        accepted_rows = _event_rows(event_ids, accepted_sequences)
+        observation = {
+            "tenantId": session.tenant_id,
+            "sessionId": session.session_id,
+            "classroomVersionId": session.version_id,
+            "knowledgePointId": quiz.knowledge_point_id,
+            "eventIds": list(event_ids),
+            "requestEnvelope": json.loads(
+                json.dumps(request_body, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+            ),
+            "requestSha256": _request_sha256(request_body),
+            "firstTicketSha256": _ticket_sha256(ticket),
+            "freshTicketSha256": _ticket_sha256(fresh_ticket),
+            "firstResponse": {
+                "statusCode": 202,
+                "accepted": accepted_rows,
+                "duplicate": [],
+                "quarantined": [],
+            },
+            "ticketReplay": {
+                "statusCode": 409,
+                "detail": "Classroom ticket already used",
+            },
+            "freshResponse": {
+                "statusCode": 202,
+                "accepted": [],
+                "duplicate": list(accepted_rows),
+                "quarantined": [],
+            },
+        }
     return {
         "metric": "event_ingest",
         "tenantId": session.tenant_id,
@@ -2046,7 +2171,7 @@ async def _ingest_session_events(
         "sequence": session.sequence,
         "latencyMs": latency_ms,
         "success": True,
-    }
+    }, observation
 
 
 async def _complete_session(
@@ -2118,6 +2243,7 @@ async def _exercise_concurrent_sessions(
     list[dict[str, object]],
     list[dict[str, str]],
     list[dict[str, object]],
+    dict[str, object],
 ]:
     expected_session_count = int(CAPACITY_PROFILE["executedConcurrentSessions"])
     if len(sessions) != expected_session_count:
@@ -2151,7 +2277,9 @@ async def _exercise_concurrent_sessions(
     baselines = dict(await _bounded_map(tenant_ids, load_baseline, limit=20))
     start_gate = _StartGate(expected_session_count)
 
-    async def ingest(session: SessionFixture) -> dict[str, object]:
+    async def ingest(
+        session: SessionFixture,
+    ) -> tuple[dict[str, object], dict[str, object] | None]:
         return await _ingest_session_events(
             api,
             material=material,
@@ -2162,7 +2290,14 @@ async def _exercise_concurrent_sessions(
         )
 
     projection_started = time.perf_counter()
-    event_samples = await _bounded_map(list(sessions), ingest, limit=expected_session_count)
+    ingestion_results = await _bounded_map(list(sessions), ingest, limit=expected_session_count)
+    event_samples = [sample for sample, _observation in ingestion_results]
+    idempotency_observations = [
+        observation for _sample, observation in ingestion_results if observation is not None
+    ]
+    if len(idempotency_observations) != 1:
+        raise CapacityProbeError("learning_event_idempotency_invalid")
+    idempotency_observation = idempotency_observations[0]
 
     async def wait_projection(tenant_id: str) -> tuple[str, float, ReportSnapshot]:
         baseline = baselines[tenant_id]
@@ -2231,7 +2366,7 @@ async def _exercise_concurrent_sessions(
         limit=expected_session_count,
     )
 
-    async def reread_report(tenant_id: str) -> None:
+    async def reread_report(tenant_id: str) -> tuple[str, ReportSnapshot]:
         selected = sessions_by_tenant[tenant_id][0]
         current = await _load_report_snapshot(
             api,
@@ -2243,18 +2378,55 @@ async def _exercise_concurrent_sessions(
         )
         if current != expected_reports[tenant_id]:
             raise CapacityProbeError("mastery_projection_invalid")
+        return tenant_id, current
 
-    await _bounded_map(tenant_ids, reread_report, limit=20)
+    reread_reports = dict(await _bounded_map(tenant_ids, reread_report, limit=20))
+    idempotency_tenant = str(idempotency_observation["tenantId"])
+    if idempotency_tenant not in baselines:
+        raise CapacityProbeError("learning_event_idempotency_invalid")
+
+    def projection_snapshot(
+        snapshot: ReportSnapshot,
+        *,
+        completed_count: int,
+    ) -> dict[str, object]:
+        return {
+            "classroomVersionId": idempotency_observation["classroomVersionId"],
+            "sessionCount": 4,
+            "completedCount": completed_count,
+            "knowledgePointId": idempotency_observation["knowledgePointId"],
+            "validQuizCount": snapshot.valid_quiz_count,
+            "correctQuizCount": snapshot.correct_quiz_count,
+            "evidenceCount": snapshot.evidence_count,
+        }
+
+    idempotency_observation["quizProjection"] = {
+        "expectedDelta": 4,
+        "baseline": projection_snapshot(baselines[idempotency_tenant], completed_count=0),
+        "visible": projection_snapshot(expected_reports[idempotency_tenant], completed_count=0),
+        "reread": projection_snapshot(reread_reports[idempotency_tenant], completed_count=4),
+    }
     observations = [
         {
             "sequence": 0,
             "active": [
-                {"sessionId": session.session_id, "tenantId": session.tenant_id}
+                {
+                    "sessionId": session.session_id,
+                    "tenantId": session.tenant_id,
+                    "classroomVersionId": session.version_id,
+                    "knowledgePointId": quizzes[session.tenant_id].knowledge_point_id,
+                }
                 for session in sorted(sessions, key=lambda item: item.sequence)
             ],
         }
     ]
-    return event_samples, projection_samples, completions, observations
+    return (
+        event_samples,
+        projection_samples,
+        completions,
+        observations,
+        idempotency_observation,
+    )
 
 
 async def _exercise_session(
@@ -2549,6 +2721,7 @@ async def _execute_capacity_probe(
         projection_samples,
         session_completions,
         session_observations,
+        idempotency_observation,
     ) = await _exercise_concurrent_sessions(
         api,
         material=material,
@@ -2596,6 +2769,7 @@ async def _execute_capacity_probe(
         ),
         "resourceSource": CAPACITY_RESOURCE_SOURCE,
         "resourceObservations": resource_observations,
+        "idempotencyObservation": idempotency_observation,
     }
     body = canonical_capacity_profile_report(report)
     parsed = parse_capacity_profile_report(
@@ -2605,11 +2779,13 @@ async def _execute_capacity_probe(
         expected_base_url=config.base_url,
     )
     summary = derive_capacity_profile_summary(parsed)
+    idempotency_checks = derive_learning_event_idempotency_checks(parsed)
     checks = summary.get("checks")
     if (
         not isinstance(checks, dict)
         or not checks
         or any(value is not True for value in checks.values())
+        or any(value is not True for value in idempotency_checks.values())
     ):
         raise CapacityProbeError("capacity_thresholds_failed")
     return body

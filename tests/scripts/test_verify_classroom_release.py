@@ -42,6 +42,15 @@ def _candidate(source_head: str) -> dict[str, object]:
     }
 
 
+def test_learning_event_idempotency_uses_capacity_probe_contract() -> None:
+    module = _load_verifier()
+
+    assert module.RECEIPT_CONTRACTS["learning_event_idempotency"] == (
+        "classroom-capacity-probe",
+        ("duplicateCountedOnce", "ticketReplayRejected", "projectionVisible"),
+    )
+
+
 def _playwright_report(
     evidence: str,
     *,
@@ -350,7 +359,7 @@ def _write_probe_proof(
                 "sha256": hashlib.sha256(attestation_path.read_bytes()).hexdigest(),
             }
         }
-    if evidence == "capacity_profile":
+    if evidence in {"capacity_profile", "learning_event_idempotency"}:
         report = _capacity_profile_report(candidate)
         report_body = (
             json.dumps(
@@ -495,8 +504,53 @@ def _capacity_profile_report(candidate: dict[str, object]) -> dict[str, object]:
             ("baseline", "generation_saturated", "sessions_saturated", "final")
         )
     ]
+    event_binding = hashlib.sha256(b"session-000").hexdigest()
+    event_ids = [
+        f"session-{event_binding}-started",
+        f"session-{event_binding}-quiz",
+        f"session-{event_binding}-completed",
+    ]
+    request_envelope = {
+        "events": [
+            {
+                "schema_version": "1.0",
+                "event_id": event_ids[0],
+                "event_type": "classroom.started",
+                "occurred_at": "2026-08-24T00:00:00Z",
+            },
+            {
+                "schema_version": "1.0",
+                "event_id": event_ids[1],
+                "event_type": "quiz.graded",
+                "occurred_at": "2026-08-24T00:00:00Z",
+                "scene_id": "scene-00",
+                "knowledge_point_id": "kp-00",
+                "assessment_id": "scene-00",
+                "question_id": "question-00",
+                "answer": ["answer-a"],
+            },
+            {
+                "schema_version": "1.0",
+                "event_id": event_ids[2],
+                "event_type": "classroom.completed",
+                "occurred_at": "2026-08-24T00:00:00Z",
+            },
+        ]
+    }
+    request_hash = hashlib.sha256(
+        json.dumps(
+            request_envelope,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    response_rows = [
+        {"eventId": event_id, "seq": sequence}
+        for sequence, event_id in enumerate(event_ids, start=1)
+    ]
     return {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "producer": "classroom-capacity-probe",
         "capacityModel": "deployed-candidate",
         "candidate": candidate,
@@ -544,6 +598,8 @@ def _capacity_profile_report(candidate: dict[str, object]) -> dict[str, object]:
                     {
                         "sessionId": f"session-{sequence:03d}",
                         "tenantId": f"tenant-{sequence % 50:02d}",
+                        "classroomVersionId": f"version-{sequence % 50:02d}",
+                        "knowledgePointId": f"kp-{sequence % 50:02d}",
                     }
                     for sequence in range(200)
                 ],
@@ -557,6 +613,63 @@ def _capacity_profile_report(candidate: dict[str, object]) -> dict[str, object]:
             }
             for sequence in range(200)
         ],
+        "idempotencyObservation": {
+            "tenantId": "tenant-00",
+            "sessionId": "session-000",
+            "classroomVersionId": "version-00",
+            "knowledgePointId": "kp-00",
+            "eventIds": event_ids,
+            "requestEnvelope": request_envelope,
+            "requestSha256": request_hash,
+            "firstTicketSha256": "4" * 64,
+            "freshTicketSha256": "5" * 64,
+            "firstResponse": {
+                "statusCode": 202,
+                "accepted": response_rows,
+                "duplicate": [],
+                "quarantined": [],
+            },
+            "ticketReplay": {
+                "statusCode": 409,
+                "detail": "Classroom ticket already used",
+            },
+            "freshResponse": {
+                "statusCode": 202,
+                "accepted": [],
+                "duplicate": list(response_rows),
+                "quarantined": [],
+            },
+            "quizProjection": {
+                "expectedDelta": 4,
+                "baseline": {
+                    "classroomVersionId": "version-00",
+                    "sessionCount": 4,
+                    "completedCount": 0,
+                    "knowledgePointId": "kp-00",
+                    "validQuizCount": 0,
+                    "correctQuizCount": 0,
+                    "evidenceCount": 0,
+                },
+                "visible": {
+                    "classroomVersionId": "version-00",
+                    "sessionCount": 4,
+                    "completedCount": 0,
+                    "knowledgePointId": "kp-00",
+                    "validQuizCount": 4,
+                    "correctQuizCount": 4,
+                    "evidenceCount": 4,
+                },
+                "reread": {
+                    "classroomVersionId": "version-00",
+                    "sessionCount": 4,
+                    "completedCount": 4,
+                    "knowledgePointId": "kp-00",
+                    "validQuizCount": 4,
+                    "correctQuizCount": 4,
+                    "evidenceCount": 4,
+                },
+            },
+        },
         "resourceSource": {
             "method": "GET",
             "path": "/api/v1/system/memory",
@@ -1175,6 +1288,43 @@ def test_file_runtime_rejects_self_attested_capacity_receipt_without_bound_prove
     )
 
 
+def test_file_runtime_rejects_self_attested_learning_event_receipt_without_bound_provenance(
+    tmp_path: Path,
+) -> None:
+    module = _load_verifier()
+    manifest, evidence_map, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    evidence_entry = evidence_map["learning_event_idempotency"]
+    assert isinstance(evidence_entry, dict)
+    artifact_path = tmp_path / str(evidence_entry["artifact"])
+    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    artifact.pop("provenance")
+    artifact_body = json.dumps(artifact, sort_keys=True).encode()
+    artifact_path.write_bytes(artifact_body)
+    evidence_entry["artifactSha256"] = hashlib.sha256(artifact_body).hexdigest()
+    manifest.write_text(
+        json.dumps(_manifest_document(module, candidate, evidence_map)),
+        encoding="utf-8",
+    )
+
+    result = module.verify(
+        module.FileReleaseRuntime(
+            manifest,
+            expected_source_head="a" * 40,
+            candidate_root=tmp_path,
+        )
+    )
+
+    assert result.layers["learning_event_idempotency"].status == "fail"
+    assert (
+        "capacity execution proof is missing or invalid"
+        in result.layers["learning_event_idempotency"].detail
+    )
+
+
 def test_file_runtime_replays_capacity_profile_raw_samples(tmp_path: Path) -> None:
     module = _load_verifier()
     manifest, _, _ = _write_complete_bundle(
@@ -1377,19 +1527,91 @@ def _rebind_capacity_proof(
     candidate: dict[str, object],
 ) -> None:
     proof_path = tmp_path / "runtime" / "capacity-profile-attestation.json"
-    evidence_entry = evidence_map["capacity_profile"]
+    proof_sha256 = hashlib.sha256(proof_path.read_bytes()).hexdigest()
+    for evidence in ("capacity_profile", "learning_event_idempotency"):
+        evidence_entry = evidence_map[evidence]
+        assert isinstance(evidence_entry, dict)
+        artifact_path = tmp_path / str(evidence_entry["artifact"])
+        artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+        artifact["provenance"]["capacityAttestation"]["sha256"] = proof_sha256
+        artifact_body = json.dumps(artifact, sort_keys=True).encode()
+        artifact_path.write_bytes(artifact_body)
+        evidence_entry["artifactSha256"] = hashlib.sha256(artifact_body).hexdigest()
+    manifest.write_text(
+        json.dumps(_manifest_document(module, candidate, evidence_map)),
+        encoding="utf-8",
+    )
+
+
+def test_file_runtime_rejects_tampered_learning_event_receipt_even_when_rehashed(
+    tmp_path: Path,
+) -> None:
+    module = _load_verifier()
+    manifest, evidence_map, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    evidence_entry = evidence_map["learning_event_idempotency"]
     assert isinstance(evidence_entry, dict)
     artifact_path = tmp_path / str(evidence_entry["artifact"])
     artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
-    artifact["provenance"]["capacityAttestation"]["sha256"] = hashlib.sha256(
-        proof_path.read_bytes()
-    ).hexdigest()
+    artifact["receipt"]["observedAt"] = "2026-08-24T00:00:01Z"
     artifact_body = json.dumps(artifact, sort_keys=True).encode()
     artifact_path.write_bytes(artifact_body)
     evidence_entry["artifactSha256"] = hashlib.sha256(artifact_body).hexdigest()
     manifest.write_text(
         json.dumps(_manifest_document(module, candidate, evidence_map)),
         encoding="utf-8",
+    )
+
+    result = module.verify(
+        module.FileReleaseRuntime(
+            manifest,
+            expected_source_head="a" * 40,
+            candidate_root=tmp_path,
+        )
+    )
+
+    assert result.layers["learning_event_idempotency"].status == "fail"
+    assert (
+        "does not match capacity execution proof"
+        in result.layers["learning_event_idempotency"].detail
+    )
+
+
+def test_file_runtime_replays_learning_event_checks_from_raw_capacity_stdout(
+    tmp_path: Path,
+) -> None:
+    module = _load_verifier()
+    manifest, evidence_map, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    proof_path = tmp_path / "runtime" / "capacity-profile-attestation.json"
+    proof = json.loads(proof_path.read_text(encoding="utf-8"))
+    report = json.loads(proof["execution"]["stdout"])
+    report["idempotencyObservation"]["freshResponse"]["duplicate"][1]["seq"] = 99
+    report_body = (
+        json.dumps(report, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n"
+    ).encode()
+    proof["execution"]["stdout"] = report_body.decode()
+    proof["execution"]["stdoutSha256"] = hashlib.sha256(report_body).hexdigest()
+    proof_path.write_text(json.dumps(proof, sort_keys=True), encoding="utf-8")
+    _rebind_capacity_proof(tmp_path, module, manifest, evidence_map, candidate)
+
+    result = module.verify(
+        module.FileReleaseRuntime(
+            manifest,
+            expected_source_head="a" * 40,
+            candidate_root=tmp_path,
+        )
+    )
+
+    assert result.layers["learning_event_idempotency"].status == "fail"
+    assert (
+        "idempotency observation is invalid" in result.layers["learning_event_idempotency"].detail
     )
 
 

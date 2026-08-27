@@ -30,6 +30,7 @@ from capacity_profile_contract import (  # noqa: E402
     MAX_CAPACITY_REPORT_BYTES,
     capacity_profile_command_record,
     derive_capacity_profile_summary,
+    derive_learning_event_idempotency_checks,
     exact_json_equal,
     parse_capacity_profile_report,
 )
@@ -152,8 +153,8 @@ RECEIPT_CONTRACTS = {
         ("databaseIsolated", "objectsIsolated", "exportsIsolated", "eventsIsolated"),
     ),
     "learning_event_idempotency": (
-        "learning-event-gate",
-        ("idempotent", "projectionVisible"),
+        CAPACITY_PRODUCER,
+        ("duplicateCountedOnce", "ticketReplayRejected", "projectionVisible"),
     ),
     "openmaic_shared_plane": ("openmaic-smoke", ("sharedGenerationPassed",)),
     "openmaic_dedicated_plane": (
@@ -1221,6 +1222,41 @@ def derive_capacity_profile_receipt_checks(
     return {name: checks[name] is True for name in checks}, str(document["observedAt"])
 
 
+def derive_learning_event_idempotency_receipt_checks(
+    body: bytes,
+    *,
+    bundle_root: Path,
+    candidate_root: Path,
+    candidate: Mapping[str, object],
+    release_run: Mapping[str, str],
+) -> tuple[dict[str, bool], str]:
+    """Replay the capacity proof stdout into learning-event checks."""
+
+    _capacity_checks, observed_at = derive_capacity_profile_receipt_checks(
+        body,
+        bundle_root=bundle_root,
+        candidate_root=candidate_root,
+        candidate=candidate,
+        release_run=release_run,
+    )
+    document = json.loads(body)
+    execution = document["execution"]
+    base_url = document["baseUrl"]
+    if not isinstance(execution, dict) or not isinstance(base_url, str):
+        raise ValueError("capacity execution proof is invalid")
+    stdout = execution.get("stdout")
+    if not isinstance(stdout, str):
+        raise ValueError("capacity execution proof is invalid")
+    report = parse_capacity_profile_report(
+        stdout.encode("utf-8", errors="strict"),
+        candidate=candidate,
+        release_run=release_run,
+        expected_base_url=base_url,
+    )
+    checks = derive_learning_event_idempotency_checks(report)
+    return checks, observed_at
+
+
 def probe_provenance_error(
     document: Mapping[str, object],
     *,
@@ -1298,7 +1334,7 @@ def probe_provenance_error(
         ):
             return "platform preflight receipt does not match execution proof"
         return None
-    if evidence == "capacity_profile":
+    if evidence in {"capacity_profile", "learning_event_idempotency"}:
         provenance = document.get("provenance")
         if not isinstance(provenance, dict) or set(provenance) != {"capacityAttestation"}:
             return "capacity execution proof is missing or invalid"
@@ -1317,7 +1353,12 @@ def probe_provenance_error(
         if isinstance(proof_body, str):
             return proof_body
         try:
-            checks, observed_at = derive_capacity_profile_receipt_checks(
+            derive_checks = (
+                derive_capacity_profile_receipt_checks
+                if evidence == "capacity_profile"
+                else derive_learning_event_idempotency_receipt_checks
+            )
+            checks, observed_at = derive_checks(
                 proof_body[0],
                 bundle_root=bundle_root,
                 candidate_root=candidate_root,
@@ -1334,7 +1375,7 @@ def probe_provenance_error(
             or not isinstance(result, dict)
             or result.get("checks") != checks
         ):
-            return "capacity receipt does not match execution proof"
+            return f"{evidence} receipt does not match capacity execution proof"
         return None
     recipe = PROBE_RECIPES.get(evidence)
     if recipe is None:

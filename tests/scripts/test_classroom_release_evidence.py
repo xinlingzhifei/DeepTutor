@@ -2024,10 +2024,12 @@ def test_capacity_profile_receipt_is_derived_from_fixed_live_execution(
     assert "COMPOSE_FILE" not in call["env"]
     proof_path = candidate_root / "runtime" / "capacity-profile-attestation.json"
     receipt_path = candidate_root / "artifacts" / "capacity_profile.json"
+    idempotency_path = candidate_root / "artifacts" / "learning_event_idempotency.json"
     assert receipt == json.loads(receipt_path.read_text(encoding="utf-8"))
     assert receipt["receipt"]["producer"] == "classroom-capacity-probe"
     assert token not in proof_path.read_text(encoding="utf-8")
     assert token not in receipt_path.read_text(encoding="utf-8")
+    assert token not in idempotency_path.read_text(encoding="utf-8")
     proof = json.loads(proof_path.read_text(encoding="utf-8"))
     assert proof["summary"]["checks"] == {
         "thresholdsPassed": True,
@@ -2037,13 +2039,39 @@ def test_capacity_profile_receipt_is_derived_from_fixed_live_execution(
         "resourceBoundaryStable": True,
     }
     assert proof["execution"]["command"] == module.capacity_profile_command_record()
+    proof_sha256 = hashlib.sha256(proof_path.read_bytes()).hexdigest()
+    idempotency = json.loads(idempotency_path.read_text(encoding="utf-8"))
+    assert idempotency["receipt"] == {
+        "producer": "classroom-capacity-probe",
+        "observedAt": "2026-08-25T00:01:00Z",
+        "result": {
+            "outcome": "pass",
+            "nativeExit": 0,
+            "checks": {
+                "duplicateCountedOnce": True,
+                "ticketReplayRejected": True,
+                "projectionVisible": True,
+            },
+        },
+    }
+    expected_provenance = {
+        "capacityAttestation": {
+            "artifact": "runtime/capacity-profile-attestation.json",
+            "sha256": proof_sha256,
+        }
+    }
+    assert receipt["provenance"] == expected_provenance
+    assert idempotency["provenance"] == expected_provenance
 
     manifest = candidate_root / "release-evidence.json"
     module.assemble_manifest(
         manifest,
         candidate_root=candidate_root,
         release_run=RELEASE_RUN,
-        receipt_paths={"capacity_profile": receipt_path},
+        receipt_paths={
+            "capacity_profile": receipt_path,
+            "learning_event_idempotency": idempotency_path,
+        },
     )
     result = verifier.verify(
         verifier.FileReleaseRuntime(
@@ -2053,6 +2081,7 @@ def test_capacity_profile_receipt_is_derived_from_fixed_live_execution(
         )
     )
     assert result.layers["capacity_profile"].status == "pass"
+    assert result.layers["learning_event_idempotency"].status == "pass"
 
 
 def _live_capacity_report(candidate: dict[str, object]) -> dict[str, object]:
@@ -2109,8 +2138,53 @@ def _live_capacity_report(candidate: dict[str, object]) -> dict[str, object]:
             ("baseline", "generation_saturated", "sessions_saturated", "final")
         )
     ]
+    event_binding = hashlib.sha256(b"session-000").hexdigest()
+    event_ids = [
+        f"session-{event_binding}-started",
+        f"session-{event_binding}-quiz",
+        f"session-{event_binding}-completed",
+    ]
+    request_envelope = {
+        "events": [
+            {
+                "schema_version": "1.0",
+                "event_id": event_ids[0],
+                "event_type": "classroom.started",
+                "occurred_at": "2026-08-25T00:00:00Z",
+            },
+            {
+                "schema_version": "1.0",
+                "event_id": event_ids[1],
+                "event_type": "quiz.graded",
+                "occurred_at": "2026-08-25T00:00:00Z",
+                "scene_id": "scene-00",
+                "knowledge_point_id": "kp-00",
+                "assessment_id": "scene-00",
+                "question_id": "question-00",
+                "answer": ["answer-a"],
+            },
+            {
+                "schema_version": "1.0",
+                "event_id": event_ids[2],
+                "event_type": "classroom.completed",
+                "occurred_at": "2026-08-25T00:00:00Z",
+            },
+        ]
+    }
+    request_hash = hashlib.sha256(
+        json.dumps(
+            request_envelope,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    response_rows = [
+        {"eventId": event_id, "seq": sequence}
+        for sequence, event_id in enumerate(event_ids, start=1)
+    ]
     return {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "producer": "classroom-capacity-probe",
         "capacityModel": "deployed-candidate",
         "candidate": candidate,
@@ -2158,6 +2232,8 @@ def _live_capacity_report(candidate: dict[str, object]) -> dict[str, object]:
                     {
                         "sessionId": f"session-{sequence:03d}",
                         "tenantId": f"tenant-{sequence % 50:02d}",
+                        "classroomVersionId": f"version-{sequence % 50:02d}",
+                        "knowledgePointId": f"kp-{sequence % 50:02d}",
                     }
                     for sequence in range(200)
                 ],
@@ -2171,6 +2247,63 @@ def _live_capacity_report(candidate: dict[str, object]) -> dict[str, object]:
             }
             for sequence in range(200)
         ],
+        "idempotencyObservation": {
+            "tenantId": "tenant-00",
+            "sessionId": "session-000",
+            "classroomVersionId": "version-00",
+            "knowledgePointId": "kp-00",
+            "eventIds": event_ids,
+            "requestEnvelope": request_envelope,
+            "requestSha256": request_hash,
+            "firstTicketSha256": "4" * 64,
+            "freshTicketSha256": "5" * 64,
+            "firstResponse": {
+                "statusCode": 202,
+                "accepted": response_rows,
+                "duplicate": [],
+                "quarantined": [],
+            },
+            "ticketReplay": {
+                "statusCode": 409,
+                "detail": "Classroom ticket already used",
+            },
+            "freshResponse": {
+                "statusCode": 202,
+                "accepted": [],
+                "duplicate": list(response_rows),
+                "quarantined": [],
+            },
+            "quizProjection": {
+                "expectedDelta": 4,
+                "baseline": {
+                    "classroomVersionId": "version-00",
+                    "sessionCount": 4,
+                    "completedCount": 0,
+                    "knowledgePointId": "kp-00",
+                    "validQuizCount": 0,
+                    "correctQuizCount": 0,
+                    "evidenceCount": 0,
+                },
+                "visible": {
+                    "classroomVersionId": "version-00",
+                    "sessionCount": 4,
+                    "completedCount": 0,
+                    "knowledgePointId": "kp-00",
+                    "validQuizCount": 4,
+                    "correctQuizCount": 4,
+                    "evidenceCount": 4,
+                },
+                "reread": {
+                    "classroomVersionId": "version-00",
+                    "sessionCount": 4,
+                    "completedCount": 4,
+                    "knowledgePointId": "kp-00",
+                    "validQuizCount": 4,
+                    "correctQuizCount": 4,
+                    "evidenceCount": 4,
+                },
+            },
+        },
         "resourceSource": {
             "method": "GET",
             "path": "/api/v1/system/memory",
@@ -2202,6 +2335,7 @@ def test_capacity_profile_stops_before_runner_without_live_fixture_token(
 
     assert not (candidate_root / "runtime" / "capacity-profile-attestation.json").exists()
     assert not (candidate_root / "artifacts" / "capacity_profile.json").exists()
+    assert not (candidate_root / "artifacts" / "learning_event_idempotency.json").exists()
 
 
 def test_capacity_profile_rejects_live_fixture_token_in_canonical_stdout(
@@ -2237,6 +2371,7 @@ def test_capacity_profile_rejects_live_fixture_token_in_canonical_stdout(
 
     assert not (candidate_root / "runtime" / "capacity-profile-attestation.json").exists()
     assert not (candidate_root / "artifacts" / "capacity_profile.json").exists()
+    assert not (candidate_root / "artifacts" / "learning_event_idempotency.json").exists()
 
 
 def test_capacity_profile_default_runner_rejects_oversized_output(
@@ -2309,6 +2444,73 @@ def test_capacity_profile_receipt_fails_closed_before_publication(
 
     assert not (candidate_root / "runtime" / "capacity-profile-attestation.json").exists()
     assert not (candidate_root / "artifacts" / "capacity_profile.json").exists()
+    assert not (candidate_root / "artifacts" / "learning_event_idempotency.json").exists()
+
+
+@pytest.mark.parametrize(
+    "relative_target",
+    (
+        "runtime/capacity-profile-attestation.json",
+        "artifacts/capacity_profile.json",
+        "artifacts/learning_event_idempotency.json",
+    ),
+)
+def test_capacity_profile_refuses_any_preexisting_publication_target_before_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative_target: str,
+) -> None:
+    module = _load_evidence_module()
+    candidate_root, _candidate = _write_candidate_root(tmp_path)
+    target = candidate_root / relative_target
+    target.parent.mkdir(parents=True, exist_ok=True)
+    sentinel = b'{"ownedBy":"another-writer"}\n'
+    target.write_bytes(sentinel)
+    monkeypatch.setenv("YFEISTAI_LIVE_FIXTURE_TOKEN", "capacity-token")
+
+    def forbidden_runner(*_args, **_kwargs):
+        pytest.fail("preexisting evidence must stop before capacity subprocess execution")
+
+    with pytest.raises(ValueError, match="evidence already exists"):
+        module.write_capacity_profile_receipt(
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            timeout_seconds=600,
+            runner=forbidden_runner,
+        )
+
+    assert target.read_bytes() == sentinel
+
+
+def test_capacity_profile_refuses_dangling_target_entry_via_lexists(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_evidence_module()
+    candidate_root, _candidate = _write_candidate_root(tmp_path)
+    dangling_target = candidate_root / "artifacts" / "learning_event_idempotency.json"
+    real_lexists = module.os.path.lexists
+    monkeypatch.setenv("YFEISTAI_LIVE_FIXTURE_TOKEN", "capacity-token")
+
+    def lexists(path: object) -> bool:
+        return Path(path).resolve() == dangling_target.resolve() or real_lexists(path)
+
+    monkeypatch.setattr(module.os.path, "lexists", lexists)
+
+    def forbidden_runner(*_args, **_kwargs):
+        pytest.fail("dangling evidence must stop before capacity subprocess execution")
+
+    with pytest.raises(ValueError, match="evidence already exists"):
+        module.write_capacity_profile_receipt(
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            timeout_seconds=600,
+            runner=forbidden_runner,
+        )
+
+    assert not dangling_target.exists()
 
 
 def test_capacity_profile_concurrent_target_is_never_overwritten_or_quarantined(
@@ -2359,14 +2561,49 @@ def test_capacity_profile_concurrent_target_is_never_overwritten_or_quarantined(
     assert all(path.read_bytes() != sentinel for path in failure_root.rglob("*.json"))
 
 
+@pytest.mark.parametrize(
+    ("failed_name", "expected_archive_names"),
+    (
+        (
+            "capacity-receipt",
+            {
+                "failure.json",
+                "proof.json",
+                "capacity-receipt.json",
+                "idempotency-receipt.json",
+            },
+        ),
+        (
+            "idempotency-receipt",
+            {
+                "failure.json",
+                "proof.json",
+                "idempotency-receipt.json",
+                "published-capacity-receipt.json",
+            },
+        ),
+        (
+            "proof",
+            {
+                "failure.json",
+                "proof.json",
+                "published-capacity-receipt.json",
+                "published-idempotency-receipt.json",
+            },
+        ),
+    ),
+)
 def test_capacity_profile_publication_failure_relocates_owned_evidence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    failed_name: str,
+    expected_archive_names: set[str],
 ) -> None:
     module = _load_evidence_module()
     candidate_root, candidate = _write_candidate_root(tmp_path)
     proof_path = candidate_root / "runtime" / "capacity-profile-attestation.json"
     receipt_path = candidate_root / "artifacts" / "capacity_profile.json"
+    idempotency_path = candidate_root / "artifacts" / "learning_event_idempotency.json"
     monkeypatch.setenv("YFEISTAI_LIVE_FIXTURE_TOKEN", "capacity-token")
 
     def runner(arguments, *, cwd, env, timeout):
@@ -2381,14 +2618,20 @@ def test_capacity_profile_publication_failure_relocates_owned_evidence(
 
     real_publish = module._publish_no_replace
 
-    def fail_proof(source: Path, target: Path) -> None:
-        if Path(target).resolve() == proof_path.resolve():
-            raise OSError("simulated capacity proof publication failure")
+    failed_path = {
+        "capacity-receipt": receipt_path,
+        "idempotency-receipt": idempotency_path,
+        "proof": proof_path,
+    }[failed_name]
+
+    def fail_publication(source: Path, target: Path) -> None:
+        if Path(target).resolve() == failed_path.resolve():
+            raise OSError(f"simulated {failed_name} publication failure")
         real_publish(source, target)
 
-    monkeypatch.setattr(module, "_publish_no_replace", fail_proof)
+    monkeypatch.setattr(module, "_publish_no_replace", fail_publication)
 
-    with pytest.raises(OSError, match="simulated capacity proof publication failure"):
+    with pytest.raises(OSError, match=f"simulated {failed_name} publication failure"):
         module.write_capacity_profile_receipt(
             candidate_root=candidate_root,
             bundle_root=candidate_root,
@@ -2399,14 +2642,11 @@ def test_capacity_profile_publication_failure_relocates_owned_evidence(
 
     assert not proof_path.exists()
     assert not receipt_path.exists()
+    assert not idempotency_path.exists()
     assert not list(candidate_root.rglob("*.staging"))
     failure_directories = list((candidate_root / "failures" / "capacity-profile").glob("*"))
     assert len(failure_directories) == 1
-    assert {path.name for path in failure_directories[0].iterdir()} == {
-        "failure.json",
-        "proof.json",
-        "published-receipt.json",
-    }
+    assert {path.name for path in failure_directories[0].iterdir()} == expected_archive_names
 
 
 def test_platform_preflight_stops_before_runner_when_trusted_docker_is_unavailable(

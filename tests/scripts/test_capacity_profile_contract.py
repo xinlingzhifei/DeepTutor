@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from functools import cache
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -102,8 +103,53 @@ def _report() -> dict[str, object]:
             ("baseline", "generation_saturated", "sessions_saturated", "final")
         )
     ]
+    event_binding = hashlib.sha256(b"session-000").hexdigest()
+    event_ids = [
+        f"session-{event_binding}-started",
+        f"session-{event_binding}-quiz",
+        f"session-{event_binding}-completed",
+    ]
+    request_envelope = {
+        "events": [
+            {
+                "schema_version": "1.0",
+                "event_id": event_ids[0],
+                "event_type": "classroom.started",
+                "occurred_at": "2026-08-27T00:00:00Z",
+            },
+            {
+                "schema_version": "1.0",
+                "event_id": event_ids[1],
+                "event_type": "quiz.graded",
+                "occurred_at": "2026-08-27T00:00:00Z",
+                "scene_id": "scene-00",
+                "knowledge_point_id": "kp-00",
+                "assessment_id": "scene-00",
+                "question_id": "question-00",
+                "answer": ["answer-a"],
+            },
+            {
+                "schema_version": "1.0",
+                "event_id": event_ids[2],
+                "event_type": "classroom.completed",
+                "occurred_at": "2026-08-27T00:00:00Z",
+            },
+        ]
+    }
+    request_hash = hashlib.sha256(
+        json.dumps(
+            request_envelope,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    response_rows = [
+        {"eventId": event_id, "seq": sequence}
+        for sequence, event_id in enumerate(event_ids, start=1)
+    ]
     return {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "producer": "classroom-capacity-probe",
         "capacityModel": "deployed-candidate",
         "candidate": _candidate(),
@@ -151,6 +197,8 @@ def _report() -> dict[str, object]:
                     {
                         "sessionId": f"session-{sequence:03d}",
                         "tenantId": f"tenant-{sequence % 50:02d}",
+                        "classroomVersionId": f"version-{sequence % 50:02d}",
+                        "knowledgePointId": f"kp-{sequence % 50:02d}",
                     }
                     for sequence in range(200)
                 ],
@@ -170,6 +218,63 @@ def _report() -> dict[str, object]:
             "scope": "deeptutor-api-container-process-tree",
         },
         "resourceObservations": resource_observations,
+        "idempotencyObservation": {
+            "tenantId": "tenant-00",
+            "sessionId": "session-000",
+            "classroomVersionId": "version-00",
+            "knowledgePointId": "kp-00",
+            "eventIds": event_ids,
+            "requestEnvelope": request_envelope,
+            "requestSha256": request_hash,
+            "firstTicketSha256": "4" * 64,
+            "freshTicketSha256": "5" * 64,
+            "firstResponse": {
+                "statusCode": 202,
+                "accepted": response_rows,
+                "duplicate": [],
+                "quarantined": [],
+            },
+            "ticketReplay": {
+                "statusCode": 409,
+                "detail": "Classroom ticket already used",
+            },
+            "freshResponse": {
+                "statusCode": 202,
+                "accepted": [],
+                "duplicate": list(response_rows),
+                "quarantined": [],
+            },
+            "quizProjection": {
+                "expectedDelta": 4,
+                "baseline": {
+                    "classroomVersionId": "version-00",
+                    "sessionCount": 4,
+                    "completedCount": 0,
+                    "knowledgePointId": "kp-00",
+                    "validQuizCount": 0,
+                    "correctQuizCount": 0,
+                    "evidenceCount": 0,
+                },
+                "visible": {
+                    "classroomVersionId": "version-00",
+                    "sessionCount": 4,
+                    "completedCount": 0,
+                    "knowledgePointId": "kp-00",
+                    "validQuizCount": 4,
+                    "correctQuizCount": 4,
+                    "evidenceCount": 4,
+                },
+                "reread": {
+                    "classroomVersionId": "version-00",
+                    "sessionCount": 4,
+                    "completedCount": 4,
+                    "knowledgePointId": "kp-00",
+                    "validQuizCount": 4,
+                    "correctQuizCount": 4,
+                    "evidenceCount": 4,
+                },
+            },
+        },
     }
 
 
@@ -227,6 +332,126 @@ def test_capacity_profile_report_replays_fixed_live_workload() -> None:
         "limitBytes": 10_000,
         "partialObserved": False,
     }
+    assert module.derive_learning_event_idempotency_checks(parsed) == {
+        "duplicateCountedOnce": True,
+        "ticketReplayRejected": True,
+        "projectionVisible": True,
+    }
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("raw-ticket", "idempotency"),
+        ("same-ticket-hash", "idempotency"),
+        ("duplicate-sequence-drift", "idempotency"),
+        ("projection-overcount", "idempotency"),
+        ("request-hash", "idempotency"),
+        ("orphan-session", "idempotency"),
+    ),
+)
+def test_capacity_profile_report_rejects_invalid_idempotency_observation(
+    mutation: str,
+    message: str,
+) -> None:
+    module = _module()
+    report = _report()
+    observation = report["idempotencyObservation"]
+    assert isinstance(observation, dict)
+    if mutation == "raw-ticket":
+        observation["ticket"] = "must-not-be-serialized"
+    elif mutation == "same-ticket-hash":
+        observation["freshTicketSha256"] = observation["firstTicketSha256"]
+    elif mutation == "duplicate-sequence-drift":
+        observation["freshResponse"]["duplicate"][1]["seq"] = 99
+    elif mutation == "projection-overcount":
+        observation["quizProjection"]["visible"]["evidenceCount"] = 5
+    elif mutation == "request-hash":
+        observation["requestSha256"] = "not-a-sha256"
+    else:
+        observation["sessionId"] = "session-004"
+
+    with pytest.raises(ValueError, match=message):
+        module.parse_capacity_profile_report(
+            _body(report),
+            candidate=_candidate(),
+            release_run=_release_run(),
+            expected_base_url="https://candidate.example.test",
+        )
+
+
+def test_capacity_profile_report_rejects_coherent_event_receipt_replacement() -> None:
+    module = _module()
+    report = _report()
+    observation = report["idempotencyObservation"]
+    replacement_ids = [
+        "other-event-000-started",
+        "other-event-000-quiz",
+        "other-event-000-completed",
+    ]
+    replacement_rows = [
+        {"eventId": event_id, "seq": sequence}
+        for event_id, sequence in zip(replacement_ids, (101, 102, 103), strict=True)
+    ]
+    observation["eventIds"] = replacement_ids
+    for event, event_id in zip(
+        observation["requestEnvelope"]["events"], replacement_ids, strict=True
+    ):
+        event["event_id"] = event_id
+    observation["requestSha256"] = hashlib.sha256(
+        json.dumps(
+            observation["requestEnvelope"],
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    observation["firstResponse"]["accepted"] = replacement_rows
+    observation["freshResponse"]["duplicate"] = list(replacement_rows)
+
+    with pytest.raises(ValueError, match="idempotency"):
+        module.parse_capacity_profile_report(
+            _body(report),
+            candidate=_candidate(),
+            release_run=_release_run(),
+            expected_base_url="https://candidate.example.test",
+        )
+
+
+@pytest.mark.parametrize("mutation", ("projection", "version-and-kp"))
+def test_capacity_profile_report_rejects_coherent_projection_binding_replacement(
+    mutation: str,
+) -> None:
+    module = _module()
+    report = _report()
+    observation = report["idempotencyObservation"]
+    if mutation == "projection":
+        for key in ("baseline", "visible", "reread"):
+            for count in ("validQuizCount", "correctQuizCount", "evidenceCount"):
+                observation["quizProjection"][key][count] += 100
+    else:
+        observation["classroomVersionId"] = "other-version"
+        observation["knowledgePointId"] = "other-kp"
+        observation["requestEnvelope"]["events"][1]["knowledge_point_id"] = "other-kp"
+        observation["requestSha256"] = hashlib.sha256(
+            json.dumps(
+                observation["requestEnvelope"],
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        for key in ("baseline", "visible", "reread"):
+            observation["quizProjection"][key]["classroomVersionId"] = "other-version"
+            observation["quizProjection"][key]["knowledgePointId"] = "other-kp"
+
+    with pytest.raises(ValueError, match="idempotency"):
+        module.parse_capacity_profile_report(
+            _body(report),
+            candidate=_candidate(),
+            release_run=_release_run(),
+            expected_base_url="https://candidate.example.test",
+        )
 
 
 def test_capacity_profile_summary_rejects_partial_resource_accounting() -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from http.cookies import SimpleCookie
 import importlib.util
 import json
@@ -31,6 +32,86 @@ def _candidate() -> dict[str, object]:
             "deeptutor": f"sha256:{'1' * 64}",
             "openmaic": f"sha256:{'2' * 64}",
             "openmaic_render": f"sha256:{'3' * 64}",
+        },
+    }
+
+
+def _raw_idempotency_observation(
+    *,
+    tenant_id: str,
+    session_id: str,
+    classroom_version_id: str,
+    knowledge_point_id: str,
+) -> dict[str, object]:
+    event_binding = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+    event_ids = [
+        f"session-{event_binding}-started",
+        f"session-{event_binding}-quiz",
+        f"session-{event_binding}-completed",
+    ]
+    request_envelope = {
+        "events": [
+            {
+                "schema_version": "1.0",
+                "event_id": event_ids[0],
+                "event_type": "classroom.started",
+                "occurred_at": "2026-08-27T00:00:00Z",
+            },
+            {
+                "schema_version": "1.0",
+                "event_id": event_ids[1],
+                "event_type": "quiz.graded",
+                "occurred_at": "2026-08-27T00:00:00Z",
+                "scene_id": "scene-00",
+                "knowledge_point_id": knowledge_point_id,
+                "assessment_id": "scene-00",
+                "question_id": "question-00",
+                "answer": ["answer-a"],
+            },
+            {
+                "schema_version": "1.0",
+                "event_id": event_ids[2],
+                "event_type": "classroom.completed",
+                "occurred_at": "2026-08-27T00:00:00Z",
+            },
+        ]
+    }
+    rows = [
+        {"eventId": event_id, "seq": sequence}
+        for sequence, event_id in enumerate(event_ids, start=1)
+    ]
+    return {
+        "tenantId": tenant_id,
+        "sessionId": session_id,
+        "classroomVersionId": classroom_version_id,
+        "knowledgePointId": knowledge_point_id,
+        "eventIds": event_ids,
+        "requestEnvelope": request_envelope,
+        "requestSha256": hashlib.sha256(
+            json.dumps(
+                request_envelope,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest(),
+        "firstTicketSha256": "4" * 64,
+        "freshTicketSha256": "5" * 64,
+        "firstResponse": {
+            "statusCode": 202,
+            "accepted": rows,
+            "duplicate": [],
+            "quarantined": [],
+        },
+        "ticketReplay": {
+            "statusCode": 409,
+            "detail": "Classroom ticket already used",
+        },
+        "freshResponse": {
+            "statusCode": 202,
+            "accepted": [],
+            "duplicate": list(rows),
+            "quarantined": [],
         },
     }
 
@@ -695,6 +776,124 @@ def test_event_ingestion_requires_positive_strictly_increasing_accepted_sequence
             module._validate_event_ingestion(invalid, event_ids)
 
 
+def test_sequence_zero_event_ingestion_proves_ticket_and_duplicate_idempotency() -> None:
+    module = _module()
+    student = module.IdentityCredential(
+        "student-a",
+        "student-user-a",
+        module.SecretStr("student-token-a"),
+    )
+    session = module.SessionFixture(0, "tenant-a", "asset-a", "version-a", "session-a")
+    material = module.IdentityMaterial(
+        "capacity-run-a",
+        "student-a",
+        module.SecretStr("student-password-a"),
+        "report-a",
+        module.SecretStr("report-password-a"),
+    )
+    quiz = module.QuizEvidence("scene-a", "question-a", "kp-a", ["answer-a"])
+    calls: list[tuple[str, str, object, object, frozenset[int]]] = []
+
+    class Api:
+        async def tenant_identity_json(
+            self,
+            method,
+            path,
+            *,
+            json_body=None,
+            headers=None,
+            expected_statuses=frozenset({200, 201, 202}),
+            **_kwargs,
+        ):
+            calls.append((method, path, json_body, headers, expected_statuses))
+            if path.endswith("/event-ticket"):
+                ticket = "ticket-first" if len(calls) == 1 else "ticket-fresh"
+                return {"ticket": ticket, "expires_in": 300}
+            events = json_body["events"]
+            rows = [
+                {"event_id": event["event_id"], "seq": index}
+                for index, event in enumerate(events, start=11)
+            ]
+            if expected_statuses == frozenset({409}):
+                return {"detail": "Classroom ticket already used"}
+            if headers == {"X-Classroom-Ticket": "ticket-fresh"}:
+                return {"accepted": [], "duplicate": rows, "quarantined": []}
+            return {"accepted": rows, "duplicate": [], "quarantined": []}
+
+    async def exercise():
+        gate = module._StartGate(1)
+        return await module._ingest_session_events(
+            Api(),
+            material=material,
+            session=session,
+            quiz=quiz,
+            student=student,
+            start_gate=gate,
+        )
+
+    sample, observation = asyncio.run(exercise())
+    event_binding = hashlib.sha256(b"session-a").hexdigest()
+    expected_event_ids = [
+        f"session-{event_binding}-started",
+        f"session-{event_binding}-quiz",
+        f"session-{event_binding}-completed",
+    ]
+    expected_rows = [
+        {"eventId": event_id, "seq": sequence}
+        for event_id, sequence in zip(expected_event_ids, (11, 12, 13), strict=True)
+    ]
+
+    assert sample["success"] is True
+    assert observation == {
+        "tenantId": "tenant-a",
+        "sessionId": "session-a",
+        "classroomVersionId": "version-a",
+        "knowledgePointId": "kp-a",
+        "eventIds": expected_event_ids,
+        "requestEnvelope": calls[1][2],
+        "requestSha256": hashlib.sha256(
+            json.dumps(
+                calls[1][2],
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest(),
+        "firstTicketSha256": module.hashlib.sha256(b"ticket-first").hexdigest(),
+        "freshTicketSha256": module.hashlib.sha256(b"ticket-fresh").hexdigest(),
+        "firstResponse": {
+            "statusCode": 202,
+            "accepted": expected_rows,
+            "duplicate": [],
+            "quarantined": [],
+        },
+        "ticketReplay": {
+            "statusCode": 409,
+            "detail": "Classroom ticket already used",
+        },
+        "freshResponse": {
+            "statusCode": 202,
+            "accepted": [],
+            "duplicate": expected_rows,
+            "quarantined": [],
+        },
+    }
+    assert [entry[4] for entry in calls] == [
+        frozenset({200}),
+        frozenset({202}),
+        frozenset({409}),
+        frozenset({200}),
+        frozenset({202}),
+    ]
+    assert "ticket-first" not in json.dumps(observation)
+    assert "ticket-fresh" not in json.dumps(observation)
+    event_bodies = [
+        body for _method, path, body, _headers, _statuses in calls if path.endswith("/events")
+    ]
+    assert len(event_bodies) == 3
+    assert len({id(body) for body in event_bodies}) == 1
+
+
 def test_report_reread_requires_expected_session_and_completion_counts() -> None:
     module = _module()
     reporter = module.IdentityCredential(
@@ -855,14 +1054,24 @@ def test_concurrent_session_workload_uses_one_200_way_barrier_and_rereads_every_
         peak = max(peak, active)
         await asyncio.sleep(0)
         active -= 1
-        return {
-            "metric": "event_ingest",
-            "tenantId": session.tenant_id,
-            "subjectId": session.session_id,
-            "sequence": session.sequence,
-            "latencyMs": 1.0,
-            "success": True,
-        }
+        return (
+            {
+                "metric": "event_ingest",
+                "tenantId": session.tenant_id,
+                "subjectId": session.session_id,
+                "sequence": session.sequence,
+                "latencyMs": 1.0,
+                "success": True,
+            },
+            _raw_idempotency_observation(
+                tenant_id=session.tenant_id,
+                session_id=session.session_id,
+                classroom_version_id=session.version_id,
+                knowledge_point_id=quizzes[session.tenant_id].knowledge_point_id,
+            )
+            if session.sequence == 0
+            else None,
+        )
 
     async def load_report(_api, *, session, **_kwargs):
         reads = report_reads.get(session.tenant_id, 0)
@@ -900,7 +1109,9 @@ def test_concurrent_session_workload_uses_one_200_way_barrier_and_rereads_every_
             end_time=module.time.monotonic() + 5,
         )
 
-    event_samples, projection_samples, completions, observations = asyncio.run(exercise())
+    event_samples, projection_samples, completions, observations, idempotency = asyncio.run(
+        exercise()
+    )
 
     assert peak == 200
     assert len(event_samples) == len(projection_samples) == len(completions) == 200
@@ -908,6 +1119,36 @@ def test_concurrent_session_workload_uses_one_200_way_barrier_and_rereads_every_
     assert len(observations[0]["active"]) == 200
     assert len(completed_calls) == len(verified_calls) == len(completed_sessions) == 200
     assert set(completed_calls) == set(verified_calls) == completed_sessions
+    assert idempotency["quizProjection"] == {
+        "expectedDelta": 4,
+        "baseline": {
+            "classroomVersionId": "version-00",
+            "sessionCount": 4,
+            "completedCount": 0,
+            "knowledgePointId": "kp-00",
+            "validQuizCount": 0,
+            "correctQuizCount": 0,
+            "evidenceCount": 0,
+        },
+        "visible": {
+            "classroomVersionId": "version-00",
+            "sessionCount": 4,
+            "completedCount": 0,
+            "knowledgePointId": "kp-00",
+            "validQuizCount": 4,
+            "correctQuizCount": 4,
+            "evidenceCount": 4,
+        },
+        "reread": {
+            "classroomVersionId": "version-00",
+            "sessionCount": 4,
+            "completedCount": 4,
+            "knowledgePointId": "kp-00",
+            "validQuizCount": 4,
+            "correctQuizCount": 4,
+            "evidenceCount": 4,
+        },
+    }
 
 
 def test_execute_capacity_probe_builds_self_validating_fixed_50_52_200_report(
@@ -1046,14 +1287,24 @@ def test_execute_capacity_probe_builds_self_validating_fixed_50_52_200_report(
 
     async def ingest_session(_api, *, session, start_gate, **_kwargs):
         await start_gate.wait()
-        return {
-            "metric": "event_ingest",
-            "tenantId": session.tenant_id,
-            "subjectId": session.session_id,
-            "sequence": session.sequence,
-            "latencyMs": 1.0,
-            "success": True,
-        }
+        return (
+            {
+                "metric": "event_ingest",
+                "tenantId": session.tenant_id,
+                "subjectId": session.session_id,
+                "sequence": session.sequence,
+                "latencyMs": 1.0,
+                "success": True,
+            },
+            _raw_idempotency_observation(
+                tenant_id=session.tenant_id,
+                session_id=session.session_id,
+                classroom_version_id=session.version_id,
+                knowledge_point_id="kp-a",
+            )
+            if session.sequence == 0
+            else None,
+        )
 
     async def complete_session(_api, *, session, **_kwargs):
         return {
@@ -1104,6 +1355,11 @@ def test_execute_capacity_probe_builds_self_validating_fixed_50_52_200_report(
     assert len(parsed["rawSamples"]) == 652
     assert len(parsed["schedulerClaims"]) == 52
     assert len(parsed["sessionCompletions"]) == 200
+    assert module.derive_learning_event_idempotency_checks(parsed) == {
+        "duplicateCountedOnce": True,
+        "ticketReplayRejected": True,
+        "projectionVisible": True,
+    }
     assert summary["checks"] == {
         "thresholdsPassed": True,
         "rawSamplesRecorded": True,

@@ -26,6 +26,7 @@ from capacity_profile_contract import (  # noqa: E402
     MAX_CAPACITY_REPORT_BYTES,
     capacity_profile_command_record,
     derive_capacity_profile_summary,
+    derive_learning_event_idempotency_checks,
     parse_capacity_profile_report,
 )
 from classroom_release_probe_contract import probe_command_record  # noqa: E402
@@ -1507,7 +1508,8 @@ def write_capacity_profile_receipt(
     candidate_path = Path(candidate_root).resolve()
     proof_path = root / "runtime" / "capacity-profile-attestation.json"
     receipt_path = root / "artifacts" / "capacity_profile.json"
-    if proof_path.exists() or receipt_path.exists():
+    idempotency_path = root / "artifacts" / "learning_event_idempotency.json"
+    if any(os.path.lexists(path) for path in (proof_path, receipt_path, idempotency_path)):
         raise ValueError("capacity profile evidence already exists")
 
     candidate = _candidate(candidate_path)
@@ -1606,6 +1608,9 @@ def write_capacity_profile_receipt(
     checks = summary.get("checks")
     if not isinstance(checks, dict) or any(value is not True for value in checks.values()):
         raise ValueError("capacity profile did not prove passing thresholds")
+    idempotency_checks = derive_learning_event_idempotency_checks(report)
+    if any(value is not True for value in idempotency_checks.values()):
+        raise ValueError("capacity profile did not prove learning event idempotency")
     observed_at = report.get("observedAt")
     if not isinstance(observed_at, str) or not _valid_observed_at(observed_at):
         raise ValueError("capacity profile observedAt is invalid")
@@ -1656,6 +1661,9 @@ def write_capacity_profile_receipt(
     attempt_id = uuid.uuid4().hex
     staged_proof = proof_path.with_name(f".{proof_path.name}.{attempt_id}.staging")
     staged_receipt = receipt_path.with_name(f".{receipt_path.name}.{attempt_id}.staging")
+    staged_idempotency = idempotency_path.with_name(
+        f".{idempotency_path.name}.{attempt_id}.staging"
+    )
     published: dict[str, Path] = {}
     try:
         _atomic_write_json(staged_proof, proof)
@@ -1685,6 +1693,21 @@ def write_capacity_profile_receipt(
                 }
             },
         )
+        _write_pass_receipt_from_candidate(
+            staged_idempotency,
+            candidate=candidate,
+            release_run=bound_run,
+            evidence="learning_event_idempotency",
+            observed_at=observed_at,
+            native_exit=0,
+            checks=idempotency_checks,
+            provenance={
+                "capacityAttestation": {
+                    "artifact": "runtime/capacity-profile-attestation.json",
+                    "sha256": proof_sha256,
+                }
+            },
+        )
         candidate_before_publish = _candidate(candidate_path)
         runtime_before_publish, runtime_before_sha256 = read_runtime_attestation_artifact(
             runtime_path,
@@ -1694,14 +1717,14 @@ def write_capacity_profile_receipt(
             candidate_before_publish != candidate
             or runtime_before_publish != runtime_body
             or runtime_before_sha256 != runtime_sha256
-            or proof_path.exists()
-            or receipt_path.exists()
+            or any(os.path.lexists(path) for path in (proof_path, receipt_path, idempotency_path))
         ):
             raise ValueError("capacity profile release binding changed before publication")
         proof_path.parent.mkdir(parents=True, exist_ok=True)
         receipt_path.parent.mkdir(parents=True, exist_ok=True)
         for name, staged, target in (
-            ("receipt", staged_receipt, receipt_path),
+            ("capacity-receipt", staged_receipt, receipt_path),
+            ("idempotency-receipt", staged_idempotency, idempotency_path),
             ("proof", staged_proof, proof_path),
         ):
             _publish_no_replace(staged, target)
@@ -1720,7 +1743,8 @@ def write_capacity_profile_receipt(
             native_exit=0,
             artifacts={
                 "proof": staged_proof,
-                "receipt": staged_receipt,
+                "capacity-receipt": staged_receipt,
+                "idempotency-receipt": staged_idempotency,
                 **published,
             },
         )

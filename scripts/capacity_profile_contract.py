@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from collections.abc import Mapping
 from datetime import datetime
+import hashlib
 import json
 import math
 from math import ceil
@@ -12,7 +13,7 @@ import re
 from urllib.parse import urlsplit
 
 MAX_CAPACITY_REPORT_BYTES = 512 * 1024
-CAPACITY_SCHEMA_VERSION = 1
+CAPACITY_SCHEMA_VERSION = 2
 CAPACITY_PRODUCER = "classroom-capacity-probe"
 CAPACITY_MODEL = "deployed-candidate"
 CAPACITY_METRICS = (
@@ -67,6 +68,7 @@ CAPACITY_RESOURCE_PHASES = (
 
 _OBSERVED_AT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
 _PUBLIC_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 def capacity_profile_command_record() -> dict[str, object]:
@@ -235,6 +237,294 @@ def _parse_samples(raw: object) -> list[dict[str, object]]:
     return samples
 
 
+def _parse_event_rows(
+    raw: object,
+    *,
+    event_ids: list[str],
+) -> list[dict[str, object]]:
+    if not isinstance(raw, list) or len(raw) != len(event_ids):
+        raise ValueError("capacity report idempotency observation is invalid")
+    rows: list[dict[str, object]] = []
+    sequences: list[int] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict) or set(item) != {"eventId", "seq"}:
+            raise ValueError("capacity report idempotency observation is invalid")
+        sequence = _exact_nonnegative_int(item.get("seq"))
+        if item.get("eventId") != event_ids[index] or sequence is None or sequence <= 0:
+            raise ValueError("capacity report idempotency observation is invalid")
+        rows.append({"eventId": event_ids[index], "seq": sequence})
+        sequences.append(sequence)
+    if any(current <= previous for previous, current in zip(sequences, sequences[1:])):
+        raise ValueError("capacity report idempotency observation is invalid")
+    return rows
+
+
+def _canonical_request_sha256(raw: Mapping[str, object]) -> str:
+    body = json.dumps(
+        raw,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(body).hexdigest()
+
+
+def _expected_learning_event_ids(session_id: str) -> list[str]:
+    binding = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+    return [
+        f"session-{binding}-started",
+        f"session-{binding}-quiz",
+        f"session-{binding}-completed",
+    ]
+
+
+def _parse_request_envelope(
+    raw: object,
+    *,
+    event_ids: list[str],
+    knowledge_point_id: str,
+) -> dict[str, object]:
+    if not isinstance(raw, dict) or set(raw) != {"events"}:
+        raise ValueError("capacity report idempotency observation is invalid")
+    events = raw.get("events")
+    if not isinstance(events, list) or len(events) != 3:
+        raise ValueError("capacity report idempotency observation is invalid")
+    expected_types = ("classroom.started", "quiz.graded", "classroom.completed")
+    normalized_events: list[dict[str, object]] = []
+    observed_at: str | None = None
+    for index, item in enumerate(events):
+        expected_keys = {"schema_version", "event_id", "event_type", "occurred_at"}
+        if index == 1:
+            expected_keys.update(
+                {
+                    "scene_id",
+                    "knowledge_point_id",
+                    "assessment_id",
+                    "question_id",
+                    "answer",
+                }
+            )
+        if not isinstance(item, dict) or set(item) != expected_keys:
+            raise ValueError("capacity report idempotency observation is invalid")
+        occurred_at = item.get("occurred_at")
+        if (
+            item.get("schema_version") != "1.0"
+            or item.get("event_id") != event_ids[index]
+            or item.get("event_type") != expected_types[index]
+            or not _valid_observed_at(occurred_at)
+            or (observed_at is not None and occurred_at != observed_at)
+        ):
+            raise ValueError("capacity report idempotency observation is invalid")
+        observed_at = str(occurred_at)
+        normalized = dict(item)
+        if index == 1:
+            answer = item.get("answer")
+            if (
+                item.get("knowledge_point_id") != knowledge_point_id
+                or not isinstance(item.get("scene_id"), str)
+                or _PUBLIC_ID.fullmatch(str(item["scene_id"])) is None
+                or item.get("assessment_id") != item.get("scene_id")
+                or not isinstance(item.get("question_id"), str)
+                or _PUBLIC_ID.fullmatch(str(item["question_id"])) is None
+                or not isinstance(answer, list)
+                or not answer
+                or any(not isinstance(value, str) or not value for value in answer)
+            ):
+                raise ValueError("capacity report idempotency observation is invalid")
+            normalized["answer"] = list(answer)
+        normalized_events.append(normalized)
+    return {"events": normalized_events}
+
+
+def _parse_projection_snapshot(raw: object) -> dict[str, object]:
+    keys = {
+        "classroomVersionId",
+        "sessionCount",
+        "completedCount",
+        "knowledgePointId",
+        "validQuizCount",
+        "correctQuizCount",
+        "evidenceCount",
+    }
+    if not isinstance(raw, dict) or set(raw) != keys:
+        raise ValueError("capacity report idempotency observation is invalid")
+    version_id = raw.get("classroomVersionId")
+    knowledge_point_id = raw.get("knowledgePointId")
+    if (
+        not isinstance(version_id, str)
+        or _PUBLIC_ID.fullmatch(version_id) is None
+        or not isinstance(knowledge_point_id, str)
+        or _PUBLIC_ID.fullmatch(knowledge_point_id) is None
+    ):
+        raise ValueError("capacity report idempotency observation is invalid")
+    normalized: dict[str, object] = {
+        "classroomVersionId": version_id,
+        "knowledgePointId": knowledge_point_id,
+    }
+    for key in keys - {"classroomVersionId", "knowledgePointId"}:
+        value = _exact_nonnegative_int(raw.get(key))
+        if value is None:
+            raise ValueError("capacity report idempotency observation is invalid")
+        normalized[key] = value
+    return normalized
+
+
+def _parse_idempotency_observation(raw: object) -> dict[str, object]:
+    expected_keys = {
+        "tenantId",
+        "sessionId",
+        "classroomVersionId",
+        "knowledgePointId",
+        "eventIds",
+        "requestEnvelope",
+        "requestSha256",
+        "firstTicketSha256",
+        "freshTicketSha256",
+        "firstResponse",
+        "ticketReplay",
+        "freshResponse",
+        "quizProjection",
+    }
+    if not isinstance(raw, dict) or set(raw) != expected_keys:
+        raise ValueError("capacity report idempotency observation is invalid")
+    tenant_id = raw.get("tenantId")
+    session_id = raw.get("sessionId")
+    classroom_version_id = raw.get("classroomVersionId")
+    knowledge_point_id = raw.get("knowledgePointId")
+    event_ids = raw.get("eventIds")
+    request_hash = raw.get("requestSha256")
+    first_hash = raw.get("firstTicketSha256")
+    fresh_hash = raw.get("freshTicketSha256")
+    if (
+        not isinstance(tenant_id, str)
+        or _PUBLIC_ID.fullmatch(tenant_id) is None
+        or not isinstance(session_id, str)
+        or _PUBLIC_ID.fullmatch(session_id) is None
+        or not isinstance(classroom_version_id, str)
+        or _PUBLIC_ID.fullmatch(classroom_version_id) is None
+        or not isinstance(knowledge_point_id, str)
+        or _PUBLIC_ID.fullmatch(knowledge_point_id) is None
+        or not isinstance(event_ids, list)
+        or len(event_ids) != 3
+        or any(
+            not isinstance(event_id, str) or _PUBLIC_ID.fullmatch(event_id) is None
+            for event_id in event_ids
+        )
+        or len(set(event_ids)) != 3
+        or not isinstance(request_hash, str)
+        or _SHA256.fullmatch(request_hash) is None
+        or not isinstance(first_hash, str)
+        or _SHA256.fullmatch(first_hash) is None
+        or not isinstance(fresh_hash, str)
+        or _SHA256.fullmatch(fresh_hash) is None
+        or first_hash == fresh_hash
+    ):
+        raise ValueError("capacity report idempotency observation is invalid")
+    if event_ids != _expected_learning_event_ids(session_id):
+        raise ValueError("capacity report idempotency observation is invalid")
+    envelope = _parse_request_envelope(
+        raw.get("requestEnvelope"),
+        event_ids=event_ids,
+        knowledge_point_id=knowledge_point_id,
+    )
+    if _canonical_request_sha256(envelope) != request_hash:
+        raise ValueError("capacity report idempotency observation is invalid")
+    first_response = raw.get("firstResponse")
+    if not isinstance(first_response, dict) or set(first_response) != {
+        "statusCode",
+        "accepted",
+        "duplicate",
+        "quarantined",
+    }:
+        raise ValueError("capacity report idempotency observation is invalid")
+    accepted = _parse_event_rows(first_response.get("accepted"), event_ids=event_ids)
+    if (
+        first_response.get("statusCode") != 202
+        or first_response.get("duplicate") != []
+        or first_response.get("quarantined") != []
+    ):
+        raise ValueError("capacity report idempotency observation is invalid")
+    fresh_response = raw.get("freshResponse")
+    if not isinstance(fresh_response, dict) or set(fresh_response) != {
+        "statusCode",
+        "accepted",
+        "duplicate",
+        "quarantined",
+    }:
+        raise ValueError("capacity report idempotency observation is invalid")
+    duplicate = _parse_event_rows(fresh_response.get("duplicate"), event_ids=event_ids)
+    if duplicate != accepted:
+        raise ValueError("capacity report idempotency observation is invalid")
+    if (
+        fresh_response.get("statusCode") != 202
+        or fresh_response.get("accepted") != []
+        or fresh_response.get("quarantined") != []
+    ):
+        raise ValueError("capacity report idempotency observation is invalid")
+    replay = raw.get("ticketReplay")
+    if replay != {"statusCode": 409, "detail": "Classroom ticket already used"}:
+        raise ValueError("capacity report idempotency observation is invalid")
+    projection = raw.get("quizProjection")
+    if not isinstance(projection, dict) or set(projection) != {
+        "expectedDelta",
+        "baseline",
+        "visible",
+        "reread",
+    }:
+        raise ValueError("capacity report idempotency observation is invalid")
+    expected_delta = _exact_nonnegative_int(projection.get("expectedDelta"))
+    baseline = _parse_projection_snapshot(projection.get("baseline"))
+    visible = _parse_projection_snapshot(projection.get("visible"))
+    reread = _parse_projection_snapshot(projection.get("reread"))
+    count_keys = ("validQuizCount", "correctQuizCount", "evidenceCount")
+    if (
+        expected_delta != 4
+        or any(baseline[key] != 0 for key in count_keys)
+        or any(visible[key] != baseline[key] + expected_delta for key in count_keys)
+        or any(reread[key] != visible[key] for key in count_keys)
+        or any(
+            snapshot["classroomVersionId"] != classroom_version_id
+            or snapshot["knowledgePointId"] != knowledge_point_id
+            or snapshot["sessionCount"] != 4
+            for snapshot in (baseline, visible, reread)
+        )
+        or baseline["completedCount"] != 0
+        or visible["completedCount"] != 0
+        or reread["completedCount"] != 4
+    ):
+        raise ValueError("capacity report idempotency observation is invalid")
+    return {
+        "tenantId": tenant_id,
+        "sessionId": session_id,
+        "classroomVersionId": classroom_version_id,
+        "knowledgePointId": knowledge_point_id,
+        "eventIds": list(event_ids),
+        "requestEnvelope": envelope,
+        "requestSha256": request_hash,
+        "firstTicketSha256": first_hash,
+        "freshTicketSha256": fresh_hash,
+        "firstResponse": {
+            "statusCode": 202,
+            "accepted": accepted,
+            "duplicate": [],
+            "quarantined": [],
+        },
+        "ticketReplay": dict(replay),
+        "freshResponse": {
+            "statusCode": 202,
+            "accepted": [],
+            "duplicate": duplicate,
+            "quarantined": [],
+        },
+        "quizProjection": {
+            "expectedDelta": expected_delta,
+            "baseline": baseline,
+            "visible": visible,
+            "reread": reread,
+        },
+    }
+
+
 def _subject_tenants(samples: list[dict[str, object]], metric: str) -> dict[str, str]:
     return {
         str(sample["subjectId"]): str(sample["tenantId"])
@@ -286,10 +576,12 @@ def _parse_observations(
         id_key = "jobId"
         metric = "job_submission_visible"
         maximum_active = CAPACITY_WORKLOAD["generationJobsSubmitted"]
+        record_keys = {id_key, "tenantId"}
     else:
         id_key = "sessionId"
         metric = CAPACITY_SESSION_METRICS[0]
         maximum_active = CAPACITY_PROFILE["executedConcurrentSessions"]
+        record_keys = {id_key, "tenantId", "classroomVersionId", "knowledgePointId"}
     if not isinstance(raw, list) or not raw or len(raw) > 4096:
         raise ValueError(f"capacity report {kind} observations are invalid")
     subject_tenants = _subject_tenants(samples, metric)
@@ -306,7 +598,7 @@ def _parse_observations(
         active: list[dict[str, str]] = []
         seen: set[str] = set()
         for record in item["active"]:
-            if not isinstance(record, dict) or set(record) != {id_key, "tenantId"}:
+            if not isinstance(record, dict) or set(record) != record_keys:
                 raise ValueError(f"capacity report {kind} observation is invalid")
             subject_id = record.get(id_key)
             tenant_id = record.get("tenantId")
@@ -318,7 +610,20 @@ def _parse_observations(
             ):
                 raise ValueError(f"capacity report {kind} observation is invalid")
             seen.add(subject_id)
-            active.append({id_key: subject_id, "tenantId": tenant_id})
+            normalized = {id_key: subject_id, "tenantId": tenant_id}
+            if kind == "session":
+                version_id = record.get("classroomVersionId")
+                knowledge_point_id = record.get("knowledgePointId")
+                if (
+                    not isinstance(version_id, str)
+                    or _PUBLIC_ID.fullmatch(version_id) is None
+                    or not isinstance(knowledge_point_id, str)
+                    or _PUBLIC_ID.fullmatch(knowledge_point_id) is None
+                ):
+                    raise ValueError(f"capacity report {kind} observation is invalid")
+                normalized["classroomVersionId"] = version_id
+                normalized["knowledgePointId"] = knowledge_point_id
+            active.append(normalized)
         observations.append({"sequence": sequence, "active": active})
     return observations
 
@@ -471,6 +776,7 @@ def parse_capacity_profile_report(
         "sessionCompletions",
         "resourceSource",
         "resourceObservations",
+        "idempotencyObservation",
     }:
         raise ValueError("capacity report is invalid")
     if type(document.get("schemaVersion")) is not int or document["schemaVersion"] != (
@@ -517,6 +823,30 @@ def parse_capacity_profile_report(
         samples=samples,
     )
     resource_observations = _parse_resource_observations(document.get("resourceObservations"))
+    idempotency_observation = _parse_idempotency_observation(document.get("idempotencyObservation"))
+    event_samples = [sample for sample in samples if sample["metric"] == "event_ingest"]
+    sequence_zero = [sample for sample in event_samples if sample["sequence"] == 0]
+    target_tenant = idempotency_observation["tenantId"]
+    if (
+        len(sequence_zero) != 1
+        or sequence_zero[0]["tenantId"] != target_tenant
+        or sequence_zero[0]["subjectId"] != idempotency_observation["sessionId"]
+        or sum(sample["tenantId"] == target_tenant for sample in event_samples) != 4
+    ):
+        raise ValueError("capacity report idempotency observation binding is invalid")
+    session_sources = [
+        record
+        for snapshot in session_observations
+        for record in snapshot["active"]
+        if record["sessionId"] == idempotency_observation["sessionId"]
+    ]
+    if not session_sources or any(
+        source["tenantId"] != target_tenant
+        or source["classroomVersionId"] != idempotency_observation["classroomVersionId"]
+        or source["knowledgePointId"] != idempotency_observation["knowledgePointId"]
+        for source in session_sources
+    ):
+        raise ValueError("capacity report idempotency observation source binding is invalid")
     normalized: dict[str, object] = dict(document)
     normalized["rawSamples"] = samples
     normalized["schedulerClaims"] = scheduler_claims
@@ -524,6 +854,7 @@ def parse_capacity_profile_report(
     normalized["sessionObservations"] = session_observations
     normalized["sessionCompletions"] = session_completions
     normalized["resourceObservations"] = resource_observations
+    normalized["idempotencyObservation"] = idempotency_observation
     if canonical_capacity_profile_report(normalized) != body:
         raise ValueError("capacity report is not canonical")
     return normalized
@@ -533,6 +864,56 @@ def _percentile(values: list[float], percentile: int) -> float:
     ordered = sorted(values)
     index = max(0, ceil((percentile / 100) * len(ordered)) - 1)
     return round(ordered[index], 3)
+
+
+def derive_learning_event_idempotency_checks(
+    report: Mapping[str, object],
+) -> dict[str, bool]:
+    observation = report.get("idempotencyObservation")
+    if not isinstance(observation, dict):
+        return {
+            "duplicateCountedOnce": False,
+            "ticketReplayRejected": False,
+            "projectionVisible": False,
+        }
+    first_response = observation.get("firstResponse")
+    fresh_response = observation.get("freshResponse")
+    accepted = first_response.get("accepted") if isinstance(first_response, dict) else None
+    duplicate = fresh_response.get("duplicate") if isinstance(fresh_response, dict) else None
+    replay = observation.get("ticketReplay")
+    projection = observation.get("quizProjection")
+    projection_visible = False
+    if isinstance(projection, dict):
+        baseline = projection.get("baseline")
+        visible = projection.get("visible")
+        reread = projection.get("reread")
+        expected_delta = projection.get("expectedDelta")
+        if (
+            type(expected_delta) is int
+            and isinstance(baseline, dict)
+            and isinstance(visible, dict)
+            and isinstance(reread, dict)
+        ):
+            keys = ("validQuizCount", "correctQuizCount", "evidenceCount")
+            projection_visible = (
+                expected_delta == 4
+                and all(
+                    type(baseline[key]) is int
+                    and type(visible[key]) is int
+                    and visible[key] == baseline[key] + expected_delta
+                    for key in keys
+                )
+                and all(reread[key] == visible[key] for key in keys)
+                and baseline.get("completedCount") == 0
+                and visible.get("completedCount") == 0
+                and reread.get("completedCount") == 4
+            )
+    return {
+        "duplicateCountedOnce": accepted == duplicate and projection_visible,
+        "ticketReplayRejected": replay
+        == {"statusCode": 409, "detail": "Classroom ticket already used"},
+        "projectionVisible": projection_visible,
+    }
 
 
 def derive_capacity_profile_summary(report: Mapping[str, object]) -> dict[str, object]:
@@ -698,6 +1079,7 @@ __all__ = [
     "canonical_capacity_profile_report",
     "capacity_profile_command_record",
     "derive_capacity_profile_summary",
+    "derive_learning_event_idempotency_checks",
     "exact_json_equal",
     "parse_capacity_profile_report",
 ]
