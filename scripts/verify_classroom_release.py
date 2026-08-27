@@ -40,11 +40,22 @@ from classroom_runtime_attestation import (  # noqa: E402
     _open_windows_regular_file_relative,
     _read_windows_file_handle,
 )
+from platform_preflight_contract import (
+    PHASE_SERVICES as PREFLIGHT_PHASE_SERVICES,
+)
+from platform_preflight_contract import (  # noqa: E402
+    PHASES as PREFLIGHT_PHASES,
+)
+from platform_preflight_contract import (
+    candidate_network_phase_command,
+    parse_candidate_network_report,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_EVIDENCE_PATH = (
     PROJECT_ROOT / "data" / "user" / "release-evidence" / "classroom-first-release.json"
 )
+MAX_RUNTIME_ARTIFACT_BYTES = 1024 * 1024
 
 REQUIRED_OPERATIONAL_LAYERS = (
     "source_head",
@@ -383,6 +394,17 @@ def _proof_bytes(
         or _SHA256.fullmatch(expected_sha256) is None
     ):
         return f"{label} reference is invalid"
+    if artifact == "runtime/platform-preflight-attestation.json":
+        try:
+            body = _runtime_artifact_body(
+                Path(artifact),
+                bundle_root=bundle_root,
+                expected_sha256=expected_sha256,
+                artifact_name="platform-preflight-attestation.json",
+            )
+        except ValueError:
+            return f"{label} cannot be read from its fixed boundary"
+        return body, artifact
     root = Path(bundle_root).resolve()
     unresolved = root / artifact
     try:
@@ -452,15 +474,32 @@ def _normalized_runtime_repo_digest(reference: str) -> str:
 
 def _read_runtime_artifact_handle(handle: object | int, *, windows: bool) -> bytes:
     if windows:
+        import ctypes
+        from ctypes import wintypes
+
+        size = ctypes.c_longlong()
+        get_size = ctypes.WinDLL("kernel32", use_last_error=True).GetFileSizeEx
+        get_size.argtypes = (wintypes.HANDLE, ctypes.POINTER(ctypes.c_longlong))
+        get_size.restype = wintypes.BOOL
+        if not get_size(handle, ctypes.byref(size)):
+            error = ctypes.get_last_error()
+            raise OSError(error, "cannot inspect runtime artifact size")
+        if size.value < 0 or size.value > MAX_RUNTIME_ARTIFACT_BYTES:
+            raise ValueError("runtime artifact is too large")
         return _read_windows_file_handle(handle)
     file_descriptor = int(handle)
     os.lseek(file_descriptor, 0, os.SEEK_SET)
     chunks: list[bytes] = []
+    total = 0
     while True:
-        chunk = os.read(file_descriptor, 1024 * 1024)
+        requested = min(64 * 1024, MAX_RUNTIME_ARTIFACT_BYTES - total + 1)
+        chunk = os.read(file_descriptor, requested)
         if not chunk:
             return b"".join(chunks)
+        if total + len(chunk) > MAX_RUNTIME_ARTIFACT_BYTES:
+            raise ValueError("runtime artifact is too large")
         chunks.append(chunk)
+        total += len(chunk)
 
 
 def _open_posix_directory_no_follow(path: Path) -> int:
@@ -502,13 +541,19 @@ def _runtime_artifact_body(
     *,
     bundle_root: Path,
     expected_sha256: str | None,
+    artifact_name: str = "runtime-attestation.json",
 ) -> bytes:
+    if artifact_name not in {
+        "runtime-attestation.json",
+        "platform-preflight-attestation.json",
+    }:
+        raise ValueError("runtime artifact name is invalid")
     root = Path(os.path.abspath(bundle_root))
     unresolved = Path(path)
     if not unresolved.is_absolute():
         unresolved = root / unresolved
     unresolved = Path(os.path.abspath(unresolved))
-    expected_path = root / "runtime" / "runtime-attestation.json"
+    expected_path = root / "runtime" / artifact_name
     if unresolved != expected_path:
         raise ValueError("runtime attestation is outside the fixed evidence bundle path")
     directory_handle: object | int | None = None
@@ -524,7 +569,7 @@ def _runtime_artifact_body(
             )
             artifact_handle, artifact_identity = _open_windows_regular_file_relative(
                 runtime_handle,
-                "runtime-attestation.json",
+                artifact_name,
                 share_access=0x00000001,
             )
         else:
@@ -537,7 +582,7 @@ def _runtime_artifact_body(
             runtime_identity = (runtime_details.st_dev, runtime_details.st_ino)
             file_flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
             artifact_handle = os.open(
-                "runtime-attestation.json",
+                artifact_name,
                 file_flags,
                 dir_fd=runtime_handle,
             )
@@ -559,7 +604,7 @@ def _runtime_artifact_body(
                 )
                 reopened_artifact, reopened_artifact_identity = _open_windows_regular_file_relative(
                     reopened_runtime,
-                    "runtime-attestation.json",
+                    artifact_name,
                     share_access=0x00000001,
                 )
             else:
@@ -580,7 +625,7 @@ def _runtime_artifact_body(
                     reopened_runtime_details.st_ino,
                 )
                 reopened_artifact = os.open(
-                    "runtime-attestation.json",
+                    artifact_name,
                     file_flags,
                     dir_fd=reopened_runtime,
                 )
@@ -842,6 +887,7 @@ def validate_runtime_attestation(
     if (
         not isinstance(document, dict)
         or set(document) != required_keys
+        or type(document.get("schemaVersion")) is not int
         or document.get("schemaVersion") != 1
         or document.get("candidate") != candidate
         or document.get("releaseRun") != release_run
@@ -929,6 +975,128 @@ def validate_runtime_attestation(
     return document
 
 
+def derive_platform_preflight_receipt_checks(
+    body: bytes,
+    *,
+    bundle_root: Path,
+    candidate_root: Path,
+    candidate: Mapping[str, object],
+    release_run: Mapping[str, str],
+) -> tuple[dict[str, dict[str, bool]], str]:
+    try:
+        document = json.loads(body)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("platform preflight attestation is invalid") from exc
+    if (
+        not isinstance(document, dict)
+        or set(document)
+        != {
+            "schemaVersion",
+            "candidate",
+            "releaseRun",
+            "observedAt",
+            "baseUrl",
+            "runtimeAttestation",
+            "executions",
+        }
+        or type(document.get("schemaVersion")) is not int
+        or document.get("schemaVersion") != 1
+        or document.get("candidate") != candidate
+        or document.get("releaseRun") != release_run
+        or not _valid_observed_at_value(document.get("observedAt"))
+        or _runtime_base_url(document.get("baseUrl")) is None
+    ):
+        raise ValueError("platform preflight attestation does not match the release")
+    runtime_proof = document.get("runtimeAttestation")
+    if (
+        not isinstance(runtime_proof, dict)
+        or set(runtime_proof) != {"artifact", "sha256"}
+        or runtime_proof.get("artifact") != "runtime/runtime-attestation.json"
+        or not isinstance(runtime_proof.get("sha256"), str)
+    ):
+        raise ValueError("platform preflight runtime proof is invalid")
+    runtime = validate_runtime_attestation(
+        Path(runtime_proof["artifact"]),
+        bundle_root=bundle_root,
+        candidate_root=candidate_root,
+        candidate=candidate,
+        release_run=release_run,
+        expected_base_url=document["baseUrl"],
+        expected_sha256=runtime_proof["sha256"],
+    )
+    containers = runtime.get("containers")
+    if not isinstance(containers, list):
+        raise ValueError("platform preflight runtime containers are invalid")
+    container_ids = {
+        container.get("service"): container.get("containerId")
+        for container in containers
+        if isinstance(container, dict)
+    }
+    executions = document.get("executions")
+    if not isinstance(executions, list) or len(executions) != len(PREFLIGHT_PHASES):
+        raise ValueError("platform preflight execution records are invalid")
+    phase_reports: dict[str, dict[str, object]] = {}
+    for phase, execution in zip(PREFLIGHT_PHASES, executions, strict=True):
+        service = PREFLIGHT_PHASE_SERVICES[phase]
+        container_id = container_ids.get(service)
+        if not isinstance(container_id, str):
+            raise ValueError("platform preflight container identity is invalid")
+        expected_command = candidate_network_phase_command(phase, container_id)
+        if (
+            not isinstance(execution, dict)
+            or set(execution)
+            != {
+                "phase",
+                "service",
+                "containerId",
+                "command",
+                "nativeExit",
+                "stdout",
+                "stdoutSha256",
+            }
+            or execution.get("phase") != phase
+            or execution.get("service") != service
+            or execution.get("containerId") != container_id
+            or execution.get("command") != expected_command
+            or execution.get("nativeExit") != 0
+            or isinstance(execution.get("nativeExit"), bool)
+            or not isinstance(execution.get("stdout"), str)
+            or not isinstance(execution.get("stdoutSha256"), str)
+        ):
+            raise ValueError("platform preflight execution records are invalid")
+        stdout = execution["stdout"]
+        try:
+            stdout_body = stdout.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ValueError("platform preflight execution stdout is invalid") from exc
+        if hashlib.sha256(stdout_body).hexdigest() != execution["stdoutSha256"]:
+            raise ValueError("platform preflight execution stdout digest does not match")
+        report = parse_candidate_network_report(stdout_body, expected_phase=phase)
+        checks = report["checks"]
+        errors = report["errors"]
+        assert isinstance(checks, dict) and isinstance(errors, list)
+        if errors or any(value is not True for value in checks.values()):
+            raise ValueError("platform preflight phase does not prove passing evidence")
+        phase_reports[phase] = report
+    database_checks = phase_reports["database-object-store"]["checks"]
+    openmaic_checks = phase_reports["openmaic"]["checks"]
+    assert isinstance(database_checks, dict) and isinstance(openmaic_checks, dict)
+    return (
+        {
+            "database_revisions": {
+                "revisionsMatch": database_checks["revisionsMatch"] is True,
+            },
+            "service_health": {
+                "allServicesHealthy": all(
+                    value is True
+                    for value in (*database_checks.values(), *openmaic_checks.values())
+                ),
+            },
+        },
+        document["observedAt"],
+    )
+
+
 def probe_provenance_error(
     document: Mapping[str, object],
     *,
@@ -967,6 +1135,44 @@ def probe_provenance_error(
             "observedAt"
         ):
             return "running containers receipt does not match runtime attestation"
+        return None
+    if evidence in {"database_revisions", "service_health"}:
+        provenance = document.get("provenance")
+        if not isinstance(provenance, dict) or set(provenance) != {"platformPreflightAttestation"}:
+            return "preflight execution proof is missing or invalid"
+        proof = provenance.get("platformPreflightAttestation")
+        if (
+            not isinstance(proof, dict)
+            or set(proof) != {"artifact", "sha256"}
+            or proof.get("artifact") != "runtime/platform-preflight-attestation.json"
+        ):
+            return "preflight execution proof is missing or invalid"
+        proof_body = _proof_bytes(
+            bundle_root,
+            proof,
+            label="platform preflight attestation",
+        )
+        if isinstance(proof_body, str):
+            return proof_body
+        try:
+            derived, observed_at = derive_platform_preflight_receipt_checks(
+                proof_body[0],
+                bundle_root=bundle_root,
+                candidate_root=candidate_root,
+                candidate=candidate,
+                release_run=release_run,
+            )
+        except ValueError as exc:
+            return str(exc)
+        receipt = document.get("receipt")
+        result = receipt.get("result") if isinstance(receipt, dict) else None
+        checks = result.get("checks") if isinstance(result, dict) else None
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("observedAt") != observed_at
+            or checks != derived[evidence]
+        ):
+            return "platform preflight receipt does not match execution proof"
         return None
     recipe = PROBE_RECIPES.get(evidence)
     if recipe is None:
@@ -1249,6 +1455,7 @@ class FileReleaseRuntime:
             or not isinstance(observed_at, str)
             or not FileReleaseRuntime._valid_observed_at(observed_at)
             or not isinstance(result, dict)
+            or set(result) != {"outcome", "nativeExit", "checks"}
             or result.get("outcome") != "pass"
             or not isinstance(native_exit, int)
             or isinstance(native_exit, bool)
@@ -1256,8 +1463,10 @@ class FileReleaseRuntime:
         ):
             return False
         checks = result.get("checks")
-        return isinstance(checks, dict) and all(
-            checks.get(check) is True for check in required_checks
+        return (
+            isinstance(checks, dict)
+            and set(checks) == set(required_checks)
+            and all(checks.get(check) is True for check in required_checks)
         )
 
     @staticmethod

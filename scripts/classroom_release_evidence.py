@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Mapping, Sequence
-from datetime import datetime
+from collections.abc import Callable, Mapping, Sequence
+from datetime import UTC, datetime
+import errno
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -21,12 +23,36 @@ if str(SCRIPTS_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_ROOT))
 
 from classroom_release_probe_contract import probe_command_record  # noqa: E402
+from classroom_runtime_attestation import (  # noqa: E402
+    _close_windows_handle,
+    _create_windows_directory_relative,
+    _create_windows_staging_file,
+    _file_identity,
+    _open_posix_directory_path_no_follow,
+    _open_windows_directory_handle,
+    _open_windows_directory_relative,
+    _open_windows_regular_file_relative,
+    _rename_windows_file_relative,
+    resolve_fixed_docker,
+)
+from platform_preflight_contract import (  # noqa: E402
+    MAX_CANDIDATE_NETWORK_REPORT_BYTES,
+    materialize_candidate_network_phase_command,
+    parse_candidate_network_report,
+)
+from platform_preflight_contract import (
+    PHASE_SERVICES as PREFLIGHT_PHASE_SERVICES,
+)
+from platform_preflight_contract import (
+    PHASES as PREFLIGHT_PHASES,
+)
 from render_platform_compose import validate_image_lock_bindings  # noqa: E402
 from verify_classroom_release import (  # noqa: E402
     ARTIFACT_SCHEMA_VERSION,
     EVIDENCE_SCHEMA_VERSION,
     PROBE_RECIPES,
     RECEIPT_CONTRACTS,
+    derive_platform_preflight_receipt_checks,
     derive_probe_checks,
     probe_provenance_error,
     read_runtime_attestation_artifact,
@@ -151,6 +177,12 @@ def _atomic_write_json(path: Path, document: Mapping[str, object]) -> None:
             staged.unlink(missing_ok=True)
 
 
+def _publish_no_replace(source: Path, target: Path) -> None:
+    """Publish one staged regular file without replacing an existing target."""
+
+    os.link(source, target, follow_symlinks=False)
+
+
 def write_pass_receipt(
     output_path: Path,
     *,
@@ -231,6 +263,45 @@ def _run_probe(
     )
 
 
+def _run_platform_preflight_phase(
+    arguments: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    timeout: int,
+) -> subprocess.CompletedProcess[str]:
+    with (
+        tempfile.TemporaryFile(mode="w+b") as stdout_buffer,
+        tempfile.TemporaryFile(mode="w+b") as stderr_buffer,
+    ):
+        completed = subprocess.run(
+            arguments,
+            cwd=cwd,
+            env=env,
+            stdout=stdout_buffer,
+            stderr=stderr_buffer,
+            check=False,
+            timeout=timeout,
+        )
+        if any(
+            os.fstat(buffer.fileno()).st_size > MAX_CANDIDATE_NETWORK_REPORT_BYTES
+            for buffer in (stdout_buffer, stderr_buffer)
+        ):
+            raise subprocess.SubprocessError("platform preflight output is too large")
+        stdout_buffer.seek(0)
+        stderr_buffer.seek(0)
+        return subprocess.CompletedProcess(
+            arguments,
+            completed.returncode,
+            stdout_buffer.read().decode("utf-8", errors="strict"),
+            stderr_buffer.read().decode("utf-8", errors="strict"),
+        )
+
+
+def _current_observed_at() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
 def _bundle_artifact(path: Path, *, bundle_root: Path, label: str) -> tuple[Path, str]:
     resolved_root = Path(bundle_root).resolve()
     resolved_path = Path(path).resolve()
@@ -276,6 +347,348 @@ def _probe_command(evidence: str, recipe: str) -> list[str]:
     ]
 
 
+def _failure_archive_document(
+    *,
+    evidence: str,
+    recipe: str,
+    reason: str,
+    native_exit: int | None,
+    moved: Mapping[str, str],
+) -> dict[str, object]:
+    return {
+        "schemaVersion": 1,
+        "evidence": evidence,
+        "recipe": recipe,
+        "reason": reason,
+        "nativeExit": native_exit,
+        "artifacts": dict(moved),
+    }
+
+
+def _bundle_relative_file(path: Path, *, bundle_root: Path) -> Path:
+    candidate = Path(os.path.abspath(path))
+    try:
+        relative = candidate.relative_to(bundle_root)
+    except ValueError as exc:
+        raise ValueError("failure archive source is outside the evidence bundle") from exc
+    if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+        raise ValueError("failure archive source is invalid")
+    return relative
+
+
+def _open_or_create_windows_directory(
+    parent_handle: object,
+    name: str,
+) -> tuple[object, tuple[int, int]]:
+    try:
+        return _open_windows_directory_relative(parent_handle, name)
+    except FileNotFoundError:
+        try:
+            return _create_and_reopen_windows_directory(parent_handle, name)
+        except OSError as exc:
+            if getattr(exc, "winerror", None) not in {80, 183}:
+                raise
+            return _open_windows_directory_relative(parent_handle, name)
+
+
+def _create_and_reopen_windows_directory(
+    parent_handle: object,
+    name: str,
+) -> tuple[object, tuple[int, int]]:
+    created_handle, created_identity = _create_windows_directory_relative(parent_handle, name)
+    _close_windows_handle(created_handle)
+    opened_handle, opened_identity = _open_windows_directory_relative(parent_handle, name)
+    if opened_identity != created_identity:
+        _close_windows_handle(opened_handle)
+        raise ValueError("failure archive directory identity changed during creation")
+    return opened_handle, opened_identity
+
+
+def _relocate_windows_bundle_file(
+    source: Path,
+    *,
+    bundle_root: Path,
+    bundle_handle: object,
+    target_handle: object,
+    target_name: str,
+) -> bool:
+    relative = _bundle_relative_file(source, bundle_root=bundle_root)
+    directory_handles: list[object] = []
+    current = bundle_handle
+    source_handle: object | None = None
+    try:
+        try:
+            for component in relative.parts[:-1]:
+                current, _identity = _open_windows_directory_relative(current, component)
+                directory_handles.append(current)
+            source_handle, _identity = _open_windows_regular_file_relative(
+                current,
+                relative.name,
+                share_access=0x00000001 | 0x00000002 | 0x00000004,
+                deletable=True,
+            )
+        except FileNotFoundError:
+            return False
+        _rename_windows_file_relative(
+            source_handle,
+            target_handle,
+            target_name,
+            replace_existing=False,
+        )
+        return True
+    finally:
+        if source_handle is not None:
+            _close_windows_handle(source_handle)
+        for handle in reversed(directory_handles):
+            _close_windows_handle(handle)
+
+
+def _record_probe_failure_windows(
+    *,
+    root: Path,
+    evidence: str,
+    recipe: str,
+    attempt_id: str,
+    reason: str,
+    native_exit: int | None,
+    artifacts: Mapping[str, Path],
+) -> None:
+    handles: list[object] = []
+    try:
+        bundle_handle, _identity = _open_windows_directory_handle(root, deletable=True)
+        handles.append(bundle_handle)
+        failure_root_handle, _identity = _open_or_create_windows_directory(
+            bundle_handle,
+            "failures",
+        )
+        handles.append(failure_root_handle)
+        evidence_handle, _identity = _open_or_create_windows_directory(
+            failure_root_handle,
+            evidence,
+        )
+        handles.append(evidence_handle)
+        failure_handle, _identity = _create_and_reopen_windows_directory(
+            evidence_handle,
+            attempt_id,
+        )
+        handles.append(failure_handle)
+        moved: dict[str, str] = {}
+        for name, source in artifacts.items():
+            target_name = f"{name}.json"
+            if _relocate_windows_bundle_file(
+                Path(source),
+                bundle_root=root,
+                bundle_handle=bundle_handle,
+                target_handle=failure_handle,
+                target_name=target_name,
+            ):
+                moved[name] = f"failures/{evidence}/{attempt_id}/{target_name}"
+        failure_file, _identity = _create_windows_staging_file(
+            failure_handle,
+            "failure.json",
+            _json_bytes(
+                _failure_archive_document(
+                    evidence=evidence,
+                    recipe=recipe,
+                    reason=reason,
+                    native_exit=native_exit,
+                    moved=moved,
+                )
+            ),
+        )
+        _close_windows_handle(failure_file)
+    finally:
+        for handle in reversed(handles):
+            _close_windows_handle(handle)
+
+
+def _open_or_create_posix_directory(
+    parent_fd: int,
+    name: str,
+    *,
+    exclusive: bool,
+) -> int:
+    if Path(name).name != name or not name:
+        raise ValueError("failure archive boundary is invalid")
+    if exclusive:
+        os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+    else:
+        try:
+            os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            pass
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    file_descriptor = os.open(name, flags, dir_fd=parent_fd)
+    if not stat.S_ISDIR(os.fstat(file_descriptor).st_mode):
+        os.close(file_descriptor)
+        raise ValueError("failure archive boundary is invalid")
+    return file_descriptor
+
+
+def _rename_posix_between_no_replace(
+    source_fd: int,
+    source: str,
+    target_fd: int,
+    target: str,
+) -> None:
+    if any(Path(name).name != name or not name for name in (source, target)):
+        raise ValueError("failure archive entry name is invalid")
+    if sys.platform.startswith("linux"):
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = getattr(libc, "renameat2", None)
+        if renameat2 is None:
+            raise OSError(errno.ENOSYS, "renameat2 is required for safe failure archival")
+        renameat2.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        renameat2.restype = ctypes.c_int
+        if (
+            renameat2(
+                source_fd,
+                os.fsencode(source),
+                target_fd,
+                os.fsencode(target),
+                1,
+            )
+            != 0
+        ):
+            error = ctypes.get_errno()
+            raise OSError(error, f"cannot safely archive failure entry: {target}")
+        return
+    raise OSError(
+        errno.ENOSYS,
+        "atomic no-replace failure archival is unavailable on this POSIX platform",
+    )
+
+
+def _relocate_posix_bundle_file(
+    source: Path,
+    *,
+    bundle_root: Path,
+    bundle_fd: int,
+    target_fd: int,
+    target_name: str,
+) -> bool:
+    relative = _bundle_relative_file(source, bundle_root=bundle_root)
+    directory_fds: list[int] = []
+    current = bundle_fd
+    source_file: int | None = None
+    try:
+        try:
+            directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+            for component in relative.parts[:-1]:
+                current = os.open(component, directory_flags, dir_fd=current)
+                directory_fds.append(current)
+            source_file = os.open(
+                relative.name,
+                os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=current,
+            )
+        except FileNotFoundError:
+            return False
+        source_details = os.fstat(source_file)
+        if not stat.S_ISREG(source_details.st_mode):
+            raise ValueError("failure archive source is not a regular file")
+        source_identity = _file_identity(source_details)
+        _rename_posix_between_no_replace(current, relative.name, target_fd, target_name)
+        target_details = os.stat(target_name, dir_fd=target_fd, follow_symlinks=False)
+        if _file_identity(target_details) != source_identity or not stat.S_ISREG(
+            target_details.st_mode
+        ):
+            raise ValueError("failure archive target identity changed")
+        os.fsync(current)
+        os.fsync(target_fd)
+        return True
+    finally:
+        if source_file is not None:
+            os.close(source_file)
+        for file_descriptor in reversed(directory_fds):
+            os.close(file_descriptor)
+
+
+def _write_posix_new_file(directory_fd: int, name: str, body: bytes) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+    file_descriptor = os.open(name, flags, 0o600, dir_fd=directory_fd)
+    try:
+        offset = 0
+        while offset < len(body):
+            written = os.write(file_descriptor, body[offset:])
+            if written <= 0:
+                raise OSError("failure archive write made no progress")
+            offset += written
+        os.fsync(file_descriptor)
+    finally:
+        os.close(file_descriptor)
+    os.fsync(directory_fd)
+
+
+def _record_probe_failure_posix(
+    *,
+    root: Path,
+    evidence: str,
+    recipe: str,
+    attempt_id: str,
+    reason: str,
+    native_exit: int | None,
+    artifacts: Mapping[str, Path],
+) -> None:
+    handles: list[int] = []
+    try:
+        bundle_fd, _identity = _open_posix_directory_path_no_follow(root)
+        handles.append(bundle_fd)
+        failure_root_fd = _open_or_create_posix_directory(
+            bundle_fd,
+            "failures",
+            exclusive=False,
+        )
+        handles.append(failure_root_fd)
+        evidence_fd = _open_or_create_posix_directory(
+            failure_root_fd,
+            evidence,
+            exclusive=False,
+        )
+        handles.append(evidence_fd)
+        failure_fd = _open_or_create_posix_directory(
+            evidence_fd,
+            attempt_id,
+            exclusive=True,
+        )
+        handles.append(failure_fd)
+        moved: dict[str, str] = {}
+        for name, source in artifacts.items():
+            target_name = f"{name}.json"
+            if _relocate_posix_bundle_file(
+                Path(source),
+                bundle_root=root,
+                bundle_fd=bundle_fd,
+                target_fd=failure_fd,
+                target_name=target_name,
+            ):
+                moved[name] = f"failures/{evidence}/{attempt_id}/{target_name}"
+        _write_posix_new_file(
+            failure_fd,
+            "failure.json",
+            _json_bytes(
+                _failure_archive_document(
+                    evidence=evidence,
+                    recipe=recipe,
+                    reason=reason,
+                    native_exit=native_exit,
+                    moved=moved,
+                )
+            ),
+        )
+    finally:
+        for file_descriptor in reversed(handles):
+            os.close(file_descriptor)
+
+
 def _record_probe_failure(
     *,
     bundle_root: Path,
@@ -286,28 +699,35 @@ def _record_probe_failure(
     native_exit: int | None,
     artifacts: Mapping[str, Path],
 ) -> Path:
-    failure_dir = Path(bundle_root).resolve() / "failures" / evidence / attempt_id
-    failure_dir.mkdir(parents=True, exist_ok=False)
-    moved: dict[str, str] = {}
-    for name, source in artifacts.items():
-        path = Path(source)
-        if not path.exists():
-            continue
-        target = failure_dir / f"{name}.json"
-        os.replace(path, target)
-        moved[name] = target.relative_to(Path(bundle_root).resolve()).as_posix()
-    _atomic_write_json(
-        failure_dir / "failure.json",
-        {
-            "schemaVersion": 1,
-            "evidence": evidence,
-            "recipe": recipe,
-            "reason": reason,
-            "nativeExit": native_exit,
-            "artifacts": moved,
-        },
-    )
-    return failure_dir
+    components = (evidence, attempt_id, *artifacts)
+    if any(
+        not isinstance(component, str)
+        or not component
+        or Path(component).name != component
+        or component in {".", ".."}
+        for component in components
+    ):
+        raise ValueError("failure archive boundary is invalid")
+    root = Path(bundle_root).resolve()
+    arguments = {
+        "root": root,
+        "evidence": evidence,
+        "recipe": recipe,
+        "attempt_id": attempt_id,
+        "reason": reason,
+        "native_exit": native_exit,
+        "artifacts": artifacts,
+    }
+    try:
+        if os.name == "nt":
+            _record_probe_failure_windows(**arguments)
+        else:
+            _record_probe_failure_posix(**arguments)
+    except ValueError as exc:
+        if str(exc).startswith("failure archive"):
+            raise
+        raise ValueError("failure archive boundary is invalid") from exc
+    return root / "failures" / evidence / attempt_id
 
 
 def run_probe_receipt(
@@ -751,6 +1171,276 @@ def write_running_containers_receipt(
     )
 
 
+def write_platform_preflight_receipts(
+    *,
+    candidate_root: Path,
+    bundle_root: Path,
+    release_run: Mapping[str, object],
+    timeout_seconds: int,
+    runner: CommandRunner = _run_platform_preflight_phase,
+    docker_resolver: Callable[[], Path] = resolve_fixed_docker,
+) -> dict[str, dict[str, object]]:
+    """Run both fixed candidate-network phases and publish their bound receipts."""
+
+    if (
+        not isinstance(timeout_seconds, int)
+        or isinstance(timeout_seconds, bool)
+        or timeout_seconds <= 0
+    ):
+        raise ValueError("platform preflight timeout is invalid")
+    root = Path(bundle_root).resolve()
+    candidate_path = Path(candidate_root).resolve()
+    proof_path = root / "runtime" / "platform-preflight-attestation.json"
+    receipt_paths = {
+        evidence: root / "artifacts" / f"{evidence}.json"
+        for evidence in ("database_revisions", "service_health")
+    }
+    targets = (proof_path, *receipt_paths.values())
+    if any(path.exists() for path in targets):
+        raise ValueError("platform preflight evidence already exists")
+
+    candidate = _candidate(candidate_path)
+    bound_run = _release_run(release_run)
+    runtime_path = root / "runtime" / "runtime-attestation.json"
+    runtime_body, runtime_sha256 = read_runtime_attestation_artifact(
+        runtime_path,
+        bundle_root=root,
+    )
+    runtime = validate_runtime_attestation(
+        runtime_path,
+        bundle_root=root,
+        candidate_root=candidate_path,
+        candidate=candidate,
+        release_run=bound_run,
+        expected_sha256=runtime_sha256,
+    )
+    containers = runtime.get("containers")
+    if not isinstance(containers, list):
+        raise ValueError("platform preflight runtime containers are invalid")
+    container_ids = {
+        container.get("service"): container.get("containerId")
+        for container in containers
+        if isinstance(container, dict)
+    }
+    base_url = runtime.get("baseUrl")
+    if not isinstance(base_url, str):
+        raise ValueError("platform preflight runtime URL is invalid")
+
+    allowed_environment = {
+        "COMSPEC",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "NO_COLOR",
+        "PATH",
+        "PATHEXT",
+        "SYSTEMDRIVE",
+        "SYSTEMROOT",
+        "TEMP",
+        "TERM",
+        "TMP",
+        "WINDIR",
+    }
+    environment = {
+        name: value for name, value in os.environ.items() if name.upper() in allowed_environment
+    }
+    executions: list[dict[str, object]] = []
+    docker = Path(docker_resolver())
+    with tempfile.TemporaryDirectory(prefix="yfeistai-preflight-docker-") as config_dir:
+        for phase in PREFLIGHT_PHASES:
+            service = PREFLIGHT_PHASE_SERVICES[phase]
+            container_id = container_ids.get(service)
+            if not isinstance(container_id, str):
+                raise ValueError("platform preflight container identity is invalid")
+            actual_command, logical_command = materialize_candidate_network_phase_command(
+                phase,
+                container_id,
+                docker_executable=docker,
+                docker_config=Path(config_dir).resolve(),
+            )
+            try:
+                completed = runner(
+                    actual_command,
+                    cwd=candidate_path,
+                    env=environment,
+                    timeout=timeout_seconds,
+                )
+            except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
+                raise ValueError("platform preflight phase could not run") from exc
+            if (
+                not isinstance(completed.returncode, int)
+                or isinstance(completed.returncode, bool)
+                or completed.returncode != 0
+                or completed.args != actual_command
+                or not isinstance(completed.stdout, str)
+                or completed.stderr != ""
+            ):
+                raise ValueError("platform preflight phase did not exit cleanly")
+            try:
+                stdout_body = completed.stdout.encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise ValueError("platform preflight phase stdout is invalid") from exc
+            report = parse_candidate_network_report(stdout_body, expected_phase=phase)
+            checks = report["checks"]
+            errors = report["errors"]
+            assert isinstance(checks, dict) and isinstance(errors, list)
+            if errors or any(value is not True for value in checks.values()):
+                raise ValueError("platform preflight phase did not prove passing evidence")
+            executions.append(
+                {
+                    "phase": phase,
+                    "service": service,
+                    "containerId": container_id,
+                    "command": logical_command,
+                    "nativeExit": 0,
+                    "stdout": completed.stdout,
+                    "stdoutSha256": hashlib.sha256(stdout_body).hexdigest(),
+                }
+            )
+        if any(Path(config_dir).iterdir()):
+            raise ValueError("platform preflight isolated Docker config was modified")
+
+    try:
+        candidate_after = _candidate(candidate_path)
+        runtime_after, runtime_after_sha256 = read_runtime_attestation_artifact(
+            runtime_path,
+            bundle_root=root,
+        )
+    except ValueError as exc:
+        raise ValueError("platform preflight release binding changed") from exc
+    if (
+        candidate_after != candidate
+        or runtime_after != runtime_body
+        or runtime_after_sha256 != runtime_sha256
+    ):
+        raise ValueError("platform preflight release binding changed")
+    validate_runtime_attestation(
+        runtime_path,
+        bundle_root=root,
+        candidate_root=candidate_path,
+        candidate=candidate,
+        release_run=bound_run,
+        expected_base_url=base_url,
+        expected_sha256=runtime_sha256,
+    )
+
+    observed_at = _current_observed_at()
+    if not _valid_observed_at(observed_at):
+        raise ValueError("platform preflight observedAt is invalid")
+    proof = {
+        "schemaVersion": 1,
+        "candidate": candidate,
+        "releaseRun": bound_run,
+        "observedAt": observed_at,
+        "baseUrl": base_url,
+        "runtimeAttestation": {
+            "artifact": "runtime/runtime-attestation.json",
+            "sha256": runtime_sha256,
+        },
+        "executions": executions,
+    }
+    attempt_id = uuid.uuid4().hex
+    staged_proof = proof_path.with_name(f".{proof_path.name}.{attempt_id}.staging")
+    staged_receipts = {
+        evidence: path.with_name(f".{path.name}.{attempt_id}.staging")
+        for evidence, path in receipt_paths.items()
+    }
+    staged_paths = {
+        "proof": staged_proof,
+        **staged_receipts,
+    }
+    published_paths: dict[str, Path] = {}
+    try:
+        _atomic_write_json(staged_proof, proof)
+        proof_body = staged_proof.read_bytes()
+        proof_sha256 = hashlib.sha256(proof_body).hexdigest()
+        derived_checks, replayed_observed_at = derive_platform_preflight_receipt_checks(
+            proof_body,
+            bundle_root=root,
+            candidate_root=candidate_path,
+            candidate=candidate,
+            release_run=bound_run,
+        )
+        if replayed_observed_at != observed_at:
+            raise ValueError("platform preflight replay timestamp changed")
+        provenance = {
+            "platformPreflightAttestation": {
+                "artifact": "runtime/platform-preflight-attestation.json",
+                "sha256": proof_sha256,
+            }
+        }
+        documents = {
+            "database_revisions": _write_pass_receipt_from_candidate(
+                staged_receipts["database_revisions"],
+                candidate=candidate,
+                release_run=bound_run,
+                evidence="database_revisions",
+                observed_at=observed_at,
+                native_exit=0,
+                checks=derived_checks["database_revisions"],
+                provenance=provenance,
+            ),
+            "service_health": _write_pass_receipt_from_candidate(
+                staged_receipts["service_health"],
+                candidate=candidate,
+                release_run=bound_run,
+                evidence="service_health",
+                observed_at=observed_at,
+                native_exit=0,
+                checks=derived_checks["service_health"],
+                provenance=provenance,
+            ),
+        }
+        candidate_before_publish = _candidate(candidate_path)
+        runtime_before_publish, sha_before_publish = read_runtime_attestation_artifact(
+            runtime_path,
+            bundle_root=root,
+        )
+        if (
+            candidate_before_publish != candidate
+            or runtime_before_publish != runtime_body
+            or sha_before_publish != runtime_sha256
+            or any(path.exists() for path in targets)
+        ):
+            raise ValueError("platform preflight release binding changed before publication")
+        proof_path.parent.mkdir(parents=True, exist_ok=True)
+        receipt_paths["database_revisions"].parent.mkdir(parents=True, exist_ok=True)
+        publication_order = (
+            (
+                "database_revisions",
+                staged_receipts["database_revisions"],
+                receipt_paths["database_revisions"],
+            ),
+            (
+                "service_health",
+                staged_receipts["service_health"],
+                receipt_paths["service_health"],
+            ),
+            ("proof", staged_proof, proof_path),
+        )
+        for name, staged, target in publication_order:
+            _publish_no_replace(staged, target)
+            published_paths[f"published-{name.replace('_', '-')}"] = target
+            if target.read_bytes() != staged.read_bytes():
+                raise ValueError("platform preflight published evidence changed")
+            staged.unlink()
+        return documents
+    except Exception:
+        _record_probe_failure(
+            bundle_root=root,
+            evidence="platform-preflight",
+            recipe="candidate-network-phases",
+            attempt_id=attempt_id,
+            reason="platform preflight proof publication failed",
+            native_exit=0,
+            artifacts={
+                **staged_paths,
+                **published_paths,
+            },
+        )
+        raise
+
+
 def _validated_receipt(
     path: Path,
     *,
@@ -878,6 +1568,13 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     running_containers.add_argument("--run-id", required=True)
     running_containers.add_argument("--environment-id", required=True)
 
+    platform_preflight = commands.add_parser("platform-preflight")
+    platform_preflight.add_argument("--candidate-root", type=Path, required=True)
+    platform_preflight.add_argument("--bundle-root", type=Path, required=True)
+    platform_preflight.add_argument("--run-id", required=True)
+    platform_preflight.add_argument("--environment-id", required=True)
+    platform_preflight.add_argument("--timeout-seconds", type=int, required=True)
+
     produce = commands.add_parser("produce")
     _add_common_receipt_arguments(produce)
     produce.add_argument("--evidence", choices=tuple(sorted(PROBE_RECIPES)), required=True)
@@ -933,6 +1630,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             bundle_root=args.bundle_root,
             release_run=release_run,
         )
+    elif args.command == "platform-preflight":
+        write_platform_preflight_receipts(
+            candidate_root=args.candidate_root,
+            bundle_root=args.bundle_root,
+            release_run=release_run,
+            timeout_seconds=args.timeout_seconds,
+        )
+        print(args.bundle_root / "runtime" / "platform-preflight-attestation.json")
+        return 0
     elif args.command == "produce":
         recipe, _expected_count = PROBE_RECIPES[args.evidence]
         run_probe_receipt(

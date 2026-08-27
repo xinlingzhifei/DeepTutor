@@ -1819,6 +1819,560 @@ def test_release_evidence_cli_derives_running_containers_receipt(
     assert capsys.readouterr().out == f"{output}\n"
 
 
+def test_platform_preflight_receipts_are_derived_from_two_fixed_container_phases(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_evidence_module()
+    verifier = _load_verifier()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    calls: list[dict[str, object]] = []
+    docker_configs: list[Path] = []
+    replayed_proofs: list[bytes] = []
+    trusted_docker = (tmp_path / "trusted" / "docker.exe").resolve()
+    resolver_calls = 0
+    monkeypatch.setenv("DOCKER_TLS_VERIFY", "1")
+    monkeypatch.setenv("COMPOSE_ANSI", "never")
+    monkeypatch.setenv("YFEISTAI_LIVE_FIXTURE_TOKEN", "must-not-reach-docker")
+
+    def runner(arguments, *, cwd, env, timeout):
+        phase = arguments[arguments.index("--runtime-phase") + 1]
+        service = "tenant-provisioner" if phase == "database-object-store" else "deeptutor"
+        checks = (
+            {
+                "activeTenantCredentialsValid": True,
+                "databaseConnected": True,
+                "objectStoreRoundTrip": True,
+                "revisionsMatch": True,
+                "tenantCrossPrefixDenied": True,
+                "tenantOwnPrefixAccessible": True,
+            }
+            if phase == "database-object-store"
+            else {"openmaicContractCompatible": True}
+        )
+        report = {
+            "schemaVersion": 1,
+            "producer": "platform-preflight",
+            "phase": phase,
+            "checks": checks,
+            "errors": [],
+        }
+        stdout = (
+            json.dumps(
+                report,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        )
+        docker_config = Path(arguments[2])
+        docker_configs.append(docker_config)
+        calls.append(
+            {
+                "arguments": arguments,
+                "cwd": cwd,
+                "env": env,
+                "timeout": timeout,
+                "phase": phase,
+                "service": service,
+            }
+        )
+        return subprocess.CompletedProcess(arguments, 0, stdout, "")
+
+    def docker_resolver() -> Path:
+        nonlocal resolver_calls
+        resolver_calls += 1
+        return trusted_docker
+
+    def derive_receipt_checks(body: bytes, **_arguments):
+        replayed_proofs.append(body)
+        return (
+            {
+                "database_revisions": {"revisionsMatch": True},
+                "service_health": {"allServicesHealthy": True},
+            },
+            "2026-08-25T00:01:00Z",
+        )
+
+    monkeypatch.setattr(
+        module,
+        "_current_observed_at",
+        lambda: "2026-08-25T00:01:00Z",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        module,
+        "derive_platform_preflight_receipt_checks",
+        derive_receipt_checks,
+        raising=False,
+    )
+    receipts = module.write_platform_preflight_receipts(
+        candidate_root=candidate_root,
+        bundle_root=candidate_root,
+        release_run=RELEASE_RUN,
+        timeout_seconds=120,
+        runner=runner,
+        docker_resolver=docker_resolver,
+    )
+
+    assert set(receipts) == {"database_revisions", "service_health"}
+    assert resolver_calls == 1
+    assert [call["phase"] for call in calls] == ["database-object-store", "openmaic"]
+    assert all(call["cwd"] == candidate_root.resolve() for call in calls)
+    assert all(call["timeout"] == 120 for call in calls)
+    assert all(
+        not any(name.startswith(("DOCKER_", "COMPOSE_")) for name in call["env"]) for call in calls
+    )
+    assert all("YFEISTAI_LIVE_FIXTURE_TOKEN" not in call["env"] for call in calls)
+    assert len(set(docker_configs)) == 1
+    assert not docker_configs[0].exists()
+
+    proof_path = candidate_root / "runtime" / "platform-preflight-attestation.json"
+    assert replayed_proofs == [proof_path.read_bytes()]
+    proof = json.loads(proof_path.read_text(encoding="utf-8"))
+    assert proof["candidate"] == candidate
+    assert proof["releaseRun"] == RELEASE_RUN
+    assert proof["observedAt"] == "2026-08-25T00:01:00Z"
+    assert [execution["service"] for execution in proof["executions"]] == [
+        "tenant-provisioner",
+        "deeptutor",
+    ]
+    assert [execution["containerId"] for execution in proof["executions"]] == [
+        "container-tenant-provisioner",
+        "container-deeptutor",
+    ]
+    for call, execution in zip(calls, proof["executions"], strict=True):
+        actual_command = call["arguments"]
+        logical_command = execution["command"]
+        assert actual_command[0] == str(trusted_docker)
+        assert logical_command[0] == "docker"
+        assert actual_command[1] == logical_command[1]
+        assert actual_command[2] == str(docker_configs[0])
+        assert actual_command[3:] == logical_command[3:]
+        assert execution["command"][2] == "<isolated-docker-config>"
+        assert execution["nativeExit"] == 0
+        assert hashlib.sha256(execution["stdout"].encode()).hexdigest() == execution["stdoutSha256"]
+
+    manifest = candidate_root / "release-evidence.json"
+    module.assemble_manifest(
+        manifest,
+        candidate_root=candidate_root,
+        release_run=RELEASE_RUN,
+        receipt_paths={
+            evidence: candidate_root / "artifacts" / f"{evidence}.json" for evidence in receipts
+        },
+    )
+    result = verifier.verify(
+        verifier.FileReleaseRuntime(
+            manifest,
+            expected_source_head=SOURCE_HEAD,
+            candidate_root=candidate_root,
+        )
+    )
+    assert result.layers["database_revisions"].status == "pass"
+    assert result.layers["service_health"].status == "pass"
+
+
+def test_platform_preflight_stops_before_runner_when_trusted_docker_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    module = _load_evidence_module()
+    candidate_root, _candidate = _write_candidate_root(tmp_path)
+
+    def unavailable() -> Path:
+        raise ValueError("trusted Docker CLI is unavailable")
+
+    def forbidden_runner(*_args, **_kwargs):
+        pytest.fail("preflight must stop before subprocess execution")
+
+    with pytest.raises(ValueError, match="trusted Docker CLI is unavailable"):
+        module.write_platform_preflight_receipts(
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            timeout_seconds=120,
+            runner=forbidden_runner,
+            docker_resolver=unavailable,
+        )
+
+    assert not (candidate_root / "runtime" / "platform-preflight-attestation.json").exists()
+    assert not (candidate_root / "artifacts" / "database_revisions.json").exists()
+    assert not (candidate_root / "artifacts" / "service_health.json").exists()
+
+
+def test_platform_preflight_default_runner_rejects_oversized_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_evidence_module()
+
+    def run(arguments, **options):
+        assert "capture_output" not in options
+        stdout = options["stdout"]
+        stdout.write(b"x" * ((16 * 1024) + 1))
+        stdout.flush()
+        return subprocess.CompletedProcess(arguments, 0)
+
+    monkeypatch.setattr(module.subprocess, "run", run)
+
+    with pytest.raises(subprocess.SubprocessError, match="output is too large"):
+        module._run_platform_preflight_phase(
+            ["trusted-docker"],
+            cwd=tmp_path,
+            env={},
+            timeout=30,
+        )
+
+
+@pytest.mark.parametrize(
+    "case",
+    ("native-exit", "failed-report", "argv-drift", "runtime-drift", "candidate-drift"),
+)
+def test_platform_preflight_receipts_fail_closed_before_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    module = _load_evidence_module()
+    candidate_root, _candidate = _write_candidate_root(tmp_path)
+    runtime_attestation = candidate_root / "runtime" / "runtime-attestation.json"
+
+    def runner(arguments, *, cwd, env, timeout):
+        del cwd, env, timeout
+        phase = arguments[arguments.index("--runtime-phase") + 1]
+        checks = (
+            {
+                "activeTenantCredentialsValid": True,
+                "databaseConnected": True,
+                "objectStoreRoundTrip": True,
+                "revisionsMatch": True,
+                "tenantCrossPrefixDenied": True,
+                "tenantOwnPrefixAccessible": True,
+            }
+            if phase == "database-object-store"
+            else {"openmaicContractCompatible": True}
+        )
+        errors: list[str] = []
+        if case == "native-exit" and phase == "openmaic":
+            return subprocess.CompletedProcess(arguments, 7, "", "phase failed")
+        if case == "failed-report" and phase == "openmaic":
+            checks["openmaicContractCompatible"] = False
+            errors.append("OpenMAIC health and contract 1.0")
+        report = {
+            "schemaVersion": 1,
+            "producer": "platform-preflight",
+            "phase": phase,
+            "checks": checks,
+            "errors": errors,
+        }
+        stdout = (
+            json.dumps(
+                report,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        )
+        if case == "runtime-drift" and phase == "openmaic":
+            runtime_attestation.write_bytes(runtime_attestation.read_bytes() + b"\n")
+        if case == "candidate-drift" and phase == "openmaic":
+            lock_path = candidate_root / "deploy" / "image-lock.json"
+            lock = json.loads(lock_path.read_text(encoding="utf-8"))
+            lock["candidate"]["sourceHead"] = "b" * 40
+            lock_path.write_text(json.dumps(lock), encoding="utf-8")
+        completed_arguments = (
+            ["attacker-controlled-command"]
+            if case == "argv-drift" and phase == "openmaic"
+            else arguments
+        )
+        return subprocess.CompletedProcess(completed_arguments, 0, stdout, "")
+
+    monkeypatch.setattr(
+        module,
+        "_current_observed_at",
+        lambda: "2026-08-25T00:01:00Z",
+        raising=False,
+    )
+    with pytest.raises(ValueError, match="preflight|attestation"):
+        module.write_platform_preflight_receipts(
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            timeout_seconds=120,
+            runner=runner,
+            docker_resolver=lambda: (tmp_path / "trusted-docker").resolve(),
+        )
+
+    assert not (candidate_root / "runtime" / "platform-preflight-attestation.json").exists()
+    assert not (candidate_root / "artifacts" / "database_revisions.json").exists()
+    assert not (candidate_root / "artifacts" / "service_health.json").exists()
+
+
+def test_platform_preflight_concurrent_target_is_never_overwritten_or_quarantined(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_evidence_module()
+    candidate_root, _candidate_document = _write_candidate_root(tmp_path)
+    service_path = candidate_root / "artifacts" / "service_health.json"
+    sentinel = b'{"ownedBy":"another-writer"}\n'
+
+    def runner(arguments, *, cwd, env, timeout):
+        del cwd, env, timeout
+        phase = arguments[arguments.index("--runtime-phase") + 1]
+        checks = (
+            {
+                "activeTenantCredentialsValid": True,
+                "databaseConnected": True,
+                "objectStoreRoundTrip": True,
+                "revisionsMatch": True,
+                "tenantCrossPrefixDenied": True,
+                "tenantOwnPrefixAccessible": True,
+            }
+            if phase == "database-object-store"
+            else {"openmaicContractCompatible": True}
+        )
+        report = {
+            "schemaVersion": 1,
+            "producer": "platform-preflight",
+            "phase": phase,
+            "checks": checks,
+            "errors": [],
+        }
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            json.dumps(report, separators=(",", ":"), sort_keys=True) + "\n",
+            "",
+        )
+
+    real_candidate = module._candidate
+    candidate_reads = 0
+
+    def inject_concurrent_target(path: Path) -> dict[str, object]:
+        nonlocal candidate_reads
+        candidate = real_candidate(path)
+        candidate_reads += 1
+        if candidate_reads == 3:
+            service_path.parent.mkdir(parents=True, exist_ok=True)
+            service_path.write_bytes(sentinel)
+        return candidate
+
+    monkeypatch.setattr(module, "_candidate", inject_concurrent_target)
+    monkeypatch.setattr(
+        module,
+        "_current_observed_at",
+        lambda: "2026-08-25T00:01:00Z",
+        raising=False,
+    )
+
+    with pytest.raises(ValueError, match="release binding|already exists"):
+        module.write_platform_preflight_receipts(
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            timeout_seconds=120,
+            runner=runner,
+            docker_resolver=lambda: (tmp_path / "trusted-docker").resolve(),
+        )
+
+    assert service_path.read_bytes() == sentinel
+    failure_root = candidate_root / "failures" / "platform-preflight"
+    assert all(path.read_bytes() != sentinel for path in failure_root.rglob("*.json"))
+
+
+def test_platform_preflight_publication_failure_relocates_all_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_evidence_module()
+    candidate_root, _candidate = _write_candidate_root(tmp_path)
+    proof_path = candidate_root / "runtime" / "platform-preflight-attestation.json"
+    database_path = candidate_root / "artifacts" / "database_revisions.json"
+    service_path = candidate_root / "artifacts" / "service_health.json"
+    docker_configs: list[Path] = []
+
+    def runner(arguments, *, cwd, env, timeout):
+        del cwd, env, timeout
+        phase = arguments[arguments.index("--runtime-phase") + 1]
+        checks = (
+            {
+                "activeTenantCredentialsValid": True,
+                "databaseConnected": True,
+                "objectStoreRoundTrip": True,
+                "revisionsMatch": True,
+                "tenantCrossPrefixDenied": True,
+                "tenantOwnPrefixAccessible": True,
+            }
+            if phase == "database-object-store"
+            else {"openmaicContractCompatible": True}
+        )
+        report = {
+            "schemaVersion": 1,
+            "producer": "platform-preflight",
+            "phase": phase,
+            "checks": checks,
+            "errors": [],
+        }
+        docker_configs.append(Path(arguments[2]))
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            json.dumps(report, separators=(",", ":"), sort_keys=True) + "\n",
+            "",
+        )
+
+    real_publish = module._publish_no_replace
+
+    def fail_service_receipt(source: Path, target: Path) -> None:
+        if Path(target).resolve() == service_path.resolve():
+            raise OSError("simulated service receipt publication failure")
+        real_publish(source, target)
+
+    monkeypatch.setattr(module, "_publish_no_replace", fail_service_receipt)
+    monkeypatch.setattr(
+        module,
+        "_current_observed_at",
+        lambda: "2026-08-25T00:01:00Z",
+        raising=False,
+    )
+
+    with pytest.raises(OSError, match="simulated service receipt publication failure"):
+        module.write_platform_preflight_receipts(
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            timeout_seconds=120,
+            runner=runner,
+            docker_resolver=lambda: (tmp_path / "trusted-docker").resolve(),
+        )
+
+    assert not proof_path.exists()
+    assert not database_path.exists()
+    assert not service_path.exists()
+    assert not list(candidate_root.rglob("*.staging"))
+    assert len(set(docker_configs)) == 1
+    assert not docker_configs[0].exists()
+    failure_directories = list((candidate_root / "failures" / "platform-preflight").glob("*"))
+    assert len(failure_directories) == 1
+    assert {path.name for path in failure_directories[0].iterdir()} == {
+        "failure.json",
+        "proof.json",
+        "published-database-revisions.json",
+        "service_health.json",
+    }
+
+
+def test_probe_failure_archive_rejects_symlink_boundary(tmp_path: Path) -> None:
+    module = _load_evidence_module()
+    bundle_root = tmp_path / "bundle"
+    outside_root = tmp_path / "outside"
+    bundle_root.mkdir()
+    outside_root.mkdir()
+    failures = bundle_root / "failures"
+    try:
+        failures.symlink_to(outside_root, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are unavailable on this test host")
+    staged = bundle_root / "staged.json"
+    staged.write_text("staged", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="failure archive boundary"):
+        module._record_probe_failure(
+            bundle_root=bundle_root,
+            evidence="platform-preflight",
+            recipe="candidate-network-phases",
+            attempt_id="fixed-attempt",
+            reason="simulated failure",
+            native_exit=0,
+            artifacts={"proof": staged},
+        )
+
+    assert staged.read_text(encoding="utf-8") == "staged"
+    assert list(outside_root.iterdir()) == []
+
+
+def test_probe_failure_archive_uses_anchored_relative_operations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_evidence_module()
+    bundle_root = tmp_path / "bundle"
+    bundle_root.mkdir()
+    staged = bundle_root / "staged.json"
+    staged.write_text("staged", encoding="utf-8")
+    monkeypatch.setattr(
+        module.os,
+        "replace",
+        lambda *_args, **_kwargs: pytest.fail("failure archive must not use path-based replace"),
+    )
+
+    failure_dir = module._record_probe_failure(
+        bundle_root=bundle_root,
+        evidence="platform-preflight",
+        recipe="candidate-network-phases",
+        attempt_id="fixed-attempt",
+        reason="simulated failure",
+        native_exit=0,
+        artifacts={"proof": staged},
+    )
+
+    assert not staged.exists()
+    assert (failure_dir / "proof.json").read_text(encoding="utf-8") == "staged"
+    assert (failure_dir / "failure.json").is_file()
+
+
+def test_release_evidence_cli_runs_fixed_platform_preflight_producer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = _load_evidence_module()
+    candidate_root = tmp_path / "candidate"
+    bundle_root = tmp_path / "bundle"
+    captured: dict[str, object] = {}
+
+    def write_receipts(**arguments: object) -> dict[str, object]:
+        captured.update(arguments)
+        return {}
+
+    monkeypatch.setattr(
+        module,
+        "write_platform_preflight_receipts",
+        write_receipts,
+        raising=False,
+    )
+    assert (
+        module.main(
+            [
+                "platform-preflight",
+                "--candidate-root",
+                str(candidate_root),
+                "--bundle-root",
+                str(bundle_root),
+                "--run-id",
+                RELEASE_RUN["runId"],
+                "--environment-id",
+                RELEASE_RUN["environmentId"],
+                "--timeout-seconds",
+                "120",
+            ]
+        )
+        == 0
+    )
+    assert captured == {
+        "candidate_root": candidate_root,
+        "bundle_root": bundle_root,
+        "release_run": RELEASE_RUN,
+        "timeout_seconds": 120,
+    }
+    assert capsys.readouterr().out == (
+        f"{bundle_root / 'runtime' / 'platform-preflight-attestation.json'}\n"
+    )
+
+
 @pytest.mark.parametrize("command", ("source-head", "image-digests"))
 def test_release_evidence_cli_writes_candidate_receipts(
     tmp_path: Path,

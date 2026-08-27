@@ -22,6 +22,12 @@ if str(PROJECT_ROOT) not in sys.path:
 if str(SCRIPTS_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_ROOT))
 
+from platform_preflight_contract import (
+    PHASES,
+    canonical_candidate_network_report,
+    failed_candidate_network_report,
+    parse_candidate_network_report,
+)
 from render_platform_compose import (
     candidate_artifact_paths,
     load_image_lock,
@@ -349,6 +355,63 @@ async def _inspect_openmaic_runtime(
     return ()
 
 
+async def inspect_candidate_network_phase(
+    *,
+    phase: str,
+    settings: Any,
+    secret_dir: Path,
+) -> dict[str, Any]:
+    """Inspect one candidate-network dependency boundary without Docker access."""
+
+    if phase not in {"database-object-store", "openmaic"}:
+        raise ValueError("unsupported candidate-network preflight phase")
+
+    database = await _inspect_database_runtime(settings)
+    if phase == "openmaic":
+        errors = tuple(
+            dict.fromkeys(
+                (
+                    *database.errors,
+                    *await _inspect_openmaic_runtime(database.shared_route, Path(secret_dir)),
+                )
+            )
+        )
+        checks = {"openmaicContractCompatible": not errors}
+    else:
+        object_store_errors = await _inspect_object_store_runtime(
+            settings,
+            Path(secret_dir),
+            database.active_tenants,
+        )
+        inventory_errors = () if database.active_tenants else ("active tenant inventory",)
+        errors = tuple(dict.fromkeys((*database.errors, *inventory_errors, *object_store_errors)))
+        blocked = set(errors)
+        database_blockers = {"database connectivity", "database migrations"}
+        credential_blockers = database_blockers | {
+            "active tenant inventory",
+            "object store bucket probe",
+            "active tenant credential",
+        }
+        own_prefix_blockers = credential_blockers | {"tenant own-prefix probe"}
+        cross_prefix_blockers = own_prefix_blockers | {"tenant cross-prefix denial probe"}
+        checks = {
+            "activeTenantCredentialsValid": blocked.isdisjoint(credential_blockers),
+            "databaseConnected": "database connectivity" not in blocked,
+            "objectStoreRoundTrip": "object store bucket probe" not in blocked,
+            "revisionsMatch": blocked.isdisjoint(database_blockers),
+            "tenantCrossPrefixDenied": blocked.isdisjoint(cross_prefix_blockers),
+            "tenantOwnPrefixAccessible": blocked.isdisjoint(own_prefix_blockers),
+        }
+
+    return {
+        "schemaVersion": 1,
+        "producer": "platform-preflight",
+        "phase": phase,
+        "checks": checks,
+        "errors": list(errors),
+    }
+
+
 class DefaultRuntimePreflightProbe:
     async def inspect(
         self,
@@ -609,12 +672,65 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--image-lock", type=Path)
     parser.add_argument("--hostname")
     parser.add_argument("--offline-contract-check", action="store_true")
+    parser.add_argument("--runtime-phase", choices=PHASES)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     arguments = parser.parse_args(argv)
+    if arguments.runtime_phase is not None:
+        if (
+            arguments.candidate_root is not None
+            or arguments.image_lock is not None
+            or arguments.hostname is not None
+            or arguments.offline_contract_check
+        ):
+            parser.error("--runtime-phase cannot be combined with host preflight options")
+        try:
+            from deeptutor.services.config import load_platform_settings
+
+            settings = load_platform_settings(arguments.config)
+        except Exception:
+            report = failed_candidate_network_report(
+                arguments.runtime_phase,
+                "platform settings",
+            )
+        else:
+            try:
+                report = asyncio.run(
+                    inspect_candidate_network_phase(
+                        phase=arguments.runtime_phase,
+                        settings=settings,
+                        secret_dir=arguments.secret_dir,
+                    )
+                )
+            except Exception:
+                report = failed_candidate_network_report(
+                    arguments.runtime_phase,
+                    "candidate network preflight",
+                )
+        try:
+            body = canonical_candidate_network_report(report)
+            validated = parse_candidate_network_report(
+                body,
+                expected_phase=arguments.runtime_phase,
+            )
+        except Exception:
+            report = failed_candidate_network_report(
+                arguments.runtime_phase,
+                "candidate network preflight",
+            )
+            body = canonical_candidate_network_report(report)
+            validated = parse_candidate_network_report(
+                body,
+                expected_phase=arguments.runtime_phase,
+            )
+        sys.stdout.write(body.decode("utf-8"))
+        checks = validated["checks"]
+        errors = validated["errors"]
+        assert isinstance(checks, dict) and isinstance(errors, list)
+        return 0 if not errors and all(value is True for value in checks.values()) else 1
     if arguments.candidate_root is not None and arguments.image_lock is not None:
         parser.error("--candidate-root cannot be combined with --image-lock")
     candidate_root = arguments.candidate_root or PROJECT_ROOT

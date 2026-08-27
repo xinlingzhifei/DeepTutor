@@ -342,6 +342,14 @@ def _write_probe_proof(
                 "sha256": hashlib.sha256(attestation_path.read_bytes()).hexdigest(),
             }
         }
+    if evidence in {"database_revisions", "service_health"}:
+        attestation_path = _write_platform_preflight_attestation(tmp_path, candidate)
+        return {
+            "platformPreflightAttestation": {
+                "artifact": "runtime/platform-preflight-attestation.json",
+                "sha256": hashlib.sha256(attestation_path.read_bytes()).hexdigest(),
+            }
+        }
     recipe = module.PROBE_RECIPES.get(evidence)
     if recipe is None:
         return None
@@ -661,6 +669,106 @@ def _write_runtime_attestation(
     (runtime / "runtime-attestation.json").write_text(json.dumps(document), encoding="utf-8")
 
 
+def _write_platform_preflight_attestation(
+    root: Path,
+    candidate: dict[str, object],
+) -> Path:
+    runtime_attestation_path = root / "runtime" / "runtime-attestation.json"
+    runtime_attestation = json.loads(runtime_attestation_path.read_text(encoding="utf-8"))
+    containers = runtime_attestation["containers"]
+    assert isinstance(containers, list)
+    container_ids = {
+        container["service"]: container["containerId"]
+        for container in containers
+        if isinstance(container, dict)
+    }
+    reports = {
+        "database-object-store": {
+            "schemaVersion": 1,
+            "producer": "platform-preflight",
+            "phase": "database-object-store",
+            "checks": {
+                "activeTenantCredentialsValid": True,
+                "databaseConnected": True,
+                "objectStoreRoundTrip": True,
+                "revisionsMatch": True,
+                "tenantCrossPrefixDenied": True,
+                "tenantOwnPrefixAccessible": True,
+            },
+            "errors": [],
+        },
+        "openmaic": {
+            "schemaVersion": 1,
+            "producer": "platform-preflight",
+            "phase": "openmaic",
+            "checks": {"openmaicContractCompatible": True},
+            "errors": [],
+        },
+    }
+    services = {
+        "database-object-store": "tenant-provisioner",
+        "openmaic": "deeptutor",
+    }
+    executions: list[dict[str, object]] = []
+    for phase in ("database-object-store", "openmaic"):
+        service = services[phase]
+        container_id = container_ids[service]
+        assert isinstance(container_id, str)
+        stdout = (
+            json.dumps(
+                reports[phase],
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        )
+        executions.append(
+            {
+                "phase": phase,
+                "service": service,
+                "containerId": container_id,
+                "command": [
+                    "docker",
+                    "--config",
+                    "<isolated-docker-config>",
+                    "--context",
+                    "default",
+                    "exec",
+                    "--user",
+                    "1000:1000",
+                    container_id,
+                    "python",
+                    "/app/scripts/platform_preflight.py",
+                    "--runtime-phase",
+                    phase,
+                    "--config",
+                    "/app/data/user/settings/platform.json",
+                    "--secret-dir",
+                    "/run/secrets",
+                ],
+                "nativeExit": 0,
+                "stdout": stdout,
+                "stdoutSha256": hashlib.sha256(stdout.encode()).hexdigest(),
+            }
+        )
+    document = {
+        "schemaVersion": 1,
+        "candidate": candidate,
+        "releaseRun": _RELEASE_RUN,
+        "observedAt": "2026-08-24T00:00:00Z",
+        "baseUrl": "https://candidate.example.test",
+        "runtimeAttestation": {
+            "artifact": "runtime/runtime-attestation.json",
+            "sha256": hashlib.sha256(runtime_attestation_path.read_bytes()).hexdigest(),
+        },
+        "executions": executions,
+    }
+    path = root / "runtime" / "platform-preflight-attestation.json"
+    path.write_text(json.dumps(document, sort_keys=True), encoding="utf-8")
+    return path
+
+
 def _write_complete_bundle(
     tmp_path: Path,
     module,
@@ -823,6 +931,251 @@ def test_all_required_layers_produce_a_ready_report() -> None:
     assert payload["status"] == "ready"
     assert payload["ok"] is True
     assert set(payload["layers"]) == set(module.REQUIRED_LAYERS)
+
+
+@pytest.mark.parametrize("evidence", ("database_revisions", "service_health"))
+def test_file_runtime_rejects_self_attested_preflight_receipt_without_bound_provenance(
+    tmp_path: Path,
+    evidence: str,
+) -> None:
+    module = _load_verifier()
+    manifest, evidence_map, _ = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    evidence_entry = evidence_map[evidence]
+    assert isinstance(evidence_entry, dict)
+    artifact_path = tmp_path / str(evidence_entry["artifact"])
+    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    artifact.pop("provenance")
+    artifact_body = json.dumps(artifact, sort_keys=True).encode()
+    artifact_path.write_bytes(artifact_body)
+    evidence_entry["artifactSha256"] = hashlib.sha256(artifact_body).hexdigest()
+    manifest.write_text(
+        json.dumps(_manifest_document(module, artifact["candidate"], evidence_map)),
+        encoding="utf-8",
+    )
+
+    result = module.verify(
+        module.FileReleaseRuntime(
+            manifest,
+            expected_source_head="a" * 40,
+            candidate_root=tmp_path,
+        )
+    )
+
+    assert result.layers[evidence].status == "fail"
+    assert "preflight execution proof is missing or invalid" in result.layers[evidence].detail
+
+
+@pytest.mark.parametrize("evidence", ("database_revisions", "service_health"))
+def test_file_runtime_rejects_tampered_platform_preflight_execution(
+    tmp_path: Path,
+    evidence: str,
+) -> None:
+    module = _load_verifier()
+    manifest, evidence_map, _ = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    proof_path = tmp_path / "runtime" / "platform-preflight-attestation.json"
+    proof = json.loads(proof_path.read_text(encoding="utf-8"))
+    execution = proof["executions"][0 if evidence == "database_revisions" else 1]
+    report = json.loads(execution["stdout"])
+    check = "revisionsMatch" if evidence == "database_revisions" else "openmaicContractCompatible"
+    report["checks"][check] = False
+    report["errors"] = [
+        "database migrations"
+        if evidence == "database_revisions"
+        else "OpenMAIC health and contract 1.0"
+    ]
+    stdout = (
+        json.dumps(
+            report,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    execution["stdout"] = stdout
+    execution["stdoutSha256"] = hashlib.sha256(stdout.encode()).hexdigest()
+    proof_path.write_text(json.dumps(proof, sort_keys=True), encoding="utf-8")
+
+    evidence_entry = evidence_map[evidence]
+    assert isinstance(evidence_entry, dict)
+    artifact_path = tmp_path / str(evidence_entry["artifact"])
+    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    artifact["provenance"]["platformPreflightAttestation"]["sha256"] = hashlib.sha256(
+        proof_path.read_bytes()
+    ).hexdigest()
+    artifact_body = json.dumps(artifact, sort_keys=True).encode()
+    artifact_path.write_bytes(artifact_body)
+    evidence_entry["artifactSha256"] = hashlib.sha256(artifact_body).hexdigest()
+    manifest.write_text(
+        json.dumps(_manifest_document(module, artifact["candidate"], evidence_map)),
+        encoding="utf-8",
+    )
+
+    result = module.verify(
+        module.FileReleaseRuntime(
+            manifest,
+            expected_source_head="a" * 40,
+            candidate_root=tmp_path,
+        )
+    )
+
+    assert result.layers[evidence].status == "fail"
+    assert "preflight" in result.layers[evidence].detail.lower()
+
+
+def test_file_runtime_rejects_boolean_platform_preflight_schema_version(
+    tmp_path: Path,
+) -> None:
+    module = _load_verifier()
+    manifest, evidence_map, _ = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    proof_path = tmp_path / "runtime" / "platform-preflight-attestation.json"
+    proof = json.loads(proof_path.read_text(encoding="utf-8"))
+    proof["schemaVersion"] = True
+    proof_body = json.dumps(proof, sort_keys=True).encode()
+    proof_path.write_bytes(proof_body)
+    proof_sha256 = hashlib.sha256(proof_body).hexdigest()
+
+    for evidence in ("database_revisions", "service_health"):
+        evidence_entry = evidence_map[evidence]
+        assert isinstance(evidence_entry, dict)
+        artifact_path = tmp_path / str(evidence_entry["artifact"])
+        artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+        artifact["provenance"]["platformPreflightAttestation"]["sha256"] = proof_sha256
+        artifact_body = json.dumps(artifact, sort_keys=True).encode()
+        artifact_path.write_bytes(artifact_body)
+        evidence_entry["artifactSha256"] = hashlib.sha256(artifact_body).hexdigest()
+
+    manifest.write_text(
+        json.dumps(_manifest_document(module, proof["candidate"], evidence_map)),
+        encoding="utf-8",
+    )
+    result = module.verify(
+        module.FileReleaseRuntime(
+            manifest,
+            expected_source_head="a" * 40,
+            candidate_root=tmp_path,
+        )
+    )
+
+    assert result.layers["database_revisions"].status == "fail"
+    assert result.layers["service_health"].status == "fail"
+
+
+def test_platform_preflight_proof_is_read_through_fixed_no_follow_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_verifier()
+    _manifest, evidence_map, _ = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    evidence_entry = evidence_map["database_revisions"]
+    assert isinstance(evidence_entry, dict)
+    artifact_path = tmp_path / str(evidence_entry["artifact"])
+    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    proof = artifact["provenance"]["platformPreflightAttestation"]
+    proof_path = tmp_path / proof["artifact"]
+    expected_body = proof_path.read_bytes()
+    original_read_bytes = Path.read_bytes
+
+    def reject_check_then_open(path: Path) -> bytes:
+        if path.resolve() == proof_path.resolve():
+            pytest.fail("platform preflight proof must use the fixed no-follow reader")
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", reject_check_then_open)
+
+    assert module._proof_bytes(
+        tmp_path,
+        proof,
+        label="platform preflight attestation",
+    ) == (expected_body, "runtime/platform-preflight-attestation.json")
+
+
+def test_platform_preflight_proof_rejects_oversized_fixed_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_verifier()
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+    proof_path = runtime_root / "platform-preflight-attestation.json"
+    oversized = b"x" * (1024 * 1024 + 1)
+    proof_path.write_bytes(oversized)
+    proof = {
+        "artifact": "runtime/platform-preflight-attestation.json",
+        "sha256": hashlib.sha256(oversized).hexdigest(),
+    }
+
+    if sys.platform == "win32":
+        monkeypatch.setattr(
+            module,
+            "_read_windows_file_handle",
+            lambda _handle: pytest.fail("oversized proof must be rejected before allocation"),
+        )
+
+    assert (
+        module._proof_bytes(
+            tmp_path,
+            proof,
+            label="platform preflight attestation",
+        )
+        == "platform preflight attestation cannot be read from its fixed boundary"
+    )
+
+
+@pytest.mark.parametrize("extra_location", ("result", "checks"))
+def test_file_runtime_rejects_extra_preflight_receipt_fields(
+    tmp_path: Path,
+    extra_location: str,
+) -> None:
+    module = _load_verifier()
+    manifest, evidence_map, _ = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    evidence_entry = evidence_map["database_revisions"]
+    assert isinstance(evidence_entry, dict)
+    artifact_path = tmp_path / str(evidence_entry["artifact"])
+    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    result_document = artifact["receipt"]["result"]
+    if extra_location == "result":
+        result_document["attackerAssertion"] = True
+    else:
+        result_document["checks"]["attackerAssertion"] = True
+    artifact_body = json.dumps(artifact, sort_keys=True).encode()
+    artifact_path.write_bytes(artifact_body)
+    evidence_entry["artifactSha256"] = hashlib.sha256(artifact_body).hexdigest()
+    manifest.write_text(
+        json.dumps(_manifest_document(module, artifact["candidate"], evidence_map)),
+        encoding="utf-8",
+    )
+
+    result = module.verify(
+        module.FileReleaseRuntime(
+            manifest,
+            expected_source_head="a" * 40,
+            candidate_root=tmp_path,
+        )
+    )
+
+    assert result.layers["database_revisions"].status == "fail"
+    assert "receipt" in result.layers["database_revisions"].detail
 
 
 def test_file_runtime_requires_the_same_candidate_head(tmp_path: Path) -> None:

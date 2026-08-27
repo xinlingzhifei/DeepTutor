@@ -586,6 +586,314 @@ def test_runtime_preflight_fails_closed_for_every_required_dependency(
     assert calls == [(tmp_path, lock_path, ROOT, ROOT)]
 
 
+def test_database_object_store_phase_never_calls_openmaic_or_docker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+    calls: list[str] = []
+
+    async def database(_settings):
+        calls.append("database")
+        return module._DatabaseInspection(
+            (),
+            (module._ActiveTenant("tenant-1", "tenant_one", "tenant-1.json"),),
+            ("shared", "http://openmaic:3000"),
+        )
+
+    async def object_store(_settings, _secret_dir, _active_tenants):
+        calls.append("object-store")
+        return ()
+
+    async def forbidden_openmaic(*_args):
+        pytest.fail("database/object-store phase must not call OpenMAIC")
+
+    def forbidden_compose(*_args, **_kwargs):
+        pytest.fail("candidate-network phase must not call Docker Compose")
+
+    monkeypatch.setattr(module, "_inspect_database_runtime", database)
+    monkeypatch.setattr(module, "_inspect_object_store_runtime", object_store)
+    monkeypatch.setattr(module, "_inspect_openmaic_runtime", forbidden_openmaic)
+    monkeypatch.setattr(module, "_inspect_compose_runtime", forbidden_compose)
+
+    report = asyncio.run(
+        module.inspect_candidate_network_phase(
+            phase="database-object-store",
+            settings=object(),
+            secret_dir=tmp_path,
+        )
+    )
+
+    assert calls == ["database", "object-store"]
+    assert report == {
+        "schemaVersion": 1,
+        "producer": "platform-preflight",
+        "phase": "database-object-store",
+        "checks": {
+            "activeTenantCredentialsValid": True,
+            "databaseConnected": True,
+            "objectStoreRoundTrip": True,
+            "revisionsMatch": True,
+            "tenantCrossPrefixDenied": True,
+            "tenantOwnPrefixAccessible": True,
+        },
+        "errors": [],
+    }
+
+
+def test_database_object_store_phase_does_not_pass_unexecuted_tenant_probes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+
+    async def database(_settings):
+        return module._DatabaseInspection((), (), ("shared", "http://openmaic:3000"))
+
+    async def object_store(_settings, _secret_dir, _active_tenants):
+        return ()
+
+    monkeypatch.setattr(module, "_inspect_database_runtime", database)
+    monkeypatch.setattr(module, "_inspect_object_store_runtime", object_store)
+
+    report = asyncio.run(
+        module.inspect_candidate_network_phase(
+            phase="database-object-store",
+            settings=object(),
+            secret_dir=tmp_path,
+        )
+    )
+
+    assert report["checks"] == {
+        "activeTenantCredentialsValid": False,
+        "databaseConnected": True,
+        "objectStoreRoundTrip": True,
+        "revisionsMatch": True,
+        "tenantCrossPrefixDenied": False,
+        "tenantOwnPrefixAccessible": False,
+    }
+    assert report["errors"] == ["active tenant inventory"]
+
+
+def test_openmaic_phase_fails_when_database_dependency_is_not_clean(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+
+    async def database(_settings):
+        return module._DatabaseInspection(
+            ("database migrations",),
+            (),
+            ("shared", "http://openmaic:3000"),
+        )
+
+    async def openmaic(_route, _secret_dir):
+        return ()
+
+    monkeypatch.setattr(module, "_inspect_database_runtime", database)
+    monkeypatch.setattr(module, "_inspect_openmaic_runtime", openmaic)
+
+    report = asyncio.run(
+        module.inspect_candidate_network_phase(
+            phase="openmaic",
+            settings=object(),
+            secret_dir=tmp_path,
+        )
+    )
+
+    assert report["checks"] == {"openmaicContractCompatible": False}
+    assert report["errors"] == ["database migrations"]
+
+
+def test_openmaic_phase_never_calls_object_store_or_docker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+    calls: list[str] = []
+
+    async def database(_settings):
+        calls.append("database")
+        return module._DatabaseInspection((), (), ("shared", "http://openmaic:3000"))
+
+    async def forbidden_object_store(*_args):
+        pytest.fail("OpenMAIC phase must not call object-store probes")
+
+    async def openmaic(_route, _secret_dir):
+        calls.append("openmaic")
+        return ()
+
+    def forbidden_compose(*_args, **_kwargs):
+        pytest.fail("candidate-network phase must not call Docker Compose")
+
+    monkeypatch.setattr(module, "_inspect_database_runtime", database)
+    monkeypatch.setattr(module, "_inspect_object_store_runtime", forbidden_object_store)
+    monkeypatch.setattr(module, "_inspect_openmaic_runtime", openmaic)
+    monkeypatch.setattr(module, "_inspect_compose_runtime", forbidden_compose)
+
+    report = asyncio.run(
+        module.inspect_candidate_network_phase(
+            phase="openmaic",
+            settings=object(),
+            secret_dir=tmp_path,
+        )
+    )
+
+    assert calls == ["database", "openmaic"]
+    assert report == {
+        "schemaVersion": 1,
+        "producer": "platform-preflight",
+        "phase": "openmaic",
+        "checks": {"openmaicContractCompatible": True},
+        "errors": [],
+    }
+
+
+def test_candidate_network_report_json_is_canonical() -> None:
+    module = _module()
+    report = {
+        "schemaVersion": 1,
+        "producer": "platform-preflight",
+        "phase": "openmaic",
+        "checks": {"openmaicContractCompatible": True},
+        "errors": [],
+    }
+
+    body = module.canonical_candidate_network_report(report)
+
+    assert body == (
+        json.dumps(
+            report,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def test_candidate_network_report_rejects_boolean_schema_version() -> None:
+    module = _module()
+    report = {
+        "schemaVersion": True,
+        "producer": "platform-preflight",
+        "phase": "openmaic",
+        "checks": {"openmaicContractCompatible": True},
+        "errors": [],
+    }
+    body = module.canonical_candidate_network_report(report)
+
+    with pytest.raises(ValueError, match="report is invalid"):
+        module.parse_candidate_network_report(body, expected_phase="openmaic")
+
+
+def test_candidate_network_report_rejects_oversized_body_before_json_decode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+    parser_json = module.parse_candidate_network_report.__globals__["json"]
+
+    def forbidden_loads(_body: bytes):
+        pytest.fail("oversized reports must be rejected before JSON decoding")
+
+    monkeypatch.setattr(parser_json, "loads", forbidden_loads)
+
+    with pytest.raises(ValueError, match="report is too large"):
+        module.parse_candidate_network_report(
+            b" " * ((16 * 1024) + 1),
+            expected_phase="openmaic",
+        )
+
+
+def test_runtime_phase_cli_skips_host_candidate_checks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = _module()
+    settings = object()
+    calls: list[tuple[str, object, Path]] = []
+
+    async def inspect(*, phase, settings, secret_dir):
+        calls.append((phase, settings, secret_dir))
+        return {
+            "schemaVersion": 1,
+            "producer": "platform-preflight",
+            "phase": phase,
+            "checks": {"openmaicContractCompatible": True},
+            "errors": [],
+        }
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("candidate-network phase must not run host preflight checks")
+
+    import deeptutor.services.config as config_module
+
+    monkeypatch.setattr(config_module, "load_platform_settings", lambda path: settings)
+    monkeypatch.setattr(module, "inspect_candidate_network_phase", inspect)
+    monkeypatch.setattr(module, "run_preflight", forbidden)
+    monkeypatch.setattr(module, "validate_image_lock_bindings", forbidden)
+
+    exit_code = module.main(
+        [
+            "--runtime-phase",
+            "openmaic",
+            "--config",
+            str(tmp_path / "platform.json"),
+            "--secret-dir",
+            str(tmp_path / "secrets"),
+        ]
+    )
+
+    assert exit_code == 0
+    assert calls == [("openmaic", settings, tmp_path / "secrets")]
+    assert capsys.readouterr().out == (
+        '{"checks":{"openmaicContractCompatible":true},"errors":[],'
+        '"phase":"openmaic","producer":"platform-preflight","schemaVersion":1}\n'
+    )
+
+
+@pytest.mark.parametrize("case", ("raises", "invalid-report"))
+def test_runtime_phase_cli_emits_canonical_failure_for_invalid_probe_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    case: str,
+) -> None:
+    module = _module()
+
+    async def inspect(**_kwargs):
+        if case == "raises":
+            raise RuntimeError("secret detail must not escape")
+        return {"attacker": True}
+
+    import deeptutor.services.config as config_module
+
+    monkeypatch.setattr(config_module, "load_platform_settings", lambda path: object())
+    monkeypatch.setattr(module, "inspect_candidate_network_phase", inspect)
+
+    exit_code = module.main(
+        [
+            "--runtime-phase",
+            "openmaic",
+            "--config",
+            str(tmp_path / "platform.json"),
+            "--secret-dir",
+            str(tmp_path / "secrets"),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert captured.err == ""
+    assert captured.out == (
+        '{"checks":{"openmaicContractCompatible":false},'
+        '"errors":["candidate network preflight"],"phase":"openmaic",'
+        '"producer":"platform-preflight","schemaVersion":1}\n'
+    )
+
+
 def test_runtime_compose_probe_rejects_old_cli_and_non_gateway_ports(
     monkeypatch,
 ) -> None:
