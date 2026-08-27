@@ -13,21 +13,9 @@ ROOT = Path(__file__).resolve().parents[2]
 PLAYWRIGHT_CONFIG = ROOT / "web" / "playwright.config.ts"
 LIVE_SPEC = ROOT / "web" / "tests" / "e2e" / "classroom-first-release.live.spec.ts"
 LIVE_FIXTURE = (
-    ROOT
-    / "web"
-    / "tests"
-    / "e2e"
-    / "support"
-    / "classroom-first-release-live-fixture.ts"
+    ROOT / "web" / "tests" / "e2e" / "support" / "classroom-first-release-live-fixture.ts"
 )
-LIVE_FLOWS = (
-    ROOT
-    / "web"
-    / "tests"
-    / "e2e"
-    / "support"
-    / "classroom-first-release-live-flows.ts"
-)
+LIVE_FLOWS = ROOT / "web" / "tests" / "e2e" / "support" / "classroom-first-release-live-flows.ts"
 LIVE_SOURCE_IMPORT_ALLOWLIST = {
     LIVE_SPEC: frozenset(
         {
@@ -119,7 +107,7 @@ def test_playwright_live_project_exposes_one_exact_spec_only_in_live_mode() -> N
     assert source.count(marker) == 1
     assert len(re.findall(r"\btestMatch\s*:", live_project)) == 1
     assert re.search(
-        r'\btestMatch:\s*LIVE_PROJECT_SELECTED\s*\?\s*'
+        r"\btestMatch:\s*LIVE_PROJECT_SELECTED\s*\?\s*"
         r'"\*\*/e2e/classroom-first-release\.live\.spec\.ts"\s*:\s*\[\]\s*,',
         live_project,
     )
@@ -131,7 +119,7 @@ def test_playwright_config_wires_live_policy_and_server_boundary() -> None:
     compact = _compact_typescript(source)
 
     assert re.search(
-        r'import\s*\{\s*isLivePlaywrightSelected\s*,\s*resolveLiveBaseUrl\s*,?\s*\}'
+        r"import\s*\{\s*isLivePlaywrightSelected\s*,\s*resolveLiveBaseUrl\s*,?\s*\}"
         r'\s*from\s*"\./playwright\.live-policy"\s*;',
         source,
     )
@@ -148,25 +136,21 @@ def test_playwright_config_wires_live_policy_and_server_boundary() -> None:
     assert "functionresolveLiveBaseUrl(" not in compact
     assert (
         "constBASE_URL=LIVE_PROJECT_SELECTED?LIVE_BASE_URL:"
-        "process.env.WEB_BASE_URL||LOCAL_BASE_URL;"
-        in compact
+        "process.env.WEB_BASE_URL||LOCAL_BASE_URL;" in compact
     )
     assert (
-        "constSTART_LOCAL_WEB_SERVER=!LIVE_PROJECT_SELECTED&&"
-        "!process.env.WEB_BASE_URL;"
-        in compact
+        "constSTART_LOCAL_WEB_SERVER=!LIVE_PROJECT_SELECTED&&!process.env.WEB_BASE_URL;" in compact
     )
     assert (
         "globalSetup:START_LOCAL_WEB_SERVER?path.join(WEB_ROOT,"
-        '"tests","e2e","support","managed-web-server.ts"):undefined,'
-        in compact
+        '"tests","e2e","support","managed-web-server.ts"):undefined,' in compact
     )
 
 
 def test_playwright_live_project_is_fixed_serial_chromium_without_artifacts() -> None:
     source = _playwright_config_source()
     live_project = _object_containing(source, 'name: "first-release-live"')
-    live_use = _object_after(live_project, 'use:')
+    live_use = _object_after(live_project, "use:")
     project_compact = _compact_typescript(live_project)
     use_compact = _compact_typescript(live_use)
 
@@ -182,7 +166,7 @@ def test_playwright_live_project_is_fixed_serial_chromium_without_artifacts() ->
     assert 'video:"off",' in use_compact
 
 
-def test_live_spec_uses_only_real_sources_and_declares_task4_markers_once() -> None:
+def test_live_spec_uses_only_real_sources_and_declares_marker_counts() -> None:
     live_sources: dict[Path, str] = {}
     for path in LIVE_SOURCE_IMPORT_ALLOWLIST:
         relative = path.relative_to(ROOT).as_posix()
@@ -240,8 +224,58 @@ def test_live_spec_uses_only_real_sources_and_declares_task4_markers_once() -> N
     spec_imports = _typescript_static_module_sources(live_sources[LIVE_SPEC])
     assert "@playwright/test" in spec_imports
     combined_source = "\n".join(live_sources.values())
-    assert combined_source.count("[release-evidence:teacher_flow]") == 1
-    assert combined_source.count("[release-evidence:content_operations_flow]") == 1
+    for evidence in (
+        "teacher_flow",
+        "student_micro_flow",
+        "student_full_flow",
+        "content_operations_flow",
+    ):
+        assert combined_source.count(f"[release-evidence:{evidence}]") == 1
+
+
+def test_live_spec_declares_exact_tailwind_matrix_and_structural_evidence() -> None:
+    source = LIVE_SPEC.read_text(encoding="utf-8")
+    compact = _compact_typescript(source)
+
+    assert (
+        'constTAILWIND_ROUTES=["/login","/home","/knowledge",'
+        '"/settings/appearance","/settings/llm","/space/learning",]asconst;' in compact
+    )
+    assert (
+        'constTAILWIND_VIEWPORTS=[{name:"desktop",width:1440,height:900},'
+        '{name:"mobile",width:390,height:844},]asconst;' in compact
+    )
+    assert 'constTAILWIND_APPEARANCES=["snow","light","dark","glass"]asconst;' in compact
+    assert re.search(
+        r"\bconst\s+TAILWIND_CASES\s*=\s*TAILWIND_ROUTES\s*\.\s*flatMap\s*\(",
+        source,
+    )
+    assert re.search(r"\bTAILWIND_CASES\s*\.\s*length\s*!==\s*48\b", source)
+    assert "new Set(TAILWIND_CASES.map" in source
+    assert "TAILWIND_CASE_KEYS.size !== 48" in source
+    assert source.count("[release-evidence:tailwind4_visual_matrix]") == 1
+    assert re.search(r"\bfor\s*\(\s*const\s+visualCase\s+of\s+TAILWIND_CASES\s*\)", source)
+    assert "route=${visualCase.route}" in source
+    assert "viewport=${visualCase.viewport.name}" in source
+    assert "appearance=${visualCase.appearance}" in source
+    assert 'localStorage.setItem("deeptutor-theme", appearance)' in source
+    assert 'new URL(response.url()).pathname === "/api/v1/settings/ui"' in source
+    assert 'themeButton.getAttribute("aria-pressed")' in source
+    assert 'themeButton).toHaveAttribute("aria-pressed", "true")' in source
+    assert 'page.on("console"' in source
+    assert 'page.on("pageerror"' in source
+    assert "document.documentElement.scrollWidth" in source
+    assert "window.innerWidth" in source
+    assert re.search(r'page\s*\.\s*locator\("div\[aria-label\]:visible"\)', source)
+    assert re.search(r'page\s*\.\s*locator\("button:visible"\)', source)
+    assert '`select:visible:has(option[value="${safeTenantId}"])`' in source
+    assert "live visual tenant switcher is missing" in source
+    assert 'page.locator("#username")' in source
+    assert 'page.locator("#password")' in source
+    assert "/Knowledge Center|知识中心/" in source
+    assert "/Appearance|外观/" in source
+    assert "/LLM/" in source
+    assert "/Mastery Path|精通之路/" in source
 
 
 def _load_probe():

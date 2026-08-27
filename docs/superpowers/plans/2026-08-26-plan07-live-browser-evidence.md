@@ -18,7 +18,7 @@
 - Modify: `scripts/classroom_release_probe_contract.py`
 - Modify: `tests/scripts/test_classroom_release_probe.py`
 
-- [ ] **Step 1: Add focused failing tests**
+- [x] **Step 1: Add focused failing tests**
 
 Add tests proving that the probe:
 
@@ -35,7 +35,7 @@ python -m pytest tests/scripts/test_classroom_release_probe.py -q -k "fixture_to
 
 Expected: RED only on the missing exact-token allow-list and validation behavior.
 
-- [ ] **Step 2: Implement the minimum trust-boundary change**
+- [x] **Step 2: Implement the minimum trust-boundary change**
 
 Define the exact allow-list:
 
@@ -45,7 +45,7 @@ _LIVE_SECRET_ENVIRONMENT = ("YFEISTAI_LIVE_FIXTURE_TOKEN",)
 
 Validate the token before candidate/runtime resolution, pass only that key into the Playwright process environment, and bump the live environment policy to version `2`. Do not log, serialize, hash into a receipt, or place the token in argv.
 
-- [ ] **Step 3: Verify focused and full Python contracts**
+- [x] **Step 3: Verify focused and full Python contracts**
 
 Run serially:
 
@@ -59,7 +59,7 @@ git diff --check
 
 Expected: all selected tests and static checks pass; no secret values appear in output.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```powershell
 git add scripts/classroom_release_probe.py scripts/classroom_release_probe_contract.py tests/scripts/test_classroom_release_probe.py
@@ -75,7 +75,7 @@ git commit -m "fix(release): isolate live browser credentials"
 - Create: `web/tests/classroom-release-live-policy.test.ts`
 - Modify: `tests/scripts/test_classroom_release_probe.py`
 
-- [ ] **Step 1: Add source and runtime contract RED tests**
+- [x] **Step 1: Add source and runtime contract RED tests**
 
 Add Python source-contract assertions proving that `web/playwright.config.ts`:
 
@@ -103,11 +103,11 @@ Pop-Location
 
 Expected: RED because the live project and its isolated runtime policy do not exist.
 
-- [ ] **Step 2: Implement live project selection and validation**
+- [x] **Step 2: Implement live project selection and validation**
 
 Implement the selection and URL rules in the pure policy module, then let the Playwright config consume those decisions. Preserve the existing mocked projects and managed server behavior when live mode is not selected, and keep the live project's `testMatch` empty unless live mode was explicitly selected.
 
-- [ ] **Step 3: Verify the config without opening a browser**
+- [x] **Step 3: Verify the config without opening a browser**
 
 Run:
 
@@ -123,7 +123,7 @@ git diff --check
 
 The live spec is intentionally absent at this stage, so do not run Playwright collection, a browser, or a local server. All commands must use the existing local dependencies without invoking a package-manager install path.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```powershell
 git add web/playwright.config.ts web/playwright.live-policy.ts web/tests/classroom-release-live-policy.test.ts tests/scripts/test_classroom_release_probe.py
@@ -137,7 +137,7 @@ git commit -m "test(release): declare live browser project"
 - Create: `web/tests/e2e/support/classroom-first-release-live-fixture.ts`
 - Create: `web/tests/classroom-first-release-live-fixture.test.ts`
 
-- [ ] **Step 1: Write Node unit RED tests around a fake API context**
+- [x] **Step 1: Write Node unit RED tests around a fake API context**
 
 Cover these behaviors without network or browser access:
 
@@ -161,7 +161,7 @@ Pop-Location
 
 Expected: RED because the helper does not exist.
 
-- [ ] **Step 2: Implement the smallest fixture client**
+- [x] **Step 2: Implement the smallest fixture client**
 
 Export explicit types such as `LiveEvidence`, `LiveRole`, `LiveFixtureContext`, and `LiveIdentity`. Accept an injected Playwright-compatible API request context so tests can provide a fake. Implement only the existing formal endpoints needed to:
 
@@ -174,7 +174,7 @@ Export explicit types such as `LiveEvidence`, `LiveRole`, `LiveFixtureContext`, 
 
 Do not add production fixture routes, direct database/object-store writes, cleanup calls, or a generic API abstraction.
 
-- [ ] **Step 3: Verify unit, type, and static boundaries**
+- [x] **Step 3: Verify unit, type, and static boundaries**
 
 Run:
 
@@ -189,7 +189,7 @@ git diff --check
 
 Expected: the focused Node tests and typecheck pass; no real HTTP requests occur.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```powershell
 git add web/tests/e2e/support/classroom-first-release-live-fixture.ts web/tests/classroom-first-release-live-fixture.test.ts
@@ -204,7 +204,7 @@ git commit -m "test(release): provision isolated live identities"
 - Create: `web/tests/e2e/classroom-first-release.live.spec.ts`
 - Modify: `tests/scripts/test_classroom_release_probe.py`
 
-- [ ] **Step 1: Add live-source boundary RED tests**
+- [x] **Step 1: Add live-source boundary RED tests**
 
 Assert across the fixed live spec, fixture helper, and flow helper that:
 
@@ -222,15 +222,15 @@ python -m pytest tests/scripts/test_classroom_release_probe.py -q -k "live_spec"
 
 Expected: RED because the fixed live spec is absent.
 
-- [ ] **Step 2: Implement the teacher recipe**
+- [x] **Step 2: Implement the teacher recipe**
 
 Use formal API setup only for tenant/identity/catalog prerequisites. Then use the real UI to sign in, select the provisioned tenant, create a teaching brief at `/teaching/classrooms/new`, wait for the real outline, confirm it, wait for generated draft content, validate it, and submit for review. The terminal assertion is a real pending-review record. Emit exactly `[release-evidence:teacher_flow]` in the test title.
 
-- [ ] **Step 3: Implement the content-operations recipe**
+- [x] **Step 3: Implement the content-operations recipe**
 
 Provision distinct author, reviewer, and publisher identities in one tenant. Drive creation and submission as the author, prove that the author cannot see approve/reject actions, approve as the separate reviewer, and publish as the authorized publisher. Emit exactly `[release-evidence:content_operations_flow]`.
 
-- [ ] **Step 4: Verify static collection only**
+- [x] **Step 4: Verify static collection only**
 
 Run:
 
@@ -247,7 +247,7 @@ git diff --check
 
 Use synthetic non-secret inputs for collection. Do not run the browser recipes against localhost or a candidate yet.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add web/tests/e2e/support/classroom-first-release-live-flows.ts web/tests/e2e/classroom-first-release.live.spec.ts tests/scripts/test_classroom_release_probe.py
@@ -262,7 +262,7 @@ git commit -m "test(release): cover live teacher operations"
 - Modify: `web/tests/e2e/classroom-first-release.live.spec.ts`
 - Modify: `web/tests/classroom-first-release-live-fixture.test.ts`
 
-- [ ] **Step 1: Add focused unit RED tests**
+- [x] **Step 1: Add focused unit RED tests**
 
 Use fake API/browser collaborators to prove that the bounded poller:
 
@@ -282,15 +282,15 @@ Pop-Location
 
 Expected: RED on missing student-flow behavior.
 
-- [ ] **Step 2: Implement the micro flow**
+- [x] **Step 2: Implement the micro flow**
 
 Provision and enroll a distinct student, sign in through the real UI, submit a micro-classroom request, wait for the actual generation job and immutable version, open `/learn/classrooms/{versionId}`, and prove the classroom document renders. Emit exactly `[release-evidence:student_micro_flow]`.
 
-- [ ] **Step 3: Implement the full flow**
+- [x] **Step 3: Implement the full flow**
 
 Provision and enroll another student, submit a full-classroom request, wait for `awaiting_confirmation`, edit and confirm the real outline, wait for generation, open the resulting immutable version, and prove the player renders. Emit exactly `[release-evidence:student_full_flow]`.
 
-- [ ] **Step 4: Verify unit, collection, and type boundaries**
+- [x] **Step 4: Verify unit, collection, and type boundaries**
 
 Run:
 
@@ -307,7 +307,7 @@ git diff --check
 
 Expected: static/list output includes one micro and one full marker; no browser is launched.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add web/tests/e2e/support/classroom-first-release-live-flows.ts web/tests/e2e/classroom-first-release.live.spec.ts web/tests/classroom-first-release-live-fixture.test.ts
@@ -322,7 +322,7 @@ git commit -m "test(release): cover live student classrooms"
 - Modify: `tests/scripts/test_classroom_release_probe.py`
 - Modify: `docs/superpowers/plans/2026-07-28-yfeistai-openmaic-07-deployment-and-acceptance-plan.md`
 
-- [ ] **Step 1: Add exact matrix RED tests**
+- [x] **Step 1: Add exact matrix RED tests**
 
 Pin the Cartesian product:
 
@@ -340,7 +340,7 @@ python -m pytest tests/scripts/test_classroom_release_probe.py -q -k "tailwind o
 
 Expected: RED until all 48 cases are present.
 
-- [ ] **Step 2: Implement the structural matrix**
+- [x] **Step 2: Implement the structural matrix**
 
 For each case, establish real login state where required, select the appearance through the supported UI/state seam, navigate to the real route, and assert:
 
@@ -351,7 +351,7 @@ For each case, establish real login state where required, select the appearance 
 
 Do not capture pixels or add visual snapshots. Keep each title unique while retaining the exact release marker.
 
-- [ ] **Step 3: Run the complete local harness verification**
+- [x] **Step 3: Run the complete local harness verification**
 
 Run each heavy command in its own globally guarded serial window:
 
@@ -367,11 +367,11 @@ git diff --check
 
 Expected list result: exactly 52 tests in `first-release-live` — 1 teacher, 1 student micro, 1 student full, 1 content operations, and 48 Tailwind matrix items. No candidate browser execution occurs in this step.
 
-- [ ] **Step 4: Update the authoritative plan boundary**
+- [x] **Step 4: Update the authoritative plan boundary**
 
 Record that the live harness is statically executable but Plan07 Task7 remains in progress until all five recipes run against the same immutable candidate and their native JSON is accepted. Record that Task8 and the eleven non-Playwright receipt producers remain incomplete.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add web/tests/e2e/classroom-first-release.live.spec.ts tests/scripts/test_classroom_release_probe.py docs/superpowers/plans/2026-07-28-yfeistai-openmaic-07-deployment-and-acceptance-plan.md

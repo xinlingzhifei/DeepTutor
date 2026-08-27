@@ -144,6 +144,20 @@ PROBE_TITLE_PATTERNS = {
     evidence: re.compile(rf"^\[release-evidence:{re.escape(evidence)}\] .+$")
     for evidence in PROBE_RECIPES
 }
+_TAILWIND_MATRIX_TITLES = frozenset(
+    "[release-evidence:tailwind4_visual_matrix] "
+    f"route={route} viewport={viewport} appearance={appearance}"
+    for route in (
+        "/login",
+        "/home",
+        "/knowledge",
+        "/settings/appearance",
+        "/settings/llm",
+        "/space/learning",
+    )
+    for viewport in ("desktop", "mobile")
+    for appearance in ("snow", "light", "dark", "glass")
+)
 
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _DIGEST = re.compile(r"^sha256:([0-9a-f]{64})$")
@@ -283,6 +297,7 @@ def derive_probe_checks(
         raise ValueError("probe selected test count does not match the fixed recipe")
 
     recounted = {name: 0 for name in outcome_names}
+    observed_titles: list[str] = []
     title_pattern = PROBE_TITLE_PATTERNS[evidence]
     for spec in specs:
         title = spec.get("title")
@@ -296,6 +311,7 @@ def derive_probe_checks(
             or len(tests) != 1
         ):
             raise ValueError("probe selected spec does not match the fixed recipe")
+        observed_titles.append(title)
         test = tests[0]
         if not isinstance(test, dict):
             raise ValueError("probe selected test is invalid")
@@ -330,6 +346,10 @@ def derive_probe_checks(
             or result.get("error") not in (None, {})
         ):
             raise ValueError("probe selected test does not prove a clean pass")
+    if evidence == "tailwind4_visual_matrix" and frozenset(observed_titles) != (
+        _TAILWIND_MATRIX_TITLES
+    ):
+        raise ValueError("probe selected spec does not match the fixed recipe")
     if any(stats[name] != recounted[name] for name in outcome_names):
         raise ValueError("probe Playwright stats do not match selected test results")
     if recounted != {

@@ -48,9 +48,29 @@ def _playwright_report(
     count: int,
 ) -> dict[str, object]:
     file = "tests/e2e/classroom-first-release.live.spec.ts"
+    tailwind_titles = [
+        (
+            "[release-evidence:tailwind4_visual_matrix] "
+            f"route={route} viewport={viewport} appearance={appearance}"
+        )
+        for route in (
+            "/login",
+            "/home",
+            "/knowledge",
+            "/settings/appearance",
+            "/settings/llm",
+            "/space/learning",
+        )
+        for viewport in ("desktop", "mobile")
+        for appearance in ("snow", "light", "dark", "glass")
+    ]
     specs = []
     for index in range(count):
-        title = f"[release-evidence:{evidence}] case {index + 1}"
+        title = (
+            tailwind_titles[index]
+            if evidence == "tailwind4_visual_matrix" and index < len(tailwind_titles)
+            else f"[release-evidence:{evidence}] case {index + 1}"
+        )
         specs.append(
             {
                 "title": title,
@@ -132,6 +152,29 @@ def test_derive_probe_checks_from_native_playwright_json() -> None:
     )
 
     assert checks == {"teacherFlowPassed": True}
+
+
+def test_derive_probe_checks_rejects_duplicate_tailwind_matrix_titles() -> None:
+    module = _load_verifier()
+    report = _playwright_report("tailwind4_visual_matrix", count=48)
+    suites = report["suites"]
+    assert isinstance(suites, list) and suites
+    suite = suites[0]
+    assert isinstance(suite, dict)
+    specs = suite["specs"]
+    assert isinstance(specs, list) and len(specs) == 48
+    first = specs[0]
+    duplicate = specs[-1]
+    assert isinstance(first, dict) and isinstance(duplicate, dict)
+    duplicate["title"] = first["title"]
+
+    with pytest.raises(ValueError, match="fixed recipe"):
+        module.derive_probe_checks(
+            "tailwind4_visual_matrix",
+            raw_report=json.dumps(report).encode(),
+            candidate=_candidate("a" * 40),
+            release_run=_RELEASE_RUN,
+        )
 
 
 def _first_probe_spec(report: dict[str, object]) -> dict[str, object]:
