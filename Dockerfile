@@ -151,8 +151,8 @@ RUN --mount=type=secret,id=debian_sources,target=/etc/apt/sources.list.d/debian.
     && printf '%s\n' \
         'Types: deb' \
         'URIs: https://apt.postgresql.org/pub/repos/apt' \
-        "Suites: $${VERSION_CODENAME}-pgdg" \
-        "Architectures: $$(dpkg --print-architecture)" \
+        "Suites: ${VERSION_CODENAME}-pgdg" \
+        "Architectures: $(dpkg --print-architecture)" \
         'Components: main' \
         'Signed-By: /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc' \
         > /etc/apt/sources.list.d/pgdg.sources \

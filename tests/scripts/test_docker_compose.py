@@ -910,7 +910,10 @@ def test_production_dockerfile_installs_postgresql_16_backup_clients() -> None:
     assert mount in production
     assert "https://www.postgresql.org/media/keys/ACCC4CF8.asc" in production
     assert "https://apt.postgresql.org/pub/repos/apt" in production
-    assert "Suites: $${VERSION_CODENAME}-pgdg" in production
+    assert "Suites: ${VERSION_CODENAME}-pgdg" in production
+    assert "Architectures: $(dpkg --print-architecture)" in production
+    assert "$${VERSION_CODENAME}" not in production
+    assert "$$(dpkg --print-architecture)" not in production
     assert "Signed-By: /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc" in production
     assert "    postgresql-client-16 \\\n" in production
     assert "pg_dump --version | grep -E '[(]PostgreSQL[)] 16[.]'" in production
