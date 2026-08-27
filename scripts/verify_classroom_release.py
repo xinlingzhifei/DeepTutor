@@ -939,6 +939,35 @@ def probe_provenance_error(
     candidate_root: Path,
 ) -> str | None:
     """Revalidate raw/execution proof for evidence backed by a fixed probe."""
+    if evidence == "running_containers":
+        provenance = document.get("provenance")
+        if not isinstance(provenance, dict) or set(provenance) != {"runtimeAttestation"}:
+            return "runtime attestation proof is missing or invalid"
+        attestation_proof = provenance.get("runtimeAttestation")
+        if (
+            not isinstance(attestation_proof, dict)
+            or set(attestation_proof) != {"artifact", "sha256"}
+            or attestation_proof.get("artifact") != "runtime/runtime-attestation.json"
+            or not isinstance(attestation_proof.get("sha256"), str)
+        ):
+            return "runtime attestation proof is missing or invalid"
+        try:
+            attestation = validate_runtime_attestation(
+                Path(attestation_proof["artifact"]),
+                bundle_root=bundle_root,
+                candidate_root=candidate_root,
+                candidate=candidate,
+                release_run=release_run,
+                expected_sha256=attestation_proof["sha256"],
+            )
+        except ValueError as exc:
+            return str(exc)
+        receipt = document.get("receipt")
+        if not isinstance(receipt, dict) or receipt.get("observedAt") != attestation.get(
+            "observedAt"
+        ):
+            return "running containers receipt does not match runtime attestation"
+        return None
     recipe = PROBE_RECIPES.get(evidence)
     if recipe is None:
         return None

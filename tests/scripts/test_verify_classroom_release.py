@@ -334,6 +334,14 @@ def _write_probe_proof(
     candidate: dict[str, object],
     evidence: str,
 ) -> dict[str, object] | None:
+    if evidence == "running_containers":
+        attestation_path = tmp_path / "runtime" / "runtime-attestation.json"
+        return {
+            "runtimeAttestation": {
+                "artifact": "runtime/runtime-attestation.json",
+                "sha256": hashlib.sha256(attestation_path.read_bytes()).hexdigest(),
+            }
+        }
     recipe = module.PROBE_RECIPES.get(evidence)
     if recipe is None:
         return None

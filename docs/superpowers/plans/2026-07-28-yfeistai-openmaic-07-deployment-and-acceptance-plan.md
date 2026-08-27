@@ -642,7 +642,9 @@ capacity_profile
 
 **Task6 本地合同状态（2026-08-27）：** `first-release-live --list` 已在本地静态收集恰好 52 项：teacher、student micro、student full、content operations 各 1 项，以及 Tailwind 4 matrix 48 项。这只证明 live harness 可静态执行和收集，不证明任何候选环境的浏览器验收已通过。Plan07 Task7 仍为进行中，必须等待上述五个 recipe 针对同一个新冻结的不可变发布候选取得 native Playwright JSON、原生 exit 0，并由 receipt verifier 接受；Task8 仍未完成。
 
-以下 11 个非 Playwright receipt producer 仍未完成：`database_revisions`、`running_containers`、`service_health`、`capacity_profile`、`classroom_exports`、`tenant_isolation`、`learning_event_idempotency`、`openmaic_shared_plane`、`openmaic_dedicated_plane`、`backup_restore`、`gateway_only_public`。
+`running_containers` 已具备正式的 candidate/run-bound receipt CLI：它只从固定的 `runtime/runtime-attestation.json` 双稳定快照派生 `stableContainerSet=true`，assembler 与 verifier 都会重放 attestation provenance 并拒绝手写自证。该本地合同不代表任何已部署候选已经取得此 receipt。
+
+以下 10 个非 Playwright receipt producer 仍未完成：`database_revisions`、`service_health`、`capacity_profile`、`classroom_exports`、`tenant_isolation`、`learning_event_idempotency`、`openmaic_shared_plane`、`openmaic_dedicated_plane`、`backup_restore`、`gateway_only_public`。
 
 **验收身份决策 A：** 只注入一个 `YFEISTAI_LIVE_FIXTURE_TOKEN`。它必须是 yFeiSTAI 权威身份源签发的 `role=admin` Bearer，不是 GHCR token；只允许通过验收进程环境传入，不得增加 `--token` 参数、写入 argv、日志或 receipt。验收夹具使用该 token，通过现有正式 API 创建隔离租户以及 teacher、student、author、reviewer、publisher 账号，并按现有正式角色模板授予所需的租户级角色（teacher→teacher、student→student、author→content_author、reviewer→content_reviewer、publisher→teacher），随后各角色通过真实 `/login` 登录。
 

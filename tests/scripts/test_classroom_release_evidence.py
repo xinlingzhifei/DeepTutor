@@ -1508,6 +1508,317 @@ def test_image_digest_receipt_rejects_compose_drift_before_publish(
     assert output.read_bytes() == b"sentinel"
 
 
+def test_running_containers_receipt_is_derived_from_fixed_runtime_attestation(
+    tmp_path: Path,
+) -> None:
+    module = _load_evidence_module()
+    verifier = _load_verifier()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    output = candidate_root / "artifacts" / "running_containers.json"
+    attestation = candidate_root / "runtime" / "runtime-attestation.json"
+
+    receipt = module.write_running_containers_receipt(
+        output,
+        candidate_root=candidate_root,
+        bundle_root=candidate_root,
+        release_run=RELEASE_RUN,
+    )
+
+    assert receipt["candidate"] == candidate
+    assert receipt["receipt"] == {
+        "producer": "docker-compose",
+        "observedAt": "2026-08-25T00:00:00Z",
+        "result": {
+            "outcome": "pass",
+            "nativeExit": 0,
+            "checks": {"stableContainerSet": True},
+        },
+    }
+    assert receipt["provenance"] == {
+        "runtimeAttestation": {
+            "artifact": "runtime/runtime-attestation.json",
+            "sha256": hashlib.sha256(attestation.read_bytes()).hexdigest(),
+        }
+    }
+
+    manifest = candidate_root / "release-evidence.json"
+    module.assemble_manifest(
+        manifest,
+        candidate_root=candidate_root,
+        release_run=RELEASE_RUN,
+        receipt_paths={"running_containers": output},
+    )
+    result = verifier.verify(
+        verifier.FileReleaseRuntime(
+            manifest,
+            expected_source_head=SOURCE_HEAD,
+            candidate_root=candidate_root,
+        )
+    )
+
+    assert result.layers["running_containers"].status == "pass"
+
+
+def test_running_containers_receipt_rejects_invalid_attestation_before_publish(
+    tmp_path: Path,
+) -> None:
+    module = _load_evidence_module()
+    candidate_root, _candidate = _write_candidate_root(tmp_path)
+    attestation = candidate_root / "runtime" / "runtime-attestation.json"
+    document = json.loads(attestation.read_text(encoding="utf-8"))
+    document["afterSnapshot"] = []
+    attestation.write_text(json.dumps(document), encoding="utf-8")
+    output = candidate_root / "artifacts" / "running_containers.json"
+    output.parent.mkdir(parents=True)
+    output.write_bytes(b"sentinel")
+
+    with pytest.raises(ValueError, match="attestation"):
+        module.write_running_containers_receipt(
+            output,
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+        )
+
+    assert output.read_bytes() == b"sentinel"
+
+
+@pytest.mark.parametrize("case", ("attestation", "candidate"))
+def test_running_containers_receipt_rejects_publish_window_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    module = _load_evidence_module()
+    candidate_root, _candidate = _write_candidate_root(tmp_path)
+    attestation = candidate_root / "runtime" / "runtime-attestation.json"
+    output = candidate_root / "artifacts" / "running_containers.json"
+    output.parent.mkdir(parents=True)
+    output.write_bytes(b"sentinel")
+    original_validate = module.validate_runtime_attestation
+    drifted = False
+
+    def validate_and_drift(*args, **kwargs):
+        nonlocal drifted
+        result = original_validate(*args, **kwargs)
+        if not drifted:
+            drifted = True
+            if case == "attestation":
+                attestation.write_bytes(attestation.read_bytes() + b"\n")
+            else:
+                lock_path = candidate_root / "deploy" / "image-lock.json"
+                lock = json.loads(lock_path.read_text(encoding="utf-8"))
+                lock["candidate"]["sourceHead"] = "b" * 40
+                lock_path.write_text(json.dumps(lock), encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(module, "validate_runtime_attestation", validate_and_drift)
+    with pytest.raises(ValueError, match="changed"):
+        module.write_running_containers_receipt(
+            output,
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+        )
+
+    assert output.read_bytes() == b"sentinel"
+
+
+@pytest.mark.parametrize(
+    "relative_output",
+    (
+        "deploy/image-lock.json",
+        "docker-compose.platform.yml",
+        "release-evidence.json",
+    ),
+)
+def test_running_containers_receipt_rejects_noncanonical_output_path(
+    tmp_path: Path,
+    relative_output: str,
+) -> None:
+    module = _load_evidence_module()
+    candidate_root, _candidate = _write_candidate_root(tmp_path)
+    output = candidate_root / relative_output
+    if not output.exists():
+        output.write_bytes(b"sentinel")
+    original = output.read_bytes()
+
+    with pytest.raises(ValueError, match="canonical"):
+        module.write_running_containers_receipt(
+            output,
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+        )
+
+    assert output.read_bytes() == original
+
+
+@pytest.mark.parametrize("consumer", ("assembler", "file-runtime"))
+def test_consumers_reject_running_containers_without_attestation_provenance(
+    tmp_path: Path,
+    consumer: str,
+) -> None:
+    module = _load_evidence_module()
+    verifier = _load_verifier()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    receipt_path = candidate_root / "artifacts" / "running_containers.json"
+    module._write_pass_receipt_from_candidate(
+        receipt_path,
+        candidate=candidate,
+        release_run=RELEASE_RUN,
+        evidence="running_containers",
+        observed_at="2026-08-25T00:00:00Z",
+        native_exit=0,
+        checks={"stableContainerSet": True},
+    )
+    manifest = candidate_root / "release-evidence.json"
+
+    if consumer == "assembler":
+        with pytest.raises(ValueError, match="runtime attestation proof"):
+            module.assemble_manifest(
+                manifest,
+                candidate_root=candidate_root,
+                release_run=RELEASE_RUN,
+                receipt_paths={"running_containers": receipt_path},
+            )
+        return
+
+    receipt_body = receipt_path.read_bytes()
+    manifest.write_text(
+        json.dumps(
+            {
+                "schemaVersion": 3,
+                "candidate": candidate,
+                "releaseRun": RELEASE_RUN,
+                "evidence": {
+                    "running_containers": {
+                        "status": "pass",
+                        "detail": "running_containers verified by docker-compose",
+                        "artifact": "artifacts/running_containers.json",
+                        "artifactSha256": hashlib.sha256(receipt_body).hexdigest(),
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    result = verifier.verify(
+        verifier.FileReleaseRuntime(
+            manifest,
+            expected_source_head=SOURCE_HEAD,
+            candidate_root=candidate_root,
+        )
+    )
+
+    assert result.layers["running_containers"].status == "fail"
+    assert "runtime attestation proof" in result.layers["running_containers"].detail
+
+
+@pytest.mark.parametrize("consumer", ("assembler", "file-runtime"))
+def test_consumers_revalidate_running_containers_attestation(
+    tmp_path: Path,
+    consumer: str,
+) -> None:
+    module = _load_evidence_module()
+    verifier = _load_verifier()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    receipt_path = candidate_root / "artifacts" / "running_containers.json"
+    module.write_running_containers_receipt(
+        receipt_path,
+        candidate_root=candidate_root,
+        bundle_root=candidate_root,
+        release_run=RELEASE_RUN,
+    )
+    manifest = candidate_root / "release-evidence.json"
+    if consumer == "file-runtime":
+        receipt_body = receipt_path.read_bytes()
+        manifest.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 3,
+                    "candidate": candidate,
+                    "releaseRun": RELEASE_RUN,
+                    "evidence": {
+                        "running_containers": {
+                            "status": "pass",
+                            "detail": "running_containers verified by docker-compose",
+                            "artifact": "artifacts/running_containers.json",
+                            "artifactSha256": hashlib.sha256(receipt_body).hexdigest(),
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+    attestation = candidate_root / "runtime" / "runtime-attestation.json"
+    attestation.write_bytes(attestation.read_bytes() + b"\n")
+
+    if consumer == "assembler":
+        with pytest.raises(ValueError, match="attestation.*digest"):
+            module.assemble_manifest(
+                manifest,
+                candidate_root=candidate_root,
+                release_run=RELEASE_RUN,
+                receipt_paths={"running_containers": receipt_path},
+            )
+        return
+
+    result = verifier.verify(
+        verifier.FileReleaseRuntime(
+            manifest,
+            expected_source_head=SOURCE_HEAD,
+            candidate_root=candidate_root,
+        )
+    )
+    assert result.layers["running_containers"].status == "fail"
+    assert "attestation" in result.layers["running_containers"].detail
+
+
+def test_release_evidence_cli_derives_running_containers_receipt(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    module = _load_evidence_module()
+    output = tmp_path / "bundle" / "artifacts" / "running_containers.json"
+    candidate_root = tmp_path / "candidate"
+    bundle_root = tmp_path / "bundle"
+    captured: dict[str, object] = {}
+
+    def write_receipt(path: Path, **arguments: object) -> dict[str, object]:
+        captured["path"] = path
+        captured.update(arguments)
+        return {}
+
+    monkeypatch.setattr(module, "write_running_containers_receipt", write_receipt)
+    assert (
+        module.main(
+            [
+                "running-containers",
+                "--output",
+                str(output),
+                "--candidate-root",
+                str(candidate_root),
+                "--bundle-root",
+                str(bundle_root),
+                "--run-id",
+                RELEASE_RUN["runId"],
+                "--environment-id",
+                RELEASE_RUN["environmentId"],
+            ]
+        )
+        == 0
+    )
+    assert captured == {
+        "path": output,
+        "candidate_root": candidate_root,
+        "bundle_root": bundle_root,
+        "release_run": RELEASE_RUN,
+    }
+    assert capsys.readouterr().out == f"{output}\n"
+
+
 @pytest.mark.parametrize("command", ("source-head", "image-digests"))
 def test_release_evidence_cli_writes_candidate_receipts(
     tmp_path: Path,

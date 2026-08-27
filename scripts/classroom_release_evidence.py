@@ -678,6 +678,79 @@ def write_image_digest_receipt(
     )
 
 
+def write_running_containers_receipt(
+    output_path: Path,
+    *,
+    candidate_root: Path,
+    bundle_root: Path,
+    release_run: Mapping[str, object],
+) -> dict[str, object]:
+    """Derive stable-container evidence from the fixed runtime attestation."""
+    resolved_output, _output_artifact = _bundle_artifact(
+        output_path,
+        bundle_root=bundle_root,
+        label="receipt output",
+    )
+    canonical_output = Path(bundle_root).resolve() / "artifacts" / "running_containers.json"
+    if resolved_output != canonical_output:
+        raise ValueError("running containers receipt must use its canonical output path")
+    candidate = _candidate(candidate_root)
+    bound_run = _release_run(release_run)
+    resolved_attestation = Path(bundle_root).resolve() / "runtime" / "runtime-attestation.json"
+    attestation_body, attestation_sha256 = read_runtime_attestation_artifact(
+        resolved_attestation,
+        bundle_root=bundle_root,
+    )
+    attestation = validate_runtime_attestation(
+        resolved_attestation,
+        bundle_root=bundle_root,
+        candidate_root=candidate_root,
+        candidate=candidate,
+        release_run=bound_run,
+        expected_sha256=attestation_sha256,
+    )
+    observed_at = attestation["observedAt"]
+    assert isinstance(observed_at, str)
+    try:
+        candidate_after = _candidate(candidate_root)
+    except ValueError as exc:
+        raise ValueError("candidate changed while container evidence was derived") from exc
+    if candidate_after != candidate:
+        raise ValueError("candidate changed while container evidence was derived")
+    try:
+        attestation_after, attestation_after_sha256 = read_runtime_attestation_artifact(
+            resolved_attestation,
+            bundle_root=bundle_root,
+        )
+    except ValueError as exc:
+        raise ValueError("runtime attestation changed while evidence was derived") from exc
+    if attestation_after != attestation_body or attestation_after_sha256 != attestation_sha256:
+        raise ValueError("runtime attestation changed while evidence was derived")
+    validate_runtime_attestation(
+        resolved_attestation,
+        bundle_root=bundle_root,
+        candidate_root=candidate_root,
+        candidate=candidate,
+        release_run=bound_run,
+        expected_sha256=attestation_sha256,
+    )
+    return _write_pass_receipt_from_candidate(
+        resolved_output,
+        candidate=candidate,
+        release_run=bound_run,
+        evidence="running_containers",
+        observed_at=observed_at,
+        native_exit=0,
+        checks={"stableContainerSet": True},
+        provenance={
+            "runtimeAttestation": {
+                "artifact": "runtime/runtime-attestation.json",
+                "sha256": attestation_sha256,
+            }
+        },
+    )
+
+
 def _validated_receipt(
     path: Path,
     *,
@@ -798,6 +871,13 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     image_digests = commands.add_parser("image-digests")
     _add_common_receipt_arguments(image_digests)
 
+    running_containers = commands.add_parser("running-containers")
+    running_containers.add_argument("--output", type=Path, required=True)
+    running_containers.add_argument("--candidate-root", type=Path, required=True)
+    running_containers.add_argument("--bundle-root", type=Path, required=True)
+    running_containers.add_argument("--run-id", required=True)
+    running_containers.add_argument("--environment-id", required=True)
+
     produce = commands.add_parser("produce")
     _add_common_receipt_arguments(produce)
     produce.add_argument("--evidence", choices=tuple(sorted(PROBE_RECIPES)), required=True)
@@ -845,6 +925,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             candidate_root=args.candidate_root,
             release_run=release_run,
             observed_at=args.observed_at,
+        )
+    elif args.command == "running-containers":
+        write_running_containers_receipt(
+            args.output,
+            candidate_root=args.candidate_root,
+            bundle_root=args.bundle_root,
+            release_run=release_run,
         )
     elif args.command == "produce":
         recipe, _expected_count = PROBE_RECIPES[args.evidence]
