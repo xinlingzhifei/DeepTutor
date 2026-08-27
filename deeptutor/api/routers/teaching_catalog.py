@@ -4,13 +4,26 @@ from __future__ import annotations
 
 from collections.abc import Awaitable
 from datetime import datetime
-from typing import Annotated, TypeVar
+from typing import Annotated, Literal, TypeVar
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Path,
+    Response,
+    UploadFile,
+    status,
+)
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.exc import SQLAlchemyError
 
+from deeptutor.api.routers.auth import require_platform_admin
 from deeptutor.multi_user.knowledge_access import resolve_kb
+from deeptutor.services.auth import TokenPayload
 from deeptutor.services.config import load_platform_settings
 from deeptutor.teaching.object_store import ObjectStoreError
 from deeptutor.teaching.policies.student_generation import ContentMode
@@ -29,6 +42,14 @@ from deeptutor.teaching.repositories.sources import (
     SourceNotFoundError,
     SourceRecord,
     SqlAlchemySourceRepository,
+)
+from deeptutor.teaching.repositories.student_generation_administration import (
+    QuotaGrantView,
+    SqlAlchemyStudentGenerationAdministrationRepository,
+    StudentGenerationAdministrationConflict,
+    StudentGenerationAdministrationError,
+    StudentGenerationAdministrationNotFound,
+    StudentSafetyAssessmentView,
 )
 from deeptutor.teaching.services.catalog import CatalogAccessDeniedError, CatalogService
 from deeptutor.teaching.services.sources import (
@@ -92,6 +113,46 @@ class ReplaceCourseGenerationPolicyRequest(_ApiModel):
         if len(value) != len(set(value)):
             raise ValueError("allowedContentModes must contain unique values")
         return value
+
+
+class GenerationQuotaGrantRequest(_ApiModel):
+    units: int = Field(ge=1, le=1_000_000, strict=True)
+
+
+class GenerationQuotaGrantResponse(_ApiModel):
+    grant_id: str
+    tenant_id: str
+    units: int
+    balance: int
+    created: bool
+
+
+class StudentSafetyAssessmentRequest(_ApiModel):
+    mode: Literal["micro", "full"]
+    content_mode: Literal["source_grounded", "open_creation"]
+    web_search_requested: bool = Field(strict=True)
+    generally_safe: bool = Field(strict=True)
+    minor_safe: bool = Field(strict=True)
+    restricted_topic: bool = Field(strict=True)
+    valid_for_seconds: int = Field(ge=60, le=86_400, strict=True)
+
+
+class StudentSafetyAssessmentResponse(_ApiModel):
+    assessment_id: str
+    tenant_id: str
+    course_id: str
+    class_id: str
+    mode: str
+    content_mode: str
+    web_search_requested: bool
+    generally_safe: bool
+    minor_safe: bool
+    restricted_topic: bool
+    reviewed_by: str
+    reviewed_at: datetime
+    assessment_version: int
+    expires_at: datetime
+    created: bool
 
 
 class BindKnowledgeRequest(_ApiModel):
@@ -171,6 +232,12 @@ def get_catalog_repository(
     context: TenantContext = Depends(require_tenant),
 ) -> SqlAlchemyCatalogRepository:
     return SqlAlchemyCatalogRepository(context.tenant_id)
+
+
+def get_student_generation_administration_repository(
+    context: TenantContext = Depends(require_tenant),
+) -> SqlAlchemyStudentGenerationAdministrationRepository:
+    return SqlAlchemyStudentGenerationAdministrationRepository(context.tenant_id)
 
 
 def get_source_repository(
@@ -300,6 +367,34 @@ async def _source_result(operation: Awaitable[_T]) -> _T:
         raise AssertionError("unreachable") from exc
 
 
+def _validated_idempotency_key(value: str) -> str:
+    if value != value.strip() or not value or len(value) > 256:
+        raise HTTPException(status_code=400, detail="Invalid Idempotency-Key")
+    if any(ord(character) < 33 or ord(character) > 126 for character in value):
+        raise HTTPException(status_code=400, detail="Invalid Idempotency-Key")
+    return value
+
+
+async def _generation_administration_result(operation: Awaitable[_T]) -> _T:
+    try:
+        return await operation
+    except StudentGenerationAdministrationNotFound:
+        raise HTTPException(
+            status_code=404,
+            detail="Student generation administration binding not found",
+        ) from None
+    except StudentGenerationAdministrationConflict:
+        raise HTTPException(
+            status_code=409,
+            detail="Student generation administration conflicts",
+        ) from None
+    except (StudentGenerationAdministrationError, SQLAlchemyError):
+        raise HTTPException(
+            status_code=503,
+            detail="Student generation administration is unavailable",
+        ) from None
+
+
 @router.get("/courses", response_model=CourseListResponse)
 async def list_courses(
     context: TenantContext = Depends(require_tenant),
@@ -367,6 +462,74 @@ async def replace_course_generation_policy(
         )
     )
     return _course_generation_policy_response(record)
+
+
+@router.post(
+    "/generation-quota-grants",
+    response_model=GenerationQuotaGrantResponse,
+)
+async def grant_generation_quota(
+    request: GenerationQuotaGrantRequest,
+    idempotency_key: Annotated[
+        str,
+        Header(alias="Idempotency-Key", min_length=1, max_length=256),
+    ],
+    payload: TokenPayload = Depends(require_platform_admin),
+    _context: TenantContext = Depends(require_tenant),
+    repository: SqlAlchemyStudentGenerationAdministrationRepository = Depends(
+        get_student_generation_administration_repository
+    ),
+) -> GenerationQuotaGrantResponse:
+    record: QuotaGrantView = await _generation_administration_result(
+        repository.grant_quota(
+            actor_id=payload.user_id,
+            idempotency_key=_validated_idempotency_key(idempotency_key),
+            units=request.units,
+        )
+    )
+    return GenerationQuotaGrantResponse.model_validate(record, from_attributes=True)
+
+
+@router.post(
+    "/courses/{course_id}/classes/{class_id}/student-safety-assessments",
+    response_model=StudentSafetyAssessmentResponse,
+)
+async def create_student_safety_assessment(
+    course_id: Annotated[
+        str,
+        Path(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$"),
+    ],
+    class_id: Annotated[
+        str,
+        Path(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$"),
+    ],
+    request: StudentSafetyAssessmentRequest,
+    idempotency_key: Annotated[
+        str,
+        Header(alias="Idempotency-Key", min_length=1, max_length=256),
+    ],
+    payload: TokenPayload = Depends(require_platform_admin),
+    _context: TenantContext = Depends(require_tenant),
+    repository: SqlAlchemyStudentGenerationAdministrationRepository = Depends(
+        get_student_generation_administration_repository
+    ),
+) -> StudentSafetyAssessmentResponse:
+    record: StudentSafetyAssessmentView = await _generation_administration_result(
+        repository.create_safety_assessment(
+            actor_id=payload.user_id,
+            idempotency_key=_validated_idempotency_key(idempotency_key),
+            course_id=course_id,
+            class_id=class_id,
+            mode=request.mode,
+            content_mode=request.content_mode,
+            web_search_requested=request.web_search_requested,
+            generally_safe=request.generally_safe,
+            minor_safe=request.minor_safe,
+            restricted_topic=request.restricted_topic,
+            valid_for_seconds=request.valid_for_seconds,
+        )
+    )
+    return StudentSafetyAssessmentResponse.model_validate(record, from_attributes=True)
 
 
 @router.get("/courses/{course_id}/classes", response_model=ClassListResponse)

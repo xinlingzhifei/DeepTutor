@@ -685,5 +685,5 @@ def test_runtime_heartbeat_migration_is_packaged_before_the_declared_head() -> N
         / "20260824_0018_teaching_runtime_heartbeats.py"
     )
 
-    assert TEACHING_MIGRATION_HEAD_REVISION == "20260825_0020"
+    assert TEACHING_MIGRATION_HEAD_REVISION == "20260827_0021"
     assert migration.is_file()

@@ -102,9 +102,9 @@ def _client(service: _ApprovalService) -> TestClient:
     application = FastAPI()
     application.include_router(student_classrooms.router, prefix="/api/v1")
     application.dependency_overrides[require_tenant] = _teacher_context
-    application.dependency_overrides[
-        student_classrooms.get_student_classroom_service
-    ] = lambda: service
+    application.dependency_overrides[student_classrooms.get_student_classroom_service] = lambda: (
+        service
+    )
     return TestClient(application)
 
 
@@ -258,15 +258,14 @@ def test_student_safety_assessment_model_binds_exact_trusted_request_shape() -> 
         "reviewed_by",
         "reviewed_at",
         "assessment_version",
+        "valid_for_seconds",
+        "requested_expires_at",
         "expires_at",
     }.issubset(table.columns.keys())
 
 
 def test_student_safety_assessment_migration_follows_student_classroom_api() -> None:
-    module_name = (
-        "deeptutor.teaching.migrations.versions."
-        "20260809_0015_student_safety_assessments"
-    )
+    module_name = "deeptutor.teaching.migrations.versions.20260809_0015_student_safety_assessments"
 
     assert importlib.util.find_spec(module_name) is not None
     migration = importlib.import_module(module_name)
@@ -275,10 +274,7 @@ def test_student_safety_assessment_migration_follows_student_classroom_api() -> 
 
 
 def test_student_classroom_api_migration_is_the_tenant_head() -> None:
-    module_name = (
-        "deeptutor.teaching.migrations.versions."
-        "20260809_0014_student_classroom_api"
-    )
+    module_name = "deeptutor.teaching.migrations.versions.20260809_0014_student_classroom_api"
     assert importlib.util.find_spec(module_name) is not None, (
         "student classroom API migration is missing"
     )
@@ -300,9 +296,7 @@ def test_classroom_repository_exposes_atomic_student_workflow_operations() -> No
 
 @pytest.mark.asyncio
 async def test_replayed_approval_returns_the_already_bound_job_without_restarting() -> None:
-    service_module = importlib.import_module(
-        "deeptutor.teaching.services.student_classrooms"
-    )
+    service_module = importlib.import_module("deeptutor.teaching.services.student_classrooms")
     record = ClassroomRecord(
         tenant_id="tenant-a",
         asset_id="student-asset-1",
@@ -387,9 +381,7 @@ async def test_replayed_approval_returns_the_already_bound_job_without_restartin
 async def test_approved_start_failure_expires_authorization_and_cancels_asset(
     failure_phase: str,
 ) -> None:
-    service_module = importlib.import_module(
-        "deeptutor.teaching.services.student_classrooms"
-    )
+    service_module = importlib.import_module("deeptutor.teaching.services.student_classrooms")
     events: list[str] = []
     record = ClassroomRecord(
         tenant_id="tenant-a",
@@ -500,18 +492,14 @@ async def test_approved_start_failure_expires_authorization_and_cancels_asset(
 
     if failure_phase == "job_cancel":
         with pytest.raises(service_module.StudentClassroomUnavailable) as captured:
-            await workflow.start_approved_generation(
-                _teacher_context("teacher-b"), approval
-            )
+            await workflow.start_approved_generation(_teacher_context("teacher-b"), approval)
         assert str(captured.value.primary_error) == "attach unavailable"
         assert [str(error) for error in captured.value.compensation_errors] == [
             "cancel unavailable"
         ]
     else:
         with pytest.raises(RuntimeError, match="unavailable"):
-            await workflow.start_approved_generation(
-                _teacher_context("teacher-b"), approval
-            )
+            await workflow.start_approved_generation(_teacher_context("teacher-b"), approval)
 
     expected = ["asset-started"]
     if failure_phase == "job":
@@ -527,9 +515,7 @@ async def test_approved_start_failure_expires_authorization_and_cancels_asset(
 
 @pytest.mark.asyncio
 async def test_each_teacher_copy_gets_a_new_asset_and_draft_identity() -> None:
-    service_module = importlib.import_module(
-        "deeptutor.teaching.services.student_classrooms"
-    )
+    service_module = importlib.import_module("deeptutor.teaching.services.student_classrooms")
     source = ClassroomRecord(
         tenant_id="tenant-a",
         asset_id="student-asset-1",

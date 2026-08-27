@@ -350,6 +350,51 @@ def _write_probe_proof(
                 "sha256": hashlib.sha256(attestation_path.read_bytes()).hexdigest(),
             }
         }
+    if evidence == "capacity_profile":
+        report = _capacity_profile_report(candidate)
+        report_body = (
+            json.dumps(
+                report,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode()
+        parsed = module.parse_capacity_profile_report(
+            report_body,
+            candidate=candidate,
+            release_run=_RELEASE_RUN,
+            expected_base_url="https://candidate.example.test",
+        )
+        runtime_path = tmp_path / "runtime" / "runtime-attestation.json"
+        attestation = {
+            "schemaVersion": 1,
+            "candidate": candidate,
+            "releaseRun": _RELEASE_RUN,
+            "observedAt": "2026-08-24T00:00:00Z",
+            "baseUrl": "https://candidate.example.test",
+            "runtimeAttestation": {
+                "artifact": "runtime/runtime-attestation.json",
+                "sha256": hashlib.sha256(runtime_path.read_bytes()).hexdigest(),
+            },
+            "execution": {
+                "command": module.capacity_profile_command_record(),
+                "nativeExit": 0,
+                "stdout": report_body.decode(),
+                "stdoutSha256": hashlib.sha256(report_body).hexdigest(),
+                "stderr": "",
+            },
+            "summary": module.derive_capacity_profile_summary(parsed),
+        }
+        attestation_path = tmp_path / "runtime" / "capacity-profile-attestation.json"
+        attestation_path.write_text(json.dumps(attestation, sort_keys=True), encoding="utf-8")
+        return {
+            "capacityAttestation": {
+                "artifact": "runtime/capacity-profile-attestation.json",
+                "sha256": hashlib.sha256(attestation_path.read_bytes()).hexdigest(),
+            }
+        }
     recipe = module.PROBE_RECIPES.get(evidence)
     if recipe is None:
         return None
@@ -393,6 +438,131 @@ def _write_probe_proof(
             "sha256": hashlib.sha256(execution_path.read_bytes()).hexdigest(),
         },
         "runtimeAttestation": attestation_proof,
+    }
+
+
+def _capacity_profile_report(candidate: dict[str, object]) -> dict[str, object]:
+    samples = [
+        {
+            "metric": metric,
+            "tenantId": f"tenant-{sequence % 50:02d}",
+            "subjectId": f"session-{sequence:03d}",
+            "sequence": sequence,
+            "latencyMs": 10.0,
+            "success": True,
+        }
+        for metric in ("core_api", "event_ingest", "mastery_projection_visible")
+        for sequence in range(200)
+    ]
+    job_samples = [
+        {
+            "metric": "job_submission_visible",
+            "tenantId": "tenant-00" if sequence < 3 else f"tenant-{sequence - 2:02d}",
+            "subjectId": f"job-{sequence:03d}",
+            "sequence": sequence,
+            "latencyMs": 10.0,
+            "success": True,
+        }
+        for sequence in range(52)
+    ]
+    samples.extend(job_samples)
+    active_groups = (
+        job_samples[:2] + job_samples[3:21],
+        job_samples[21:41],
+        job_samples[41:52],
+        job_samples[2:3],
+    )
+    claim_order = job_samples[:2] + job_samples[3:] + job_samples[2:3]
+    resource_observations = [
+        {
+            "sequence": sequence,
+            "phase": phase,
+            "observedAt": f"2026-08-24T00:00:0{sequence}Z",
+            "available": True,
+            "totalRssBytes": 600,
+            "limitBytes": 10_000,
+            "availableBytes": 8_000,
+            "limitSource": "cgroup",
+            "usageRatio": 0.06,
+            "partial": False,
+            "processes": [
+                {"label": "supervisor", "count": 1, "rssBytes": 100},
+                {"label": "backend", "count": 1, "rssBytes": 200},
+                {"label": "web", "count": 1, "rssBytes": 300},
+            ],
+        }
+        for sequence, phase in enumerate(
+            ("baseline", "generation_saturated", "sessions_saturated", "final")
+        )
+    ]
+    return {
+        "schemaVersion": 1,
+        "producer": "classroom-capacity-probe",
+        "capacityModel": "deployed-candidate",
+        "candidate": candidate,
+        "releaseRun": _RELEASE_RUN,
+        "observedAt": "2026-08-24T00:00:00Z",
+        "baseUrl": "https://candidate.example.test",
+        "profile": {
+            "name": "first-release",
+            "declaredRegisteredUsers": 100_000,
+            "declaredDailyActiveUsers": 10_000,
+            "executedTenants": 50,
+            "executedConcurrentSessions": 200,
+            "sharedGenerationSlots": 20,
+            "defaultTenantSlots": 2,
+        },
+        "workload": {
+            "generationJobsSubmitted": 52,
+            "learningSessionsStarted": 200,
+            "learningSessionsCompleted": 200,
+        },
+        "rawSamples": samples,
+        "schedulerSource": "admin-atomic-db-claim-audit",
+        "schedulerClaims": [
+            {
+                "sequence": sequence,
+                "jobId": sample["subjectId"],
+                "tenantId": sample["tenantId"],
+            }
+            for sequence, sample in enumerate(claim_order)
+        ],
+        "schedulerObservations": [
+            {
+                "sequence": sequence,
+                "active": [
+                    {"jobId": sample["subjectId"], "tenantId": sample["tenantId"]}
+                    for sample in active
+                ],
+            }
+            for sequence, active in enumerate(active_groups)
+        ],
+        "sessionObservations": [
+            {
+                "sequence": 0,
+                "active": [
+                    {
+                        "sessionId": f"session-{sequence:03d}",
+                        "tenantId": f"tenant-{sequence % 50:02d}",
+                    }
+                    for sequence in range(200)
+                ],
+            }
+        ],
+        "sessionCompletions": [
+            {
+                "sessionId": f"session-{sequence:03d}",
+                "tenantId": f"tenant-{sequence % 50:02d}",
+                "status": "completed",
+            }
+            for sequence in range(200)
+        ],
+        "resourceSource": {
+            "method": "GET",
+            "path": "/api/v1/system/memory",
+            "scope": "deeptutor-api-container-process-tree",
+        },
+        "resourceObservations": resource_observations,
     }
 
 
@@ -969,6 +1139,260 @@ def test_file_runtime_rejects_self_attested_preflight_receipt_without_bound_prov
     assert "preflight execution proof is missing or invalid" in result.layers[evidence].detail
 
 
+def test_file_runtime_rejects_self_attested_capacity_receipt_without_bound_provenance(
+    tmp_path: Path,
+) -> None:
+    module = _load_verifier()
+    manifest, evidence_map, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    evidence_entry = evidence_map["capacity_profile"]
+    assert isinstance(evidence_entry, dict)
+    artifact_path = tmp_path / str(evidence_entry["artifact"])
+    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    artifact.pop("provenance")
+    artifact_body = json.dumps(artifact, sort_keys=True).encode()
+    artifact_path.write_bytes(artifact_body)
+    evidence_entry["artifactSha256"] = hashlib.sha256(artifact_body).hexdigest()
+    manifest.write_text(
+        json.dumps(_manifest_document(module, candidate, evidence_map)),
+        encoding="utf-8",
+    )
+
+    result = module.verify(
+        module.FileReleaseRuntime(
+            manifest,
+            expected_source_head="a" * 40,
+            candidate_root=tmp_path,
+        )
+    )
+
+    assert result.layers["capacity_profile"].status == "fail"
+    assert (
+        "capacity execution proof is missing or invalid" in result.layers["capacity_profile"].detail
+    )
+
+
+def test_file_runtime_replays_capacity_profile_raw_samples(tmp_path: Path) -> None:
+    module = _load_verifier()
+    manifest, _, _ = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+
+    result = module.verify(
+        module.FileReleaseRuntime(
+            manifest,
+            expected_source_head="a" * 40,
+            candidate_root=tmp_path,
+        )
+    )
+
+    assert result.layers["capacity_profile"].status == "pass"
+
+
+def test_file_runtime_rejects_tampered_capacity_samples_even_when_proof_is_rehashed(
+    tmp_path: Path,
+) -> None:
+    module = _load_verifier()
+    manifest, evidence_map, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    proof_path = tmp_path / "runtime" / "capacity-profile-attestation.json"
+    proof = json.loads(proof_path.read_text(encoding="utf-8"))
+    report = json.loads(proof["execution"]["stdout"])
+    for sample in report["rawSamples"]:
+        if sample["metric"] == "core_api":
+            sample["latencyMs"] = 500.0
+    report_body = (
+        json.dumps(
+            report,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode()
+    proof["execution"]["stdout"] = report_body.decode()
+    proof["execution"]["stdoutSha256"] = hashlib.sha256(report_body).hexdigest()
+    parsed = module.parse_capacity_profile_report(
+        report_body,
+        candidate=candidate,
+        release_run=_RELEASE_RUN,
+        expected_base_url="https://candidate.example.test",
+    )
+    proof["summary"] = module.derive_capacity_profile_summary(parsed)
+    proof_path.write_text(json.dumps(proof, sort_keys=True), encoding="utf-8")
+    _rebind_capacity_proof(tmp_path, module, manifest, evidence_map, candidate)
+
+    result = module.verify(
+        module.FileReleaseRuntime(
+            manifest,
+            expected_source_head="a" * 40,
+            candidate_root=tmp_path,
+        )
+    )
+
+    assert result.layers["capacity_profile"].status == "fail"
+    assert "receipt does not match" in result.layers["capacity_profile"].detail
+
+
+def test_file_runtime_rejects_simulated_capacity_profile(tmp_path: Path) -> None:
+    module = _load_verifier()
+    manifest, evidence_map, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    proof_path = tmp_path / "runtime" / "capacity-profile-attestation.json"
+    proof = json.loads(proof_path.read_text(encoding="utf-8"))
+    report = json.loads(proof["execution"]["stdout"])
+    report["capacityModel"] = "simulated"
+    report_body = (
+        json.dumps(
+            report,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode()
+    proof["execution"]["stdout"] = report_body.decode()
+    proof["execution"]["stdoutSha256"] = hashlib.sha256(report_body).hexdigest()
+    proof_path.write_text(json.dumps(proof, sort_keys=True), encoding="utf-8")
+    _rebind_capacity_proof(tmp_path, module, manifest, evidence_map, candidate)
+
+    result = module.verify(
+        module.FileReleaseRuntime(
+            manifest,
+            expected_source_head="a" * 40,
+            candidate_root=tmp_path,
+        )
+    )
+
+    assert result.layers["capacity_profile"].status == "fail"
+    assert "deployed candidate" in result.layers["capacity_profile"].detail
+
+
+def test_file_runtime_rejects_capacity_summary_numeric_type_tamper(tmp_path: Path) -> None:
+    module = _load_verifier()
+    manifest, evidence_map, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    proof_path = tmp_path / "runtime" / "capacity-profile-attestation.json"
+    proof = json.loads(proof_path.read_text(encoding="utf-8"))
+    proof["summary"]["metrics"]["core_api"]["count"] = 200.0
+    proof_path.write_text(json.dumps(proof, sort_keys=True), encoding="utf-8")
+    _rebind_capacity_proof(tmp_path, module, manifest, evidence_map, candidate)
+
+    result = module.verify(
+        module.FileReleaseRuntime(
+            manifest,
+            expected_source_head="a" * 40,
+            candidate_root=tmp_path,
+        )
+    )
+
+    assert result.layers["capacity_profile"].status == "fail"
+    assert "summary does not match raw samples" in result.layers["capacity_profile"].detail
+
+
+def test_file_runtime_rejects_capacity_raw_change_with_stale_summary(tmp_path: Path) -> None:
+    module = _load_verifier()
+    manifest, evidence_map, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    proof_path = tmp_path / "runtime" / "capacity-profile-attestation.json"
+    proof = json.loads(proof_path.read_text(encoding="utf-8"))
+    report = json.loads(proof["execution"]["stdout"])
+    for sample in report["rawSamples"]:
+        if sample["metric"] == "core_api":
+            sample["latencyMs"] = 11.0
+    report_body = (
+        json.dumps(report, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n"
+    ).encode()
+    proof["execution"]["stdout"] = report_body.decode()
+    proof["execution"]["stdoutSha256"] = hashlib.sha256(report_body).hexdigest()
+    proof_path.write_text(json.dumps(proof, sort_keys=True), encoding="utf-8")
+    _rebind_capacity_proof(tmp_path, module, manifest, evidence_map, candidate)
+
+    result = module.verify(
+        module.FileReleaseRuntime(
+            manifest,
+            expected_source_head="a" * 40,
+            candidate_root=tmp_path,
+        )
+    )
+
+    assert result.layers["capacity_profile"].status == "fail"
+    assert "summary does not match raw samples" in result.layers["capacity_profile"].detail
+
+
+def test_file_runtime_rejects_float_capacity_receipt_schema_version(tmp_path: Path) -> None:
+    module = _load_verifier()
+    manifest, evidence_map, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    evidence_entry = evidence_map["capacity_profile"]
+    assert isinstance(evidence_entry, dict)
+    artifact_path = tmp_path / str(evidence_entry["artifact"])
+    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    artifact["schemaVersion"] = float(module.ARTIFACT_SCHEMA_VERSION)
+    artifact_body = json.dumps(artifact, sort_keys=True).encode()
+    artifact_path.write_bytes(artifact_body)
+    evidence_entry["artifactSha256"] = hashlib.sha256(artifact_body).hexdigest()
+    manifest.write_text(
+        json.dumps(_manifest_document(module, candidate, evidence_map)),
+        encoding="utf-8",
+    )
+
+    result = module.verify(
+        module.FileReleaseRuntime(
+            manifest,
+            expected_source_head="a" * 40,
+            candidate_root=tmp_path,
+        )
+    )
+
+    assert result.layers["capacity_profile"].status == "fail"
+    assert "envelope is invalid" in result.layers["capacity_profile"].detail
+
+
+def _rebind_capacity_proof(
+    tmp_path: Path,
+    module,
+    manifest: Path,
+    evidence_map: dict[str, object],
+    candidate: dict[str, object],
+) -> None:
+    proof_path = tmp_path / "runtime" / "capacity-profile-attestation.json"
+    evidence_entry = evidence_map["capacity_profile"]
+    assert isinstance(evidence_entry, dict)
+    artifact_path = tmp_path / str(evidence_entry["artifact"])
+    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    artifact["provenance"]["capacityAttestation"]["sha256"] = hashlib.sha256(
+        proof_path.read_bytes()
+    ).hexdigest()
+    artifact_body = json.dumps(artifact, sort_keys=True).encode()
+    artifact_path.write_bytes(artifact_body)
+    evidence_entry["artifactSha256"] = hashlib.sha256(artifact_body).hexdigest()
+    manifest.write_text(
+        json.dumps(_manifest_document(module, candidate, evidence_map)),
+        encoding="utf-8",
+    )
+
+
 @pytest.mark.parametrize("evidence", ("database_revisions", "service_health"))
 def test_file_runtime_rejects_tampered_platform_preflight_execution(
     tmp_path: Path,
@@ -1135,6 +1559,71 @@ def test_platform_preflight_proof_rejects_oversized_fixed_artifact(
             label="platform preflight attestation",
         )
         == "platform preflight attestation cannot be read from its fixed boundary"
+    )
+
+
+def test_capacity_profile_proof_is_read_through_fixed_no_follow_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_verifier()
+    _manifest, evidence_map, _ = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    evidence_entry = evidence_map["capacity_profile"]
+    assert isinstance(evidence_entry, dict)
+    artifact_path = tmp_path / str(evidence_entry["artifact"])
+    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    proof = artifact["provenance"]["capacityAttestation"]
+    proof_path = tmp_path / proof["artifact"]
+    expected_body = proof_path.read_bytes()
+    original_read_bytes = Path.read_bytes
+
+    def reject_check_then_open(path: Path) -> bytes:
+        if path.resolve() == proof_path.resolve():
+            pytest.fail("capacity proof must use the fixed no-follow reader")
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", reject_check_then_open)
+
+    assert module._proof_bytes(
+        tmp_path,
+        proof,
+        label="capacity execution attestation",
+    ) == (expected_body, "runtime/capacity-profile-attestation.json")
+
+
+def test_capacity_profile_proof_rejects_oversized_fixed_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_verifier()
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+    proof_path = runtime_root / "capacity-profile-attestation.json"
+    oversized = b"x" * (1024 * 1024 + 1)
+    proof_path.write_bytes(oversized)
+    proof = {
+        "artifact": "runtime/capacity-profile-attestation.json",
+        "sha256": hashlib.sha256(oversized).hexdigest(),
+    }
+
+    if sys.platform == "win32":
+        monkeypatch.setattr(
+            module,
+            "_read_windows_file_handle",
+            lambda _handle: pytest.fail("oversized proof must be rejected before allocation"),
+        )
+
+    assert (
+        module._proof_bytes(
+            tmp_path,
+            proof,
+            label="capacity execution attestation",
+        )
+        == "capacity execution attestation cannot be read from its fixed boundary"
     )
 
 

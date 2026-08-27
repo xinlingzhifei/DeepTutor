@@ -262,7 +262,7 @@ stdout_logfile=/dev/fd/1
 stdout_logfile_maxbytes=0
 stderr_logfile=/dev/fd/2
 stderr_logfile_maxbytes=0
-environment=PYTHONPATH="/app",PYTHONUNBUFFERED="1"
+environment=PYTHONPATH="/app",PYTHONUNBUFFERED="1",DEEPTUTOR_SUPERVISOR_PID="1"
 
 [program:frontend]
 command=/bin/bash /app/start-frontend.sh

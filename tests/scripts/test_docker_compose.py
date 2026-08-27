@@ -994,6 +994,14 @@ def test_supervisord_runs_as_root_with_unprivileged_children() -> None:
         )
 
 
+def test_production_backend_exports_supervisor_pid_for_complete_memory_accounting() -> None:
+    root = Path(__file__).resolve().parents[2]
+    content = (root / "Dockerfile").read_text(encoding="utf-8")
+    backend = content.split("[program:backend]", 1)[1].split("[program:frontend]", 1)[0]
+
+    assert 'DEEPTUTOR_SUPERVISOR_PID="1"' in backend
+
+
 def test_frontend_api_is_url_agnostic_passthrough() -> None:
     """web/lib/api.ts no longer carries a build-time API base or a placeholder
     token; apiUrl/wsUrl are pass-throughs and the Next.js middleware

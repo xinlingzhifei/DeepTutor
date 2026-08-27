@@ -8,7 +8,7 @@ import pytest
 from sqlalchemy.dialects import postgresql
 
 
-def test_teaching_metrics_migration_is_declared_head_and_dual_scope() -> None:
+def test_teaching_metrics_migration_precedes_current_head_and_is_dual_scope() -> None:
     from deeptutor.teaching.migrations.runner import TEACHING_MIGRATION_HEAD_REVISION
 
     migration = (
@@ -20,7 +20,7 @@ def test_teaching_metrics_migration_is_declared_head_and_dual_scope() -> None:
         / "20260825_0019_teaching_metric_rollups.py"
     )
 
-    assert TEACHING_MIGRATION_HEAD_REVISION == "20260825_0020"
+    assert TEACHING_MIGRATION_HEAD_REVISION == "20260827_0021"
     assert migration.is_file()
     source = migration.read_text(encoding="utf-8")
     assert 'revision: str = "20260825_0019"' in source

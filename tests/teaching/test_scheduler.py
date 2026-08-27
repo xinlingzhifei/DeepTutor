@@ -47,6 +47,26 @@ def test_generation_capacity_contract_is_twenty_global_and_two_per_tenant() -> N
     assert STANDARD_TENANT_SLOT_LIMIT == 2
 
 
+def test_generation_claim_audit_is_secret_free_and_bound_to_the_claim() -> None:
+    queue_job = SimpleNamespace(
+        tenant_id="tenant-a",
+        job_id="job-a",
+        job_kind="generation",
+    )
+
+    audit = scheduler_module._generation_claim_audit(queue_job, worker_id="worker-a")
+
+    assert audit is not None
+    assert audit.tenant_id == "tenant-a"
+    assert audit.actor_id == "worker-a"
+    assert audit.action == "generation.job_claimed"
+    assert audit.resource_type == "generation_job"
+    assert audit.resource_id == "job-a"
+    assert "lease" not in vars(audit)
+    queue_job.job_kind = "export"
+    assert scheduler_module._generation_claim_audit(queue_job, worker_id="worker-a") is None
+
+
 def test_mp4_exports_use_a_separate_slot_pool() -> None:
     assert slot_pool_for("generation", None) == "generation"
     for export_format in ("classroom_zip", "pptx", "offline_html"):

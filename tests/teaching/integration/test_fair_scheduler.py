@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from deeptutor.teaching.models import (
+    AuditLog,
     DataPlaneRoute,
     ProviderProfile,
     TeachingMetricCounterRollup,
@@ -369,6 +370,32 @@ def test_concurrent_claimers_respect_twenty_global_two_tenant_and_mp4_pool(
                 )
                 assert generation_claims == 20
                 assert mp4_claims == 1
+                claim_events = (
+                    (
+                        await session.execute(
+                            select(AuditLog)
+                            .where(
+                                AuditLog.action == "generation.job_claimed",
+                                AuditLog.resource_type == "generation_job",
+                            )
+                            .order_by(AuditLog.id)
+                        )
+                    )
+                    .scalars()
+                    .all()
+                )
+                assert len(claim_events) == 20
+                assert {event.resource_id for event in claim_events} == {
+                    job.job_id for job in claimed
+                }
+                assert {event.tenant_id for event in claim_events} == {
+                    job.tenant_id for job in claimed
+                }
+                assert all(
+                    event.actor_id and event.actor_id.startswith("capacity-worker-")
+                    for event in claim_events
+                )
+                assert "mp4-export" not in {event.resource_id for event in claim_events}
         finally:
             await engine.dispose()
 

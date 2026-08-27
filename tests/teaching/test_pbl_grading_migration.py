@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 
-def test_pbl_grading_migration_is_current_tenant_head() -> None:
+def test_pbl_grading_migration_precedes_current_tenant_head() -> None:
     from deeptutor.teaching.migrations.runner import TEACHING_MIGRATION_HEAD_REVISION
 
     migration = (
@@ -16,7 +16,7 @@ def test_pbl_grading_migration_is_current_tenant_head() -> None:
     )
     source = migration.read_text(encoding="utf-8")
 
-    assert TEACHING_MIGRATION_HEAD_REVISION == "20260825_0020"
+    assert TEACHING_MIGRATION_HEAD_REVISION == "20260827_0021"
     assert 'revision: str = "20260825_0020"' in source
     assert 'down_revision: str | None = "20260825_0019"' in source
     assert '"pbl_grading_results"' in source

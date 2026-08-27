@@ -222,6 +222,9 @@ def test_teaching_health_routes_register_only_for_enabled_platform() -> None:
     from deeptutor.api.routers import teaching_health
     from deeptutor.api.routers.teaching_health import get_active_health_probe_service
     from deeptutor.teaching.metrics import TeachingMetricsSnapshot
+    from deeptutor.teaching.repositories.capacity_scheduler import (
+        get_capacity_scheduler_repository,
+    )
     from deeptutor.teaching.repositories.metrics import get_teaching_metrics_repository
     from deeptutor.teaching.repositories.runtime_heartbeats import (
         get_runtime_heartbeat_repository,
@@ -239,6 +242,7 @@ def test_teaching_health_routes_register_only_for_enabled_platform() -> None:
     enabled = FastAPI()
     assert _register_teaching_health_routes(enabled, enabled=True)
     assert "/api/v1/system/teaching-health" in enabled.openapi()["paths"]
+    assert "/api/v1/system/generation-scheduler-snapshot" in enabled.openapi()["paths"]
     enabled.dependency_overrides[get_teaching_metrics_repository] = MetricsRepository
     assert TestClient(enabled).get("/internal/metrics").status_code == 200
     routes = {
@@ -251,13 +255,22 @@ def test_teaching_health_routes_register_only_for_enabled_platform() -> None:
     metrics_dependencies = {
         dependency.call for dependency in routes["/internal/metrics"].dependant.dependencies
     }
+    snapshot_dependencies = {
+        dependency.call
+        for dependency in routes[
+            "/api/v1/system/generation-scheduler-snapshot"
+        ].dependant.dependencies
+    }
     assert require_platform_admin in health_dependencies
     assert get_runtime_heartbeat_repository in health_dependencies
     assert get_active_health_probe_service in health_dependencies
     assert require_platform_admin not in metrics_dependencies
     assert get_teaching_metrics_repository in metrics_dependencies
+    assert require_platform_admin in snapshot_dependencies
+    assert get_capacity_scheduler_repository in snapshot_dependencies
     assert inspect.iscoroutinefunction(teaching_health.teaching_health)
     assert inspect.iscoroutinefunction(teaching_health.teaching_metrics)
+    assert inspect.iscoroutinefunction(teaching_health.generation_scheduler_snapshot)
 
 
 @pytest.mark.asyncio

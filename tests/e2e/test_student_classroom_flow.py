@@ -162,9 +162,7 @@ def _open_creation_document(asset_id: str, version_id: str) -> tuple[str, str, s
     )
     without_hash = dict(normalized)
     without_hash.pop("fileSha256")
-    normalized["fileSha256"] = hashlib.sha256(
-        canonical_json_bytes(without_hash)
-    ).hexdigest()
+    normalized["fileSha256"] = hashlib.sha256(canonical_json_bytes(without_hash)).hexdigest()
     document = ClassroomDocument.model_validate(normalized)
     payload = canonical_json_bytes(document).decode()
     return (
@@ -310,9 +308,7 @@ async def _complete_outline_job(
             template_id=request.template_id,
             template_version=request.template_version,
         ),
-        contract_sha256=(
-            "a45b0310d5b58a8e2d461ccfa9d60be24615583825a1f3a4f4460672cbd19ba5"
-        ),
+        contract_sha256=("a45b0310d5b58a8e2d461ccfa9d60be24615583825a1f3a4f4460672cbd19ba5"),
     )
     await repository.complete_outline(
         claim,
@@ -353,13 +349,13 @@ async def test_student_micro_full_and_approval_flows_stay_private(
     application = FastAPI()
     application.include_router(student_classrooms.router, prefix="/api/v1")
     application.dependency_overrides[require_tenant] = lambda: selected_context["value"]
-    application.dependency_overrides[
-        student_classrooms.get_student_classroom_service
-    ] = lambda: _service(
-        engine=engine,
-        context=selected_context["value"],
-        selector=_Selector(selection),
-        job_repository=job_repository,
+    application.dependency_overrides[student_classrooms.get_student_classroom_service] = lambda: (
+        _service(
+            engine=engine,
+            context=selected_context["value"],
+            selector=_Selector(selection),
+            job_repository=job_repository,
+        )
     )
 
     try:
@@ -483,19 +479,28 @@ async def test_student_micro_full_and_approval_flows_stay_private(
                     f'INSERT INTO "{schema_name}".student_safety_assessments '
                     "(id, tenant_id, course_id, class_id, mode, content_mode, "
                     "web_search_requested, generally_safe, minor_safe, restricted_topic, "
-                    "reviewed_by, reviewed_at, assessment_version, expires_at) VALUES "
+                    "reviewed_by, reviewed_at, assessment_version, valid_for_seconds, "
+                    "requested_expires_at, expires_at) VALUES "
                     "('safety-micro', :tenant_id, 'course-micro', 'class-micro', "
                     "'micro', 'open_creation', false, true, true, false, 'teacher-e2e', "
-                    "clock_timestamp(), 1, clock_timestamp() + interval '1 hour'), "
+                    "statement_timestamp(), 1, 3600, "
+                    "statement_timestamp() + interval '1 hour', "
+                    "statement_timestamp() + interval '1 hour'), "
                     "('safety-full', :tenant_id, 'course-full', 'class-full', "
                     "'full', 'open_creation', false, true, true, false, :teacher_id, "
-                    "clock_timestamp(), 1, clock_timestamp() + interval '1 hour'), "
+                    "statement_timestamp(), 1, 3600, "
+                    "statement_timestamp() + interval '1 hour', "
+                    "statement_timestamp() + interval '1 hour'), "
                     "('safety-blocked', :tenant_id, 'course-blocked', 'class-blocked', "
                     "'full', 'open_creation', false, true, true, false, :teacher_id, "
-                    "clock_timestamp(), 1, clock_timestamp() + interval '1 hour'), "
+                    "statement_timestamp(), 1, 3600, "
+                    "statement_timestamp() + interval '1 hour', "
+                    "statement_timestamp() + interval '1 hour'), "
                     "('safety-approval', :tenant_id, 'course-approval', 'class-approval', "
                     "'micro', 'open_creation', false, true, true, false, :teacher_id, "
-                    "clock_timestamp(), 1, clock_timestamp() + interval '1 hour')"
+                    "statement_timestamp(), 1, 3600, "
+                    "statement_timestamp() + interval '1 hour', "
+                    "statement_timestamp() + interval '1 hour')"
                 ),
                 {"tenant_id": tenant_id, "teacher_id": teacher_id},
             )
@@ -530,7 +535,7 @@ async def test_student_micro_full_and_approval_flows_stay_private(
                 selection=selection,
                 repository=job_repository,
             )
-            result = client.get(f'/api/v1/student-classrooms/{body["assetId"]}')
+            result = client.get(f"/api/v1/student-classrooms/{body['assetId']}")
             assert result.status_code == 200, result.text
             assert result.json()["status"] == "succeeded"
             assert result.json()["classroomVersionId"] == version_id
@@ -539,7 +544,7 @@ async def test_student_micro_full_and_approval_flows_stay_private(
             job_rows = (
                 await connection.execute(
                     text(
-                        f'SELECT owner_id, visibility, phase, status, result_ref FROM '
+                        f"SELECT owner_id, visibility, phase, status, result_ref FROM "
                         f'"{schema_name}".generation_jobs WHERE id = :job_id'
                     ),
                     {"job_id": body["generationJobId"]},
@@ -557,7 +562,7 @@ async def test_student_micro_full_and_approval_flows_stay_private(
 
         with TestClient(application) as client:
             selected_context["value"] = other_learner
-            hidden = client.get(f'/api/v1/student-classrooms/{body["assetId"]}')
+            hidden = client.get(f"/api/v1/student-classrooms/{body['assetId']}")
             assert hidden.status_code == 404
 
             selected_context["value"] = learner
@@ -582,26 +587,20 @@ async def test_student_micro_full_and_approval_flows_stay_private(
             )
             assert full_job_id == full["generationJobId"]
 
-            outline_ready = client.get(
-                f'/api/v1/student-classrooms/{full["assetId"]}'
-            )
+            outline_ready = client.get(f"/api/v1/student-classrooms/{full['assetId']}")
             assert outline_ready.status_code == 200, outline_ready.text
             outline_body = outline_ready.json()
             assert outline_body["status"] == "awaiting_confirmation"
             edited_outline = dict(outline_body["outline"])
             edited_outline["title"] = "Student-reviewed full classroom"
             edited = client.put(
-                f'/api/v1/student-classrooms/{full["assetId"]}/outline',
+                f"/api/v1/student-classrooms/{full['assetId']}/outline",
                 headers={"If-Match": f'"revision-{outline_body["revision"]}"'},
                 json={"outline": edited_outline},
             )
             assert edited.status_code == 200, edited.text
-            assert edited.json()["outline"]["title"] == (
-                "Student-reviewed full classroom"
-            )
-            confirmed = client.post(
-                f'/api/v1/student-classrooms/{full["assetId"]}/confirm-outline'
-            )
+            assert edited.json()["outline"]["title"] == ("Student-reviewed full classroom")
+            confirmed = client.post(f"/api/v1/student-classrooms/{full['assetId']}/confirm-outline")
             assert confirmed.status_code == 202, confirmed.text
             assert confirmed.json()["status"] == "queued"
             full_version_id = await _finish_micro_job(
@@ -611,9 +610,7 @@ async def test_student_micro_full_and_approval_flows_stay_private(
                 selection=selection,
                 repository=job_repository,
             )
-            full_result = client.get(
-                f'/api/v1/student-classrooms/{full["assetId"]}'
-            )
+            full_result = client.get(f"/api/v1/student-classrooms/{full['assetId']}")
             assert full_result.status_code == 200, full_result.text
             assert full_result.json()["status"] == "succeeded"
             assert full_result.json()["classroomVersionId"] == full_version_id
@@ -673,8 +670,7 @@ async def test_student_micro_full_and_approval_flows_stay_private(
                 )
             selected_context["value"] = teacher
             approved = client.post(
-                "/api/v1/student-generation-approvals/"
-                f'{approval["approvalId"]}/approve',
+                f"/api/v1/student-generation-approvals/{approval['approvalId']}/approve",
                 json={},
             )
             assert approved.status_code == 202, approved.text
@@ -690,9 +686,9 @@ async def test_student_micro_full_and_approval_flows_stay_private(
             approval_state = (
                 await connection.execute(
                     text(
-                        f'SELECT request.scene_max, request.estimated_units, '
-                        f'request.quota_state, request.evaluated_checks, job.owner_id, '
-                        f'job.visibility, job.quota_units, job.status FROM '
+                        f"SELECT request.scene_max, request.estimated_units, "
+                        f"request.quota_state, request.evaluated_checks, job.owner_id, "
+                        f"job.visibility, job.quota_units, job.status FROM "
                         f'"{schema_name}".student_generation_requests AS request '
                         f'JOIN "{schema_name}".generation_jobs AS job '
                         "ON job.id = :job_id WHERE request.id = :request_id"

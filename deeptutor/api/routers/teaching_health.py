@@ -9,6 +9,7 @@ from dataclasses import asdict
 from fastapi import APIRouter, Depends, HTTPException, Response
 import httpx
 from prometheus_client import CONTENT_TYPE_LATEST
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from deeptutor.api.routers.auth import require_platform_admin
 from deeptutor.services.config import PlatformSettings, load_platform_settings
@@ -28,6 +29,11 @@ from deeptutor.teaching.health_probes import (
     SqlAlchemyMigrationHealthRepository,
 )
 from deeptutor.teaching.metrics import TeachingMetrics
+from deeptutor.teaching.repositories.capacity_scheduler import (
+    MAX_CAPACITY_SNAPSHOT_JOBS,
+    SqlAlchemyCapacitySchedulerRepository,
+    get_capacity_scheduler_repository,
+)
 from deeptutor.teaching.repositories.data_planes import SqlAlchemyDataPlaneRepository
 from deeptutor.teaching.repositories.metrics import (
     SqlAlchemyTeachingMetricsRepository,
@@ -43,6 +49,23 @@ from deeptutor.teaching.storage_credentials import (
 )
 
 router = APIRouter()
+
+
+class GenerationSchedulerSnapshotRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    job_ids: list[str] = Field(
+        alias="jobIds",
+        min_length=1,
+        max_length=MAX_CAPACITY_SNAPSHOT_JOBS,
+    )
+
+    @field_validator("job_ids")
+    @classmethod
+    def validate_job_ids(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != len(value):
+            raise ValueError("jobIds must be unique")
+        return value
 
 
 def _unavailable_probe(reason: str):
@@ -124,6 +147,70 @@ async def teaching_health(
 ) -> dict[str, object]:
     active_results = await active_probes.probe()
     return asdict(await service.report_active(runtime_repository, active_results))
+
+
+def _iso_utc(value) -> str:
+    return value.isoformat().replace("+00:00", "Z")
+
+
+@router.post(
+    "/api/v1/system/generation-scheduler-snapshot",
+    dependencies=[Depends(require_platform_admin)],
+)
+async def generation_scheduler_snapshot(
+    request: GenerationSchedulerSnapshotRequest,
+    repository: SqlAlchemyCapacitySchedulerRepository = Depends(get_capacity_scheduler_repository),
+) -> dict[str, object]:
+    try:
+        snapshot = await repository.fetch_snapshot(tuple(request.job_ids))
+    except ValueError:
+        raise HTTPException(
+            status_code=503,
+            detail="generation_scheduler_snapshot_unavailable",
+        ) from None
+    return {
+        "schemaVersion": 1,
+        "observedAt": _iso_utc(snapshot.observed_at),
+        "jobs": [
+            {
+                "jobId": job.job_id,
+                "tenantId": job.tenant_id,
+                "workerPoolRef": job.worker_pool_ref,
+                "status": job.status,
+                "claimedAt": _iso_utc(job.claimed_at) if job.claimed_at else None,
+            }
+            for job in snapshot.jobs
+        ],
+        "claimEvents": [
+            {
+                "cursor": event.cursor,
+                "jobId": event.job_id,
+                "tenantId": event.tenant_id,
+                "claimedAt": _iso_utc(event.claimed_at),
+            }
+            for event in snapshot.claim_events
+        ],
+        "missingJobIds": list(snapshot.missing_job_ids),
+        "pools": [
+            {
+                "workerPoolRef": pool.worker_pool_ref,
+                "globalSlotCapacity": pool.global_slot_capacity,
+                "tenantSlotCapacities": [
+                    {"tenantId": item.tenant_id, "capacity": item.capacity}
+                    for item in pool.tenant_capacities
+                ],
+                "active": [
+                    {
+                        "jobId": claim.job_id,
+                        "tenantId": claim.tenant_id,
+                        "ordinal": claim.ordinal,
+                    }
+                    for claim in pool.active
+                ],
+            }
+            for pool in snapshot.pools
+        ],
+    }
 
 
 @router.get("/internal/metrics", include_in_schema=False)

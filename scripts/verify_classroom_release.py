@@ -25,6 +25,14 @@ SCRIPTS_ROOT = Path(__file__).resolve().parent
 if str(SCRIPTS_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_ROOT))
 
+from capacity_profile_contract import (  # noqa: E402
+    CAPACITY_PRODUCER,
+    MAX_CAPACITY_REPORT_BYTES,
+    capacity_profile_command_record,
+    derive_capacity_profile_summary,
+    exact_json_equal,
+    parse_capacity_profile_report,
+)
 from classroom_release_probe_contract import (  # noqa: E402
     LIVE_PROJECT,
     LIVE_SPEC,
@@ -121,7 +129,16 @@ RECEIPT_CONTRACTS = {
     "database_revisions": ("platform-preflight", ("revisionsMatch",)),
     "running_containers": ("docker-compose", ("stableContainerSet",)),
     "service_health": ("platform-preflight", ("allServicesHealthy",)),
-    "capacity_profile": ("load-classroom", ("thresholdsPassed", "rawSamplesRecorded")),
+    "capacity_profile": (
+        CAPACITY_PRODUCER,
+        (
+            "thresholdsPassed",
+            "rawSamplesRecorded",
+            "resourceObservationsRecorded",
+            "resourceAccountingComplete",
+            "resourceBoundaryStable",
+        ),
+    ),
     "teacher_flow": ("playwright", ("teacherFlowPassed",)),
     "student_micro_flow": ("playwright", ("studentMicroFlowPassed",)),
     "student_full_flow": ("playwright", ("studentFullFlowPassed",)),
@@ -394,13 +411,18 @@ def _proof_bytes(
         or _SHA256.fullmatch(expected_sha256) is None
     ):
         return f"{label} reference is invalid"
-    if artifact == "runtime/platform-preflight-attestation.json":
+    fixed_runtime_artifacts = {
+        "runtime/platform-preflight-attestation.json": "platform-preflight-attestation.json",
+        "runtime/capacity-profile-attestation.json": "capacity-profile-attestation.json",
+    }
+    fixed_name = fixed_runtime_artifacts.get(artifact)
+    if fixed_name is not None:
         try:
             body = _runtime_artifact_body(
                 Path(artifact),
                 bundle_root=bundle_root,
                 expected_sha256=expected_sha256,
-                artifact_name="platform-preflight-attestation.json",
+                artifact_name=fixed_name,
             )
         except ValueError:
             return f"{label} cannot be read from its fixed boundary"
@@ -546,6 +568,7 @@ def _runtime_artifact_body(
     if artifact_name not in {
         "runtime-attestation.json",
         "platform-preflight-attestation.json",
+        "capacity-profile-attestation.json",
     }:
         raise ValueError("runtime artifact name is invalid")
     root = Path(os.path.abspath(bundle_root))
@@ -1097,6 +1120,107 @@ def derive_platform_preflight_receipt_checks(
     )
 
 
+def derive_capacity_profile_receipt_checks(
+    body: bytes,
+    *,
+    bundle_root: Path,
+    candidate_root: Path,
+    candidate: Mapping[str, object],
+    release_run: Mapping[str, str],
+) -> tuple[dict[str, bool], str]:
+    """Replay one fixed live-capacity attestation into receipt checks."""
+
+    try:
+        document = json.loads(body)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("capacity execution proof is invalid") from exc
+    if (
+        not isinstance(document, dict)
+        or set(document)
+        != {
+            "schemaVersion",
+            "candidate",
+            "releaseRun",
+            "observedAt",
+            "baseUrl",
+            "runtimeAttestation",
+            "execution",
+            "summary",
+        }
+        or type(document.get("schemaVersion")) is not int
+        or document.get("schemaVersion") != 1
+        or document.get("candidate") != candidate
+        or document.get("releaseRun") != release_run
+        or not _valid_observed_at_value(document.get("observedAt"))
+    ):
+        raise ValueError("capacity execution proof is invalid")
+    base_url = _runtime_base_url(document.get("baseUrl"))
+    if base_url is None:
+        raise ValueError("capacity execution proof is invalid")
+    runtime_proof = document.get("runtimeAttestation")
+    if (
+        not isinstance(runtime_proof, dict)
+        or set(runtime_proof) != {"artifact", "sha256"}
+        or runtime_proof.get("artifact") != "runtime/runtime-attestation.json"
+        or not isinstance(runtime_proof.get("sha256"), str)
+    ):
+        raise ValueError("capacity runtime attestation proof is invalid")
+    try:
+        validate_runtime_attestation(
+            Path("runtime/runtime-attestation.json"),
+            bundle_root=bundle_root,
+            candidate_root=candidate_root,
+            candidate=candidate,
+            release_run=release_run,
+            expected_base_url=base_url,
+            expected_sha256=runtime_proof["sha256"],
+        )
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
+    execution = document.get("execution")
+    if (
+        not isinstance(execution, dict)
+        or set(execution) != {"command", "nativeExit", "stdout", "stdoutSha256", "stderr"}
+        or execution.get("command") != capacity_profile_command_record()
+        or type(execution.get("nativeExit")) is not int
+        or execution.get("nativeExit") != 0
+        or execution.get("stderr") != ""
+        or not isinstance(execution.get("stdout"), str)
+        or not isinstance(execution.get("stdoutSha256"), str)
+    ):
+        raise ValueError("capacity execution proof is invalid")
+    try:
+        stdout = execution["stdout"].encode("utf-8", errors="strict")
+    except UnicodeEncodeError as exc:
+        raise ValueError("capacity execution proof is invalid") from exc
+    if (
+        len(stdout) > MAX_CAPACITY_REPORT_BYTES
+        or hashlib.sha256(stdout).hexdigest() != execution["stdoutSha256"]
+    ):
+        raise ValueError("capacity execution proof is invalid")
+    report = parse_capacity_profile_report(
+        stdout,
+        candidate=candidate,
+        release_run=release_run,
+        expected_base_url=base_url,
+    )
+    if report.get("observedAt") != document.get("observedAt"):
+        raise ValueError("capacity execution proof timestamp does not match the report")
+    summary = derive_capacity_profile_summary(report)
+    if not exact_json_equal(document.get("summary"), summary):
+        raise ValueError("capacity execution proof summary does not match raw samples")
+    checks = summary.get("checks")
+    if not isinstance(checks, dict) or set(checks) != {
+        "thresholdsPassed",
+        "rawSamplesRecorded",
+        "resourceObservationsRecorded",
+        "resourceAccountingComplete",
+        "resourceBoundaryStable",
+    }:
+        raise ValueError("capacity execution proof checks are invalid")
+    return {name: checks[name] is True for name in checks}, str(document["observedAt"])
+
+
 def probe_provenance_error(
     document: Mapping[str, object],
     *,
@@ -1173,6 +1297,44 @@ def probe_provenance_error(
             or checks != derived[evidence]
         ):
             return "platform preflight receipt does not match execution proof"
+        return None
+    if evidence == "capacity_profile":
+        provenance = document.get("provenance")
+        if not isinstance(provenance, dict) or set(provenance) != {"capacityAttestation"}:
+            return "capacity execution proof is missing or invalid"
+        proof = provenance.get("capacityAttestation")
+        if (
+            not isinstance(proof, dict)
+            or set(proof) != {"artifact", "sha256"}
+            or proof.get("artifact") != "runtime/capacity-profile-attestation.json"
+        ):
+            return "capacity execution proof is missing or invalid"
+        proof_body = _proof_bytes(
+            bundle_root,
+            proof,
+            label="capacity execution attestation",
+        )
+        if isinstance(proof_body, str):
+            return proof_body
+        try:
+            checks, observed_at = derive_capacity_profile_receipt_checks(
+                proof_body[0],
+                bundle_root=bundle_root,
+                candidate_root=candidate_root,
+                candidate=candidate,
+                release_run=release_run,
+            )
+        except ValueError as exc:
+            return str(exc)
+        receipt = document.get("receipt")
+        result = receipt.get("result") if isinstance(receipt, dict) else None
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("observedAt") != observed_at
+            or not isinstance(result, dict)
+            or result.get("checks") != checks
+        ):
+            return "capacity receipt does not match execution proof"
         return None
     recipe = PROBE_RECIPES.get(evidence)
     if recipe is None:
@@ -1616,6 +1778,7 @@ class FileReleaseRuntime:
             return LayerEvidence("fail", "evidence artifact is not valid JSON")
         if (
             not isinstance(artifact_document, dict)
+            or type(artifact_document.get("schemaVersion")) is not int
             or artifact_document.get("schemaVersion") != ARTIFACT_SCHEMA_VERSION
             or artifact_document.get("evidence") != name
         ):

@@ -1974,6 +1974,441 @@ def test_platform_preflight_receipts_are_derived_from_two_fixed_container_phases
     assert result.layers["service_health"].status == "pass"
 
 
+def test_capacity_profile_receipt_is_derived_from_fixed_live_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_evidence_module()
+    verifier = _load_verifier()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    calls: list[dict[str, object]] = []
+    token = "capacity-token-must-not-be-serialized"
+    monkeypatch.setenv("YFEISTAI_LIVE_FIXTURE_TOKEN", token)
+    monkeypatch.setenv("COMPOSE_FILE", "attacker-compose.yml")
+
+    def runner(arguments, *, cwd, env, timeout):
+        report = _live_capacity_report(candidate)
+        stdout = (
+            json.dumps(
+                report,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        )
+        calls.append(
+            {
+                "arguments": arguments,
+                "cwd": cwd,
+                "env": env,
+                "timeout": timeout,
+            }
+        )
+        return subprocess.CompletedProcess(arguments, 0, stdout, "")
+
+    receipt = module.write_capacity_profile_receipt(
+        candidate_root=candidate_root,
+        bundle_root=candidate_root,
+        release_run=RELEASE_RUN,
+        timeout_seconds=600,
+        runner=runner,
+    )
+
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["cwd"] == candidate_root.resolve()
+    assert call["timeout"] == 600
+    assert call["arguments"][-2:] == ["--profile", "first-release"]
+    assert call["env"]["YFEISTAI_LIVE_FIXTURE_TOKEN"] == token
+    assert "COMPOSE_FILE" not in call["env"]
+    proof_path = candidate_root / "runtime" / "capacity-profile-attestation.json"
+    receipt_path = candidate_root / "artifacts" / "capacity_profile.json"
+    assert receipt == json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["receipt"]["producer"] == "classroom-capacity-probe"
+    assert token not in proof_path.read_text(encoding="utf-8")
+    assert token not in receipt_path.read_text(encoding="utf-8")
+    proof = json.loads(proof_path.read_text(encoding="utf-8"))
+    assert proof["summary"]["checks"] == {
+        "thresholdsPassed": True,
+        "rawSamplesRecorded": True,
+        "resourceObservationsRecorded": True,
+        "resourceAccountingComplete": True,
+        "resourceBoundaryStable": True,
+    }
+    assert proof["execution"]["command"] == module.capacity_profile_command_record()
+
+    manifest = candidate_root / "release-evidence.json"
+    module.assemble_manifest(
+        manifest,
+        candidate_root=candidate_root,
+        release_run=RELEASE_RUN,
+        receipt_paths={"capacity_profile": receipt_path},
+    )
+    result = verifier.verify(
+        verifier.FileReleaseRuntime(
+            manifest,
+            expected_source_head=SOURCE_HEAD,
+            candidate_root=candidate_root,
+        )
+    )
+    assert result.layers["capacity_profile"].status == "pass"
+
+
+def _live_capacity_report(candidate: dict[str, object]) -> dict[str, object]:
+    samples = [
+        {
+            "metric": metric,
+            "tenantId": f"tenant-{sequence % 50:02d}",
+            "subjectId": f"session-{sequence:03d}",
+            "sequence": sequence,
+            "latencyMs": 10.0,
+            "success": True,
+        }
+        for metric in ("core_api", "event_ingest", "mastery_projection_visible")
+        for sequence in range(200)
+    ]
+    job_samples = [
+        {
+            "metric": "job_submission_visible",
+            "tenantId": "tenant-00" if sequence < 3 else f"tenant-{sequence - 2:02d}",
+            "subjectId": f"job-{sequence:03d}",
+            "sequence": sequence,
+            "latencyMs": 10.0,
+            "success": True,
+        }
+        for sequence in range(52)
+    ]
+    samples.extend(job_samples)
+    active_groups = (
+        job_samples[:2] + job_samples[3:21],
+        job_samples[21:41],
+        job_samples[41:52],
+        job_samples[2:3],
+    )
+    claim_order = job_samples[:2] + job_samples[3:] + job_samples[2:3]
+    resource_observations = [
+        {
+            "sequence": sequence,
+            "phase": phase,
+            "observedAt": f"2026-08-25T00:00:0{sequence}Z",
+            "available": True,
+            "totalRssBytes": 600,
+            "limitBytes": 10_000,
+            "availableBytes": 8_000,
+            "limitSource": "cgroup",
+            "usageRatio": 0.06,
+            "partial": False,
+            "processes": [
+                {"label": "supervisor", "count": 1, "rssBytes": 100},
+                {"label": "backend", "count": 1, "rssBytes": 200},
+                {"label": "web", "count": 1, "rssBytes": 300},
+            ],
+        }
+        for sequence, phase in enumerate(
+            ("baseline", "generation_saturated", "sessions_saturated", "final")
+        )
+    ]
+    return {
+        "schemaVersion": 1,
+        "producer": "classroom-capacity-probe",
+        "capacityModel": "deployed-candidate",
+        "candidate": candidate,
+        "releaseRun": RELEASE_RUN,
+        "observedAt": "2026-08-25T00:01:00Z",
+        "baseUrl": BASE_URL,
+        "profile": {
+            "name": "first-release",
+            "declaredRegisteredUsers": 100_000,
+            "declaredDailyActiveUsers": 10_000,
+            "executedTenants": 50,
+            "executedConcurrentSessions": 200,
+            "sharedGenerationSlots": 20,
+            "defaultTenantSlots": 2,
+        },
+        "workload": {
+            "generationJobsSubmitted": 52,
+            "learningSessionsStarted": 200,
+            "learningSessionsCompleted": 200,
+        },
+        "rawSamples": samples,
+        "schedulerSource": "admin-atomic-db-claim-audit",
+        "schedulerClaims": [
+            {
+                "sequence": sequence,
+                "jobId": sample["subjectId"],
+                "tenantId": sample["tenantId"],
+            }
+            for sequence, sample in enumerate(claim_order)
+        ],
+        "schedulerObservations": [
+            {
+                "sequence": sequence,
+                "active": [
+                    {"jobId": sample["subjectId"], "tenantId": sample["tenantId"]}
+                    for sample in active
+                ],
+            }
+            for sequence, active in enumerate(active_groups)
+        ],
+        "sessionObservations": [
+            {
+                "sequence": 0,
+                "active": [
+                    {
+                        "sessionId": f"session-{sequence:03d}",
+                        "tenantId": f"tenant-{sequence % 50:02d}",
+                    }
+                    for sequence in range(200)
+                ],
+            }
+        ],
+        "sessionCompletions": [
+            {
+                "sessionId": f"session-{sequence:03d}",
+                "tenantId": f"tenant-{sequence % 50:02d}",
+                "status": "completed",
+            }
+            for sequence in range(200)
+        ],
+        "resourceSource": {
+            "method": "GET",
+            "path": "/api/v1/system/memory",
+            "scope": "deeptutor-api-container-process-tree",
+        },
+        "resourceObservations": resource_observations,
+    }
+
+
+def test_capacity_profile_stops_before_runner_without_live_fixture_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_evidence_module()
+    candidate_root, _candidate = _write_candidate_root(tmp_path)
+    monkeypatch.delenv("YFEISTAI_LIVE_FIXTURE_TOKEN", raising=False)
+
+    def forbidden_runner(*_args, **_kwargs):
+        pytest.fail("capacity profile must stop before subprocess execution")
+
+    with pytest.raises(ValueError, match="live fixture token is unavailable"):
+        module.write_capacity_profile_receipt(
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            timeout_seconds=600,
+            runner=forbidden_runner,
+        )
+
+    assert not (candidate_root / "runtime" / "capacity-profile-attestation.json").exists()
+    assert not (candidate_root / "artifacts" / "capacity_profile.json").exists()
+
+
+def test_capacity_profile_rejects_live_fixture_token_in_canonical_stdout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_evidence_module()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    token = "capacityTokenMustStaySecret"
+    monkeypatch.setenv("YFEISTAI_LIVE_FIXTURE_TOKEN", token)
+
+    def runner(arguments, *, cwd, env, timeout):
+        del cwd, env, timeout
+        report = _live_capacity_report(candidate)
+        for sample in report["rawSamples"]:
+            if sample["sequence"] == 0:
+                sample["subjectId"] = token
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            json.dumps(report, separators=(",", ":"), sort_keys=True) + "\n",
+            "",
+        )
+
+    with pytest.raises(ValueError, match="serialized live fixture token"):
+        module.write_capacity_profile_receipt(
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            timeout_seconds=600,
+            runner=runner,
+        )
+
+    assert not (candidate_root / "runtime" / "capacity-profile-attestation.json").exists()
+    assert not (candidate_root / "artifacts" / "capacity_profile.json").exists()
+
+
+def test_capacity_profile_default_runner_rejects_oversized_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_evidence_module()
+
+    def run(arguments, **options):
+        assert "capture_output" not in options
+        stdout = options["stdout"]
+        stdout.write(b"x" * (module.MAX_CAPACITY_REPORT_BYTES + 1))
+        stdout.flush()
+        return subprocess.CompletedProcess(arguments, 0)
+
+    monkeypatch.setattr(module.subprocess, "run", run)
+
+    with pytest.raises(subprocess.SubprocessError, match="output is too large"):
+        module._run_capacity_profile(
+            ["python", "capacity-probe"],
+            cwd=tmp_path,
+            env={},
+            timeout=30,
+        )
+
+
+@pytest.mark.parametrize(
+    "case",
+    ("native-exit", "failed-report", "argv-drift", "runtime-drift", "candidate-drift"),
+)
+def test_capacity_profile_receipt_fails_closed_before_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    module = _load_evidence_module()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    runtime_attestation = candidate_root / "runtime" / "runtime-attestation.json"
+    monkeypatch.setenv("YFEISTAI_LIVE_FIXTURE_TOKEN", "capacity-token")
+
+    def runner(arguments, *, cwd, env, timeout):
+        del cwd, env, timeout
+        report = _live_capacity_report(candidate)
+        if case == "failed-report":
+            report["rawSamples"][0]["success"] = False
+        stdout = json.dumps(report, separators=(",", ":"), sort_keys=True) + "\n"
+        if case == "runtime-drift":
+            runtime_attestation.write_bytes(runtime_attestation.read_bytes() + b"\n")
+        if case == "candidate-drift":
+            lock_path = candidate_root / "deploy" / "image-lock.json"
+            lock = json.loads(lock_path.read_text(encoding="utf-8"))
+            lock["candidate"]["sourceHead"] = "b" * 40
+            lock_path.write_text(json.dumps(lock), encoding="utf-8")
+        completed_arguments = ["attacker-command"] if case == "argv-drift" else arguments
+        return subprocess.CompletedProcess(
+            completed_arguments,
+            7 if case == "native-exit" else 0,
+            stdout,
+            "probe failed" if case == "native-exit" else "",
+        )
+
+    with pytest.raises(ValueError, match="capacity profile"):
+        module.write_capacity_profile_receipt(
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            timeout_seconds=600,
+            runner=runner,
+        )
+
+    assert not (candidate_root / "runtime" / "capacity-profile-attestation.json").exists()
+    assert not (candidate_root / "artifacts" / "capacity_profile.json").exists()
+
+
+def test_capacity_profile_concurrent_target_is_never_overwritten_or_quarantined(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_evidence_module()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    receipt_path = candidate_root / "artifacts" / "capacity_profile.json"
+    sentinel = b'{"ownedBy":"another-writer"}\n'
+    monkeypatch.setenv("YFEISTAI_LIVE_FIXTURE_TOKEN", "capacity-token")
+
+    def runner(arguments, *, cwd, env, timeout):
+        del cwd, env, timeout
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            json.dumps(_live_capacity_report(candidate), separators=(",", ":"), sort_keys=True)
+            + "\n",
+            "",
+        )
+
+    real_candidate = module._candidate
+    candidate_reads = 0
+
+    def inject_concurrent_target(path: Path) -> dict[str, object]:
+        nonlocal candidate_reads
+        value = real_candidate(path)
+        candidate_reads += 1
+        if candidate_reads == 3:
+            receipt_path.parent.mkdir(parents=True, exist_ok=True)
+            receipt_path.write_bytes(sentinel)
+        return value
+
+    monkeypatch.setattr(module, "_candidate", inject_concurrent_target)
+
+    with pytest.raises(ValueError, match="release binding changed before publication"):
+        module.write_capacity_profile_receipt(
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            timeout_seconds=600,
+            runner=runner,
+        )
+
+    assert receipt_path.read_bytes() == sentinel
+    failure_root = candidate_root / "failures" / "capacity-profile"
+    assert all(path.read_bytes() != sentinel for path in failure_root.rglob("*.json"))
+
+
+def test_capacity_profile_publication_failure_relocates_owned_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_evidence_module()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    proof_path = candidate_root / "runtime" / "capacity-profile-attestation.json"
+    receipt_path = candidate_root / "artifacts" / "capacity_profile.json"
+    monkeypatch.setenv("YFEISTAI_LIVE_FIXTURE_TOKEN", "capacity-token")
+
+    def runner(arguments, *, cwd, env, timeout):
+        del cwd, env, timeout
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            json.dumps(_live_capacity_report(candidate), separators=(",", ":"), sort_keys=True)
+            + "\n",
+            "",
+        )
+
+    real_publish = module._publish_no_replace
+
+    def fail_proof(source: Path, target: Path) -> None:
+        if Path(target).resolve() == proof_path.resolve():
+            raise OSError("simulated capacity proof publication failure")
+        real_publish(source, target)
+
+    monkeypatch.setattr(module, "_publish_no_replace", fail_proof)
+
+    with pytest.raises(OSError, match="simulated capacity proof publication failure"):
+        module.write_capacity_profile_receipt(
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            timeout_seconds=600,
+            runner=runner,
+        )
+
+    assert not proof_path.exists()
+    assert not receipt_path.exists()
+    assert not list(candidate_root.rglob("*.staging"))
+    failure_directories = list((candidate_root / "failures" / "capacity-profile").glob("*"))
+    assert len(failure_directories) == 1
+    assert {path.name for path in failure_directories[0].iterdir()} == {
+        "failure.json",
+        "proof.json",
+        "published-receipt.json",
+    }
+
+
 def test_platform_preflight_stops_before_runner_when_trusted_docker_is_unavailable(
     tmp_path: Path,
 ) -> None:
@@ -2370,6 +2805,55 @@ def test_release_evidence_cli_runs_fixed_platform_preflight_producer(
     }
     assert capsys.readouterr().out == (
         f"{bundle_root / 'runtime' / 'platform-preflight-attestation.json'}\n"
+    )
+
+
+def test_release_evidence_cli_runs_fixed_capacity_profile_producer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = _load_evidence_module()
+    candidate_root = tmp_path / "candidate"
+    bundle_root = tmp_path / "bundle"
+    captured: dict[str, object] = {}
+
+    def write_receipt(**arguments: object) -> dict[str, object]:
+        captured.update(arguments)
+        return {}
+
+    monkeypatch.setattr(
+        module,
+        "write_capacity_profile_receipt",
+        write_receipt,
+        raising=False,
+    )
+    assert (
+        module.main(
+            [
+                "capacity-profile",
+                "--candidate-root",
+                str(candidate_root),
+                "--bundle-root",
+                str(bundle_root),
+                "--run-id",
+                RELEASE_RUN["runId"],
+                "--environment-id",
+                RELEASE_RUN["environmentId"],
+                "--timeout-seconds",
+                "300",
+            ]
+        )
+        == 0
+    )
+    assert captured == {
+        "candidate_root": candidate_root,
+        "bundle_root": bundle_root,
+        "release_run": RELEASE_RUN,
+        "timeout_seconds": 300,
+    }
+    assert capsys.readouterr().out == (
+        f"{bundle_root / 'runtime' / 'capacity-profile-attestation.json'}\n"
     )
 
 

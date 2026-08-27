@@ -22,6 +22,12 @@ SCRIPTS_ROOT = Path(__file__).resolve().parent
 if str(SCRIPTS_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_ROOT))
 
+from capacity_profile_contract import (  # noqa: E402
+    MAX_CAPACITY_REPORT_BYTES,
+    capacity_profile_command_record,
+    derive_capacity_profile_summary,
+    parse_capacity_profile_report,
+)
 from classroom_release_probe_contract import probe_command_record  # noqa: E402
 from classroom_runtime_attestation import (  # noqa: E402
     _close_windows_handle,
@@ -52,6 +58,7 @@ from verify_classroom_release import (  # noqa: E402
     EVIDENCE_SCHEMA_VERSION,
     PROBE_RECIPES,
     RECEIPT_CONTRACTS,
+    derive_capacity_profile_receipt_checks,
     derive_platform_preflight_receipt_checks,
     derive_probe_checks,
     probe_provenance_error,
@@ -89,6 +96,7 @@ class CommandRunner(Protocol):
 
 _DIRECT_RECEIPT_EVIDENCE = frozenset(("source_head", "image_digests"))
 _PROBE_CLEANUP_MARGIN_SECONDS = 30
+_CAPACITY_STDERR_LIMIT_BYTES = 64 * 1024
 
 
 def _candidate(candidate_root: Path) -> dict[str, Any]:
@@ -288,6 +296,41 @@ def _run_platform_preflight_phase(
             for buffer in (stdout_buffer, stderr_buffer)
         ):
             raise subprocess.SubprocessError("platform preflight output is too large")
+        stdout_buffer.seek(0)
+        stderr_buffer.seek(0)
+        return subprocess.CompletedProcess(
+            arguments,
+            completed.returncode,
+            stdout_buffer.read().decode("utf-8", errors="strict"),
+            stderr_buffer.read().decode("utf-8", errors="strict"),
+        )
+
+
+def _run_capacity_profile(
+    arguments: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    timeout: int,
+) -> subprocess.CompletedProcess[str]:
+    with (
+        tempfile.TemporaryFile(mode="w+b") as stdout_buffer,
+        tempfile.TemporaryFile(mode="w+b") as stderr_buffer,
+    ):
+        completed = subprocess.run(
+            arguments,
+            cwd=cwd,
+            env=env,
+            stdout=stdout_buffer,
+            stderr=stderr_buffer,
+            check=False,
+            timeout=timeout,
+        )
+        if (
+            os.fstat(stdout_buffer.fileno()).st_size > MAX_CAPACITY_REPORT_BYTES
+            or os.fstat(stderr_buffer.fileno()).st_size > _CAPACITY_STDERR_LIMIT_BYTES
+        ):
+            raise subprocess.SubprocessError("capacity profile output is too large")
         stdout_buffer.seek(0)
         stderr_buffer.seek(0)
         return subprocess.CompletedProcess(
@@ -1441,6 +1484,249 @@ def write_platform_preflight_receipts(
         raise
 
 
+def write_capacity_profile_receipt(
+    *,
+    candidate_root: Path,
+    bundle_root: Path,
+    release_run: Mapping[str, object],
+    timeout_seconds: int,
+    runner: CommandRunner = _run_capacity_profile,
+) -> dict[str, object]:
+    """Run the fixed live capacity probe and publish its proof marker last."""
+
+    if (
+        not isinstance(timeout_seconds, int)
+        or isinstance(timeout_seconds, bool)
+        or timeout_seconds <= _PROBE_CLEANUP_MARGIN_SECONDS
+    ):
+        raise ValueError("capacity profile timeout is invalid")
+    token = os.environ.get("YFEISTAI_LIVE_FIXTURE_TOKEN")
+    if not isinstance(token, str) or not token.strip():
+        raise ValueError("capacity profile live fixture token is unavailable")
+    root = Path(bundle_root).resolve()
+    candidate_path = Path(candidate_root).resolve()
+    proof_path = root / "runtime" / "capacity-profile-attestation.json"
+    receipt_path = root / "artifacts" / "capacity_profile.json"
+    if proof_path.exists() or receipt_path.exists():
+        raise ValueError("capacity profile evidence already exists")
+
+    candidate = _candidate(candidate_path)
+    bound_run = _release_run(release_run)
+    runtime_path = root / "runtime" / "runtime-attestation.json"
+    runtime_body, runtime_sha256 = read_runtime_attestation_artifact(
+        runtime_path,
+        bundle_root=root,
+    )
+    runtime = validate_runtime_attestation(
+        runtime_path,
+        bundle_root=root,
+        candidate_root=candidate_path,
+        candidate=candidate,
+        release_run=bound_run,
+        expected_sha256=runtime_sha256,
+    )
+    base_url = runtime.get("baseUrl")
+    if not isinstance(base_url, str):
+        raise ValueError("capacity profile runtime URL is invalid")
+
+    logical_command = capacity_profile_command_record()
+    arguments = [
+        sys.executable,
+        str(SCRIPTS_ROOT / "classroom_capacity_probe.py"),
+        "--profile",
+        "first-release",
+    ]
+    allowed_environment = {
+        "COMSPEC",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "NO_COLOR",
+        "PATH",
+        "PATHEXT",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+        "SYSTEMDRIVE",
+        "SYSTEMROOT",
+        "TEMP",
+        "TERM",
+        "TMP",
+        "WINDIR",
+    }
+    environment = {
+        name: value for name, value in os.environ.items() if name.upper() in allowed_environment
+    }
+    environment.update(
+        {
+            "YFEISTAI_LIVE_FIXTURE_TOKEN": token,
+            "YFEISTAI_CANDIDATE_ROOT": str(candidate_path),
+            "YFEISTAI_RELEASE_RUN_ID": bound_run["runId"],
+            "YFEISTAI_ENVIRONMENT_ID": bound_run["environmentId"],
+            "YFEISTAI_CAPACITY_TIMEOUT_SECONDS": str(
+                timeout_seconds - _PROBE_CLEANUP_MARGIN_SECONDS
+            ),
+            "WEB_BASE_URL": base_url,
+        }
+    )
+    try:
+        completed = runner(
+            arguments,
+            cwd=candidate_path,
+            env=environment,
+            timeout=timeout_seconds,
+        )
+    except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
+        raise ValueError("capacity profile probe could not run") from exc
+    if (
+        not isinstance(completed.returncode, int)
+        or isinstance(completed.returncode, bool)
+        or completed.returncode != 0
+        or completed.args != arguments
+        or not isinstance(completed.stdout, str)
+        or completed.stderr != ""
+    ):
+        raise ValueError("capacity profile probe did not exit cleanly")
+    try:
+        stdout = completed.stdout.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as exc:
+        raise ValueError("capacity profile probe output is invalid") from exc
+    if any(
+        secret.encode("utf-8", errors="strict") in stdout
+        for secret in {token, token.strip()}
+        if secret
+    ):
+        raise ValueError("capacity profile serialized live fixture token")
+    report = parse_capacity_profile_report(
+        stdout,
+        candidate=candidate,
+        release_run=bound_run,
+        expected_base_url=base_url,
+    )
+    summary = derive_capacity_profile_summary(report)
+    checks = summary.get("checks")
+    if not isinstance(checks, dict) or any(value is not True for value in checks.values()):
+        raise ValueError("capacity profile did not prove passing thresholds")
+    observed_at = report.get("observedAt")
+    if not isinstance(observed_at, str) or not _valid_observed_at(observed_at):
+        raise ValueError("capacity profile observedAt is invalid")
+
+    try:
+        candidate_after = _candidate(candidate_path)
+        runtime_after, runtime_after_sha256 = read_runtime_attestation_artifact(
+            runtime_path,
+            bundle_root=root,
+        )
+    except ValueError as exc:
+        raise ValueError("capacity profile release binding changed") from exc
+    if (
+        candidate_after != candidate
+        or runtime_after != runtime_body
+        or runtime_after_sha256 != runtime_sha256
+    ):
+        raise ValueError("capacity profile release binding changed")
+    validate_runtime_attestation(
+        runtime_path,
+        bundle_root=root,
+        candidate_root=candidate_path,
+        candidate=candidate,
+        release_run=bound_run,
+        expected_base_url=base_url,
+        expected_sha256=runtime_sha256,
+    )
+
+    proof = {
+        "schemaVersion": 1,
+        "candidate": candidate,
+        "releaseRun": bound_run,
+        "observedAt": observed_at,
+        "baseUrl": base_url,
+        "runtimeAttestation": {
+            "artifact": "runtime/runtime-attestation.json",
+            "sha256": runtime_sha256,
+        },
+        "execution": {
+            "command": logical_command,
+            "nativeExit": 0,
+            "stdout": completed.stdout,
+            "stdoutSha256": hashlib.sha256(stdout).hexdigest(),
+            "stderr": "",
+        },
+        "summary": summary,
+    }
+    attempt_id = uuid.uuid4().hex
+    staged_proof = proof_path.with_name(f".{proof_path.name}.{attempt_id}.staging")
+    staged_receipt = receipt_path.with_name(f".{receipt_path.name}.{attempt_id}.staging")
+    published: dict[str, Path] = {}
+    try:
+        _atomic_write_json(staged_proof, proof)
+        proof_body = staged_proof.read_bytes()
+        proof_sha256 = hashlib.sha256(proof_body).hexdigest()
+        derived_checks, replayed_observed_at = derive_capacity_profile_receipt_checks(
+            proof_body,
+            bundle_root=root,
+            candidate_root=candidate_path,
+            candidate=candidate,
+            release_run=bound_run,
+        )
+        if replayed_observed_at != observed_at or derived_checks != checks:
+            raise ValueError("capacity profile replay changed")
+        receipt = _write_pass_receipt_from_candidate(
+            staged_receipt,
+            candidate=candidate,
+            release_run=bound_run,
+            evidence="capacity_profile",
+            observed_at=observed_at,
+            native_exit=0,
+            checks=derived_checks,
+            provenance={
+                "capacityAttestation": {
+                    "artifact": "runtime/capacity-profile-attestation.json",
+                    "sha256": proof_sha256,
+                }
+            },
+        )
+        candidate_before_publish = _candidate(candidate_path)
+        runtime_before_publish, runtime_before_sha256 = read_runtime_attestation_artifact(
+            runtime_path,
+            bundle_root=root,
+        )
+        if (
+            candidate_before_publish != candidate
+            or runtime_before_publish != runtime_body
+            or runtime_before_sha256 != runtime_sha256
+            or proof_path.exists()
+            or receipt_path.exists()
+        ):
+            raise ValueError("capacity profile release binding changed before publication")
+        proof_path.parent.mkdir(parents=True, exist_ok=True)
+        receipt_path.parent.mkdir(parents=True, exist_ok=True)
+        for name, staged, target in (
+            ("receipt", staged_receipt, receipt_path),
+            ("proof", staged_proof, proof_path),
+        ):
+            _publish_no_replace(staged, target)
+            published[f"published-{name}"] = target
+            if target.read_bytes() != staged.read_bytes():
+                raise ValueError("capacity profile published evidence changed")
+            staged.unlink()
+        return receipt
+    except Exception:
+        _record_probe_failure(
+            bundle_root=root,
+            evidence="capacity-profile",
+            recipe="live-first-release",
+            attempt_id=attempt_id,
+            reason="capacity profile proof publication failed",
+            native_exit=0,
+            artifacts={
+                "proof": staged_proof,
+                "receipt": staged_receipt,
+                **published,
+            },
+        )
+        raise
+
+
 def _validated_receipt(
     path: Path,
     *,
@@ -1457,6 +1743,7 @@ def _validated_receipt(
         raise ValueError("receipt is unavailable or invalid") from exc
     if (
         not isinstance(document, dict)
+        or type(document.get("schemaVersion")) is not int
         or document.get("schemaVersion") != ARTIFACT_SCHEMA_VERSION
         or document.get("candidate") != candidate
         or document.get("releaseRun") != release_run
@@ -1575,6 +1862,13 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     platform_preflight.add_argument("--environment-id", required=True)
     platform_preflight.add_argument("--timeout-seconds", type=int, required=True)
 
+    capacity_profile = commands.add_parser("capacity-profile")
+    capacity_profile.add_argument("--candidate-root", type=Path, required=True)
+    capacity_profile.add_argument("--bundle-root", type=Path, required=True)
+    capacity_profile.add_argument("--run-id", required=True)
+    capacity_profile.add_argument("--environment-id", required=True)
+    capacity_profile.add_argument("--timeout-seconds", type=int, required=True)
+
     produce = commands.add_parser("produce")
     _add_common_receipt_arguments(produce)
     produce.add_argument("--evidence", choices=tuple(sorted(PROBE_RECIPES)), required=True)
@@ -1638,6 +1932,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             timeout_seconds=args.timeout_seconds,
         )
         print(args.bundle_root / "runtime" / "platform-preflight-attestation.json")
+        return 0
+    elif args.command == "capacity-profile":
+        write_capacity_profile_receipt(
+            candidate_root=args.candidate_root,
+            bundle_root=args.bundle_root,
+            release_run=release_run,
+            timeout_seconds=args.timeout_seconds,
+        )
+        print(args.bundle_root / "runtime" / "capacity-profile-attestation.json")
         return 0
     elif args.command == "produce":
         recipe, _expected_count = PROBE_RECIPES[args.evidence]

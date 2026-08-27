@@ -93,6 +93,8 @@ class StudentSafetyAssessmentRecord(TenantBase):
     reviewed_by: Mapped[str] = mapped_column(String(128))
     reviewed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     assessment_version: Mapped[int] = mapped_column(Integer)
+    valid_for_seconds: Mapped[int] = mapped_column(Integer)
+    requested_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
     __table_args__ = (
@@ -132,8 +134,10 @@ class StudentSafetyAssessmentRecord(TenantBase):
             name="content_mode",
         ),
         CheckConstraint("assessment_version > 0", name="assessment_version"),
+        CheckConstraint("valid_for_seconds > 0", name="valid_for_seconds"),
         CheckConstraint("length(reviewed_by) > 0", name="reviewed_by"),
         CheckConstraint("reviewed_at < expires_at", name="validity_window"),
+        CheckConstraint("expires_at <= requested_expires_at", name="supersession_window"),
         Index(
             "ix_student_safety_assessments_lookup",
             "tenant_id",

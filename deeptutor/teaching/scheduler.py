@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from deeptutor.teaching.database import get_platform_engine
 from deeptutor.teaching.job_route_binding import lock_active_job_binding
-from deeptutor.teaching.models import Tenant
+from deeptutor.teaching.models import AuditLog, Tenant
 from deeptutor.teaching.models.jobs import (
     GenerationQueue,
     GenerationSlot,
@@ -40,6 +40,22 @@ PRIORITY_RANK = {
 
 class SchedulerClaimConflict(RuntimeError):
     """The tenant job no longer matches its scheduling projection."""
+
+
+def _generation_claim_audit(
+    queue_job: GenerationQueue,
+    *,
+    worker_id: str,
+) -> AuditLog | None:
+    if queue_job.job_kind != "generation":
+        return None
+    return AuditLog(
+        tenant_id=queue_job.tenant_id,
+        actor_id=worker_id,
+        action="generation.job_claimed",
+        resource_type="generation_job",
+        resource_id=queue_job.job_id,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -514,6 +530,9 @@ class FairScheduler:
                     slot.heartbeat_at = now
                 tenant_state.last_dispatched_at = now
                 tenant_state.updated_at = now
+                claim_audit = _generation_claim_audit(queue_job, worker_id=worker_id)
+                if claim_audit is not None:
+                    session.add(claim_audit)
                 await session.flush()
                 metric_fact_key = (
                     f"{queue_job.tenant_id}/{queue_job.job_id}/{queue_job.phase}/{attempt_count}"
