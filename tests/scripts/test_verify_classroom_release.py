@@ -4,9 +4,11 @@ import copy
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 from types import SimpleNamespace
+import zipfile
 
 import pytest
 
@@ -16,6 +18,12 @@ _RELEASE_RUN = {
 }
 _SOURCE_REPOSITORY = "xinlingzhifei/DeepTutor"
 _OPENMAIC_HEAD = "0cf2a330411681190e89f48e20f305345ff99f87"
+_LIVE_FIXTURE_TOKEN = "classroom-verifier-fixture-token"
+
+
+@pytest.fixture(autouse=True)
+def _live_fixture_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("YFEISTAI_LIVE_FIXTURE_TOKEN", _LIVE_FIXTURE_TOKEN)
 
 
 def _load_verifier():
@@ -26,6 +34,22 @@ def _load_verifier():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _load_classroom_export_support():
+    path = Path(__file__).parent / "test_classroom_export_contract.py"
+    spec = importlib.util.spec_from_file_location(
+        "classroom_export_contract_support_for_release_verifier",
+        path,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        sys.modules.pop(spec.name, None)
 
 
 def _candidate(source_head: str) -> dict[str, object]:
@@ -48,6 +72,15 @@ def test_learning_event_idempotency_uses_capacity_probe_contract() -> None:
     assert module.RECEIPT_CONTRACTS["learning_event_idempotency"] == (
         "classroom-capacity-probe",
         ("duplicateCountedOnce", "ticketReplayRejected", "projectionVisible"),
+    )
+
+
+def test_classroom_exports_uses_the_fixed_export_probe_contract() -> None:
+    module = _load_verifier()
+
+    assert module.RECEIPT_CONTRACTS["classroom_exports"] == (
+        "classroom-export-probe",
+        ("zipOpened", "pptxOpened", "offlineHtmlOpened", "mp4Opened"),
     )
 
 
@@ -402,6 +435,60 @@ def _write_probe_proof(
             "capacityAttestation": {
                 "artifact": "runtime/capacity-profile-attestation.json",
                 "sha256": hashlib.sha256(attestation_path.read_bytes()).hexdigest(),
+            }
+        }
+    if evidence == "classroom_exports":
+        support = _load_classroom_export_support()
+        raw_root = tmp_path / "raw" / "classroom-exports"
+        support._write_valid_artifacts(raw_root)
+        report = support._report(raw_root)
+        report.update(
+            candidate=candidate,
+            releaseRun=_RELEASE_RUN,
+            observedAt="2026-08-24T00:00:00Z",
+            baseUrl="https://candidate.example.test",
+            tenantId="tenant-00",
+        )
+        stdout = support._module().canonical_classroom_export_report(report)
+        runtime_path = tmp_path / "runtime" / "runtime-attestation.json"
+        capacity_path = tmp_path / "runtime" / "capacity-profile-attestation.json"
+        proof = {
+            "schemaVersion": 1,
+            "candidate": candidate,
+            "releaseRun": _RELEASE_RUN,
+            "observedAt": report["observedAt"],
+            "baseUrl": report["baseUrl"],
+            "tenantId": report["tenantId"],
+            "runtimeAttestation": {
+                "artifact": "runtime/runtime-attestation.json",
+                "sha256": hashlib.sha256(runtime_path.read_bytes()).hexdigest(),
+            },
+            "capacityAttestation": {
+                "artifact": "runtime/capacity-profile-attestation.json",
+                "sha256": hashlib.sha256(capacity_path.read_bytes()).hexdigest(),
+            },
+            "execution": {
+                "command": module.classroom_exports_command_record(),
+                "nativeExit": 0,
+                "stdout": stdout.decode("utf-8"),
+                "stdoutSha256": hashlib.sha256(stdout).hexdigest(),
+                "stderr": "",
+            },
+            "rawArtifacts": {
+                kind: {
+                    "artifact": f"raw/classroom-exports/{relative_path}",
+                    "sha256": hashlib.sha256((raw_root / relative_path).read_bytes()).hexdigest(),
+                    "sizeBytes": (raw_root / relative_path).stat().st_size,
+                }
+                for kind, relative_path in module.CLASSROOM_EXPORT_PATHS.items()
+            },
+        }
+        proof_path = tmp_path / "runtime" / "classroom-exports-attestation.json"
+        proof_path.write_text(json.dumps(proof, sort_keys=True), encoding="utf-8")
+        return {
+            "classroomExportsAttestation": {
+                "artifact": "runtime/classroom-exports-attestation.json",
+                "sha256": hashlib.sha256(proof_path.read_bytes()).hexdigest(),
             }
         }
     recipe = module.PROBE_RECIPES.get(evidence)
@@ -1323,6 +1410,259 @@ def test_file_runtime_rejects_self_attested_learning_event_receipt_without_bound
         "capacity execution proof is missing or invalid"
         in result.layers["learning_event_idempotency"].detail
     )
+
+
+def test_file_runtime_rejects_self_attested_classroom_exports_without_bound_provenance(
+    tmp_path: Path,
+) -> None:
+    module = _load_verifier()
+    manifest, evidence_map, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    evidence_entry = evidence_map["classroom_exports"]
+    assert isinstance(evidence_entry, dict)
+    artifact_path = tmp_path / str(evidence_entry["artifact"])
+    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    artifact.pop("provenance")
+    artifact_body = json.dumps(artifact, sort_keys=True).encode()
+    artifact_path.write_bytes(artifact_body)
+    evidence_entry["artifactSha256"] = hashlib.sha256(artifact_body).hexdigest()
+    manifest.write_text(
+        json.dumps(_manifest_document(module, candidate, evidence_map)),
+        encoding="utf-8",
+    )
+
+    result = module.verify(
+        module.FileReleaseRuntime(
+            manifest,
+            expected_source_head="a" * 40,
+            candidate_root=tmp_path,
+        )
+    )
+
+    assert result.layers["classroom_exports"].status == "fail"
+    assert (
+        "classroom exports execution proof is missing or invalid"
+        in result.layers["classroom_exports"].detail
+    )
+
+
+@pytest.mark.parametrize("case", ("missing", "tampered", "symlink", "dangling", "extra"))
+def test_file_runtime_rejects_invalid_classroom_export_raw_boundaries(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    module = _load_verifier()
+    manifest, _, _ = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    raw_root = tmp_path / "raw" / "classroom-exports"
+    target = raw_root / "classroom.html"
+    if case == "tampered":
+        target.write_bytes(b"tampered")
+    elif case == "extra":
+        (raw_root / "unexpected.txt").write_text("unexpected", encoding="utf-8")
+    else:
+        retained = tmp_path / "retained-classroom.html"
+        os.replace(target, retained)
+        if case == "symlink":
+            try:
+                target.symlink_to(retained)
+            except OSError:
+                pytest.skip("file symlinks are unavailable on this test host")
+        elif case == "dangling":
+            try:
+                target.symlink_to(tmp_path / "does-not-exist.html")
+            except OSError:
+                pytest.skip("file symlinks are unavailable on this test host")
+
+    result = module.verify(
+        module.FileReleaseRuntime(
+            manifest,
+            expected_source_head="a" * 40,
+            candidate_root=tmp_path,
+        )
+    )
+
+    assert result.layers["classroom_exports"].status == "fail"
+    assert "classroom export" in result.layers["classroom_exports"].detail
+
+
+def test_classroom_export_replay_rejects_raw_drift_during_contract_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_verifier()
+    _manifest, _evidence, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    proof_body = (tmp_path / "runtime" / "classroom-exports-attestation.json").read_bytes()
+    target = tmp_path / "raw" / "classroom-exports" / "classroom.html"
+    original_derive = module.derive_classroom_export_checks
+
+    def derive_and_drift(*args, **kwargs):
+        checks = original_derive(*args, **kwargs)
+        target.write_bytes(b"changed during replay")
+        return checks
+
+    monkeypatch.setattr(module, "derive_classroom_export_checks", derive_and_drift)
+
+    with pytest.raises(ValueError, match="raw artifact.*changed"):
+        module.derive_classroom_exports_receipt_checks(
+            proof_body,
+            bundle_root=tmp_path,
+            candidate_root=tmp_path,
+            candidate=candidate,
+            release_run=_RELEASE_RUN,
+        )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="exercises retained Windows directory handles")
+def test_classroom_export_raw_snapshot_rejects_directory_aba(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_verifier()
+    _manifest, _evidence, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    proof_body = (tmp_path / "runtime" / "classroom-exports-attestation.json").read_bytes()
+    raw_parent = tmp_path / "raw"
+    original = raw_parent / "classroom-exports"
+    alternate = raw_parent / "classroom-exports-alternate"
+    alternate.mkdir()
+    for artifact in original.iterdir():
+        (alternate / artifact.name).write_bytes(artifact.read_bytes())
+    retained = raw_parent / "classroom-exports-original"
+    real_open_relative = module._open_windows_directory_relative
+    swapped = False
+
+    def open_relative_with_aba(parent_handle, name):
+        nonlocal swapped
+        if name != "classroom-exports" or swapped:
+            return real_open_relative(parent_handle, name)
+        os.replace(original, retained)
+        os.replace(alternate, original)
+        try:
+            opened = real_open_relative(parent_handle, name)
+        finally:
+            os.replace(original, alternate)
+            os.replace(retained, original)
+        swapped = True
+        return opened
+
+    monkeypatch.setattr(module, "_open_windows_directory_relative", open_relative_with_aba)
+
+    with pytest.raises(ValueError, match="raw boundary changed"):
+        module.derive_classroom_exports_receipt_checks(
+            proof_body,
+            bundle_root=tmp_path,
+            candidate_root=tmp_path,
+            candidate=candidate,
+            release_run=_RELEASE_RUN,
+        )
+
+    assert swapped is True
+    assert set(path.name for path in original.iterdir()) == {
+        "classroom.zip",
+        "classroom.pptx",
+        "classroom.html",
+        "classroom.mp4",
+    }
+
+
+def test_classroom_export_replay_requires_the_live_fixture_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_verifier()
+    _manifest, _evidence, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    proof_body = (tmp_path / "runtime" / "classroom-exports-attestation.json").read_bytes()
+    monkeypatch.delenv("YFEISTAI_LIVE_FIXTURE_TOKEN")
+
+    with pytest.raises(ValueError, match="live fixture token"):
+        module.derive_classroom_exports_receipt_checks(
+            proof_body,
+            bundle_root=tmp_path,
+            candidate_root=tmp_path,
+            candidate=candidate,
+            release_run=_RELEASE_RUN,
+        )
+
+
+def test_classroom_export_replay_rejects_a_fixture_token_in_bound_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_verifier()
+    _manifest, _evidence, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    proof_body = (tmp_path / "runtime" / "classroom-exports-attestation.json").read_bytes()
+    monkeypatch.setenv("YFEISTAI_LIVE_FIXTURE_TOKEN", "Classroom")
+
+    with pytest.raises(ValueError, match="live fixture token"):
+        module.derive_classroom_exports_receipt_checks(
+            proof_body,
+            bundle_root=tmp_path,
+            candidate_root=tmp_path,
+            candidate=candidate,
+            release_run=_RELEASE_RUN,
+        )
+
+
+@pytest.mark.parametrize(
+    ("artifact_name", "member_name", "token"),
+    (
+        ("classroom.zip", "media/voice.mp3", b"first-release-audio"),
+        ("classroom.pptx", "ppt/slides/slide1.xml", b"Verified classroom export"),
+    ),
+    ids=("classroom_zip", "pptx"),
+)
+def test_classroom_export_replay_rejects_secret_bearing_deflated_member(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    artifact_name: str,
+    member_name: str,
+    token: bytes,
+) -> None:
+    module = _load_verifier()
+    _manifest, _evidence, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    artifact = tmp_path / "raw" / "classroom-exports" / artifact_name
+    with zipfile.ZipFile(artifact) as archive:
+        info = archive.getinfo(member_name)
+        assert info.compress_type == zipfile.ZIP_DEFLATED
+        assert token in archive.read(info)
+    assert token not in artifact.read_bytes()
+    monkeypatch.setenv("YFEISTAI_LIVE_FIXTURE_TOKEN", token.decode("utf-8"))
+    proof_body = (tmp_path / "runtime" / "classroom-exports-attestation.json").read_bytes()
+
+    with pytest.raises(ValueError, match="live fixture token"):
+        module.derive_classroom_exports_receipt_checks(
+            proof_body,
+            bundle_root=tmp_path,
+            candidate_root=tmp_path,
+            candidate=candidate,
+            release_run=_RELEASE_RUN,
+        )
 
 
 def test_file_runtime_replays_capacity_profile_raw_samples(tmp_path: Path) -> None:

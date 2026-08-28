@@ -176,7 +176,7 @@ async def test_student_safety_duration_migration_backfills_and_blocks_lossy_down
                 {"tenant_id": tenant_id},
             )
 
-        upgraded = run_tenant_migration(generation_database, schema_name, "20260827_0021")
+        upgraded = run_tenant_migration(generation_database, schema_name, "20260828_0022")
         assert upgraded.returncode == 0, f"{upgraded.stdout}\n{upgraded.stderr}"
 
         async def inspect() -> dict[str, object]:
@@ -274,8 +274,8 @@ async def test_student_safety_duration_migration_backfills_and_blocks_lossy_down
             "activeMatchesRequested": True,
             "validConstraint": True,
             "supersessionConstraint": True,
-            "alembicRevision": "20260827_0021",
-            "stateRevision": "20260827_0021",
+            "alembicRevision": "20260828_0022",
+            "stateRevision": "20260828_0022",
         }
 
         downgraded = run_tenant_migration(
@@ -296,7 +296,7 @@ async def test_student_safety_duration_migration_backfills_and_blocks_lossy_down
             "stateRevision": "20260825_0020",
         }
 
-        reupgraded = run_tenant_migration(generation_database, schema_name, "20260827_0021")
+        reupgraded = run_tenant_migration(generation_database, schema_name, "20260828_0022")
         assert reupgraded.returncode == 0, f"{reupgraded.stdout}\n{reupgraded.stderr}"
         async with engine.begin() as connection:
             await connection.execute(
@@ -322,8 +322,8 @@ async def test_student_safety_duration_migration_backfills_and_blocks_lossy_down
             "activeMatchesRequested": False,
             "validConstraint": True,
             "supersessionConstraint": True,
-            "alembicRevision": "20260827_0021",
-            "stateRevision": "20260827_0021",
+            "alembicRevision": "20260828_0022",
+            "stateRevision": "20260828_0022",
         }
     finally:
         async with engine.begin() as connection:
@@ -1501,7 +1501,7 @@ async def test_postgres_student_generation_migration_constraints_state_and_downg
             for table_name, table in expected_tables.items()
             for column in table.c
         }
-        assert (revision, state_revision) == ("20260827_0021", "20260827_0021")
+        assert (revision, state_revision) == ("20260828_0022", "20260828_0022")
 
         with pytest.raises(IntegrityError):
             async with engine.begin() as connection:
@@ -1578,7 +1578,7 @@ async def test_postgres_student_generation_migration_constraints_state_and_downg
                 ),
                 {"schema_name": schema_name},
             )
-        assert (revision, state_revision) == ("20260827_0021", "20260827_0021")
+        assert (revision, state_revision) == ("20260828_0022", "20260828_0022")
     finally:
         async with engine.begin() as connection:
             await connection.execute(

@@ -15,7 +15,7 @@ import re
 import stat
 import subprocess
 import sys
-from typing import Protocol
+from typing import BinaryIO, Protocol
 from urllib.parse import urlsplit
 
 import yaml
@@ -34,6 +34,17 @@ from capacity_profile_contract import (  # noqa: E402
     exact_json_equal,
     parse_capacity_profile_report,
 )
+from classroom_export_contract import (  # noqa: E402
+    CLASSROOM_EXPORT_PATHS,
+    CLASSROOM_EXPORT_PRODUCER,
+    MAX_CLASSROOM_EXPORT_REPORT_BYTES,
+    MAX_EXPORT_BYTES,
+    MAX_TOTAL_EXPORT_BYTES,
+    classroom_export_archive_contains_forbidden_bytes,
+    classroom_exports_command_record,
+    derive_classroom_export_checks,
+    parse_classroom_export_report,
+)
 from classroom_release_probe_contract import (  # noqa: E402
     LIVE_PROJECT,
     LIVE_SPEC,
@@ -43,6 +54,7 @@ from classroom_release_probe_contract import (  # noqa: E402
 from classroom_runtime_attestation import (  # noqa: E402
     _CandidateContractLease,
     _close_windows_handle,
+    _file_identity,
     _load_candidate_token,
     _open_windows_directory_handle,
     _open_windows_directory_relative,
@@ -145,7 +157,7 @@ RECEIPT_CONTRACTS = {
     "student_full_flow": ("playwright", ("studentFullFlowPassed",)),
     "content_operations_flow": ("playwright", ("contentOperationsFlowPassed",)),
     "classroom_exports": (
-        "artifact-inspector",
+        CLASSROOM_EXPORT_PRODUCER,
         ("zipOpened", "pptxOpened", "offlineHtmlOpened", "mp4Opened"),
     ),
     "tenant_isolation": (
@@ -415,6 +427,7 @@ def _proof_bytes(
     fixed_runtime_artifacts = {
         "runtime/platform-preflight-attestation.json": "platform-preflight-attestation.json",
         "runtime/capacity-profile-attestation.json": "capacity-profile-attestation.json",
+        "runtime/classroom-exports-attestation.json": "classroom-exports-attestation.json",
     }
     fixed_name = fixed_runtime_artifacts.get(artifact)
     if fixed_name is not None:
@@ -570,6 +583,7 @@ def _runtime_artifact_body(
         "runtime-attestation.json",
         "platform-preflight-attestation.json",
         "capacity-profile-attestation.json",
+        "classroom-exports-attestation.json",
     }:
         raise ValueError("runtime artifact name is invalid")
     root = Path(os.path.abspath(bundle_root))
@@ -703,6 +717,22 @@ def read_runtime_attestation_artifact(
         path,
         bundle_root=bundle_root,
         expected_sha256=None,
+    )
+    return body, hashlib.sha256(body).hexdigest()
+
+
+def read_capacity_profile_attestation_artifact(
+    path: Path,
+    *,
+    bundle_root: Path,
+) -> tuple[bytes, str]:
+    """Read the fixed capacity proof through the runtime no-follow boundary."""
+
+    body = _runtime_artifact_body(
+        path,
+        bundle_root=bundle_root,
+        expected_sha256=None,
+        artifact_name="capacity-profile-attestation.json",
     )
     return body, hashlib.sha256(body).hexdigest()
 
@@ -1222,6 +1252,601 @@ def derive_capacity_profile_receipt_checks(
     return {name: checks[name] is True for name in checks}, str(document["observedAt"])
 
 
+def derive_capacity_profile_tenant_id(
+    body: bytes,
+    *,
+    bundle_root: Path,
+    candidate_root: Path,
+    candidate: Mapping[str, object],
+    release_run: Mapping[str, str],
+) -> str:
+    """Return the existing tenant bound into one validated capacity proof."""
+
+    derive_capacity_profile_receipt_checks(
+        body,
+        bundle_root=bundle_root,
+        candidate_root=candidate_root,
+        candidate=candidate,
+        release_run=release_run,
+    )
+    document = json.loads(body)
+    execution = document.get("execution") if isinstance(document, dict) else None
+    base_url = document.get("baseUrl") if isinstance(document, dict) else None
+    stdout = execution.get("stdout") if isinstance(execution, dict) else None
+    if not isinstance(base_url, str) or not isinstance(stdout, str):
+        raise ValueError("capacity execution proof is invalid")
+    report = parse_capacity_profile_report(
+        stdout.encode("utf-8", errors="strict"),
+        candidate=candidate,
+        release_run=release_run,
+        expected_base_url=base_url,
+    )
+    observation = report.get("idempotencyObservation")
+    tenant_id = observation.get("tenantId") if isinstance(observation, dict) else None
+    if not isinstance(tenant_id, str) or not tenant_id:
+        raise ValueError("capacity execution proof tenant is invalid")
+    return tenant_id
+
+
+def _classroom_fixture_secret_bytes() -> set[bytes]:
+    token = os.environ.get("YFEISTAI_LIVE_FIXTURE_TOKEN")
+    if not isinstance(token, str) or not token.strip():
+        raise ValueError("classroom exports live fixture token is unavailable")
+    return {value.encode("utf-8", errors="strict") for value in {token, token.strip()} if value}
+
+
+def _windows_directory_entry_names(directory_handle: object) -> set[str]:
+    import ctypes
+    from ctypes import wintypes
+
+    class _IoStatusBlock(ctypes.Structure):
+        _fields_ = (("status", wintypes.LONG), ("information", ctypes.c_size_t))
+
+    ntdll = ctypes.WinDLL("ntdll")
+    query_directory = ntdll.NtQueryDirectoryFile
+    query_directory.argtypes = (
+        wintypes.HANDLE,
+        wintypes.HANDLE,
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+        ctypes.POINTER(_IoStatusBlock),
+        wintypes.LPVOID,
+        wintypes.ULONG,
+        wintypes.ULONG,
+        wintypes.BOOLEAN,
+        wintypes.LPVOID,
+        wintypes.BOOLEAN,
+    )
+    query_directory.restype = wintypes.LONG
+    status_no_more_files = ctypes.c_long(0x80000006).value
+    status_buffer_overflow = ctypes.c_long(0x80000005).value
+    names: set[str] = set()
+    restart = True
+    while True:
+        buffer = ctypes.create_string_buffer(64 * 1024)
+        io_status = _IoStatusBlock()
+        status = query_directory(
+            directory_handle,
+            None,
+            None,
+            None,
+            ctypes.byref(io_status),
+            buffer,
+            len(buffer),
+            37,
+            False,
+            None,
+            restart,
+        )
+        restart = False
+        if status == status_no_more_files:
+            return names
+        if status < 0 and status != status_buffer_overflow:
+            status_to_error = ntdll.RtlNtStatusToDosError
+            status_to_error.argtypes = (wintypes.LONG,)
+            status_to_error.restype = wintypes.ULONG
+            error = status_to_error(status)
+            raise OSError(error, "cannot enumerate classroom export directory")
+        used = int(io_status.information)
+        if used <= 0 or used > len(buffer):
+            raise ValueError("classroom export raw boundary enumeration is invalid")
+        offset = 0
+        raw = buffer.raw
+        while offset < used:
+            if offset + 104 > used:
+                raise ValueError("classroom export raw boundary enumeration is invalid")
+            next_offset = int.from_bytes(raw[offset : offset + 4], "little")
+            name_length = int.from_bytes(raw[offset + 60 : offset + 64], "little")
+            name_end = offset + 104 + name_length
+            if name_length % 2 or name_end > used:
+                raise ValueError("classroom export raw boundary enumeration is invalid")
+            try:
+                name = raw[offset + 104 : name_end].decode("utf-16-le", errors="strict")
+            except UnicodeError as exc:
+                raise ValueError("classroom export raw boundary enumeration is invalid") from exc
+            if name not in {".", ".."}:
+                if name in names:
+                    raise ValueError("classroom export raw boundary enumeration is invalid")
+                names.add(name)
+            if next_offset == 0:
+                break
+            if next_offset % 8 or next_offset < 104 or offset + next_offset >= used:
+                raise ValueError("classroom export raw boundary enumeration is invalid")
+            offset += next_offset
+
+
+def _read_classroom_artifact_handle(
+    handle: BinaryIO,
+    *,
+    kind: str,
+    max_bytes: int,
+    forbidden_secrets: set[bytes] | None = None,
+) -> tuple[int, str]:
+    details = os.fstat(handle.fileno())
+    if not stat.S_ISREG(details.st_mode) or details.st_size <= 0 or details.st_size > max_bytes:
+        raise ValueError("classroom export raw artifact size is invalid")
+    secrets = forbidden_secrets or set()
+    overlap = max((len(secret) for secret in secrets), default=1) - 1
+    previous = b""
+    digest = hashlib.sha256()
+    size = 0
+    handle.seek(0)
+    try:
+        while chunk := handle.read(1024 * 1024):
+            window = previous + chunk
+            if any(secret in window for secret in secrets):
+                raise ValueError("classroom export raw artifact contains a live fixture token")
+            digest.update(chunk)
+            size += len(chunk)
+            if size > max_bytes:
+                raise ValueError("classroom export raw artifact size is invalid")
+            previous = window[-overlap:] if overlap > 0 else b""
+    finally:
+        handle.seek(0)
+    if size != details.st_size:
+        raise ValueError("classroom export raw artifact size changed")
+    if secrets and classroom_export_archive_contains_forbidden_bytes(
+        handle,
+        kind=kind,
+        forbidden=secrets,
+    ):
+        raise ValueError("classroom export raw artifact contains a live fixture token")
+    return size, digest.hexdigest()
+
+
+@dataclass
+class _ClassroomRawSnapshot:
+    raw_root: Path
+    windows: bool
+    directory_handles: tuple[object | int, object | int, object | int]
+    directory_identities: tuple[tuple[int, int], tuple[int, int], tuple[int, int]]
+    artifact_handles: dict[str, BinaryIO]
+    artifact_path_identities: dict[str, tuple[int, int]]
+    artifact_file_identities: dict[str, tuple[int, int]]
+    records: dict[str, dict[str, object]]
+
+    def _entry_names(self) -> set[str]:
+        exports_handle = self.directory_handles[2]
+        if self.windows:
+            return _windows_directory_entry_names(exports_handle)
+        return set(os.listdir(int(exports_handle)))
+
+    def assert_unchanged(self) -> None:
+        expected_names = set(CLASSROOM_EXPORT_PATHS.values())
+        if self._entry_names() != expected_names:
+            raise ValueError("classroom export raw artifact set changed")
+        for kind, handle in self.artifact_handles.items():
+            details = os.fstat(handle.fileno())
+            size, digest = _read_classroom_artifact_handle(
+                handle,
+                kind=kind,
+                max_bytes=MAX_EXPORT_BYTES[kind],
+            )
+            if (
+                not stat.S_ISREG(details.st_mode)
+                or _file_identity(details) != self.artifact_file_identities[kind]
+                or size != self.records[kind]["sizeBytes"]
+                or digest != self.records[kind]["sha256"]
+            ):
+                raise ValueError("classroom export raw artifact changed")
+
+        bundle_handle, raw_handle, exports_handle = self.directory_handles
+        reopened: list[object | int] = []
+        try:
+            if self.windows:
+                reopened_raw, raw_identity = _open_windows_directory_relative(
+                    bundle_handle,
+                    "raw",
+                )
+                reopened.append(reopened_raw)
+                reopened_exports, exports_identity = _open_windows_directory_relative(
+                    raw_handle,
+                    "classroom-exports",
+                )
+                reopened.append(reopened_exports)
+                if (
+                    raw_identity != self.directory_identities[1]
+                    or exports_identity != self.directory_identities[2]
+                ):
+                    raise ValueError("classroom export raw boundary changed")
+                for kind, name in CLASSROOM_EXPORT_PATHS.items():
+                    reopened_file, identity = _open_windows_regular_file_relative(
+                        exports_handle,
+                        name,
+                        share_access=0x00000001 | 0x00000002 | 0x00000004,
+                    )
+                    reopened.append(reopened_file)
+                    if identity != self.artifact_path_identities[kind]:
+                        raise ValueError("classroom export raw artifact identity changed")
+            else:
+                directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+                reopened_raw = os.open("raw", directory_flags, dir_fd=int(bundle_handle))
+                reopened.append(reopened_raw)
+                reopened_exports = os.open(
+                    "classroom-exports",
+                    directory_flags,
+                    dir_fd=int(raw_handle),
+                )
+                reopened.append(reopened_exports)
+                if (
+                    _file_identity(os.fstat(reopened_raw)) != self.directory_identities[1]
+                    or _file_identity(os.fstat(reopened_exports)) != self.directory_identities[2]
+                ):
+                    raise ValueError("classroom export raw boundary changed")
+                file_flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
+                for kind, name in CLASSROOM_EXPORT_PATHS.items():
+                    reopened_file = os.open(name, file_flags, dir_fd=int(exports_handle))
+                    reopened.append(reopened_file)
+                    if (
+                        _file_identity(os.fstat(reopened_file))
+                        != self.artifact_path_identities[kind]
+                    ):
+                        raise ValueError("classroom export raw artifact identity changed")
+        except OSError as exc:
+            raise ValueError("classroom export raw boundary changed") from exc
+        finally:
+            for handle in reversed(reopened):
+                if self.windows:
+                    _close_windows_handle(handle)
+                else:
+                    os.close(int(handle))
+
+    def close(self) -> None:
+        for handle in self.artifact_handles.values():
+            handle.close()
+        self.artifact_handles.clear()
+        for handle in reversed(self.directory_handles):
+            if self.windows:
+                _close_windows_handle(handle)
+            else:
+                os.close(int(handle))
+        self.directory_handles = ()  # type: ignore[assignment]
+
+
+def _classroom_raw_artifact_records(
+    bundle_root: Path,
+    *,
+    forbidden_secrets: set[bytes],
+) -> _ClassroomRawSnapshot:
+    root = Path(os.path.abspath(bundle_root))
+    raw_root = root / "raw" / "classroom-exports"
+    windows = os.name == "nt"
+    directory_handles: list[object | int] = []
+    directory_identities: list[tuple[int, int]] = []
+    artifact_handles: dict[str, BinaryIO] = {}
+    artifact_path_identities: dict[str, tuple[int, int]] = {}
+    artifact_file_identities: dict[str, tuple[int, int]] = {}
+    try:
+        if windows:
+            bundle_handle, bundle_identity = _open_windows_directory_no_follow(root)
+            directory_handles.append(bundle_handle)
+            directory_identities.append(bundle_identity)
+            raw_handle, raw_identity = _open_windows_directory_relative(bundle_handle, "raw")
+            directory_handles.append(raw_handle)
+            directory_identities.append(raw_identity)
+            exports_handle, exports_identity = _open_windows_directory_relative(
+                raw_handle,
+                "classroom-exports",
+            )
+            directory_handles.append(exports_handle)
+            directory_identities.append(exports_identity)
+            entry_names = _windows_directory_entry_names(exports_handle)
+        else:
+            bundle_handle = _open_posix_directory_no_follow(root)
+            directory_handles.append(bundle_handle)
+            directory_identities.append(_file_identity(os.fstat(bundle_handle)))
+            directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+            raw_handle = os.open("raw", directory_flags, dir_fd=bundle_handle)
+            directory_handles.append(raw_handle)
+            directory_identities.append(_file_identity(os.fstat(raw_handle)))
+            exports_handle = os.open(
+                "classroom-exports",
+                directory_flags,
+                dir_fd=raw_handle,
+            )
+            directory_handles.append(exports_handle)
+            directory_identities.append(_file_identity(os.fstat(exports_handle)))
+            entry_names = set(os.listdir(exports_handle))
+        if entry_names != set(CLASSROOM_EXPORT_PATHS.values()):
+            raise ValueError("classroom export raw artifact set is invalid")
+
+        records: dict[str, dict[str, object]] = {}
+        total_size = 0
+        for kind, name in CLASSROOM_EXPORT_PATHS.items():
+            if windows:
+                import msvcrt
+
+                native_handle, native_identity = _open_windows_regular_file_relative(
+                    directory_handles[2],
+                    name,
+                    share_access=0x00000001 | 0x00000002 | 0x00000004,
+                )
+                descriptor: int | None = None
+                try:
+                    handle_value = getattr(native_handle, "value", native_handle)
+                    descriptor = msvcrt.open_osfhandle(
+                        int(handle_value),
+                        os.O_RDONLY | os.O_BINARY,
+                    )
+                    handle = os.fdopen(descriptor, "rb")
+                except BaseException:
+                    if descriptor is None:
+                        _close_windows_handle(native_handle)
+                    else:
+                        os.close(descriptor)
+                    raise
+                artifact_path_identities[kind] = native_identity
+            else:
+                file_flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
+                descriptor = os.open(name, file_flags, dir_fd=int(directory_handles[2]))
+                try:
+                    handle = os.fdopen(descriptor, "rb")
+                except BaseException:
+                    os.close(descriptor)
+                    raise
+                artifact_path_identities[kind] = _file_identity(os.fstat(handle.fileno()))
+            artifact_handles[kind] = handle
+            details = os.fstat(handle.fileno())
+            artifact_file_identities[kind] = _file_identity(details)
+            size, digest = _read_classroom_artifact_handle(
+                handle,
+                kind=kind,
+                max_bytes=MAX_EXPORT_BYTES[kind],
+                forbidden_secrets=forbidden_secrets,
+            )
+            total_size += size
+            if total_size > MAX_TOTAL_EXPORT_BYTES:
+                raise ValueError("classroom export raw artifact set is too large")
+            records[kind] = {
+                "artifact": f"raw/classroom-exports/{name}",
+                "sha256": digest,
+                "sizeBytes": size,
+            }
+        snapshot = _ClassroomRawSnapshot(
+            raw_root=raw_root,
+            windows=windows,
+            directory_handles=(
+                directory_handles[0],
+                directory_handles[1],
+                directory_handles[2],
+            ),
+            directory_identities=(
+                directory_identities[0],
+                directory_identities[1],
+                directory_identities[2],
+            ),
+            artifact_handles=artifact_handles,
+            artifact_path_identities=artifact_path_identities,
+            artifact_file_identities=artifact_file_identities,
+            records=records,
+        )
+        snapshot.assert_unchanged()
+        return snapshot
+    except OSError as exc:
+        for handle in artifact_handles.values():
+            handle.close()
+        for handle in reversed(directory_handles):
+            if windows:
+                _close_windows_handle(handle)
+            else:
+                os.close(int(handle))
+        raise ValueError("classroom export raw boundary is unavailable") from exc
+    except ValueError as exc:
+        for handle in artifact_handles.values():
+            handle.close()
+        for handle in reversed(directory_handles):
+            if windows:
+                _close_windows_handle(handle)
+            else:
+                os.close(int(handle))
+        if str(exc).startswith("classroom export"):
+            raise
+        raise ValueError("classroom export raw boundary is unavailable") from exc
+    except BaseException:
+        for handle in artifact_handles.values():
+            handle.close()
+        for handle in reversed(directory_handles):
+            if windows:
+                _close_windows_handle(handle)
+            else:
+                os.close(int(handle))
+        raise
+
+
+def derive_classroom_exports_receipt_checks(
+    body: bytes,
+    *,
+    bundle_root: Path,
+    candidate_root: Path,
+    candidate: Mapping[str, object],
+    release_run: Mapping[str, str],
+) -> tuple[dict[str, bool], str]:
+    """Replay the fixed classroom export proof and all four raw artifacts."""
+
+    forbidden_secrets = _classroom_fixture_secret_bytes()
+    if any(secret in body for secret in forbidden_secrets):
+        raise ValueError("classroom exports proof contains a live fixture token")
+
+    try:
+        document = json.loads(body)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("classroom exports execution proof is invalid") from exc
+    expected_keys = {
+        "schemaVersion",
+        "candidate",
+        "releaseRun",
+        "observedAt",
+        "baseUrl",
+        "tenantId",
+        "runtimeAttestation",
+        "capacityAttestation",
+        "execution",
+        "rawArtifacts",
+    }
+    if (
+        not isinstance(document, dict)
+        or set(document) != expected_keys
+        or type(document.get("schemaVersion")) is not int
+        or document.get("schemaVersion") != 1
+        or not exact_json_equal(document.get("candidate"), dict(candidate))
+        or not exact_json_equal(document.get("releaseRun"), dict(release_run))
+        or not _valid_observed_at_value(document.get("observedAt"))
+    ):
+        raise ValueError("classroom exports execution proof is invalid")
+    base_url = _runtime_base_url(document.get("baseUrl"))
+    tenant_id = document.get("tenantId")
+    if base_url is None or not isinstance(tenant_id, str) or not tenant_id:
+        raise ValueError("classroom exports execution proof is invalid")
+
+    runtime_proof = document.get("runtimeAttestation")
+    if (
+        not isinstance(runtime_proof, dict)
+        or set(runtime_proof) != {"artifact", "sha256"}
+        or runtime_proof.get("artifact") != "runtime/runtime-attestation.json"
+        or not isinstance(runtime_proof.get("sha256"), str)
+    ):
+        raise ValueError("classroom exports runtime attestation proof is invalid")
+    validate_runtime_attestation(
+        Path("runtime/runtime-attestation.json"),
+        bundle_root=bundle_root,
+        candidate_root=candidate_root,
+        candidate=candidate,
+        release_run=release_run,
+        expected_base_url=base_url,
+        expected_sha256=runtime_proof["sha256"],
+    )
+
+    capacity_proof = document.get("capacityAttestation")
+    if (
+        not isinstance(capacity_proof, dict)
+        or set(capacity_proof) != {"artifact", "sha256"}
+        or capacity_proof.get("artifact") != "runtime/capacity-profile-attestation.json"
+    ):
+        raise ValueError("classroom exports capacity attestation proof is invalid")
+    capacity_body = _proof_bytes(
+        Path(bundle_root),
+        capacity_proof,
+        label="classroom exports capacity attestation",
+    )
+    if isinstance(capacity_body, str):
+        raise ValueError(capacity_body)
+    capacity_tenant = derive_capacity_profile_tenant_id(
+        capacity_body[0],
+        bundle_root=bundle_root,
+        candidate_root=candidate_root,
+        candidate=candidate,
+        release_run=release_run,
+    )
+    if tenant_id != capacity_tenant:
+        raise ValueError("classroom exports tenant does not match capacity proof")
+
+    execution = document.get("execution")
+    if (
+        not isinstance(execution, dict)
+        or set(execution) != {"command", "nativeExit", "stdout", "stdoutSha256", "stderr"}
+        or execution.get("command") != classroom_exports_command_record()
+        or type(execution.get("nativeExit")) is not int
+        or execution.get("nativeExit") != 0
+        or execution.get("stderr") != ""
+        or not isinstance(execution.get("stdout"), str)
+        or not isinstance(execution.get("stdoutSha256"), str)
+    ):
+        raise ValueError("classroom exports execution proof is invalid")
+    try:
+        stdout = execution["stdout"].encode("utf-8", errors="strict")
+    except UnicodeEncodeError as exc:
+        raise ValueError("classroom exports execution proof is invalid") from exc
+    if (
+        len(stdout) > MAX_CLASSROOM_EXPORT_REPORT_BYTES
+        or hashlib.sha256(stdout).hexdigest() != execution["stdoutSha256"]
+    ):
+        raise ValueError("classroom exports execution proof is invalid")
+
+    raw_snapshot = _classroom_raw_artifact_records(
+        Path(bundle_root),
+        forbidden_secrets=forbidden_secrets,
+    )
+    try:
+        raw_root = raw_snapshot.raw_root
+        actual_records = raw_snapshot.records
+        artifact_handles = raw_snapshot.artifact_handles
+        raw_records = document.get("rawArtifacts")
+        if not isinstance(raw_records, dict) or set(raw_records) != set(CLASSROOM_EXPORT_PATHS):
+            raise ValueError("classroom exports raw artifact proof is invalid")
+        for kind in CLASSROOM_EXPORT_PATHS:
+            record = raw_records.get(kind)
+            if (
+                not isinstance(record, dict)
+                or type(record.get("sizeBytes")) is not int
+                or record != actual_records[kind]
+            ):
+                raise ValueError("classroom exports raw artifact proof does not match")
+
+        report = parse_classroom_export_report(
+            stdout,
+            artifact_root=raw_root,
+            artifact_handles=artifact_handles,
+            candidate=candidate,
+            release_run=release_run,
+            expected_base_url=base_url,
+        )
+        if (
+            report.get("observedAt") != document.get("observedAt")
+            or report.get("tenantId") != tenant_id
+        ):
+            raise ValueError("classroom exports report binding is invalid")
+        checks = derive_classroom_export_checks(
+            stdout,
+            artifact_root=raw_root,
+            artifact_handles=artifact_handles,
+            candidate=candidate,
+            release_run=release_run,
+            expected_base_url=base_url,
+        )
+        raw_snapshot.assert_unchanged()
+        replayed_snapshot: _ClassroomRawSnapshot | None = None
+        try:
+            replayed_snapshot = _classroom_raw_artifact_records(
+                Path(bundle_root),
+                forbidden_secrets=forbidden_secrets,
+            )
+            replayed_snapshot.assert_unchanged()
+            if (
+                replayed_snapshot.raw_root != raw_root
+                or replayed_snapshot.records != actual_records
+            ):
+                raise ValueError("classroom export raw artifact set changed during replay")
+        except ValueError as exc:
+            raise ValueError("classroom export raw artifact set changed during replay") from exc
+        finally:
+            if replayed_snapshot is not None:
+                replayed_snapshot.close()
+        raw_snapshot.assert_unchanged()
+        return checks, str(document["observedAt"])
+    finally:
+        raw_snapshot.close()
+
+
 def derive_learning_event_idempotency_receipt_checks(
     body: bytes,
     *,
@@ -1333,6 +1958,56 @@ def probe_provenance_error(
             or checks != derived[evidence]
         ):
             return "platform preflight receipt does not match execution proof"
+        return None
+    if evidence == "classroom_exports":
+        try:
+            forbidden_secrets = _classroom_fixture_secret_bytes()
+            receipt_body = json.dumps(
+                document,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8", errors="strict")
+        except (UnicodeEncodeError, ValueError) as exc:
+            return str(exc)
+        if any(secret in receipt_body for secret in forbidden_secrets):
+            return "classroom exports receipt contains a live fixture token"
+        provenance = document.get("provenance")
+        if not isinstance(provenance, dict) or set(provenance) != {"classroomExportsAttestation"}:
+            return "classroom exports execution proof is missing or invalid"
+        proof = provenance.get("classroomExportsAttestation")
+        if (
+            not isinstance(proof, dict)
+            or set(proof) != {"artifact", "sha256"}
+            or proof.get("artifact") != "runtime/classroom-exports-attestation.json"
+        ):
+            return "classroom exports execution proof is missing or invalid"
+        proof_body = _proof_bytes(
+            bundle_root,
+            proof,
+            label="classroom exports attestation",
+        )
+        if isinstance(proof_body, str):
+            return proof_body
+        try:
+            checks, observed_at = derive_classroom_exports_receipt_checks(
+                proof_body[0],
+                bundle_root=bundle_root,
+                candidate_root=candidate_root,
+                candidate=candidate,
+                release_run=release_run,
+            )
+        except ValueError as exc:
+            return str(exc)
+        receipt = document.get("receipt")
+        result = receipt.get("result") if isinstance(receipt, dict) else None
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("observedAt") != observed_at
+            or not isinstance(result, dict)
+            or result.get("checks") != checks
+        ):
+            return "classroom exports receipt does not match execution proof"
         return None
     if evidence in {"capacity_profile", "learning_event_idempotency"}:
         provenance = document.get("provenance")

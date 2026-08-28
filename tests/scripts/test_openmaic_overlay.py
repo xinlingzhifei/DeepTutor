@@ -302,6 +302,14 @@ def test_classroom_route_types_json_cloned_actions_at_serialization_boundary() -
     assert "portableClone<Array<Record<string,JsonValue>>>(actions" in compact_source
 
 
+def test_pptx_export_binds_document_digest_in_visible_slide_text() -> None:
+    source = (
+        INTEGRATION_ROOT / "overlay" / "app" / "api" / "yfeistai" / "v1" / "exports" / "route.ts"
+    ).read_text(encoding="utf-8")
+
+    assert "slide.addText(`Document SHA-256: ${request.classroomDocumentSha256}`" in source
+
+
 def test_outline_contract_hash_verifier_rejects_a_handwritten_mismatch() -> None:
     verifier = _load_verifier()
     source = (

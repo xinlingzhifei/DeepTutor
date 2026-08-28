@@ -644,7 +644,7 @@ capacity_profile
 
 `running_containers` 已具备正式的 candidate/run-bound receipt CLI：它只从固定的 `runtime/runtime-attestation.json` 双稳定快照派生 `stableContainerSet=true`，assembler 与 verifier 都会重放 attestation provenance 并拒绝手写自证。`database_revisions` 与 `service_health` 也已具备正式的本地 producer/consumer 合同：固定可信 Docker 可执行文件、固定 phase/service/check 集合、候选与 runtime attestation 绑定、限长规范 JSON，以及 receipts-first / proof-last 的 fail-closed 发布顺序；verifier 会从平台预检 proof 重放两项 receipt checks。零 active tenant 会明确失败 `active tenant inventory`，因此这两项不能外推为 `tenant_isolation`。上述本地合同均不代表任何已部署候选已经取得对应 receipt。
 
-以下 8 个非 Playwright receipt producer 仍未完成：`capacity_profile`、`classroom_exports`、`tenant_isolation`、`learning_event_idempotency`、`openmaic_shared_plane`、`openmaic_dedicated_plane`、`backup_restore`、`gateway_only_public`。
+这 8 个非 Playwright receipt producer 的本地实现进度为：`capacity_profile` 与 `learning_event_idempotency` 已实现并提交；`classroom_exports` 的 producer、原始导出合同与 verifier replay 已在当前候选分支实现并纳入本批，且尚无 live receipt。其最新本地证据为三份离线 evidence/verifier 文件 `358 passed / 2 skipped`，以及不依赖 Docker 的受影响跨层文件 `720 passed / 2 skipped`；PostgreSQL/Testcontainers 集成因本地 Docker daemon 不可用而仅取得 setup INCOMPLETE，不能据此宣称 migration 或真实数据库通过。仍缺本地 producer 实现的 5 项是 `tenant_isolation`、`openmaic_shared_plane`、`openmaic_dedicated_plane`、`backup_restore`、`gateway_only_public`。上述本地实现状态均不代表同一已部署发布候选已取得 live receipt。
 
 **验收身份决策 A：** 只注入一个 `YFEISTAI_LIVE_FIXTURE_TOKEN`。它必须是 yFeiSTAI 权威身份源签发的 `role=admin` Bearer，不是 GHCR token；只允许通过验收进程环境传入，不得增加 `--token` 参数、写入 argv、日志或 receipt。验收夹具使用该 token，通过现有正式 API 创建隔离租户以及 teacher、student、author、reviewer、publisher 账号，并按现有正式角色模板授予所需的租户级角色（teacher→teacher、student→student、author→content_author、reviewer→content_reviewer、publisher→teacher），随后各角色通过真实 `/login` 登录。
 

@@ -369,6 +369,16 @@ async function exportPptx(
         color: "667085",
         ...(classroomUrl ? { hyperlink: { url: classroomUrl } } : {}),
       });
+      slide.addText(`Document SHA-256: ${request.classroomDocumentSha256}`, {
+        x: 5.8,
+        y: 6.75,
+        w: 6.75,
+        h: 0.3,
+        fontSize: 8,
+        color: "667085",
+        align: "right",
+        margin: 0,
+      });
     }
   }
   const output = await presentation.write({ outputType: "nodebuffer" });

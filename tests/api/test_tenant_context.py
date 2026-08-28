@@ -1527,7 +1527,7 @@ def test_write_statements_bind_scope_state_and_conflict_keys() -> None:
         build_activation_lock_statement("tenant-a", "job-a", 2),
         "tenant_schema_states.tenant_id = 'tenant-a'",
         "tenant_schema_states.status = 'active'",
-        "tenant_schema_states.revision = '20260827_0021'",
+        "tenant_schema_states.revision = '20260828_0022'",
         f"tenant_schema_states.schema_name = '{tenant_schema_name('tenant-a')}'",
         "tenant_storage_states.tenant_id = 'tenant-a'",
         "tenant_storage_states.status = 'active'",
@@ -1875,6 +1875,7 @@ def _failed_retry_session(
     return _RecordingSession(
         execute_results=(
             _Result(),
+            _Result(),
             _Result(existing),
             _Result(rowcount=tenant_rowcount),
             _Result(rowcount=job_rowcount),
@@ -1891,11 +1892,30 @@ def _failed_retry_session(
         ),
         (
             "create",
-            ("begin", "execute", "execute", "scalar", "add", "add", "flush", "commit"),
+            (
+                "begin",
+                "execute",
+                "execute",
+                "execute",
+                "scalar",
+                "add",
+                "add",
+                "flush",
+                "commit",
+            ),
         ),
         (
             "retry",
-            ("begin", "execute", "execute", "execute", "execute", "flush", "commit"),
+            (
+                "begin",
+                "execute",
+                "execute",
+                "execute",
+                "execute",
+                "execute",
+                "flush",
+                "commit",
+            ),
         ),
     ],
 )
@@ -1969,7 +1989,13 @@ def test_existing_idempotency_payload_conflict_rolls_back_before_mutation(monkey
     with pytest.raises(TenantConflictError, match="idempotency"):
         asyncio.run(operation)
 
-    assert _trace_names(session) == ("begin", "execute", "execute", "rollback")
+    assert _trace_names(session) == (
+        "begin",
+        "execute",
+        "execute",
+        "execute",
+        "rollback",
+    )
 
 
 @pytest.mark.parametrize(

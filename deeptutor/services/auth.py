@@ -159,17 +159,18 @@ def list_users() -> list[dict]:
     return list_user_info(AUTH_USERNAME, AUTH_PASSWORD_HASH)
 
 
-def delete_user(username: str) -> bool:
+def delete_user(username: str, *, expected_user_id: str) -> str | None:
     """
-    Remove a user from the store. Returns True if the user existed.
+    Remove the expected user identity and return its stable id when found.
 
     """
     from deeptutor.multi_user.identity import delete_user as _delete_user
 
-    if not _delete_user(username):
-        return False
+    deleted_user_id = _delete_user(username, expected_user_id=expected_user_id)
+    if deleted_user_id is None:
+        return None
     logger.info("User '%s' deleted", username)
-    return True
+    return deleted_user_id
 
 
 def set_role(username: str, role: str) -> bool:

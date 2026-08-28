@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import inspect
 import json
 from types import SimpleNamespace
 
 from fastapi import FastAPI
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 import pytest
 
 from deeptutor.api.routers import auth as auth_router
 from deeptutor.api.routers import classroom_exports as exports_router
+from deeptutor.api.routers.auth import TokenPayload
 from deeptutor.teaching.object_store import (
     ObjectStoreAccessDenied,
     ObjectStoreError,
@@ -121,6 +124,72 @@ class FakeService:
         if self.hidden or export_id != self.record.export_id:
             return None
         return self.record
+
+
+class FakeExportPolicyRepository:
+    def __init__(self) -> None:
+        self.exists = False
+        self.allow_mp4 = False
+        self.revision = "absent"
+        self.operation_id: str | None = None
+        self.updated_by: str | None = None
+        self.replacements: list[tuple[bool, str, str, str]] = []
+        self.deletions: list[tuple[str, str, str]] = []
+
+    def _state(self):
+        return SimpleNamespace(
+            tenant_id="tenant-a",
+            exists=self.exists,
+            allow_mp4=self.allow_mp4,
+            revision=self.revision,
+            operation_id=self.operation_id,
+        )
+
+    async def policy_state(self):
+        return self._state()
+
+    async def replace_mp4_policy(
+        self,
+        *,
+        allow_mp4: bool,
+        expected_revision: str,
+        operation_id: str,
+        updated_by: str,
+    ):
+        if operation_id == self.operation_id:
+            if allow_mp4 != self.allow_mp4 or updated_by != self.updated_by:
+                raise exports_router.ExportPolicyConflict
+            return self._state()
+        if expected_revision != self.revision:
+            raise exports_router.ExportPolicyConflict
+        self.replacements.append((allow_mp4, expected_revision, operation_id, updated_by))
+        self.exists = True
+        self.allow_mp4 = allow_mp4
+        self.revision = f"{len(self.replacements):064x}"
+        self.operation_id = operation_id
+        self.updated_by = updated_by
+        return self._state()
+
+    async def delete_mp4_policy(
+        self,
+        *,
+        expected_revision: str,
+        operation_id: str,
+        updated_by: str,
+    ):
+        if operation_id == self.operation_id:
+            if updated_by != self.updated_by:
+                raise exports_router.ExportPolicyConflict
+            return self._state()
+        if expected_revision != self.revision:
+            raise exports_router.ExportPolicyConflict
+        self.deletions.append((expected_revision, operation_id, updated_by))
+        self.exists = False
+        self.allow_mp4 = False
+        self.revision = f"{len(self.replacements) + len(self.deletions):064x}"
+        self.operation_id = operation_id
+        self.updated_by = updated_by
+        return self._state()
 
 
 class FakeStore:
@@ -337,6 +406,161 @@ def test_mp4_policy_denial_has_stable_public_reason(api_harness) -> None:
 
     assert response.status_code == 403
     assert response.json()["detail"] == "MP4_EXPORT_DISABLED_BY_TENANT_POLICY"
+
+
+def test_platform_admin_reads_and_replaces_active_tenant_mp4_policy() -> None:
+    app = FastAPI()
+    repository = FakeExportPolicyRepository()
+    app.include_router(exports_router.router, prefix="/api/v1")
+    app.dependency_overrides[auth_router.require_platform_enabled] = lambda: None
+    app.dependency_overrides[require_tenant] = _context
+    app.dependency_overrides[auth_router.require_platform_admin] = lambda: TokenPayload(
+        username="platform-admin",
+        role="admin",
+        user_id="platform-admin-a",
+    )
+    app.dependency_overrides[exports_router.get_classroom_export_policy_repository] = lambda: (
+        repository
+    )
+    client = TestClient(app)
+
+    initial = client.get("/api/v1/classroom-export-policy")
+    enabled = client.put(
+        "/api/v1/classroom-export-policy",
+        json={
+            "allow_mp4": True,
+            "expected_revision": "absent",
+            "operation_id": "a" * 32,
+        },
+    )
+    replayed = client.put(
+        "/api/v1/classroom-export-policy",
+        json={
+            "allow_mp4": True,
+            "expected_revision": "absent",
+            "operation_id": "a" * 32,
+        },
+    )
+    reread = client.get("/api/v1/classroom-export-policy")
+    restored = client.request(
+        "DELETE",
+        "/api/v1/classroom-export-policy",
+        json={
+            "expected_revision": f"{1:064x}",
+            "operation_id": "b" * 32,
+        },
+    )
+
+    assert initial.status_code == 200
+    assert initial.json() == {
+        "tenant_id": "tenant-a",
+        "exists": False,
+        "allow_mp4": False,
+        "revision": "absent",
+        "operation_id": None,
+    }
+    assert enabled.status_code == 200
+    assert enabled.json() == {
+        "tenant_id": "tenant-a",
+        "exists": True,
+        "allow_mp4": True,
+        "revision": f"{1:064x}",
+        "operation_id": "a" * 32,
+    }
+    assert replayed.json() == enabled.json()
+    assert reread.json() == enabled.json()
+    assert restored.json() == {
+        "tenant_id": "tenant-a",
+        "exists": False,
+        "allow_mp4": False,
+        "revision": f"{2:064x}",
+        "operation_id": "b" * 32,
+    }
+    assert repository.replacements == [
+        (True, "absent", "a" * 32, "platform-admin-a"),
+    ]
+    assert repository.deletions == [
+        (f"{1:064x}", "b" * 32, "platform-admin-a"),
+    ]
+
+
+def test_mp4_policy_delete_requires_an_operation_id() -> None:
+    app = FastAPI()
+    repository = FakeExportPolicyRepository()
+    repository.exists = True
+    repository.revision = "f" * 64
+    app.include_router(exports_router.router, prefix="/api/v1")
+    app.dependency_overrides[auth_router.require_platform_enabled] = lambda: None
+    app.dependency_overrides[require_tenant] = _context
+    app.dependency_overrides[auth_router.require_platform_admin] = lambda: TokenPayload(
+        username="platform-admin",
+        role="admin",
+        user_id="platform-admin-a",
+    )
+    app.dependency_overrides[exports_router.get_classroom_export_policy_repository] = lambda: (
+        repository
+    )
+    client = TestClient(app)
+
+    response = client.request(
+        "DELETE",
+        "/api/v1/classroom-export-policy",
+        json={"expected_revision": "f" * 64},
+    )
+
+    assert response.status_code == 422
+    assert repository.deletions == []
+
+
+def test_mp4_policy_replacement_rejects_a_stale_revision() -> None:
+    app = FastAPI()
+    repository = FakeExportPolicyRepository()
+    repository.exists = True
+    repository.revision = "f" * 64
+    repository.operation_id = "a" * 32
+    repository.updated_by = "platform-admin-a"
+    app.include_router(exports_router.router, prefix="/api/v1")
+    app.dependency_overrides[auth_router.require_platform_enabled] = lambda: None
+    app.dependency_overrides[require_tenant] = _context
+    app.dependency_overrides[auth_router.require_platform_admin] = lambda: TokenPayload(
+        username="platform-admin",
+        role="admin",
+        user_id="platform-admin-a",
+    )
+    app.dependency_overrides[exports_router.get_classroom_export_policy_repository] = lambda: (
+        repository
+    )
+    client = TestClient(app)
+
+    response = client.put(
+        "/api/v1/classroom-export-policy",
+        json={
+            "allow_mp4": True,
+            "expected_revision": "absent",
+            "operation_id": "b" * 32,
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Export policy changed concurrently"}
+    assert repository.replacements == []
+
+
+def test_mp4_policy_routes_require_platform_admin_and_active_tenant() -> None:
+    routes = {
+        (route.path, method): route
+        for route in exports_router.router.routes
+        if isinstance(route, APIRoute)
+        for method in route.methods
+    }
+
+    for method in ("GET", "PUT", "DELETE"):
+        route = routes[("/classroom-export-policy", method)]
+        dependencies = {item.call for item in route.dependant.dependencies}
+        assert auth_router.require_platform_admin in dependencies
+        assert require_tenant in dependencies
+        assert exports_router.get_classroom_export_policy_repository in dependencies
+        assert inspect.iscoroutinefunction(route.endpoint)
 
 
 def test_other_tenant_or_unauthorized_actor_observes_export_as_not_found(

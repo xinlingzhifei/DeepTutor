@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
+import secrets
 from typing import Protocol
 
 from sqlalchemy import and_, select, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from deeptutor.teaching.contracts import ClassroomDocument, canonical_json_bytes
@@ -17,6 +21,7 @@ from deeptutor.teaching.models.classrooms import (
     ClassroomDraftMedia,
     ClassroomExport,
     ClassroomExportPolicy,
+    ClassroomExportPolicyOperation,
     ClassroomPublicationMaterialization,
     ClassroomVersion,
     TeachingBrief,
@@ -39,6 +44,106 @@ from deeptutor.teaching.services.exports import (
 )
 
 _MAX_DOCUMENT_BYTES = 8 * 1024 * 1024
+_ABSENT_POLICY_REVISION = "absent"
+
+
+class ExportPolicyConflict(RuntimeError):
+    """The tenant export policy changed after the caller observed it."""
+
+
+@dataclass(frozen=True)
+class ClassroomExportPolicyState:
+    tenant_id: str
+    exists: bool
+    allow_mp4: bool
+    revision: str
+    operation_id: str | None
+
+
+def _policy_state(
+    tenant_id: str,
+    model: ClassroomExportPolicy | None,
+) -> ClassroomExportPolicyState:
+    if model is None:
+        return ClassroomExportPolicyState(
+            tenant_id=tenant_id,
+            exists=False,
+            allow_mp4=False,
+            revision=_ABSENT_POLICY_REVISION,
+            operation_id=None,
+        )
+    return ClassroomExportPolicyState(
+        tenant_id=tenant_id,
+        exists=model.exists,
+        allow_mp4=model.allow_mp4,
+        revision=model.revision,
+        operation_id=model.operation_id,
+    )
+
+
+def _validate_policy_revision(value: str) -> None:
+    if value == _ABSENT_POLICY_REVISION:
+        return
+    if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
+        raise ValueError("export policy revision is invalid")
+
+
+def _validate_policy_operation_id(value: str) -> None:
+    if len(value) != 32 or any(character not in "0123456789abcdef" for character in value):
+        raise ValueError("export policy operation id is invalid")
+
+
+def _is_policy_mutation_conflict(exc: IntegrityError) -> bool:
+    original = exc.orig
+    sqlstate = getattr(original, "sqlstate", None) or getattr(original, "pgcode", None)
+    if sqlstate == "23505":
+        constraint = getattr(getattr(original, "diag", None), "constraint_name", None)
+        return constraint in {
+            None,
+            "pk_classroom_export_policies",
+            "pk_classroom_export_policy_operations",
+        }
+    message = str(original)
+    return any(
+        marker in message
+        for marker in (
+            "UNIQUE constraint failed: classroom_export_policies.tenant_id",
+            "UNIQUE constraint failed: classroom_export_policy_operations.operation_id",
+        )
+    )
+
+
+def _policy_operation_matches(
+    operation: ClassroomExportPolicyOperation,
+    *,
+    mutation: str,
+    expected_revision: str,
+    allow_mp4: bool | None,
+    operation_id: str,
+    updated_by: str,
+) -> bool:
+    return (
+        hmac.compare_digest(operation.operation_id, operation_id)
+        and hmac.compare_digest(operation.mutation, mutation)
+        and hmac.compare_digest(operation.expected_revision, expected_revision)
+        and operation.allow_mp4 == allow_mp4
+        and hmac.compare_digest(operation.updated_by, updated_by)
+    )
+
+
+def _policy_operation_state(
+    tenant_id: str,
+    operation: ClassroomExportPolicyOperation,
+) -> ClassroomExportPolicyState:
+    if not hmac.compare_digest(operation.tenant_id, tenant_id):
+        raise ExportPolicyConflict
+    return ClassroomExportPolicyState(
+        tenant_id=tenant_id,
+        exists=operation.result_exists,
+        allow_mp4=operation.result_allow_mp4,
+        revision=operation.result_revision,
+        operation_id=operation.result_operation_id,
+    )
 
 
 class ExportStoreProvider(Protocol):
@@ -730,5 +835,201 @@ class SqlAlchemyClassroomExportRepository:
             )
             return value is True
 
+    async def policy_state(self) -> ClassroomExportPolicyState:
+        async with self._session_factory() as session:
+            model = await session.scalar(
+                select(ClassroomExportPolicy).where(
+                    ClassroomExportPolicy.tenant_id == self._tenant_id
+                )
+            )
+            return _policy_state(self._tenant_id, model)
 
-__all__ = ["SqlAlchemyClassroomExportRepository"]
+    async def _policy_operation(
+        self,
+        session: AsyncSession,
+        operation_id: str,
+    ) -> ClassroomExportPolicyOperation | None:
+        return await session.scalar(
+            select(ClassroomExportPolicyOperation).where(
+                ClassroomExportPolicyOperation.operation_id == operation_id
+            )
+        )
+
+    def _policy_operation_replay(
+        self,
+        operation: ClassroomExportPolicyOperation,
+        *,
+        mutation: str,
+        expected_revision: str,
+        allow_mp4: bool | None,
+        operation_id: str,
+        updated_by: str,
+    ) -> ClassroomExportPolicyState:
+        if not hmac.compare_digest(operation.tenant_id, self._tenant_id) or not (
+            _policy_operation_matches(
+                operation,
+                mutation=mutation,
+                expected_revision=expected_revision,
+                allow_mp4=allow_mp4,
+                operation_id=operation_id,
+                updated_by=updated_by,
+            )
+        ):
+            raise ExportPolicyConflict
+        return _policy_operation_state(self._tenant_id, operation)
+
+    async def _policy_replay_state(
+        self,
+        *,
+        mutation: str,
+        expected_revision: str,
+        allow_mp4: bool | None,
+        operation_id: str,
+        updated_by: str,
+    ) -> ClassroomExportPolicyState | None:
+        async with self._session_factory() as session:
+            operation = await self._policy_operation(session, operation_id)
+            if operation is None:
+                return None
+            return self._policy_operation_replay(
+                operation,
+                mutation=mutation,
+                expected_revision=expected_revision,
+                allow_mp4=allow_mp4,
+                operation_id=operation_id,
+                updated_by=updated_by,
+            )
+
+    async def _mutate_mp4_policy(
+        self,
+        *,
+        mutation: str,
+        expected_revision: str,
+        allow_mp4: bool | None,
+        operation_id: str,
+        updated_by: str,
+    ) -> ClassroomExportPolicyState:
+        _validate_policy_revision(expected_revision)
+        _validate_policy_operation_id(operation_id)
+        try:
+            async with self._session_factory() as session:
+                async with session.begin():
+                    operation = await self._policy_operation(session, operation_id)
+                    if operation is not None:
+                        return self._policy_operation_replay(
+                            operation,
+                            mutation=mutation,
+                            expected_revision=expected_revision,
+                            allow_mp4=allow_mp4,
+                            operation_id=operation_id,
+                            updated_by=updated_by,
+                        )
+                    model = await session.scalar(
+                        select(ClassroomExportPolicy)
+                        .where(ClassroomExportPolicy.tenant_id == self._tenant_id)
+                        .with_for_update()
+                    )
+                    operation = await self._policy_operation(session, operation_id)
+                    if operation is not None:
+                        return self._policy_operation_replay(
+                            operation,
+                            mutation=mutation,
+                            expected_revision=expected_revision,
+                            allow_mp4=allow_mp4,
+                            operation_id=operation_id,
+                            updated_by=updated_by,
+                        )
+                    current = _policy_state(self._tenant_id, model)
+                    if not hmac.compare_digest(current.revision, expected_revision):
+                        raise ExportPolicyConflict
+                    result_exists = mutation == "replace"
+                    result_allow_mp4 = bool(allow_mp4) if result_exists else False
+                    now = datetime.now(timezone.utc)
+                    next_revision = secrets.token_hex(32)
+                    if model is None:
+                        model = ClassroomExportPolicy(
+                            tenant_id=self._tenant_id,
+                            exists=result_exists,
+                            allow_mp4=result_allow_mp4,
+                            revision=next_revision,
+                            operation_id=operation_id,
+                            updated_by=updated_by,
+                            updated_at=now,
+                        )
+                        session.add(model)
+                    else:
+                        model.exists = result_exists
+                        model.allow_mp4 = result_allow_mp4
+                        model.revision = next_revision
+                        model.operation_id = operation_id
+                        model.updated_by = updated_by
+                        model.updated_at = now
+                    result = _policy_state(self._tenant_id, model)
+                    session.add(
+                        ClassroomExportPolicyOperation(
+                            operation_id=operation_id,
+                            tenant_id=self._tenant_id,
+                            mutation=mutation,
+                            expected_revision=expected_revision,
+                            allow_mp4=allow_mp4,
+                            updated_by=updated_by,
+                            result_exists=result.exists,
+                            result_allow_mp4=result.allow_mp4,
+                            result_revision=result.revision,
+                            result_operation_id=operation_id,
+                            created_at=now,
+                        )
+                    )
+                    await session.flush()
+                    return result
+        except IntegrityError as exc:
+            if not _is_policy_mutation_conflict(exc):
+                raise
+            replayed = await self._policy_replay_state(
+                mutation=mutation,
+                expected_revision=expected_revision,
+                allow_mp4=allow_mp4,
+                operation_id=operation_id,
+                updated_by=updated_by,
+            )
+            if replayed is not None:
+                return replayed
+            raise ExportPolicyConflict from exc
+
+    async def replace_mp4_policy(
+        self,
+        *,
+        allow_mp4: bool,
+        expected_revision: str,
+        operation_id: str,
+        updated_by: str,
+    ) -> ClassroomExportPolicyState:
+        return await self._mutate_mp4_policy(
+            mutation="replace",
+            expected_revision=expected_revision,
+            allow_mp4=allow_mp4,
+            operation_id=operation_id,
+            updated_by=updated_by,
+        )
+
+    async def delete_mp4_policy(
+        self,
+        *,
+        expected_revision: str,
+        operation_id: str,
+        updated_by: str,
+    ) -> ClassroomExportPolicyState:
+        return await self._mutate_mp4_policy(
+            mutation="delete",
+            expected_revision=expected_revision,
+            allow_mp4=None,
+            operation_id=operation_id,
+            updated_by=updated_by,
+        )
+
+
+__all__ = [
+    "ClassroomExportPolicyState",
+    "ExportPolicyConflict",
+    "SqlAlchemyClassroomExportRepository",
+]

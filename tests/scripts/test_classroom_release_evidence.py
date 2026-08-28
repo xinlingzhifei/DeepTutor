@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import inspect
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
+import zipfile
 
 import pytest
 
@@ -50,6 +52,13 @@ def _load_verifier():
     return _load_path(
         "verify_classroom_release_for_evidence_test",
         ROOT / "scripts" / "verify_classroom_release.py",
+    )
+
+
+def _load_classroom_export_support():
+    return _load_path(
+        "classroom_export_contract_support_for_release_evidence",
+        ROOT / "tests" / "scripts" / "test_classroom_export_contract.py",
     )
 
 
@@ -2311,6 +2320,680 @@ def _live_capacity_report(candidate: dict[str, object]) -> dict[str, object]:
         },
         "resourceObservations": resource_observations,
     }
+
+
+def _write_capacity_dependency(
+    module,
+    candidate_root: Path,
+    candidate: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("YFEISTAI_LIVE_FIXTURE_TOKEN", "classroom-release-token")
+
+    def runner(arguments, *, cwd, env, timeout):
+        del cwd, env, timeout
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            json.dumps(
+                _live_capacity_report(candidate),
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n",
+            "",
+        )
+
+    module.write_capacity_profile_receipt(
+        candidate_root=candidate_root,
+        bundle_root=candidate_root,
+        release_run=RELEASE_RUN,
+        timeout_seconds=600,
+        runner=runner,
+    )
+
+
+def _classroom_export_runner(
+    module,
+    candidate: dict[str, object],
+    calls: list[dict[str, object]],
+):
+    support = _load_classroom_export_support()
+
+    def runner(arguments, *, cwd, env, timeout):
+        staging = Path(env["YFEISTAI_CLASSROOM_EXPORT_STAGING_DIR"])
+        assert staging.is_dir()
+        assert not list(staging.iterdir())
+        assert env["YFEISTAI_ACCEPTANCE_TENANT_ID"] == "tenant-00"
+        support._write_valid_artifacts(staging)
+        report = support._report(staging)
+        report.update(
+            candidate=candidate,
+            releaseRun=RELEASE_RUN,
+            baseUrl=BASE_URL,
+            tenantId="tenant-00",
+        )
+        calls.append(
+            {
+                "arguments": arguments,
+                "cwd": cwd,
+                "env": env,
+                "timeout": timeout,
+            }
+        )
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            support._module().canonical_classroom_export_report(report).decode("utf-8"),
+            "",
+        )
+
+    return runner
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows relative-handle contract")
+def test_classroom_raw_leases_open_relative_to_retained_staging_handle_for_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_evidence_module()
+    support = _load_classroom_export_support()
+    assert "boundary" in inspect.signature(module._open_classroom_artifact_leases).parameters
+
+    bundle_root = tmp_path / "bundle"
+    bundle_root.mkdir()
+    boundary = module._ClassroomPublicationBoundary.open(bundle_root, "a" * 32)
+    leases = {}
+    try:
+        assert boundary.staging is not None
+        support._write_valid_artifacts(boundary.staging)
+        staging_handle = boundary.leases["staging/attempt"].handle
+        calls: list[tuple[object, str, int, bool]] = []
+        real_open = module._open_windows_regular_file_relative
+
+        def record_relative_open(
+            directory_handle,
+            name: str,
+            *,
+            share_access: int,
+            deletable: bool = False,
+        ):
+            calls.append((directory_handle, name, share_access, deletable))
+            return real_open(
+                directory_handle,
+                name,
+                share_access=share_access,
+                deletable=deletable,
+            )
+
+        monkeypatch.setattr(
+            module,
+            "_open_windows_regular_file_relative",
+            record_relative_open,
+        )
+        leases = module._open_classroom_artifact_leases(boundary)
+
+        assert {name for _parent, name, _share, _delete in calls} == set(
+            module.CLASSROOM_EXPORT_PATHS.values()
+        )
+        assert all(parent is staging_handle for parent, _name, _share, _delete in calls)
+        assert all(share == 0x00000007 for _parent, _name, share, _delete in calls)
+        assert all(deletable is True for _parent, _name, _share, deletable in calls)
+
+        for kind, lease in leases.items():
+            target = boundary.raw_root / module.CLASSROOM_EXPORT_PATHS[kind]
+            module._publish_classroom_no_replace(
+                boundary,
+                lease.path,
+                target,
+                source_handle=lease.handle,
+            )
+            assert (
+                os.stat(target, follow_symlinks=False).st_ino
+                == os.fstat(lease.handle.fileno()).st_ino
+            )
+    finally:
+        for lease in leases.values():
+            lease.handle.close()
+        boundary.close()
+
+
+def test_classroom_exports_receipt_publishes_bound_raw_artifacts_and_proof_last(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_evidence_module()
+    verifier = _load_verifier()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    _write_capacity_dependency(module, candidate_root, candidate, monkeypatch)
+    calls: list[dict[str, object]] = []
+    publications: list[str] = []
+    real_publish = module._publish_classroom_no_replace
+
+    def record_publication(boundary, source: Path, target: Path, *, source_handle) -> None:
+        real_publish(boundary, source, target, source_handle=source_handle)
+        publications.append(target.relative_to(candidate_root).as_posix())
+
+    monkeypatch.setattr(module, "_publish_classroom_no_replace", record_publication)
+    receipt = module.write_classroom_exports_receipt(
+        candidate_root=candidate_root,
+        bundle_root=candidate_root,
+        release_run=RELEASE_RUN,
+        timeout_seconds=600,
+        runner=_classroom_export_runner(module, candidate, calls),
+    )
+
+    proof_path = candidate_root / "runtime" / "classroom-exports-attestation.json"
+    receipt_path = candidate_root / "artifacts" / "classroom_exports.json"
+    raw_root = candidate_root / "raw" / "classroom-exports"
+    assert publications[-1] == "runtime/classroom-exports-attestation.json"
+    assert set(publications[:-2]) == {
+        "raw/classroom-exports/classroom.zip",
+        "raw/classroom-exports/classroom.pptx",
+        "raw/classroom-exports/classroom.html",
+        "raw/classroom-exports/classroom.mp4",
+    }
+    assert publications[-2] == "artifacts/classroom_exports.json"
+    assert {path.name for path in raw_root.iterdir()} == {
+        "classroom.zip",
+        "classroom.pptx",
+        "classroom.html",
+        "classroom.mp4",
+    }
+    assert receipt == json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["receipt"]["producer"] == "classroom-export-probe"
+    proof_sha256 = hashlib.sha256(proof_path.read_bytes()).hexdigest()
+    assert receipt["provenance"] == {
+        "classroomExportsAttestation": {
+            "artifact": "runtime/classroom-exports-attestation.json",
+            "sha256": proof_sha256,
+        }
+    }
+    proof = json.loads(proof_path.read_text(encoding="utf-8"))
+    assert proof["tenantId"] == "tenant-00"
+    assert proof["execution"]["command"] == module.classroom_exports_command_record()
+    assert proof["capacityAttestation"]["artifact"] == ("runtime/capacity-profile-attestation.json")
+    assert set(proof["rawArtifacts"]) == set(module.CLASSROOM_EXPORT_PATHS)
+    assert len(calls) == 1
+    assert calls[0]["arguments"][-2:] == ["--profile", "first-release"]
+    assert calls[0]["cwd"] == candidate_root.resolve()
+    assert not list((candidate_root / "staging").iterdir())
+
+    manifest = candidate_root / "release-evidence.json"
+    module.assemble_manifest(
+        manifest,
+        candidate_root=candidate_root,
+        release_run=RELEASE_RUN,
+        receipt_paths={"classroom_exports": receipt_path},
+    )
+    result = verifier.verify(
+        verifier.FileReleaseRuntime(
+            manifest,
+            expected_source_head=SOURCE_HEAD,
+            candidate_root=candidate_root,
+        )
+    )
+    assert result.layers["classroom_exports"].status == "pass"
+
+
+def test_classroom_exports_publication_failure_leaves_no_proof_or_partial_raw_set(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_evidence_module()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    _write_capacity_dependency(module, candidate_root, candidate, monkeypatch)
+    proof_path = candidate_root / "runtime" / "classroom-exports-attestation.json"
+    receipt_path = candidate_root / "artifacts" / "classroom_exports.json"
+    raw_root = candidate_root / "raw" / "classroom-exports"
+    real_publish = module._publish_classroom_no_replace
+
+    def fail_proof(boundary, source: Path, target: Path, *, source_handle) -> None:
+        if target == proof_path:
+            raise OSError("simulated classroom proof publication failure")
+        real_publish(boundary, source, target, source_handle=source_handle)
+
+    monkeypatch.setattr(module, "_publish_classroom_no_replace", fail_proof)
+    with pytest.raises(OSError, match="simulated classroom proof publication failure"):
+        module.write_classroom_exports_receipt(
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            timeout_seconds=600,
+            runner=_classroom_export_runner(module, candidate, []),
+        )
+
+    assert not proof_path.exists()
+    assert not receipt_path.exists()
+    assert not raw_root.exists() or not list(raw_root.iterdir())
+    assert not list(candidate_root.rglob("*.staging"))
+    failure_directories = list((candidate_root / "failures" / "classroom-exports").glob("*"))
+    assert len(failure_directories) == 1
+    assert (failure_directories[0] / "failure.json").is_file()
+
+
+def test_classroom_exports_discards_secret_bearing_raw_artifact_instead_of_archiving(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_evidence_module()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    _write_capacity_dependency(module, candidate_root, candidate, monkeypatch)
+    token = "classroom-token-must-never-be-archived"
+    monkeypatch.setenv("YFEISTAI_LIVE_FIXTURE_TOKEN", token)
+    base_runner = _classroom_export_runner(module, candidate, [])
+
+    def runner(arguments, *, cwd, env, timeout):
+        completed = base_runner(arguments, cwd=cwd, env=env, timeout=timeout)
+        artifact = Path(env["YFEISTAI_CLASSROOM_EXPORT_STAGING_DIR"]) / "classroom.html"
+        artifact.write_bytes(artifact.read_bytes() + token.encode("utf-8"))
+        return completed
+
+    with pytest.raises(ValueError, match="raw artifact contains a live fixture token"):
+        module.write_classroom_exports_receipt(
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            timeout_seconds=600,
+            runner=runner,
+        )
+
+    failure_directories = list((candidate_root / "failures" / "classroom-exports").glob("*"))
+    assert len(failure_directories) == 1
+    assert {path.name for path in failure_directories[0].iterdir()} == {"failure.json"}
+    assert not any(
+        token.encode("utf-8") in path.read_bytes()
+        for path in candidate_root.rglob("*")
+        if path.is_file()
+    )
+    assert not any(os.path.lexists(path) for path in _classroom_formal_paths(candidate_root))
+    assert not list((candidate_root / "staging").iterdir())
+
+
+@pytest.mark.parametrize(
+    ("kind", "artifact_name", "member_name", "token"),
+    (
+        ("classroom_zip", "classroom.zip", "media/voice.mp3", b"first-release-audio"),
+        ("pptx", "classroom.pptx", "ppt/slides/slide1.xml", b"Verified classroom export"),
+    ),
+    ids=("classroom_zip", "pptx"),
+)
+def test_classroom_exports_discards_secret_bearing_deflated_member_instead_of_archiving(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    artifact_name: str,
+    member_name: str,
+    token: bytes,
+) -> None:
+    module = _load_evidence_module()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    _write_capacity_dependency(module, candidate_root, candidate, monkeypatch)
+    monkeypatch.setenv("YFEISTAI_LIVE_FIXTURE_TOKEN", token.decode("utf-8"))
+    base_runner = _classroom_export_runner(module, candidate, [])
+
+    def runner(arguments, *, cwd, env, timeout):
+        completed = base_runner(arguments, cwd=cwd, env=env, timeout=timeout)
+        staging = Path(env["YFEISTAI_CLASSROOM_EXPORT_STAGING_DIR"])
+        artifact = staging / artifact_name
+        with zipfile.ZipFile(artifact) as archive:
+            info = archive.getinfo(member_name)
+            assert info.compress_type == zipfile.ZIP_DEFLATED
+            assert token in archive.read(info)
+        assert token not in artifact.read_bytes()
+        assert all(
+            token not in (staging / name).read_bytes()
+            for other_kind, name in module.CLASSROOM_EXPORT_PATHS.items()
+            if other_kind != kind
+        )
+        return completed
+
+    with pytest.raises(ValueError, match="raw artifact contains a live fixture token"):
+        module.write_classroom_exports_receipt(
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            timeout_seconds=600,
+            runner=runner,
+        )
+
+    failure_directories = list((candidate_root / "failures" / "classroom-exports").glob("*"))
+    assert len(failure_directories) == 1
+    assert {path.name for path in failure_directories[0].iterdir()} == {"failure.json"}
+    assert not any(os.path.lexists(path) for path in _classroom_formal_paths(candidate_root))
+    assert not list((candidate_root / "staging").iterdir())
+
+
+def _classroom_formal_paths(candidate_root: Path) -> tuple[Path, ...]:
+    return (
+        candidate_root / "runtime" / "classroom-exports-attestation.json",
+        candidate_root / "artifacts" / "classroom_exports.json",
+        *(
+            candidate_root / "raw" / "classroom-exports" / name
+            for name in ("classroom.zip", "classroom.pptx", "classroom.html", "classroom.mp4")
+        ),
+    )
+
+
+def _directory_snapshot(root: Path) -> dict[str, bytes]:
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+
+
+@pytest.mark.parametrize("parent_name", ("runtime", "artifacts", "raw", "staging"))
+def test_classroom_exports_rejects_redirected_bundle_parent_before_any_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    parent_name: str,
+) -> None:
+    module = _load_evidence_module()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    _write_capacity_dependency(module, candidate_root, candidate, monkeypatch)
+    parent = candidate_root / parent_name
+    redirected = tmp_path / f"redirected-{parent_name}"
+    if parent.exists():
+        os.replace(parent, redirected)
+    else:
+        redirected.mkdir()
+    before = _directory_snapshot(redirected)
+    try:
+        parent.symlink_to(redirected, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are unavailable on this test host")
+    before_children = {path.name for path in candidate_root.iterdir()}
+
+    def forbidden_runner(*_args, **_kwargs):
+        pytest.fail("redirected publication parents must stop before probe execution")
+
+    with pytest.raises(ValueError, match="boundary|symlink|junction|reparse|directory"):
+        module.write_classroom_exports_receipt(
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            timeout_seconds=600,
+            runner=forbidden_runner,
+        )
+
+    assert parent.is_symlink()
+    assert _directory_snapshot(redirected) == before
+    assert {path.name for path in candidate_root.iterdir()} == before_children
+    assert not any(os.path.lexists(path) for path in _classroom_formal_paths(candidate_root))
+
+
+def test_classroom_exports_never_publishes_through_a_redirected_target_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_evidence_module()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    _write_capacity_dependency(module, candidate_root, candidate, monkeypatch)
+    raw_root = candidate_root / "raw" / "classroom-exports"
+    retained_raw_root = candidate_root / "raw" / "classroom-exports-retained"
+    redirected = tmp_path / "redirected-publication"
+    redirected.mkdir()
+    real_publish = module._publish_classroom_no_replace
+    redirected_once = False
+
+    def redirect_before_publication(
+        boundary,
+        source: Path,
+        target: Path,
+        *,
+        source_handle,
+    ) -> None:
+        nonlocal redirected_once
+        if not redirected_once and target.parent == raw_root:
+            os.replace(raw_root, retained_raw_root)
+            try:
+                raw_root.symlink_to(redirected, target_is_directory=True)
+            except OSError:
+                os.replace(retained_raw_root, raw_root)
+                pytest.skip("directory symlinks are unavailable on this test host")
+            redirected_once = True
+        real_publish(
+            boundary,
+            source,
+            target,
+            source_handle=source_handle,
+        )
+
+    monkeypatch.setattr(module, "_publish_classroom_no_replace", redirect_before_publication)
+    with pytest.raises(ValueError, match="publication directory changed"):
+        module.write_classroom_exports_receipt(
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            timeout_seconds=600,
+            runner=_classroom_export_runner(module, candidate, []),
+        )
+
+    assert redirected_once is True
+    assert not list(redirected.iterdir())
+    assert not list(retained_raw_root.iterdir())
+    assert not any(os.path.lexists(path) for path in _classroom_formal_paths(candidate_root))
+
+
+@pytest.mark.parametrize("drift", ("raw", "receipt"))
+def test_classroom_exports_retracts_proof_when_evidence_drifts_after_proof_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    drift: str,
+) -> None:
+    module = _load_evidence_module()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    _write_capacity_dependency(module, candidate_root, candidate, monkeypatch)
+    proof_path = candidate_root / "runtime" / "classroom-exports-attestation.json"
+    drift_path = (
+        candidate_root / "raw" / "classroom-exports" / "classroom.html"
+        if drift == "raw"
+        else candidate_root / "artifacts" / "classroom_exports.json"
+    )
+    real_publish = module._publish_classroom_no_replace
+
+    def drift_after_proof(boundary, source: Path, target: Path, *, source_handle) -> None:
+        real_publish(boundary, source, target, source_handle=source_handle)
+        if target == proof_path:
+            replacement = candidate_root / f"tampered-{drift}.replacement"
+            replacement.write_bytes(b"tampered after proof publication")
+            os.replace(replacement, drift_path)
+
+    monkeypatch.setattr(module, "_publish_classroom_no_replace", drift_after_proof)
+    with pytest.raises(ValueError, match="published .* changed"):
+        module.write_classroom_exports_receipt(
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            timeout_seconds=600,
+            runner=_classroom_export_runner(module, candidate, []),
+        )
+
+    assert drift_path.read_bytes() == b"tampered after proof publication"
+    assert not any(
+        os.path.lexists(path)
+        for path in _classroom_formal_paths(candidate_root)
+        if path != drift_path
+    )
+
+
+def test_classroom_exports_preserves_competing_publication_when_no_replace_loses_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_evidence_module()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    _write_capacity_dependency(module, candidate_root, candidate, monkeypatch)
+    competing_path = candidate_root / "raw" / "classroom-exports" / "classroom.zip"
+    competing_body = b"competing writer evidence"
+    real_publish = module._publish_classroom_no_replace
+
+    def lose_race(boundary, source: Path, target: Path, *, source_handle) -> None:
+        if target == competing_path:
+            target.write_bytes(competing_body)
+        real_publish(boundary, source, target, source_handle=source_handle)
+
+    monkeypatch.setattr(module, "_publish_classroom_no_replace", lose_race)
+    with pytest.raises(OSError):
+        module.write_classroom_exports_receipt(
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            timeout_seconds=600,
+            runner=_classroom_export_runner(module, candidate, []),
+        )
+
+    assert competing_path.read_bytes() == competing_body
+    assert not any(
+        os.path.lexists(path)
+        for path in _classroom_formal_paths(candidate_root)
+        if path != competing_path
+    )
+
+
+def test_classroom_exports_retracts_formal_links_after_process_interrupt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_evidence_module()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    _write_capacity_dependency(module, candidate_root, candidate, monkeypatch)
+    proof_path = candidate_root / "runtime" / "classroom-exports-attestation.json"
+    real_publish = module._publish_classroom_no_replace
+
+    def interrupt_after_proof(boundary, source: Path, target: Path, *, source_handle) -> None:
+        real_publish(boundary, source, target, source_handle=source_handle)
+        if target == proof_path:
+            raise KeyboardInterrupt
+
+    def forbidden_archive(**_arguments: object) -> Path:
+        pytest.fail("process interrupts must retract without publishing a failure archive")
+
+    monkeypatch.setattr(module, "_publish_classroom_no_replace", interrupt_after_proof)
+    monkeypatch.setattr(module, "_record_probe_failure", forbidden_archive)
+    with pytest.raises(KeyboardInterrupt):
+        module.write_classroom_exports_receipt(
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            timeout_seconds=600,
+            runner=_classroom_export_runner(module, candidate, []),
+        )
+
+    assert not any(os.path.lexists(path) for path in _classroom_formal_paths(candidate_root))
+
+
+def test_classroom_exports_retracts_formal_links_before_failure_archive_interrupt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_evidence_module()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    _write_capacity_dependency(module, candidate_root, candidate, monkeypatch)
+    proof_path = candidate_root / "runtime" / "classroom-exports-attestation.json"
+    real_publish = module._publish_classroom_no_replace
+
+    def fail_after_proof(boundary, source: Path, target: Path, *, source_handle) -> None:
+        real_publish(boundary, source, target, source_handle=source_handle)
+        if target == proof_path:
+            raise OSError("failure after proof publication")
+
+    def interrupt_archive(**_arguments: object) -> Path:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(module, "_publish_classroom_no_replace", fail_after_proof)
+    monkeypatch.setattr(module, "_record_probe_failure", interrupt_archive)
+    with pytest.raises(KeyboardInterrupt):
+        module.write_classroom_exports_receipt(
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            timeout_seconds=600,
+            runner=_classroom_export_runner(module, candidate, []),
+        )
+
+    assert not any(os.path.lexists(path) for path in _classroom_formal_paths(candidate_root))
+    assert not list((candidate_root / "staging").iterdir())
+
+
+def test_classroom_exports_archive_failure_preserves_primary_error_and_retracts_formal_links(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_evidence_module()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    _write_capacity_dependency(module, candidate_root, candidate, monkeypatch)
+    proof_path = candidate_root / "runtime" / "classroom-exports-attestation.json"
+    real_publish = module._publish_classroom_no_replace
+
+    def fail_proof(boundary, source: Path, target: Path, *, source_handle) -> None:
+        if target == proof_path:
+            raise OSError("primary proof publication failure")
+        real_publish(boundary, source, target, source_handle=source_handle)
+
+    def fail_archive(**_arguments: object) -> Path:
+        raise RuntimeError("failure archive unavailable")
+
+    monkeypatch.setattr(module, "_publish_classroom_no_replace", fail_proof)
+    monkeypatch.setattr(module, "_record_probe_failure", fail_archive)
+    with pytest.raises(OSError, match="primary proof publication failure") as failure:
+        module.write_classroom_exports_receipt(
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            timeout_seconds=600,
+            runner=_classroom_export_runner(module, candidate, []),
+        )
+
+    assert isinstance(failure.value.__cause__, RuntimeError)
+    assert "failure archive unavailable" in str(failure.value.__cause__)
+    assert not any(os.path.lexists(path) for path in _classroom_formal_paths(candidate_root))
+
+
+def test_release_evidence_cli_runs_fixed_classroom_exports_producer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = _load_evidence_module()
+    candidate_root = tmp_path / "candidate"
+    bundle_root = tmp_path / "bundle"
+    captured: dict[str, object] = {}
+
+    def write_receipt(**arguments: object) -> dict[str, object]:
+        captured.update(arguments)
+        return {}
+
+    monkeypatch.setattr(module, "write_classroom_exports_receipt", write_receipt, raising=False)
+    assert (
+        module.main(
+            [
+                "classroom-exports",
+                "--candidate-root",
+                str(candidate_root),
+                "--bundle-root",
+                str(bundle_root),
+                "--run-id",
+                RELEASE_RUN["runId"],
+                "--environment-id",
+                RELEASE_RUN["environmentId"],
+                "--timeout-seconds",
+                "600",
+            ]
+        )
+        == 0
+    )
+    assert captured == {
+        "candidate_root": candidate_root,
+        "bundle_root": bundle_root,
+        "release_run": RELEASE_RUN,
+        "timeout_seconds": 600,
+    }
+    assert capsys.readouterr().out == (
+        f"{bundle_root / 'runtime' / 'classroom-exports-attestation.json'}\n"
+    )
 
 
 def test_capacity_profile_stops_before_runner_without_live_fixture_token(

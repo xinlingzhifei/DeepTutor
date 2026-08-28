@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import secrets
 
 from sqlalchemy import (
     BigInteger,
@@ -730,15 +731,94 @@ class ClassroomExportPolicy(TenantBase):
     __tablename__ = "classroom_export_policies"
 
     tenant_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    exists: Mapped[bool] = mapped_column(
+        Boolean,
+        default=True,
+        server_default="true",
+    )
     allow_mp4: Mapped[bool] = mapped_column(
         Boolean,
         default=False,
         server_default="false",
     )
+    revision: Mapped[str] = mapped_column(
+        String(64),
+        default=lambda: secrets.token_hex(32),
+    )
+    operation_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
     updated_by: Mapped[str] = mapped_column(String(128))
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            '"exists" OR NOT allow_mp4',
+            name="tombstone",
+        ),
+        CheckConstraint(
+            "revision ~ '^[0-9a-f]{64}$'",
+            name="revision",
+        ),
+        CheckConstraint(
+            "operation_id IS NULL OR operation_id ~ '^[0-9a-f]{32}$'",
+            name="operation_id",
+        ),
+    )
+
+
+class ClassroomExportPolicyOperation(TenantBase):
+    """Permanent idempotency record for one export-policy mutation."""
+
+    __tablename__ = "classroom_export_policy_operations"
+
+    operation_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey(
+            "tenant.classroom_export_policies.tenant_id",
+            name="fk_classroom_export_policy_operations_policy",
+            ondelete="RESTRICT",
+        ),
+    )
+    mutation: Mapped[str] = mapped_column(String(16))
+    expected_revision: Mapped[str] = mapped_column(String(64))
+    allow_mp4: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    updated_by: Mapped[str] = mapped_column(String(128))
+    result_exists: Mapped[bool] = mapped_column(Boolean)
+    result_allow_mp4: Mapped[bool] = mapped_column(Boolean)
+    result_revision: Mapped[str] = mapped_column(String(64))
+    result_operation_id: Mapped[str] = mapped_column(String(32))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "operation_id ~ '^[0-9a-f]{32}$'",
+            name="operation_id",
+        ),
+        CheckConstraint(
+            "expected_revision = 'absent' OR expected_revision ~ '^[0-9a-f]{64}$'",
+            name="expected_revision",
+        ),
+        CheckConstraint(
+            "result_revision ~ '^[0-9a-f]{64}$'",
+            name="result_revision",
+        ),
+        CheckConstraint(
+            "result_operation_id = operation_id",
+            name="result_operation",
+        ),
+        CheckConstraint(
+            "(mutation = 'replace' AND allow_mp4 IS NOT NULL "
+            "AND result_exists AND result_allow_mp4 = allow_mp4) OR "
+            "(mutation = 'delete' AND allow_mp4 IS NULL "
+            "AND NOT result_exists AND NOT result_allow_mp4)",
+            name="shape",
+        ),
     )
 
 
@@ -1355,6 +1435,7 @@ __all__ = [
     "ClassroomDraftMedia",
     "ClassroomExport",
     "ClassroomExportPolicy",
+    "ClassroomExportPolicyOperation",
     "ClassroomPublicationMaterialization",
     "ClassroomReviewPolicy",
     "ClassroomReviewRequest",

@@ -291,7 +291,9 @@ def test_classroom_export_policy_defaults_mp4_to_denied() -> None:
     assert policy.c.allow_mp4.nullable is False
     assert policy.c.allow_mp4.server_default is not None
     assert str(policy.c.allow_mp4.server_default.arg) == "false"
-    assert {"updated_by", "updated_at"}.issubset(policy.c.keys())
+    assert {"revision", "operation_id", "updated_by", "updated_at"}.issubset(policy.c.keys())
+    assert policy.c.revision.nullable is False
+    assert policy.c.operation_id.nullable is True
 
 
 def test_classroom_export_migration_follows_review_publication() -> None:

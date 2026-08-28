@@ -237,9 +237,116 @@ def test_admin_user_deletion_removes_avatar_file(profile_client):
     )
     assert get_avatar_file(users["bob"]["id"]) is not None
 
-    response = client.delete("/api/v1/auth/users/bob", headers=_auth("admin-token"))
+    response = client.request(
+        "DELETE",
+        "/api/v1/auth/users/bob",
+        headers=_auth("admin-token"),
+        json={"expected_user_id": users["bob"]["id"]},
+    )
     assert response.status_code == 200
     assert get_avatar_file(users["bob"]["id"]) is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        None,
+        {},
+        {"expected_user_id": None},
+        {"expected_user_id": ""},
+        {"expected_user_id": "not a valid user id"},
+    ),
+)
+def test_admin_user_deletion_requires_a_valid_expected_identity_before_delete(
+    profile_client,
+    monkeypatch: pytest.MonkeyPatch,
+    payload: dict[str, object] | None,
+):
+    import deeptutor.api.routers.auth as auth_router
+    from deeptutor.multi_user.identity import load_users
+
+    client, users = profile_client
+    calls: list[tuple[str, str | None]] = []
+
+    def record_delete(username: str, *, expected_user_id: str | None = None) -> None:
+        calls.append((username, expected_user_id))
+
+    monkeypatch.setattr(auth_router, "delete_user", record_delete)
+    request: dict[str, object] = {
+        "headers": _auth("admin-token"),
+    }
+    if payload is not None:
+        request["json"] = payload
+
+    response = client.request("DELETE", "/api/v1/auth/users/bob", **request)
+
+    assert response.status_code == 422
+    assert calls == []
+    assert load_users()["bob"]["id"] == users["bob"]["id"]
+
+
+def test_admin_user_deletion_compares_the_expected_identity(profile_client):
+    from deeptutor.multi_user.identity import load_users
+
+    client, users = profile_client
+    replaced_id = "u_" + "f" * 32
+
+    conflict = client.request(
+        "DELETE",
+        "/api/v1/auth/users/bob",
+        headers=_auth("admin-token"),
+        json={"expected_user_id": replaced_id},
+    )
+
+    assert conflict.status_code == 409
+    assert conflict.json() == {"detail": "User identity changed concurrently"}
+    assert load_users()["bob"]["id"] == users["bob"]["id"]
+
+    removed = client.request(
+        "DELETE",
+        "/api/v1/auth/users/bob",
+        headers=_auth("admin-token"),
+        json={"expected_user_id": users["bob"]["id"]},
+    )
+    assert removed.status_code == 200
+    assert "bob" not in load_users()
+
+
+def test_admin_user_deletion_cleans_avatar_for_the_locked_identity(
+    profile_client,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import deeptutor.api.routers.auth as auth_router
+    from deeptutor.multi_user import identity
+
+    client, users = profile_client
+    observed_id = users["bob"]["id"]
+    replacement_id = "u_" + "e" * 32
+    observed_info = auth_router.get_user_info("bob")
+    records = identity.load_users()
+    records["bob"]["id"] = replacement_id
+    identity._write_users(records)
+    identity.save_avatar_file(observed_id, WEBP_BYTES, "webp")
+    identity.save_avatar_file(replacement_id, PNG_BYTES, "png")
+    real_get_user_info = auth_router.get_user_info
+
+    def stale_username_observation(username: str):
+        if username == "bob":
+            return observed_info
+        return real_get_user_info(username)
+
+    monkeypatch.setattr(auth_router, "get_user_info", stale_username_observation)
+
+    response = client.request(
+        "DELETE",
+        "/api/v1/auth/users/bob",
+        headers=_auth("admin-token"),
+        json={"expected_user_id": replacement_id},
+    )
+
+    assert response.status_code == 200
+    assert identity.get_avatar_file(replacement_id) is None
+    assert identity.get_avatar_file(observed_id) is not None
 
 
 def test_avatar_serving_rejects_missing_and_malformed_ids(profile_client):

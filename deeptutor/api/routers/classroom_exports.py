@@ -8,10 +8,14 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.exc import SQLAlchemyError
 
-from deeptutor.api.routers.auth import require_platform_enabled
+from deeptutor.api.routers.auth import (
+    TokenPayload,
+    require_platform_admin,
+    require_platform_enabled,
+)
 from deeptutor.api.routers.classroom_content import (
     classroom_content_response,
     get_classroom_content_service,
@@ -35,6 +39,8 @@ from deeptutor.teaching.openmaic.data_planes import (
 from deeptutor.teaching.quota import InsufficientQuota
 from deeptutor.teaching.repositories.data_planes import SqlAlchemyDataPlaneRepository
 from deeptutor.teaching.repositories.exports import (
+    ClassroomExportPolicyState,
+    ExportPolicyConflict,
     SqlAlchemyClassroomExportRepository,
 )
 from deeptutor.teaching.repositories.jobs import SqlAlchemyGenerationJobRepository
@@ -93,6 +99,29 @@ class ExportStatusResponse(BaseModel):
     download_ready: bool
 
 
+class ExportPolicyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    allow_mp4: bool
+    expected_revision: str = Field(pattern=r"^(?:absent|[0-9a-f]{64})$")
+    operation_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+
+
+class ExportPolicyDeleteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_revision: str = Field(pattern=r"^(?:absent|[0-9a-f]{64})$")
+    operation_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+
+
+class ExportPolicyResponse(BaseModel):
+    tenant_id: str
+    exists: bool
+    allow_mp4: bool
+    revision: str = Field(pattern=r"^(?:absent|[0-9a-f]{64})$")
+    operation_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+
+
 class ClassroomExportServiceLike(Protocol):
     async def create_for_draft(
         self,
@@ -122,6 +151,27 @@ class ClassroomExportServiceLike(Protocol):
 
 class ExportStoreProvider(Protocol):
     async def store_for_tenant(self, tenant_id: str) -> ClassroomArtifactStore: ...
+
+
+class ClassroomExportPolicyRepositoryLike(Protocol):
+    async def policy_state(self) -> ClassroomExportPolicyState: ...
+
+    async def replace_mp4_policy(
+        self,
+        *,
+        allow_mp4: bool,
+        expected_revision: str,
+        operation_id: str,
+        updated_by: str,
+    ) -> ClassroomExportPolicyState: ...
+
+    async def delete_mp4_policy(
+        self,
+        *,
+        expected_revision: str,
+        operation_id: str,
+        updated_by: str,
+    ) -> ClassroomExportPolicyState: ...
 
 
 def get_export_store_provider() -> ExportStoreProvider:
@@ -154,6 +204,99 @@ def get_classroom_export_service(
         gateway,
         mp4_enabled=lambda _tenant_id: repository.mp4_enabled(),
     )
+
+
+def get_classroom_export_policy_repository(
+    context: TenantContext = Depends(require_tenant),
+    stores: ExportStoreProvider = Depends(get_export_store_provider),
+) -> SqlAlchemyClassroomExportRepository:
+    return SqlAlchemyClassroomExportRepository(
+        get_platform_engine(),
+        context.tenant_id,
+        stores,
+    )
+
+
+def _export_policy_response(
+    state: ClassroomExportPolicyState,
+    *,
+    tenant_id: str,
+) -> ExportPolicyResponse:
+    if state.tenant_id != tenant_id:
+        raise HTTPException(status_code=503, detail="Export policy is unavailable")
+    return ExportPolicyResponse(
+        tenant_id=state.tenant_id,
+        exists=state.exists,
+        allow_mp4=state.allow_mp4,
+        revision=state.revision,
+        operation_id=state.operation_id,
+    )
+
+
+@router.get("/classroom-export-policy", response_model=ExportPolicyResponse)
+async def get_classroom_export_policy(
+    _payload: TokenPayload = Depends(require_platform_admin),
+    context: TenantContext = Depends(require_tenant),
+    repository: ClassroomExportPolicyRepositoryLike = Depends(
+        get_classroom_export_policy_repository
+    ),
+) -> ExportPolicyResponse:
+    try:
+        policy = await repository.policy_state()
+    except SQLAlchemyError:
+        raise HTTPException(status_code=503, detail="Export policy is unavailable") from None
+    return _export_policy_response(policy, tenant_id=context.tenant_id)
+
+
+@router.put("/classroom-export-policy", response_model=ExportPolicyResponse)
+async def replace_classroom_export_policy(
+    request: ExportPolicyRequest,
+    payload: TokenPayload = Depends(require_platform_admin),
+    context: TenantContext = Depends(require_tenant),
+    repository: ClassroomExportPolicyRepositoryLike = Depends(
+        get_classroom_export_policy_repository
+    ),
+) -> ExportPolicyResponse:
+    try:
+        policy = await repository.replace_mp4_policy(
+            allow_mp4=request.allow_mp4,
+            expected_revision=request.expected_revision,
+            operation_id=request.operation_id,
+            updated_by=payload.user_id,
+        )
+    except ExportPolicyConflict:
+        raise HTTPException(
+            status_code=409,
+            detail="Export policy changed concurrently",
+        ) from None
+    except SQLAlchemyError:
+        raise HTTPException(status_code=503, detail="Export policy is unavailable") from None
+    return _export_policy_response(policy, tenant_id=context.tenant_id)
+
+
+@router.delete("/classroom-export-policy", response_model=ExportPolicyResponse)
+async def delete_classroom_export_policy(
+    request: ExportPolicyDeleteRequest,
+    payload: TokenPayload = Depends(require_platform_admin),
+    context: TenantContext = Depends(require_tenant),
+    repository: ClassroomExportPolicyRepositoryLike = Depends(
+        get_classroom_export_policy_repository
+    ),
+) -> ExportPolicyResponse:
+    try:
+        policy = await repository.delete_mp4_policy(
+            expected_revision=request.expected_revision,
+            operation_id=request.operation_id,
+            updated_by=payload.user_id,
+        )
+    except ExportPolicyConflict:
+        raise HTTPException(
+            status_code=409,
+            detail="Export policy changed concurrently",
+        ) from None
+    except SQLAlchemyError:
+        raise HTTPException(status_code=503, detail="Export policy is unavailable") from None
+    return _export_policy_response(policy, tenant_id=context.tenant_id)
 
 
 def _parse_if_match(value: str | None) -> int:

@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from deeptutor.multi_user import identity, paths
 from deeptutor.multi_user.context import reset_current_user, set_current_user
 from deeptutor.multi_user.models import CurrentUser, UserScope
@@ -21,6 +23,17 @@ def test_identity_migrates_legacy_users_with_stable_uid(tmp_path, monkeypatch):
     assert users["alice"]["role"] == "admin"
     assert users["bob"]["role"] == "user"
     assert users_file.exists()
+
+
+def test_delete_user_compares_and_returns_the_locked_identity(mu_isolated_root):
+    record = identity.save_user("alice", "$2b$12$placeholder", role="admin")
+
+    with pytest.raises(identity.UserIdentityConflict):
+        identity.delete_user("alice", expected_user_id="u_" + "f" * 32)
+
+    assert identity.load_users()["alice"]["id"] == record["id"]
+    assert identity.delete_user("alice", expected_user_id=record["id"]) == record["id"]
+    assert "alice" not in identity.load_users()
 
 
 def test_path_service_uses_current_user_scope(tmp_path, monkeypatch):

@@ -30,6 +30,10 @@ LEGACY_USERS_FILE = PROJECT_ROOT / "data" / "user" / "auth_users.json"
 LEGACY_SECRET_FILE = PROJECT_ROOT / "data" / "user" / "auth_secret"
 
 
+class UserIdentityConflict(RuntimeError):
+    """The username no longer resolves to the identity the caller observed."""
+
+
 def new_user_id() -> str:
     return f"u_{uuid4().hex}"
 
@@ -264,15 +268,22 @@ def get_user_by_id(user_id: str) -> tuple[str, dict[str, Any]] | None:
     return None
 
 
-def delete_user(username: str) -> bool:
+def delete_user(username: str, *, expected_user_id: str) -> str | None:
+    if not expected_user_id:
+        raise ValueError("expected_user_id is required")
     if not USERS_FILE.exists():
-        return False
-    users = load_users()
-    if username not in users:
-        return False
-    users.pop(username, None)
-    _write_users(users)
-    return True
+        return None
+    with _USERS_WRITE_LOCK:
+        users = load_users()
+        record = users.get(username)
+        if record is None:
+            return None
+        user_id = str(record.get("id") or "")
+        if user_id != expected_user_id:
+            raise UserIdentityConflict
+        users.pop(username, None)
+        _write_users(users)
+        return user_id
 
 
 def set_avatar(username: str, avatar: str) -> bool:

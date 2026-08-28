@@ -134,6 +134,19 @@ class SetRoleRequest(BaseModel):
         return v
 
 
+class DeleteUserRequest(BaseModel):
+    """Required compare-and-delete guard for administrative cleanup."""
+
+    expected_user_id: str = Field(min_length=1, max_length=64)
+
+    @field_validator("expected_user_id")
+    @classmethod
+    def expected_user_id_valid(cls, value: str) -> str:
+        if not _USER_ID_RE.fullmatch(value):
+            raise ValueError("Invalid expected user id")
+        return value
+
+
 class AuthTenantSummary(BaseModel):
     """Safe tenant chooser fields returned with auth status."""
 
@@ -994,6 +1007,7 @@ async def admin_create_user(
 @router.delete("/users/{username}", status_code=status.HTTP_200_OK)
 async def remove_user(
     username: str,
+    body: DeleteUserRequest,
     current: TokenPayload = Depends(require_admin),
 ) -> dict:
     """Delete a user. Admins cannot delete their own account."""
@@ -1003,18 +1017,25 @@ async def remove_user(
             detail="You cannot delete your own account",
         )
 
-    # Capture the id before the record disappears so the avatar file can go too.
-    info = get_user_info(username)
+    from deeptutor.multi_user.identity import UserIdentityConflict
 
-    removed = delete_user(username)
-    if not removed:
+    try:
+        deleted_user_id = delete_user(
+            username,
+            expected_user_id=body.expected_user_id,
+        )
+    except UserIdentityConflict:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="User identity changed concurrently",
+        ) from None
+    if deleted_user_id is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
-    user_id = str(info.get("id") or "") if info else ""
-    if user_id and _USER_ID_RE.match(user_id):
+    if _USER_ID_RE.fullmatch(deleted_user_id):
         from deeptutor.multi_user.identity import delete_avatar_file
 
-        delete_avatar_file(user_id)
+        delete_avatar_file(deleted_user_id)
 
     logger.info(f"Admin '{current.username if current else 'local'}' deleted user '{username}'")
     return {"ok": True}
