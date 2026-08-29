@@ -395,6 +395,48 @@ def _artifact_document(
     return document
 
 
+def _openmaic_shared_report(
+    candidate: dict[str, object],
+    *,
+    runtime_attestation_sha256: str,
+) -> dict[str, object]:
+    return {
+        "schemaVersion": 1,
+        "producer": "openmaic-smoke",
+        "plane": "shared",
+        "candidate": candidate,
+        "releaseRun": _RELEASE_RUN,
+        "observedAt": "2026-08-24T00:00:00Z",
+        "baseUrl": "https://candidate.example.test",
+        "runtimeAttestation": {
+            "artifact": "runtime/runtime-attestation.json",
+            "sha256": runtime_attestation_sha256,
+        },
+        "fixture": {
+            "tenantId": "tenant-openmaic-shared-01",
+            "teacherUserId": "teacher-openmaic-shared-01",
+            "courseId": "course-openmaic-shared-01",
+            "classId": "class-openmaic-shared-01",
+        },
+        "binding": {
+            "routeId": "shared-primary",
+            "providerProfileId": "platform-default",
+            "workerPoolRef": "shared-generation",
+            "queueRef": "openmaic.shared",
+        },
+        "generation": {
+            "jobId": "job-openmaic-shared-01",
+            "jobStatus": "succeeded",
+            "assetId": "asset-openmaic-shared-01",
+            "classroomStatus": "succeeded",
+            "classroomVersionId": "version-openmaic-shared-01",
+            "documentSha256": "b" * 64,
+            "documentSizeBytes": 4096,
+            "documentEtag": '"sha256-' + "b" * 64 + '"',
+        },
+    }
+
+
 def _write_probe_proof(
     tmp_path: Path,
     module,
@@ -550,6 +592,55 @@ def _write_probe_proof(
             "tenantIsolationAttestation": {
                 "artifact": "runtime/tenant-isolation-attestation.json",
                 "sha256": hashlib.sha256(attestation_path.read_bytes()).hexdigest(),
+            }
+        }
+    if evidence == "openmaic_shared_plane":
+        runtime_path = tmp_path / "runtime" / "runtime-attestation.json"
+        runtime_sha256 = hashlib.sha256(runtime_path.read_bytes()).hexdigest()
+        report = _openmaic_shared_report(
+            candidate,
+            runtime_attestation_sha256=runtime_sha256,
+        )
+        stdout = (
+            json.dumps(
+                report,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("utf-8")
+        proof = {
+            "schemaVersion": 1,
+            "candidate": candidate,
+            "releaseRun": _RELEASE_RUN,
+            "observedAt": report["observedAt"],
+            "baseUrl": report["baseUrl"],
+            "runtimeAttestation": report["runtimeAttestation"],
+            "execution": {
+                "command": {
+                    "runner": "python",
+                    "script": "scripts/openmaic_smoke_probe.py",
+                    "arguments": ["--plane", "shared", "--profile", "first-release"],
+                },
+                "nativeExit": 0,
+                "stdout": stdout.decode("utf-8"),
+                "stdoutSha256": hashlib.sha256(stdout).hexdigest(),
+                "stderr": "",
+            },
+            "summary": {
+                "fixture": report["fixture"],
+                "binding": report["binding"],
+                "generation": report["generation"],
+                "checks": {"sharedGenerationPassed": True},
+            },
+        }
+        proof_path = tmp_path / "runtime" / "openmaic-shared-plane-attestation.json"
+        proof_path.write_text(json.dumps(proof, sort_keys=True), encoding="utf-8")
+        return {
+            "openmaicSharedPlaneAttestation": {
+                "artifact": "runtime/openmaic-shared-plane-attestation.json",
+                "sha256": hashlib.sha256(proof_path.read_bytes()).hexdigest(),
             }
         }
     if evidence == "classroom_exports":
@@ -1599,6 +1690,113 @@ def test_file_runtime_rejects_self_attested_tenant_isolation_without_bound_prove
         "tenant isolation execution proof is missing or invalid"
         in result.layers["tenant_isolation"].detail
     )
+
+
+def test_file_runtime_rejects_self_attested_openmaic_shared_plane_without_bound_provenance(
+    tmp_path: Path,
+) -> None:
+    module = _load_verifier()
+    manifest, evidence_map, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    evidence_entry = evidence_map["openmaic_shared_plane"]
+    assert isinstance(evidence_entry, dict)
+    artifact_path = tmp_path / str(evidence_entry["artifact"])
+    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    artifact.pop("provenance")
+    artifact_body = json.dumps(artifact, sort_keys=True).encode()
+    artifact_path.write_bytes(artifact_body)
+    evidence_entry["artifactSha256"] = hashlib.sha256(artifact_body).hexdigest()
+    manifest.write_text(
+        json.dumps(_manifest_document(module, candidate, evidence_map)),
+        encoding="utf-8",
+    )
+
+    result = module.verify(
+        module.FileReleaseRuntime(
+            manifest,
+            expected_source_head="a" * 40,
+            candidate_root=tmp_path,
+        )
+    )
+
+    assert result.layers["openmaic_shared_plane"].status == "fail"
+    assert (
+        "OpenMAIC shared plane execution proof is missing or invalid"
+        in result.layers["openmaic_shared_plane"].detail
+    )
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ("candidate", "release_run", "runtime", "command", "stdout_digest", "summary"),
+)
+def test_openmaic_shared_plane_replay_rejects_bound_proof_tampering(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    module = _load_verifier()
+    _manifest, _evidence, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    proof_path = tmp_path / "runtime" / "openmaic-shared-plane-attestation.json"
+    proof = json.loads(proof_path.read_text(encoding="utf-8"))
+    if tamper == "candidate":
+        proof["candidate"]["sourceHead"] = "b" * 40
+    elif tamper == "release_run":
+        proof["releaseRun"]["runId"] = "run-other"
+    elif tamper == "runtime":
+        proof["runtimeAttestation"]["sha256"] = "0" * 64
+    elif tamper == "command":
+        proof["execution"]["command"]["script"] = "scripts/other.py"
+    elif tamper == "stdout_digest":
+        proof["execution"]["stdoutSha256"] = "0" * 64
+    else:
+        proof["summary"]["generation"]["jobId"] = "job-other"
+
+    with pytest.raises(ValueError):
+        module.derive_openmaic_shared_plane_receipt_checks(
+            json.dumps(proof, sort_keys=True).encode(),
+            bundle_root=tmp_path,
+            candidate_root=tmp_path,
+            candidate=candidate,
+            release_run=_RELEASE_RUN,
+        )
+
+
+def test_openmaic_shared_plane_replay_rejects_current_live_token_in_stdout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_verifier()
+    _manifest, _evidence, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    token = "live-fixture-token-public-shaped"
+    monkeypatch.setenv("YFEISTAI_LIVE_FIXTURE_TOKEN", token)
+    proof_path = tmp_path / "runtime" / "openmaic-shared-plane-attestation.json"
+    proof = json.loads(proof_path.read_text(encoding="utf-8"))
+    report = json.loads(proof["execution"]["stdout"])
+    report["fixture"]["teacherUserId"] = token
+    stdout = json.dumps(report, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n"
+    proof["execution"]["stdout"] = stdout
+    proof["execution"]["stdoutSha256"] = hashlib.sha256(stdout.encode()).hexdigest()
+    proof["summary"]["fixture"]["teacherUserId"] = token
+
+    with pytest.raises(ValueError, match="strict report is invalid"):
+        module.derive_openmaic_shared_plane_receipt_checks(
+            json.dumps(proof, sort_keys=True).encode(),
+            bundle_root=tmp_path,
+            candidate_root=tmp_path,
+            candidate=candidate,
+            release_run=_RELEASE_RUN,
+        )
 
 
 @pytest.mark.parametrize("case", ("missing", "tampered", "symlink", "dangling", "extra"))

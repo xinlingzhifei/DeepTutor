@@ -6,12 +6,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import hmac
-from typing import Any, Literal, Protocol
+from typing import Annotated, Any, Literal, Protocol
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Path, status
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from deeptutor.api.routers.auth import require_platform_enabled
+from deeptutor.api.routers.auth import require_platform_admin, require_platform_enabled
 from deeptutor.services.config import load_platform_settings
 from deeptutor.teaching.contracts import (
     ClassroomMode,
@@ -183,6 +183,21 @@ class JobStatusResponse(BaseModel):
     retry_of_job_id: str | None
     export_format: str | None
     download_ready: bool
+
+
+class GenerationBindingSnapshotResponse(_ApiModel):
+    schema_version: Literal[1] = 1
+    tenant_id: str
+    job_id: str
+    job_kind: str
+    phase: str
+    status: str
+    progress_percent: int
+    classroom_version_id: str | None
+    data_plane_route_id: str
+    provider_profile_id: str
+    worker_pool_ref: str
+    queue_ref: str
 
 
 class JobCancellationGateway(Protocol):
@@ -417,6 +432,49 @@ def _response(details: GenerationJobDetails) -> JobStatusResponse:
         retry_of_job_id=details.retry_of_job_id,
         export_format=details.export_format,
         download_ready=details.job_kind == "export" and details.status == "succeeded",
+    )
+
+
+@router.get(
+    "/system/classroom-jobs/{tenant_id}/{job_id}/binding",
+    response_model=GenerationBindingSnapshotResponse,
+    dependencies=[Depends(require_platform_admin)],
+)
+async def generation_binding_snapshot(
+    tenant_id: Annotated[
+        str,
+        Path(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"),
+    ],
+    job_id: Annotated[
+        str,
+        Path(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"),
+    ],
+    repository: SqlAlchemyGenerationJobRepository = Depends(get_job_repository),
+) -> GenerationBindingSnapshotResponse:
+    """Return the secret-free immutable route binding for one generation job."""
+
+    details = await repository.get_job_details(tenant_id, job_id)
+    if details is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    classroom_version_id = (
+        details.result_ref
+        if details.job_kind == "generation"
+        and details.phase == "content"
+        and details.status == "succeeded"
+        else None
+    )
+    return GenerationBindingSnapshotResponse(
+        tenant_id=details.tenant_id,
+        job_id=details.job_id,
+        job_kind=details.job_kind,
+        phase=details.phase,
+        status=details.status,
+        progress_percent=details.progress_percent,
+        classroom_version_id=classroom_version_id,
+        data_plane_route_id=details.data_plane_route_id,
+        provider_profile_id=details.provider_profile_id,
+        worker_pool_ref=details.worker_pool_ref,
+        queue_ref=details.queue_ref,
     )
 
 

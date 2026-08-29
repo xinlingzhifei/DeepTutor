@@ -61,6 +61,12 @@ from classroom_runtime_attestation import (  # noqa: E402
     _open_windows_regular_file_relative,
     _read_windows_file_handle,
 )
+from openmaic_smoke_contract import (  # noqa: E402
+    MAX_OPENMAIC_SMOKE_REPORT_BYTES,
+    derive_openmaic_shared_plane_checks,
+    openmaic_shared_plane_command_record,
+    parse_openmaic_smoke_report,
+)
 from platform_preflight_contract import (
     PHASE_SERVICES as PREFLIGHT_PHASE_SERVICES,
 )
@@ -436,6 +442,9 @@ def _proof_bytes(
         "runtime/capacity-profile-attestation.json": "capacity-profile-attestation.json",
         "runtime/classroom-exports-attestation.json": "classroom-exports-attestation.json",
         "runtime/tenant-isolation-attestation.json": "tenant-isolation-attestation.json",
+        "runtime/openmaic-shared-plane-attestation.json": (
+            "openmaic-shared-plane-attestation.json"
+        ),
     }
     fixed_name = fixed_runtime_artifacts.get(artifact)
     if fixed_name is not None:
@@ -593,6 +602,7 @@ def _runtime_artifact_body(
         "capacity-profile-attestation.json",
         "classroom-exports-attestation.json",
         "tenant-isolation-attestation.json",
+        "openmaic-shared-plane-attestation.json",
     }:
         raise ValueError("runtime artifact name is invalid")
     root = Path(os.path.abspath(bundle_root))
@@ -1493,6 +1503,121 @@ def derive_tenant_isolation_receipt_checks(
     return checks, str(document["observedAt"])
 
 
+def derive_openmaic_shared_plane_receipt_checks(
+    body: bytes,
+    *,
+    bundle_root: Path,
+    candidate_root: Path,
+    candidate: Mapping[str, object],
+    release_run: Mapping[str, str],
+) -> tuple[dict[str, bool], str]:
+    """Replay one fixed shared-plane smoke proof into receipt checks."""
+
+    try:
+        document = json.loads(body)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("OpenMAIC shared plane execution proof is invalid") from exc
+    if (
+        not isinstance(document, dict)
+        or set(document)
+        != {
+            "schemaVersion",
+            "candidate",
+            "releaseRun",
+            "observedAt",
+            "baseUrl",
+            "runtimeAttestation",
+            "execution",
+            "summary",
+        }
+        or type(document.get("schemaVersion")) is not int
+        or document.get("schemaVersion") != 1
+        or not exact_json_equal(document.get("candidate"), dict(candidate))
+        or not exact_json_equal(document.get("releaseRun"), dict(release_run))
+        or not _valid_observed_at_value(document.get("observedAt"))
+    ):
+        raise ValueError("OpenMAIC shared plane execution proof is invalid")
+    base_url = _runtime_base_url(document.get("baseUrl"))
+    if base_url is None:
+        raise ValueError("OpenMAIC shared plane execution proof is invalid")
+
+    runtime_proof = document.get("runtimeAttestation")
+    if (
+        not isinstance(runtime_proof, dict)
+        or set(runtime_proof) != {"artifact", "sha256"}
+        or runtime_proof.get("artifact") != "runtime/runtime-attestation.json"
+        or not isinstance(runtime_proof.get("sha256"), str)
+    ):
+        raise ValueError("OpenMAIC shared plane runtime attestation proof is invalid")
+    try:
+        validate_runtime_attestation(
+            Path("runtime/runtime-attestation.json"),
+            bundle_root=bundle_root,
+            candidate_root=candidate_root,
+            candidate=candidate,
+            release_run=release_run,
+            expected_base_url=base_url,
+            expected_sha256=runtime_proof["sha256"],
+        )
+    except ValueError as exc:
+        raise ValueError(f"OpenMAIC shared plane runtime attestation is invalid: {exc}") from exc
+
+    execution = document.get("execution")
+    if (
+        not isinstance(execution, dict)
+        or set(execution) != {"command", "nativeExit", "stdout", "stdoutSha256", "stderr"}
+        or execution.get("command") != openmaic_shared_plane_command_record()
+        or type(execution.get("nativeExit")) is not int
+        or execution.get("nativeExit") != 0
+        or execution.get("stderr") != ""
+        or not isinstance(execution.get("stdout"), str)
+        or not isinstance(execution.get("stdoutSha256"), str)
+    ):
+        raise ValueError("OpenMAIC shared plane execution proof is invalid")
+    try:
+        stdout = execution["stdout"].encode("utf-8", errors="strict")
+    except UnicodeEncodeError as exc:
+        raise ValueError("OpenMAIC shared plane execution proof is invalid") from exc
+    if (
+        len(stdout) > MAX_OPENMAIC_SMOKE_REPORT_BYTES
+        or hashlib.sha256(stdout).hexdigest() != execution["stdoutSha256"]
+    ):
+        raise ValueError("OpenMAIC shared plane execution proof is invalid")
+    live_token = os.environ.get("YFEISTAI_LIVE_FIXTURE_TOKEN")
+    forbidden_secrets = tuple(
+        value.encode("utf-8", errors="strict")
+        for value in ({live_token, live_token.strip()} if isinstance(live_token, str) else set())
+        if value
+    )
+    try:
+        report = parse_openmaic_smoke_report(
+            stdout,
+            candidate=candidate,
+            release_run=release_run,
+            expected_base_url=base_url,
+            expected_runtime_attestation_sha256=runtime_proof["sha256"],
+            forbidden_secret_values=forbidden_secrets,
+        )
+    except ValueError as exc:
+        raise ValueError(f"OpenMAIC shared plane strict report is invalid: {exc}") from exc
+    if report.get("observedAt") != document.get("observedAt"):
+        raise ValueError("OpenMAIC shared plane proof timestamp does not match the report")
+    checks = derive_openmaic_shared_plane_checks(report)
+    if set(checks) != set(RECEIPT_CONTRACTS["openmaic_shared_plane"][1]) or any(
+        value is not True for value in checks.values()
+    ):
+        raise ValueError("OpenMAIC shared plane proof checks did not all pass")
+    summary = {
+        "fixture": report.get("fixture"),
+        "binding": report.get("binding"),
+        "generation": report.get("generation"),
+        "checks": checks,
+    }
+    if not exact_json_equal(document.get("summary"), summary):
+        raise ValueError("OpenMAIC shared plane proof summary does not match the report")
+    return checks, str(document["observedAt"])
+
+
 def _classroom_fixture_secret_bytes() -> set[bytes]:
     token = os.environ.get("YFEISTAI_LIVE_FIXTURE_TOKEN")
     if not isinstance(token, str) or not token.strip():
@@ -2251,6 +2376,46 @@ def probe_provenance_error(
             or result.get("checks") != checks
         ):
             return "tenant isolation receipt does not match execution proof"
+        return None
+    if evidence == "openmaic_shared_plane":
+        provenance = document.get("provenance")
+        if not isinstance(provenance, dict) or set(provenance) != {
+            "openmaicSharedPlaneAttestation"
+        }:
+            return "OpenMAIC shared plane execution proof is missing or invalid"
+        proof = provenance.get("openmaicSharedPlaneAttestation")
+        if (
+            not isinstance(proof, dict)
+            or set(proof) != {"artifact", "sha256"}
+            or proof.get("artifact") != "runtime/openmaic-shared-plane-attestation.json"
+        ):
+            return "OpenMAIC shared plane execution proof is missing or invalid"
+        proof_body = _proof_bytes(
+            bundle_root,
+            proof,
+            label="OpenMAIC shared plane attestation",
+        )
+        if isinstance(proof_body, str):
+            return proof_body
+        try:
+            checks, observed_at = derive_openmaic_shared_plane_receipt_checks(
+                proof_body[0],
+                bundle_root=bundle_root,
+                candidate_root=candidate_root,
+                candidate=candidate,
+                release_run=release_run,
+            )
+        except ValueError as exc:
+            return str(exc)
+        receipt = document.get("receipt")
+        result = receipt.get("result") if isinstance(receipt, dict) else None
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("observedAt") != observed_at
+            or not isinstance(result, dict)
+            or not exact_json_equal(result.get("checks"), checks)
+        ):
+            return "OpenMAIC shared plane receipt does not match execution proof"
         return None
     if evidence in {"capacity_profile", "learning_event_idempotency"}:
         provenance = document.get("provenance")

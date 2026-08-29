@@ -56,6 +56,12 @@ from classroom_runtime_attestation import (  # noqa: E402
     _rename_windows_file_relative,
     resolve_fixed_docker,
 )
+from openmaic_smoke_contract import (  # noqa: E402
+    MAX_OPENMAIC_SMOKE_REPORT_BYTES,
+    derive_openmaic_shared_plane_checks,
+    openmaic_shared_plane_command_record,
+    parse_openmaic_smoke_report,
+)
 from platform_preflight_contract import (  # noqa: E402
     MAX_CANDIDATE_NETWORK_REPORT_BYTES,
     materialize_candidate_network_phase_command,
@@ -125,6 +131,7 @@ _PROBE_CLEANUP_MARGIN_SECONDS = 30
 _CAPACITY_STDERR_LIMIT_BYTES = 64 * 1024
 _CLASSROOM_EXPORT_STDERR_LIMIT_BYTES = 64 * 1024
 _TENANT_ISOLATION_STDERR_LIMIT_BYTES = 64 * 1024
+_OPENMAIC_SMOKE_STDERR_LIMIT_BYTES = 64 * 1024
 
 
 def _candidate(candidate_root: Path) -> dict[str, Any]:
@@ -416,6 +423,41 @@ def _run_tenant_isolation(
             or os.fstat(stderr_buffer.fileno()).st_size > _TENANT_ISOLATION_STDERR_LIMIT_BYTES
         ):
             raise subprocess.SubprocessError("tenant isolation output is too large")
+        stdout_buffer.seek(0)
+        stderr_buffer.seek(0)
+        return subprocess.CompletedProcess(
+            arguments,
+            completed.returncode,
+            stdout_buffer.read().decode("utf-8", errors="strict"),
+            stderr_buffer.read().decode("utf-8", errors="strict"),
+        )
+
+
+def _run_openmaic_smoke(
+    arguments: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    timeout: int,
+) -> subprocess.CompletedProcess[str]:
+    with (
+        tempfile.TemporaryFile(mode="w+b") as stdout_buffer,
+        tempfile.TemporaryFile(mode="w+b") as stderr_buffer,
+    ):
+        completed = subprocess.run(
+            arguments,
+            cwd=cwd,
+            env=env,
+            stdout=stdout_buffer,
+            stderr=stderr_buffer,
+            check=False,
+            timeout=timeout,
+        )
+        if (
+            os.fstat(stdout_buffer.fileno()).st_size > MAX_OPENMAIC_SMOKE_REPORT_BYTES
+            or os.fstat(stderr_buffer.fileno()).st_size > _OPENMAIC_SMOKE_STDERR_LIMIT_BYTES
+        ):
+            raise subprocess.SubprocessError("OpenMAIC smoke output is too large")
         stdout_buffer.seek(0)
         stderr_buffer.seek(0)
         return subprocess.CompletedProcess(
@@ -871,7 +913,22 @@ class _TenantPublicationBoundary(_ClassroomPublicationBoundary):
     _FIXED_NAMES = ("runtime", "artifacts", "staging")
 
     @classmethod
-    def open(cls, root: Path, attempt_id: str) -> _TenantPublicationBoundary:
+    def open(
+        cls,
+        root: Path,
+        attempt_id: str,
+        *,
+        staging_prefix: str = "tenant-isolation",
+    ) -> _TenantPublicationBoundary:
+        if (
+            not staging_prefix
+            or Path(staging_prefix).name != staging_prefix
+            or not all(
+                character.isascii() and (character.isalnum() or character == "-")
+                for character in staging_prefix
+            )
+        ):
+            raise ValueError("release evidence staging prefix is invalid")
         boundary = cls(Path(os.path.abspath(root)))
         try:
             _assert_classroom_fixed_parents(boundary.root)
@@ -898,10 +955,10 @@ class _TenantPublicationBoundary(_ClassroomPublicationBoundary):
                     create=not existing[name],
                 )
 
-            staging_name = f"tenant-isolation-{attempt_id}"
+            staging_name = f"{staging_prefix}-{attempt_id}"
             staging = boundary.root / "staging" / staging_name
             if os.path.lexists(staging):
-                raise ValueError("tenant isolation staging already exists")
+                raise ValueError("release evidence staging already exists")
             boundary.leases["staging/attempt"] = _open_classroom_directory_relative(
                 boundary.leases["staging"],
                 name=staging_name,
@@ -1128,6 +1185,58 @@ def _assert_published_classroom_receipt(
     ):
         raise ValueError(message)
     return identity
+
+
+def _assert_published_classroom_receipt_relative(
+    boundary: _ClassroomPublicationBoundary,
+    path: Path,
+    *,
+    expected_body: bytes,
+    expected_identity: tuple[int, int],
+    label: str,
+) -> None:
+    message = f"published classroom exports {label} changed"
+    parent = _classroom_publication_parent(boundary, path)
+    descriptor: int | None = None
+    native_handle: object | None = None
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            native_handle, _native_identity = _open_windows_regular_file_relative(
+                parent.handle,
+                path.name,
+                share_access=0x00000001 | 0x00000002 | 0x00000004,
+            )
+            handle_value = getattr(native_handle, "value", native_handle)
+            descriptor = msvcrt.open_osfhandle(
+                int(handle_value),
+                os.O_RDONLY | os.O_BINARY,
+            )
+            native_handle = None
+        else:
+            descriptor = os.open(
+                path.name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=int(parent.handle),
+            )
+        details = os.fstat(descriptor)
+        with os.fdopen(descriptor, "rb", closefd=True) as handle:
+            descriptor = None
+            body = handle.read()
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or _file_identity(details) != expected_identity
+            or body != expected_body
+        ):
+            raise ValueError(message)
+    except OSError as exc:
+        raise ValueError(message) from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if native_handle is not None:
+            _close_windows_handle(native_handle)
 
 
 def _remove_classroom_entries(
@@ -2663,6 +2772,371 @@ def write_capacity_profile_receipt(
         raise
 
 
+def write_openmaic_shared_plane_receipt(
+    *,
+    candidate_root: Path,
+    bundle_root: Path,
+    release_run: Mapping[str, object],
+    timeout_seconds: int,
+    runner: CommandRunner = _run_openmaic_smoke,
+) -> dict[str, object]:
+    """Run the fixed shared-plane smoke and publish its proof marker last."""
+
+    if (
+        not isinstance(timeout_seconds, int)
+        or isinstance(timeout_seconds, bool)
+        or timeout_seconds <= _PROBE_CLEANUP_MARGIN_SECONDS
+    ):
+        raise ValueError("OpenMAIC shared-plane timeout is invalid")
+    token = os.environ.get("YFEISTAI_LIVE_FIXTURE_TOKEN")
+    if not isinstance(token, str) or not token.strip():
+        raise ValueError("OpenMAIC shared-plane live fixture token is unavailable")
+    secrets = tuple(
+        value.encode("utf-8", errors="strict") for value in {token, token.strip()} if value
+    )
+    root = Path(os.path.abspath(bundle_root))
+    candidate_path = Path(candidate_root).resolve()
+    proof_path = root / "runtime" / "openmaic-shared-plane-attestation.json"
+    receipt_path = root / "artifacts" / "openmaic_shared_plane.json"
+    if any(os.path.lexists(path) for path in (proof_path, receipt_path)):
+        raise ValueError("OpenMAIC shared-plane evidence already exists")
+
+    candidate = _candidate(candidate_path)
+    bound_run = _release_run(release_run)
+    runtime_path = root / "runtime" / "runtime-attestation.json"
+    runtime_body, runtime_sha256 = read_runtime_attestation_artifact(
+        runtime_path,
+        bundle_root=root,
+    )
+    runtime = validate_runtime_attestation(
+        runtime_path,
+        bundle_root=root,
+        candidate_root=candidate_path,
+        candidate=candidate,
+        release_run=bound_run,
+        expected_sha256=runtime_sha256,
+    )
+    base_url = runtime.get("baseUrl")
+    if not isinstance(base_url, str):
+        raise ValueError("OpenMAIC shared-plane runtime URL is invalid")
+
+    logical_command = openmaic_shared_plane_command_record()
+    arguments = [
+        sys.executable,
+        str(SCRIPTS_ROOT / "openmaic_smoke_probe.py"),
+        "--plane",
+        "shared",
+        "--profile",
+        "first-release",
+    ]
+    allowed_environment = {
+        "COMSPEC",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "NO_COLOR",
+        "PATH",
+        "PATHEXT",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+        "SYSTEMDRIVE",
+        "SYSTEMROOT",
+        "TEMP",
+        "TERM",
+        "TMP",
+        "WINDIR",
+    }
+    environment = {
+        name: value for name, value in os.environ.items() if name.upper() in allowed_environment
+    }
+    environment.update(
+        {
+            "YFEISTAI_LIVE_FIXTURE_TOKEN": token,
+            "YFEISTAI_CANDIDATE_ROOT": str(candidate_path),
+            "YFEISTAI_RELEASE_RUN_ID": bound_run["runId"],
+            "YFEISTAI_ENVIRONMENT_ID": bound_run["environmentId"],
+            "YFEISTAI_RUNTIME_ATTESTATION_SHA256": runtime_sha256,
+            "YFEISTAI_OPENMAIC_SMOKE_TIMEOUT_SECONDS": str(
+                timeout_seconds - _PROBE_CLEANUP_MARGIN_SECONDS
+            ),
+            "WEB_BASE_URL": base_url,
+        }
+    )
+    try:
+        completed = runner(
+            arguments,
+            cwd=candidate_path,
+            env=environment,
+            timeout=timeout_seconds,
+        )
+    except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
+        raise ValueError("OpenMAIC shared-plane probe could not run") from exc
+    if (
+        not isinstance(completed.returncode, int)
+        or isinstance(completed.returncode, bool)
+        or completed.returncode != 0
+        or completed.args != arguments
+        or not isinstance(completed.stdout, str)
+        or completed.stderr != ""
+    ):
+        raise ValueError("OpenMAIC shared-plane probe did not exit cleanly")
+    try:
+        stdout = completed.stdout.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as exc:
+        raise ValueError("OpenMAIC shared-plane probe output is invalid") from exc
+    if len(stdout) > MAX_OPENMAIC_SMOKE_REPORT_BYTES or any(secret in stdout for secret in secrets):
+        raise ValueError("OpenMAIC shared-plane probe output is invalid or contains a secret")
+    report = parse_openmaic_smoke_report(
+        stdout,
+        candidate=candidate,
+        release_run=bound_run,
+        expected_base_url=base_url,
+        expected_runtime_attestation_sha256=runtime_sha256,
+        forbidden_secret_values=secrets,
+    )
+    checks = derive_openmaic_shared_plane_checks(report)
+    if checks != {"sharedGenerationPassed": True}:
+        raise ValueError("OpenMAIC shared-plane probe did not prove materialized generation")
+    observed_at = report.get("observedAt")
+    fixture = report.get("fixture")
+    binding = report.get("binding")
+    generation = report.get("generation")
+    if (
+        not isinstance(observed_at, str)
+        or not _valid_observed_at(observed_at)
+        or not isinstance(fixture, dict)
+        or not isinstance(binding, dict)
+        or not isinstance(generation, dict)
+    ):
+        raise ValueError("OpenMAIC shared-plane report summary is invalid")
+
+    def assert_release_binding() -> None:
+        try:
+            candidate_after = _candidate(candidate_path)
+            runtime_after, runtime_after_sha256 = read_runtime_attestation_artifact(
+                runtime_path,
+                bundle_root=root,
+            )
+        except ValueError as exc:
+            raise ValueError("OpenMAIC shared-plane release binding changed") from exc
+        if (
+            candidate_after != candidate
+            or runtime_after != runtime_body
+            or runtime_after_sha256 != runtime_sha256
+        ):
+            raise ValueError("OpenMAIC shared-plane release binding changed")
+        validate_runtime_attestation(
+            runtime_path,
+            bundle_root=root,
+            candidate_root=candidate_path,
+            candidate=candidate,
+            release_run=bound_run,
+            expected_base_url=base_url,
+            expected_sha256=runtime_sha256,
+        )
+
+    assert_release_binding()
+    proof = {
+        "schemaVersion": 1,
+        "candidate": candidate,
+        "releaseRun": bound_run,
+        "observedAt": observed_at,
+        "baseUrl": base_url,
+        "runtimeAttestation": {
+            "artifact": "runtime/runtime-attestation.json",
+            "sha256": runtime_sha256,
+        },
+        "execution": {
+            "command": logical_command,
+            "nativeExit": 0,
+            "stdout": completed.stdout,
+            "stdoutSha256": hashlib.sha256(stdout).hexdigest(),
+            "stderr": "",
+        },
+        "summary": {
+            "fixture": json.loads(json.dumps(fixture)),
+            "binding": json.loads(json.dumps(binding)),
+            "generation": json.loads(json.dumps(generation)),
+            "checks": checks,
+        },
+    }
+    attempt_id = uuid.uuid4().hex
+    boundary = _TenantPublicationBoundary.open(
+        root,
+        attempt_id,
+        staging_prefix="openmaic-shared-plane",
+    )
+    staging = boundary.staging
+    if staging is None:
+        boundary.close()
+        raise ValueError("OpenMAIC shared-plane staging is unavailable")
+    staged_proof = staging / "openmaic-shared-plane-attestation.json"
+    staged_receipt = staging / "openmaic_shared_plane.json"
+    proof_handle: BinaryIO | None = None
+    receipt_handle: BinaryIO | None = None
+    proof_identity: tuple[int, int] | None = None
+    receipt_identity: tuple[int, int] | None = None
+    published: dict[str, tuple[Path, tuple[int, int]]] = {}
+    archive_artifacts = {
+        "proof": staged_proof,
+        "receipt": staged_receipt,
+    }
+    try:
+        boundary.assert_unchanged()
+        proof_handle, proof_identity, proof_body = _create_classroom_json_staging(
+            boundary,
+            parent_key="staging/attempt",
+            path=staged_proof,
+            document=proof,
+        )
+        proof_sha256 = hashlib.sha256(proof_body).hexdigest()
+        receipt = _pass_receipt_from_candidate(
+            candidate=candidate,
+            release_run=bound_run,
+            evidence="openmaic_shared_plane",
+            observed_at=observed_at,
+            native_exit=0,
+            checks=checks,
+            provenance={
+                "openmaicSharedPlaneAttestation": {
+                    "artifact": "runtime/openmaic-shared-plane-attestation.json",
+                    "sha256": proof_sha256,
+                }
+            },
+        )
+        receipt_handle, receipt_identity, receipt_body = _create_classroom_json_staging(
+            boundary,
+            parent_key="staging/attempt",
+            path=staged_receipt,
+            document=receipt,
+        )
+        if any(secret in proof_body or secret in receipt_body for secret in secrets):
+            raise ValueError("OpenMAIC shared-plane evidence contains a live fixture token")
+        replayed_report = parse_openmaic_smoke_report(
+            stdout,
+            candidate=candidate,
+            release_run=bound_run,
+            expected_base_url=base_url,
+            expected_runtime_attestation_sha256=runtime_sha256,
+            forbidden_secret_values=secrets,
+        )
+        if (
+            replayed_report != report
+            or derive_openmaic_shared_plane_checks(replayed_report) != checks
+        ):
+            raise ValueError("OpenMAIC shared-plane proof replay changed")
+        assert_release_binding()
+        boundary.assert_unchanged()
+        if any(os.path.lexists(path) for path in (proof_path, receipt_path)):
+            raise ValueError("OpenMAIC shared-plane publication target appeared concurrently")
+        for name, staged, target, source_handle, expected_body, expected_identity in (
+            (
+                "receipt",
+                staged_receipt,
+                receipt_path,
+                receipt_handle,
+                receipt_body,
+                receipt_identity,
+            ),
+            (
+                "proof",
+                staged_proof,
+                proof_path,
+                proof_handle,
+                proof_body,
+                proof_identity,
+            ),
+        ):
+            boundary.assert_unchanged()
+            assert source_handle is not None
+            assert expected_identity is not None
+            published[f"published-{name}"] = (target, expected_identity)
+            _publish_classroom_no_replace(
+                boundary,
+                staged,
+                target,
+                source_handle=source_handle,
+            )
+            boundary.assert_unchanged()
+            _assert_published_classroom_receipt_relative(
+                boundary,
+                target,
+                expected_body=expected_body,
+                expected_identity=expected_identity,
+                label=f"OpenMAIC shared-plane {name}",
+            )
+            assert_release_binding()
+        boundary.assert_unchanged()
+        assert_release_binding()
+        return receipt
+    except BaseException as original_error:
+        if proof_handle is not None:
+            proof_handle.close()
+            proof_handle = None
+        if receipt_handle is not None:
+            receipt_handle.close()
+            receipt_handle = None
+        cleanup_error: Exception | None = None
+        try:
+            _remove_classroom_entries(
+                boundary,
+                {path: identity for path, identity in published.values()},
+                label="OpenMAIC shared-plane formal evidence",
+            )
+        except Exception as exc:
+            cleanup_error = exc
+        archive_error: Exception | None = None
+        if isinstance(original_error, Exception):
+            try:
+                boundary.assert_unchanged()
+                _record_probe_failure(
+                    bundle_root=root,
+                    evidence="openmaic-shared-plane",
+                    recipe="live-first-release",
+                    attempt_id=attempt_id,
+                    reason="OpenMAIC shared-plane execution or publication failed",
+                    native_exit=0,
+                    artifacts=archive_artifacts,
+                )
+            except Exception as exc:
+                archive_error = exc
+        if archive_error is not None:
+            if cleanup_error is not None:
+                archive_error.add_note(f"formal evidence retraction also failed: {cleanup_error}")
+            raise original_error from archive_error
+        if cleanup_error is not None:
+            raise original_error from cleanup_error
+        raise
+    finally:
+        if proof_handle is not None:
+            proof_handle.close()
+        if receipt_handle is not None:
+            receipt_handle.close()
+        active_error = sys.exception()
+        staging_cleanup_error: Exception | None = None
+        try:
+            _remove_classroom_entries(
+                boundary,
+                {
+                    staged_proof: proof_identity,
+                    staged_receipt: receipt_identity,
+                },
+                label="OpenMAIC shared-plane staging evidence",
+            )
+        except Exception as exc:
+            staging_cleanup_error = exc
+            if active_error is not None:
+                active_error.add_note(f"staging evidence cleanup failed: {exc}")
+        finally:
+            boundary.close()
+            try:
+                staging.rmdir()
+            except OSError:
+                pass
+        if staging_cleanup_error is not None and active_error is None:
+            raise staging_cleanup_error
+
+
 def write_tenant_isolation_receipt(
     *,
     candidate_root: Path,
@@ -3671,6 +4145,13 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     tenant_isolation.add_argument("--environment-id", required=True)
     tenant_isolation.add_argument("--timeout-seconds", type=int, required=True)
 
+    openmaic_shared_plane = commands.add_parser("openmaic-shared-plane")
+    openmaic_shared_plane.add_argument("--candidate-root", type=Path, required=True)
+    openmaic_shared_plane.add_argument("--bundle-root", type=Path, required=True)
+    openmaic_shared_plane.add_argument("--run-id", required=True)
+    openmaic_shared_plane.add_argument("--environment-id", required=True)
+    openmaic_shared_plane.add_argument("--timeout-seconds", type=int, required=True)
+
     classroom_exports = commands.add_parser("classroom-exports")
     classroom_exports.add_argument("--candidate-root", type=Path, required=True)
     classroom_exports.add_argument("--bundle-root", type=Path, required=True)
@@ -3759,6 +4240,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             timeout_seconds=args.timeout_seconds,
         )
         print(args.bundle_root / "runtime" / "tenant-isolation-attestation.json")
+        return 0
+    elif args.command == "openmaic-shared-plane":
+        write_openmaic_shared_plane_receipt(
+            candidate_root=args.candidate_root,
+            bundle_root=args.bundle_root,
+            release_run=release_run,
+            timeout_seconds=args.timeout_seconds,
+        )
+        print(args.bundle_root / "runtime" / "openmaic-shared-plane-attestation.json")
         return 0
     elif args.command == "classroom-exports":
         write_classroom_exports_receipt(

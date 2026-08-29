@@ -384,11 +384,7 @@ class FakeExportService:
 
     async def get(self, context: TenantContext, export_id: str):
         details = await self.repository.get_job_details(context.tenant_id, export_id)
-        if (
-            details is None
-            or details.job_kind != "export"
-            or details.owner_id != context.user_id
-        ):
+        if details is None or details.job_kind != "export" or details.owner_id != context.user_id:
             return None
         request = ExportRequest.model_validate_json(details.request_payload)
         artifact = await self.repository.get_export_artifact(
@@ -442,11 +438,12 @@ def api_harness():
         FakeTrustedTeachingBriefResolver()
     )
     app.dependency_overrides[jobs_router.get_cancellation_gateway] = lambda: cancellation
-    app.dependency_overrides[exports_router.get_classroom_export_service] = (
-        lambda: FakeExportService(repository)
+    app.dependency_overrides[exports_router.get_classroom_export_service] = lambda: (
+        FakeExportService(repository)
     )
     app.dependency_overrides[exports_router.get_export_store_provider] = lambda: stores
     app.dependency_overrides[auth_router.require_platform_enabled] = lambda: None
+    app.dependency_overrides[jobs_router.require_platform_admin] = lambda: None
     app.dependency_overrides[require_tenant] = lambda: _context("teacher-1", "teacher")
     return app, repository, cancellation, stores, store
 
@@ -563,6 +560,107 @@ def test_create_rejects_client_selected_policy_and_embedded_brief(api_harness) -
     response = TestClient(app).post("/api/v1/classroom-jobs", json=body)
 
     assert response.status_code == 422
+
+
+def test_platform_admin_can_read_one_secret_free_generation_binding(api_harness) -> None:
+    app, repository, _cancellation, _stores, _store = api_harness
+    job = _detail(
+        job_id="job-shared-smoke",
+        status="succeeded",
+        phase="content",
+        progress_percent=100,
+    )
+    job.data_plane_route_id = "shared-primary"
+    job.provider_profile_id = "platform-default"
+    job.worker_pool_ref = "shared-generation"
+    job.queue_ref = "openmaic.shared"
+    job.result_ref = "classroom-version-shared-smoke"
+    job.request_payload = '{"providerApiKey":"must-not-leak"}'
+    repository.jobs[job.job_id] = job
+
+    response = TestClient(app).get(
+        "/api/v1/system/classroom-jobs/tenant-1/job-shared-smoke/binding"
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "schemaVersion": 1,
+        "tenantId": "tenant-1",
+        "jobId": "job-shared-smoke",
+        "jobKind": "generation",
+        "phase": "content",
+        "status": "succeeded",
+        "progressPercent": 100,
+        "classroomVersionId": "classroom-version-shared-smoke",
+        "dataPlaneRouteId": "shared-primary",
+        "providerProfileId": "platform-default",
+        "workerPoolRef": "shared-generation",
+        "queueRef": "openmaic.shared",
+    }
+    assert "must-not-leak" not in response.text
+
+
+def test_anonymous_cannot_read_system_binding_before_repository_access(
+    api_harness,
+    monkeypatch,
+) -> None:
+    app, repository, _cancellation, _stores, _store = api_harness
+
+    async def unexpected_get_job_details(_tenant_id: str, _job_id: str):
+        raise AssertionError("anonymous binding request must not query the repository")
+
+    monkeypatch.setattr(repository, "get_job_details", unexpected_get_job_details)
+    monkeypatch.setattr(auth_router, "AUTH_ENABLED", True)
+    del app.dependency_overrides[jobs_router.require_platform_admin]
+    app.dependency_overrides[auth_router.require_platform_enabled] = lambda: None
+
+    response = TestClient(app).get(
+        "/api/v1/system/classroom-jobs/tenant-1/job-shared-smoke/binding"
+    )
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Not authenticated"
+
+
+def test_non_platform_admin_cannot_read_system_binding_before_repository_access(
+    api_harness,
+    monkeypatch,
+) -> None:
+    app, repository, _cancellation, _stores, _store = api_harness
+    payload = auth_router.TokenPayload(
+        username="teacher-1",
+        role="user",
+        user_id="teacher-1",
+    )
+
+    async def unexpected_get_job_details(_tenant_id: str, _job_id: str):
+        raise AssertionError("non-admin binding request must not query the repository")
+
+    async def authenticated_user():
+        return payload
+
+    monkeypatch.setattr(repository, "get_job_details", unexpected_get_job_details)
+    monkeypatch.setattr(auth_router, "POCKETBASE_ENABLED", False)
+    monkeypatch.setattr(
+        auth_router,
+        "get_user_info",
+        lambda _username: {
+            "id": payload.user_id,
+            "username": payload.username,
+            "role": payload.role,
+            "disabled": False,
+        },
+    )
+    del app.dependency_overrides[jobs_router.require_platform_admin]
+    app.dependency_overrides[auth_router.require_platform_enabled] = lambda: None
+    app.dependency_overrides[auth_router.require_auth] = authenticated_user
+
+    response = TestClient(app).get(
+        "/api/v1/system/classroom-jobs/tenant-1/job-shared-smoke/binding"
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Admin access required"
 
 
 def test_create_rejects_trusted_brief_when_canonical_hash_is_stale(api_harness) -> None:

@@ -69,6 +69,13 @@ def _load_tenant_isolation_support():
     )
 
 
+def _load_openmaic_smoke_support():
+    return _load_path(
+        "openmaic_smoke_contract_support_for_release_evidence",
+        ROOT / "tests" / "scripts" / "test_openmaic_smoke_contract.py",
+    )
+
+
 def _teacher_playwright_report() -> dict[str, object]:
     file = "tests/e2e/classroom-first-release.live.spec.ts"
     return {
@@ -3287,6 +3294,315 @@ def test_release_evidence_cli_runs_fixed_tenant_isolation_producer(
     }
     assert capsys.readouterr().out == (
         f"{bundle_root / 'runtime' / 'tenant-isolation-attestation.json'}\n"
+    )
+
+
+def test_openmaic_shared_plane_receipt_is_derived_from_fixed_live_smoke(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_evidence_module()
+    assert callable(getattr(module, "write_openmaic_shared_plane_receipt", None)), (
+        "fixed OpenMAIC shared-plane receipt producer is missing"
+    )
+    support = _load_openmaic_smoke_support()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    runtime_path = candidate_root / "runtime" / "runtime-attestation.json"
+    runtime_sha256 = hashlib.sha256(runtime_path.read_bytes()).hexdigest()
+    token = "openmaic-shared-plane-token-must-not-be-serialized"
+    monkeypatch.setenv("YFEISTAI_LIVE_FIXTURE_TOKEN", token)
+    monkeypatch.setenv("COMPOSE_FILE", "attacker-compose.yml")
+    calls: list[dict[str, object]] = []
+    publications: list[str] = []
+    real_publish = module._publish_classroom_no_replace
+
+    def runner(arguments, *, cwd, env, timeout):
+        report = support._report(
+            candidate=candidate,
+            release_run=RELEASE_RUN,
+            runtime_attestation_sha256=runtime_sha256,
+        )
+        calls.append(
+            {
+                "arguments": arguments,
+                "cwd": cwd,
+                "env": env,
+                "timeout": timeout,
+            }
+        )
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            support._body(report).decode("utf-8"),
+            "",
+        )
+
+    def record_publication(boundary, source: Path, target: Path, *, source_handle) -> None:
+        real_publish(boundary, source, target, source_handle=source_handle)
+        publications.append(target.relative_to(candidate_root).as_posix())
+
+    monkeypatch.setattr(module, "_publish_classroom_no_replace", record_publication)
+    receipt = module.write_openmaic_shared_plane_receipt(
+        candidate_root=candidate_root,
+        bundle_root=candidate_root,
+        release_run=RELEASE_RUN,
+        timeout_seconds=600,
+        runner=runner,
+    )
+
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["arguments"][-4:] == [
+        "--plane",
+        "shared",
+        "--profile",
+        "first-release",
+    ]
+    assert call["cwd"] == candidate_root.resolve()
+    assert call["timeout"] == 600
+    assert call["env"]["YFEISTAI_LIVE_FIXTURE_TOKEN"] == token
+    assert call["env"]["YFEISTAI_CANDIDATE_ROOT"] == str(candidate_root.resolve())
+    assert call["env"]["YFEISTAI_RELEASE_RUN_ID"] == RELEASE_RUN["runId"]
+    assert call["env"]["YFEISTAI_ENVIRONMENT_ID"] == RELEASE_RUN["environmentId"]
+    assert call["env"]["YFEISTAI_OPENMAIC_SMOKE_TIMEOUT_SECONDS"] == "570"
+    assert call["env"]["WEB_BASE_URL"] == BASE_URL
+    assert "COMPOSE_FILE" not in call["env"]
+
+    receipt_path = candidate_root / "artifacts" / "openmaic_shared_plane.json"
+    proof_path = candidate_root / "runtime" / "openmaic-shared-plane-attestation.json"
+    assert publications == [
+        "artifacts/openmaic_shared_plane.json",
+        "runtime/openmaic-shared-plane-attestation.json",
+    ]
+    assert receipt == json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["evidence"] == "openmaic_shared_plane"
+    assert receipt["receipt"]["producer"] == "openmaic-smoke"
+    assert receipt["receipt"]["result"]["checks"] == {"sharedGenerationPassed": True}
+    proof_sha256 = hashlib.sha256(proof_path.read_bytes()).hexdigest()
+    assert receipt["provenance"] == {
+        "openmaicSharedPlaneAttestation": {
+            "artifact": "runtime/openmaic-shared-plane-attestation.json",
+            "sha256": proof_sha256,
+        }
+    }
+    proof = json.loads(proof_path.read_text(encoding="utf-8"))
+    assert proof["runtimeAttestation"] == {
+        "artifact": "runtime/runtime-attestation.json",
+        "sha256": runtime_sha256,
+    }
+    assert proof["execution"]["command"] == module.openmaic_shared_plane_command_record()
+    assert proof["summary"]["fixture"] == {
+        "tenantId": "tenant-openmaic-shared-01",
+        "teacherUserId": "teacher-openmaic-shared-01",
+        "courseId": "course-openmaic-shared-01",
+        "classId": "class-openmaic-shared-01",
+    }
+    assert proof["summary"]["binding"] == {
+        "routeId": "shared-primary",
+        "providerProfileId": "platform-default",
+        "workerPoolRef": "shared-generation",
+        "queueRef": "openmaic.shared",
+    }
+    assert proof["summary"]["checks"] == {"sharedGenerationPassed": True}
+    assert token not in receipt_path.read_text(encoding="utf-8")
+    assert token not in proof_path.read_text(encoding="utf-8")
+
+    manifest = candidate_root / "release-evidence.json"
+    module.assemble_manifest(
+        manifest,
+        candidate_root=candidate_root,
+        release_run=RELEASE_RUN,
+        receipt_paths={"openmaic_shared_plane": receipt_path},
+    )
+    verifier = _load_verifier()
+    result = verifier.verify(
+        verifier.FileReleaseRuntime(
+            manifest,
+            expected_source_head=SOURCE_HEAD,
+            candidate_root=candidate_root,
+        )
+    )
+    assert result.layers["openmaic_shared_plane"].status == "pass"
+
+
+def test_openmaic_shared_plane_publication_failure_leaves_no_formal_receipt_or_proof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_evidence_module()
+    support = _load_openmaic_smoke_support()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    runtime_sha256 = hashlib.sha256(
+        (candidate_root / "runtime" / "runtime-attestation.json").read_bytes()
+    ).hexdigest()
+    monkeypatch.setenv("YFEISTAI_LIVE_FIXTURE_TOKEN", "openmaic-shared-plane-token")
+    proof_path = candidate_root / "runtime" / "openmaic-shared-plane-attestation.json"
+    receipt_path = candidate_root / "artifacts" / "openmaic_shared_plane.json"
+    real_publish = module._publish_classroom_no_replace
+
+    def runner(arguments, *, cwd, env, timeout):
+        del cwd, env, timeout
+        report = support._report(
+            candidate=candidate,
+            release_run=RELEASE_RUN,
+            runtime_attestation_sha256=runtime_sha256,
+        )
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            support._body(report).decode("utf-8"),
+            "",
+        )
+
+    def fail_proof(boundary, source: Path, target: Path, *, source_handle) -> None:
+        if target == proof_path:
+            raise OSError("simulated OpenMAIC shared-plane proof publication failure")
+        real_publish(boundary, source, target, source_handle=source_handle)
+
+    monkeypatch.setattr(module, "_publish_classroom_no_replace", fail_proof)
+    with pytest.raises(
+        OSError,
+        match="simulated OpenMAIC shared-plane proof publication failure",
+    ):
+        module.write_openmaic_shared_plane_receipt(
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            timeout_seconds=600,
+            runner=runner,
+        )
+
+    assert not proof_path.exists()
+    assert not receipt_path.exists()
+    assert not list((candidate_root / "staging").iterdir())
+
+
+@pytest.mark.parametrize(
+    ("parent_name", "published_name"),
+    (
+        ("artifacts", "openmaic_shared_plane.json"),
+        ("runtime", "openmaic-shared-plane-attestation.json"),
+    ),
+)
+def test_openmaic_shared_plane_never_publishes_through_a_replaced_target_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    parent_name: str,
+    published_name: str,
+) -> None:
+    module = _load_evidence_module()
+    support = _load_openmaic_smoke_support()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    runtime_sha256 = hashlib.sha256(
+        (candidate_root / "runtime" / "runtime-attestation.json").read_bytes()
+    ).hexdigest()
+    monkeypatch.setenv("YFEISTAI_LIVE_FIXTURE_TOKEN", "openmaic-shared-plane-token")
+    target_parent = candidate_root / parent_name
+    retained_parent = candidate_root / f"{parent_name}-retained"
+    redirected = tmp_path / f"redirected-openmaic-shared-plane-{parent_name}"
+    redirected.mkdir()
+    real_publish = module._publish_classroom_no_replace
+    redirected_once = False
+    replacement_blocked = False
+    retained_snapshot: dict[str, bytes] | None = None
+
+    def runner(arguments, *, cwd, env, timeout):
+        del cwd, env, timeout
+        report = support._report(
+            candidate=candidate,
+            release_run=RELEASE_RUN,
+            runtime_attestation_sha256=runtime_sha256,
+        )
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            support._body(report).decode("utf-8"),
+            "",
+        )
+
+    def replace_parent(boundary, source: Path, target: Path, *, source_handle) -> None:
+        nonlocal redirected_once, replacement_blocked, retained_snapshot
+        if not redirected_once and target.parent == target_parent:
+            retained_snapshot = _directory_snapshot(target_parent)
+            try:
+                os.replace(target_parent, retained_parent)
+            except PermissionError as exc:
+                replacement_blocked = True
+                raise ValueError("publication directory changed") from exc
+            try:
+                target_parent.symlink_to(redirected, target_is_directory=True)
+            except OSError:
+                os.replace(retained_parent, target_parent)
+                pytest.skip("directory symlinks are unavailable on this test host")
+            redirected_once = True
+        real_publish(boundary, source, target, source_handle=source_handle)
+
+    monkeypatch.setattr(module, "_publish_classroom_no_replace", replace_parent)
+    with pytest.raises(ValueError, match="publication directory changed"):
+        module.write_openmaic_shared_plane_receipt(
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            timeout_seconds=600,
+            runner=runner,
+        )
+
+    assert redirected_once is True or replacement_blocked is True
+    assert not list(redirected.iterdir())
+    assert retained_snapshot is not None
+    retained_or_original = retained_parent if redirected_once else target_parent
+    assert _directory_snapshot(retained_or_original) == retained_snapshot
+    assert not (retained_or_original / published_name).exists()
+    assert not (candidate_root / "artifacts" / "openmaic_shared_plane.json").exists()
+    assert not (candidate_root / "runtime" / "openmaic-shared-plane-attestation.json").exists()
+
+
+def test_release_evidence_cli_runs_fixed_openmaic_shared_plane_producer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = _load_evidence_module()
+    candidate_root = tmp_path / "candidate"
+    bundle_root = tmp_path / "bundle"
+    captured: dict[str, object] = {}
+
+    def write_receipt(**arguments: object) -> dict[str, object]:
+        captured.update(arguments)
+        return {}
+
+    monkeypatch.setattr(
+        module,
+        "write_openmaic_shared_plane_receipt",
+        write_receipt,
+        raising=False,
+    )
+    assert (
+        module.main(
+            [
+                "openmaic-shared-plane",
+                "--candidate-root",
+                str(candidate_root),
+                "--bundle-root",
+                str(bundle_root),
+                "--run-id",
+                RELEASE_RUN["runId"],
+                "--environment-id",
+                RELEASE_RUN["environmentId"],
+                "--timeout-seconds",
+                "600",
+            ]
+        )
+        == 0
+    )
+    assert captured == {
+        "candidate_root": candidate_root,
+        "bundle_root": bundle_root,
+        "release_run": RELEASE_RUN,
+        "timeout_seconds": 600,
+    }
+    assert capsys.readouterr().out == (
+        f"{bundle_root / 'runtime' / 'openmaic-shared-plane-attestation.json'}\n"
     )
 
 
