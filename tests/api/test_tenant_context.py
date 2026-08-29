@@ -12,6 +12,7 @@ from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 import pytest
 from sqlalchemy.dialects import postgresql
+from sqlalchemy.exc import SQLAlchemyError
 
 from deeptutor.api.routers import auth as auth_router
 from deeptutor.api.routers import tenants as tenants_router
@@ -27,6 +28,7 @@ from deeptutor.teaching.repositories.tenants import (
     TenantAccess,
     TenantAccessDeniedError,
     TenantConflictError,
+    TenantMemberNotFoundError,
     TenantNotActiveError,
     TenantNotFoundError,
     TenantSummary,
@@ -73,6 +75,8 @@ class FakeTenantRepository:
         self.list_admin_flags: list[bool] = []
         self.access_calls: list[tuple[str, str, bool]] = []
         self.member_calls: list[tuple[str, str, frozenset[str]]] = []
+        self.member_delete_calls: list[tuple[str, str]] = []
+        self.member_delete_error: Exception | None = None
         self.scoped_member_calls: list[tuple[str, str, frozenset[tuple[str, str, str]]]] = []
         self.grant_calls: list[tuple[str, str, frozenset[str]]] = []
         self.scoped_grant_calls: list[tuple[str, str, frozenset[tuple[str, str, str]]]] = []
@@ -316,6 +320,16 @@ class FakeTenantRepository:
             roles=frozenset(role for role, _scope_type, _scope_id in normalized),
         )
 
+    async def delete_member(self, tenant_id: str, user_id: str) -> None:
+        self.member_delete_calls.append((tenant_id, user_id))
+        if self.member_delete_error is not None:
+            raise self.member_delete_error
+        if tenant_id not in self.tenants:
+            raise TenantNotFoundError(tenant_id)
+        if self.memberships.pop((tenant_id, user_id), None) is None:
+            raise TenantMemberNotFoundError(f"{tenant_id}:{user_id}")
+        self.roles.pop((tenant_id, user_id), None)
+
     async def replace_grants(
         self,
         tenant_id: str,
@@ -470,6 +484,7 @@ def _assert_repository_unused(repository: FakeTenantRepository) -> None:
     assert repository.create_calls == 0
     assert repository.provisioning_reads == 0
     assert repository.member_calls == []
+    assert repository.member_delete_calls == []
     assert repository.grant_calls == []
 
 
@@ -488,6 +503,15 @@ def _control_plane_requests(tenant_id: str) -> tuple[tuple[Any, ...], ...]:
             f"/api/v1/tenants/{tenant_id}/members/u-student/grants",
             {"roles": ["student"]},
             {"Cookie": f"dt_tenant={tenant_id}"},
+        ),
+        (
+            "DELETE",
+            f"/api/v1/tenants/{tenant_id}/members/u-student",
+            {
+                "expected_tenant_id": tenant_id,
+                "expected_user_id": "u-student",
+            },
+            None,
         ),
     )
 
@@ -1357,6 +1381,118 @@ def test_member_and_grant_writes_require_matching_tenant_manage_scope(
     assert all(call[0] == "tenant-a" for call in repository.member_calls)
 
 
+def test_platform_admin_deletes_exact_member_without_tenant_cookie(monkeypatch) -> None:
+    repository = FakeTenantRepository()
+    repository.add_tenant("tenant-a")
+    repository.add_member("tenant-a", "u-fixture", roles=frozenset({"teacher"}))
+    app = _authenticated_app(
+        monkeypatch,
+        repository,
+        user_id="u-root",
+        role="admin",
+    )
+
+    response = TestClient(app).request(
+        "DELETE",
+        "/api/v1/tenants/tenant-a/members/u-fixture",
+        json={
+            "expected_tenant_id": "tenant-a",
+            "expected_user_id": "u-fixture",
+        },
+    )
+
+    assert response.status_code == 204
+    assert response.content == b""
+    assert repository.member_delete_calls == [("tenant-a", "u-fixture")]
+    assert ("tenant-a", "u-fixture") not in repository.memberships
+
+
+def test_tenant_manager_cannot_use_platform_member_cleanup(monkeypatch) -> None:
+    repository = FakeTenantRepository()
+    repository.add_tenant("tenant-a")
+    repository.add_member("tenant-a", "u-manager", roles=frozenset({"org_admin"}))
+    repository.add_member("tenant-a", "u-fixture")
+    app = _authenticated_app(
+        monkeypatch,
+        repository,
+        user_id="u-manager",
+        role="user",
+    )
+
+    response = TestClient(app).request(
+        "DELETE",
+        "/api/v1/tenants/tenant-a/members/u-fixture",
+        headers={"Cookie": "dt_tenant=tenant-a"},
+        json={
+            "expected_tenant_id": "tenant-a",
+            "expected_user_id": "u-fixture",
+        },
+    )
+
+    assert response.status_code == 403
+    assert repository.member_delete_calls == []
+
+
+@pytest.mark.parametrize(
+    "body",
+    (
+        {"expected_tenant_id": "tenant-b", "expected_user_id": "u-fixture"},
+        {"expected_tenant_id": "tenant-a", "expected_user_id": "u-replacement"},
+    ),
+)
+def test_member_cleanup_rejects_expected_identity_mismatch_before_repository(
+    monkeypatch,
+    body: dict[str, str],
+) -> None:
+    repository = FakeTenantRepository()
+    repository.add_tenant("tenant-a")
+    repository.add_member("tenant-a", "u-fixture")
+    app = _authenticated_app(monkeypatch, repository, user_id="u-root", role="admin")
+
+    response = TestClient(app).request(
+        "DELETE",
+        "/api/v1/tenants/tenant-a/members/u-fixture",
+        json=body,
+    )
+
+    assert response.status_code == 409
+    assert repository.member_delete_calls == []
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_status"),
+    (
+        (TenantNotFoundError("tenant-a"), 404),
+        (TenantMemberNotFoundError("tenant-a:u-fixture"), 404),
+        (TenantConflictError("changed"), 409),
+        (SQLAlchemyError("database password=must-not-leak"), 503),
+    ),
+)
+def test_member_cleanup_maps_repository_failures_without_leaking_details(
+    monkeypatch,
+    error: Exception,
+    expected_status: int,
+) -> None:
+    repository = FakeTenantRepository()
+    repository.add_tenant("tenant-a")
+    repository.add_member("tenant-a", "u-fixture")
+    repository.member_delete_error = error
+    app = _authenticated_app(monkeypatch, repository, user_id="u-root", role="admin")
+
+    response = TestClient(app).request(
+        "DELETE",
+        "/api/v1/tenants/tenant-a/members/u-fixture",
+        json={
+            "expected_tenant_id": "tenant-a",
+            "expected_user_id": "u-fixture",
+        },
+    )
+
+    assert response.status_code == expected_status
+    assert "must-not-leak" not in response.text
+    assert repository.member_delete_calls == [("tenant-a", "u-fixture")]
+
+
 def test_member_write_without_exact_permission_is_denied(monkeypatch) -> None:
     repository = FakeTenantRepository()
     repository.add_tenant("tenant-a")
@@ -1783,6 +1919,85 @@ def test_scoped_member_upsert_validates_resources_before_membership_activation(
     )
     assert "courses.id in ('course-a')" in _compiled_sql(session.trace[2][1])
     assert "insert into platform.tenant_memberships" in _compiled_sql(session.trace[3][1])
+
+
+def test_member_delete_locks_exact_tenant_and_membership_before_delete(monkeypatch) -> None:
+    session = _RecordingSession(
+        execute_results=(_Result(rowcount=1),),
+        scalar_results=("tenant-a", "u-fixture"),
+    )
+    _install_recording_session(monkeypatch, session)
+
+    asyncio.run(
+        tenant_repositories.TenantRepository().delete_member(
+            "tenant-a",
+            "u-fixture",
+        )
+    )
+
+    assert _trace_names(session) == (
+        "begin",
+        "scalar",
+        "scalar",
+        "execute",
+        "flush",
+        "commit",
+    )
+    tenant_lock = _compiled_sql(session.trace[1][1])
+    membership_lock = _compiled_sql(session.trace[2][1])
+    membership_delete = _compiled_sql(session.trace[3][1])
+    assert "tenants.id = 'tenant-a'" in tenant_lock
+    assert "tenants.status" not in tenant_lock
+    for statement in (membership_lock, membership_delete):
+        assert "tenant_memberships.tenant_id = 'tenant-a'" in statement
+        assert "tenant_memberships.user_id = 'u-fixture'" in statement
+    assert "for update" in membership_lock
+    assert "delete from platform.tenant_memberships" in membership_delete
+
+
+@pytest.mark.parametrize(
+    ("scalar_results", "error_type"),
+    (
+        ((None,), TenantNotFoundError),
+        (("tenant-a", None), TenantMemberNotFoundError),
+    ),
+)
+def test_member_delete_rolls_back_when_exact_target_is_missing(
+    monkeypatch,
+    scalar_results: tuple[object, ...],
+    error_type: type[Exception],
+) -> None:
+    session = _RecordingSession(scalar_results=scalar_results)
+    _install_recording_session(monkeypatch, session)
+
+    with pytest.raises(error_type):
+        asyncio.run(
+            tenant_repositories.TenantRepository().delete_member(
+                "tenant-a",
+                "u-fixture",
+            )
+        )
+
+    assert _trace_names(session)[-1] == "rollback"
+    assert "execute" not in _trace_names(session)
+
+
+def test_member_delete_rowcount_drift_rolls_back(monkeypatch) -> None:
+    session = _RecordingSession(
+        execute_results=(_Result(rowcount=0),),
+        scalar_results=("tenant-a", "u-fixture"),
+    )
+    _install_recording_session(monkeypatch, session)
+
+    with pytest.raises(TenantConflictError, match="changed concurrently"):
+        asyncio.run(
+            tenant_repositories.TenantRepository().delete_member(
+                "tenant-a",
+                "u-fixture",
+            )
+        )
+
+    assert _trace_names(session)[-1] == "rollback"
 
 
 def test_invalid_scoped_member_resource_does_not_activate_membership(

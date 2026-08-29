@@ -71,6 +71,13 @@ from platform_preflight_contract import (
     candidate_network_phase_command,
     parse_candidate_network_report,
 )
+from tenant_isolation_contract import (  # noqa: E402
+    MAX_TENANT_ISOLATION_REPORT_BYTES,
+    TENANT_ISOLATION_PRODUCER,
+    derive_tenant_isolation_checks,
+    parse_tenant_isolation_report,
+    tenant_isolation_command_record,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_EVIDENCE_PATH = (
@@ -161,7 +168,7 @@ RECEIPT_CONTRACTS = {
         ("zipOpened", "pptxOpened", "offlineHtmlOpened", "mp4Opened"),
     ),
     "tenant_isolation": (
-        "tenant-isolation-gate",
+        TENANT_ISOLATION_PRODUCER,
         ("databaseIsolated", "objectsIsolated", "exportsIsolated", "eventsIsolated"),
     ),
     "learning_event_idempotency": (
@@ -428,6 +435,7 @@ def _proof_bytes(
         "runtime/platform-preflight-attestation.json": "platform-preflight-attestation.json",
         "runtime/capacity-profile-attestation.json": "capacity-profile-attestation.json",
         "runtime/classroom-exports-attestation.json": "classroom-exports-attestation.json",
+        "runtime/tenant-isolation-attestation.json": "tenant-isolation-attestation.json",
     }
     fixed_name = fixed_runtime_artifacts.get(artifact)
     if fixed_name is not None:
@@ -584,6 +592,7 @@ def _runtime_artifact_body(
         "platform-preflight-attestation.json",
         "capacity-profile-attestation.json",
         "classroom-exports-attestation.json",
+        "tenant-isolation-attestation.json",
     }:
         raise ValueError("runtime artifact name is invalid")
     root = Path(os.path.abspath(bundle_root))
@@ -1286,6 +1295,202 @@ def derive_capacity_profile_tenant_id(
     if not isinstance(tenant_id, str) or not tenant_id:
         raise ValueError("capacity execution proof tenant is invalid")
     return tenant_id
+
+
+def derive_capacity_profile_tenant_ids(
+    body: bytes,
+    *,
+    bundle_root: Path,
+    candidate_root: Path,
+    candidate: Mapping[str, object],
+    release_run: Mapping[str, str],
+) -> tuple[str, ...]:
+    """Return every executed tenant from one passing, fully replayed capacity proof."""
+
+    checks, _observed_at = derive_capacity_profile_receipt_checks(
+        body,
+        bundle_root=bundle_root,
+        candidate_root=candidate_root,
+        candidate=candidate,
+        release_run=release_run,
+    )
+    if any(value is not True for value in checks.values()):
+        raise ValueError("capacity execution proof checks did not all pass")
+
+    try:
+        document = json.loads(body)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("capacity execution proof is invalid") from exc
+    execution = document.get("execution") if isinstance(document, dict) else None
+    base_url = document.get("baseUrl") if isinstance(document, dict) else None
+    stdout = execution.get("stdout") if isinstance(execution, dict) else None
+    if not isinstance(base_url, str) or not isinstance(stdout, str):
+        raise ValueError("capacity execution proof is invalid")
+    report = parse_capacity_profile_report(
+        stdout.encode("utf-8", errors="strict"),
+        candidate=candidate,
+        release_run=release_run,
+        expected_base_url=base_url,
+    )
+    profile = report.get("profile")
+    completions = report.get("sessionCompletions")
+    expected_tenants = profile.get("executedTenants") if isinstance(profile, dict) else None
+    if type(expected_tenants) is not int or not isinstance(completions, list):
+        raise ValueError("capacity execution proof tenant inventory is invalid")
+    tenant_ids = tuple(
+        sorted(
+            {
+                tenant_id
+                for completion in completions
+                if isinstance(completion, dict)
+                and isinstance((tenant_id := completion.get("tenantId")), str)
+                and tenant_id
+            }
+        )
+    )
+    if len(tenant_ids) != expected_tenants:
+        raise ValueError("capacity execution proof tenant inventory is invalid")
+    return tenant_ids
+
+
+def derive_tenant_isolation_receipt_checks(
+    body: bytes,
+    *,
+    bundle_root: Path,
+    candidate_root: Path,
+    candidate: Mapping[str, object],
+    release_run: Mapping[str, str],
+) -> tuple[dict[str, bool], str]:
+    """Replay one tenant-isolation proof and both of its bound dependencies."""
+
+    try:
+        document = json.loads(body)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("tenant isolation execution proof is invalid") from exc
+    required_keys = {
+        "schemaVersion",
+        "candidate",
+        "releaseRun",
+        "observedAt",
+        "baseUrl",
+        "runtimeAttestation",
+        "capacityAttestation",
+        "execution",
+    }
+    if (
+        not isinstance(document, dict)
+        or frozenset(document)
+        not in {frozenset(required_keys), frozenset((*required_keys, "summary"))}
+        or type(document.get("schemaVersion")) is not int
+        or document.get("schemaVersion") != 1
+        or not exact_json_equal(document.get("candidate"), dict(candidate))
+        or not exact_json_equal(document.get("releaseRun"), dict(release_run))
+        or not _valid_observed_at_value(document.get("observedAt"))
+    ):
+        raise ValueError("tenant isolation execution proof is invalid")
+    base_url = _runtime_base_url(document.get("baseUrl"))
+    if base_url is None:
+        raise ValueError("tenant isolation execution proof is invalid")
+
+    runtime_proof = document.get("runtimeAttestation")
+    if (
+        not isinstance(runtime_proof, dict)
+        or set(runtime_proof) != {"artifact", "sha256"}
+        or runtime_proof.get("artifact") != "runtime/runtime-attestation.json"
+        or not isinstance(runtime_proof.get("sha256"), str)
+    ):
+        raise ValueError("tenant isolation runtime attestation proof is invalid")
+    try:
+        validate_runtime_attestation(
+            Path("runtime/runtime-attestation.json"),
+            bundle_root=bundle_root,
+            candidate_root=candidate_root,
+            candidate=candidate,
+            release_run=release_run,
+            expected_base_url=base_url,
+            expected_sha256=runtime_proof["sha256"],
+        )
+    except ValueError as exc:
+        raise ValueError(f"tenant isolation runtime attestation is invalid: {exc}") from exc
+
+    capacity_proof = document.get("capacityAttestation")
+    if (
+        not isinstance(capacity_proof, dict)
+        or set(capacity_proof) != {"artifact", "sha256"}
+        or capacity_proof.get("artifact") != "runtime/capacity-profile-attestation.json"
+    ):
+        raise ValueError("tenant isolation capacity attestation proof is invalid")
+    capacity_body = _proof_bytes(
+        bundle_root,
+        capacity_proof,
+        label="tenant isolation capacity attestation",
+    )
+    if isinstance(capacity_body, str):
+        raise ValueError(capacity_body)
+    try:
+        capacity_tenant_ids = derive_capacity_profile_tenant_ids(
+            capacity_body[0],
+            bundle_root=bundle_root,
+            candidate_root=candidate_root,
+            candidate=candidate,
+            release_run=release_run,
+        )
+    except ValueError as exc:
+        raise ValueError(f"tenant isolation capacity attestation is invalid: {exc}") from exc
+    selected_tenant_ids = capacity_tenant_ids[:2]
+    if (
+        len(selected_tenant_ids) != 2
+        or len(set(selected_tenant_ids)) != 2
+        or selected_tenant_ids != tuple(sorted(selected_tenant_ids))
+    ):
+        raise ValueError("tenant isolation capacity tenant pair is invalid")
+
+    execution = document.get("execution")
+    if (
+        not isinstance(execution, dict)
+        or set(execution) != {"command", "nativeExit", "stdout", "stdoutSha256", "stderr"}
+        or execution.get("command") != tenant_isolation_command_record()
+        or type(execution.get("nativeExit")) is not int
+        or execution.get("nativeExit") != 0
+        or execution.get("stderr") != ""
+        or not isinstance(execution.get("stdout"), str)
+        or not isinstance(execution.get("stdoutSha256"), str)
+    ):
+        raise ValueError("tenant isolation execution proof is invalid")
+    try:
+        stdout = execution["stdout"].encode("utf-8", errors="strict")
+    except UnicodeEncodeError as exc:
+        raise ValueError("tenant isolation execution proof is invalid") from exc
+    if (
+        len(stdout) > MAX_TENANT_ISOLATION_REPORT_BYTES
+        or hashlib.sha256(stdout).hexdigest() != execution["stdoutSha256"]
+    ):
+        raise ValueError("tenant isolation execution proof is invalid")
+    try:
+        report = parse_tenant_isolation_report(
+            stdout,
+            candidate=candidate,
+            release_run=release_run,
+            expected_base_url=base_url,
+            expected_capacity_report_sha256=capacity_proof["sha256"],
+            expected_capacity_tenant_ids=selected_tenant_ids,
+            forbidden_secret_values=(),
+        )
+    except ValueError as exc:
+        raise ValueError(f"tenant isolation strict report is invalid: {exc}") from exc
+    if report.get("observedAt") != document.get("observedAt"):
+        raise ValueError("tenant isolation execution proof timestamp does not match the report")
+    checks = derive_tenant_isolation_checks(report)
+    if set(checks) != set(RECEIPT_CONTRACTS["tenant_isolation"][1]) or any(
+        value is not True for value in checks.values()
+    ):
+        raise ValueError("tenant isolation execution proof checks did not all pass")
+    if "summary" in document and not exact_json_equal(
+        document["summary"],
+        {"checks": checks},
+    ):
+        raise ValueError("tenant isolation execution proof summary does not match the report")
+    return checks, str(document["observedAt"])
 
 
 def _classroom_fixture_secret_bytes() -> set[bytes]:
@@ -2008,6 +2213,44 @@ def probe_provenance_error(
             or result.get("checks") != checks
         ):
             return "classroom exports receipt does not match execution proof"
+        return None
+    if evidence == "tenant_isolation":
+        provenance = document.get("provenance")
+        if not isinstance(provenance, dict) or set(provenance) != {"tenantIsolationAttestation"}:
+            return "tenant isolation execution proof is missing or invalid"
+        proof = provenance.get("tenantIsolationAttestation")
+        if (
+            not isinstance(proof, dict)
+            or set(proof) != {"artifact", "sha256"}
+            or proof.get("artifact") != "runtime/tenant-isolation-attestation.json"
+        ):
+            return "tenant isolation execution proof is missing or invalid"
+        proof_body = _proof_bytes(
+            bundle_root,
+            proof,
+            label="tenant isolation attestation",
+        )
+        if isinstance(proof_body, str):
+            return proof_body
+        try:
+            checks, observed_at = derive_tenant_isolation_receipt_checks(
+                proof_body[0],
+                bundle_root=bundle_root,
+                candidate_root=candidate_root,
+                candidate=candidate,
+                release_run=release_run,
+            )
+        except ValueError as exc:
+            return str(exc)
+        receipt = document.get("receipt")
+        result = receipt.get("result") if isinstance(receipt, dict) else None
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("observedAt") != observed_at
+            or not isinstance(result, dict)
+            or result.get("checks") != checks
+        ):
+            return "tenant isolation receipt does not match execution proof"
         return None
     if evidence in {"capacity_profile", "learning_event_idempotency"}:
         provenance = document.get("provenance")

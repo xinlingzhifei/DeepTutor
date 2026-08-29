@@ -6,6 +6,7 @@ from typing import Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
 from pydantic import BaseModel, Field, field_validator, model_validator
+from sqlalchemy.exc import SQLAlchemyError
 
 from deeptutor.api.routers.auth import (
     _COOKIE_MAX_AGE,
@@ -25,6 +26,7 @@ from deeptutor.teaching.repositories.tenants import (
     ProvisioningSummary,
     TenantAccessDeniedError,
     TenantConflictError,
+    TenantMemberNotFoundError,
     TenantNotActiveError,
     TenantNotFoundError,
     TenantRepository,
@@ -178,6 +180,19 @@ class ReplaceGrantsRequest(BaseModel):
         return self
 
 
+class DeleteMemberRequest(BaseModel):
+    expected_tenant_id: str = Field(min_length=1, max_length=64)
+    expected_user_id: str = Field(min_length=1, max_length=128)
+
+    @field_validator("expected_tenant_id", "expected_user_id")
+    @classmethod
+    def normalize_expected_ids(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("value is required")
+        return normalized
+
+
 class MemberGrantsResponse(BaseModel):
     tenant_id: str
     user_id: str
@@ -220,6 +235,11 @@ def _raise_repository_http(error: Exception) -> None:
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Tenant not found",
         ) from error
+    if isinstance(error, TenantMemberNotFoundError):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Tenant membership not found",
+        ) from error
     if isinstance(error, TenantAccessDeniedError):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -239,6 +259,11 @@ def _raise_repository_http(error: Exception) -> None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Tenant operation conflicts with current state",
+        ) from error
+    if isinstance(error, SQLAlchemyError):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Tenant repository is unavailable",
         ) from error
     raise error
 
@@ -441,6 +466,49 @@ async def add_member(
     ) as exc:
         _raise_repository_http(exc)
     return _member_grants_response(tenant_id, body.user_id, grants)
+
+
+@router.delete(
+    "/{tenant_id}/members/{user_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_member(
+    tenant_id: str,
+    user_id: str,
+    body: DeleteMemberRequest,
+    _payload: TokenPayload = Depends(require_platform_admin),
+    repository: TenantRepository = Depends(get_tenant_repository),
+) -> Response:
+    normalized_tenant_id = tenant_id.strip()
+    normalized_user_id = user_id.strip()
+    if (
+        not normalized_tenant_id
+        or len(normalized_tenant_id) > 64
+        or not normalized_user_id
+        or len(normalized_user_id) > 128
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid tenant membership path",
+        )
+    if (
+        body.expected_tenant_id != normalized_tenant_id
+        or body.expected_user_id != normalized_user_id
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Tenant membership identity changed concurrently",
+        )
+    try:
+        await repository.delete_member(normalized_tenant_id, normalized_user_id)
+    except (
+        SQLAlchemyError,
+        TenantConflictError,
+        TenantMemberNotFoundError,
+        TenantNotFoundError,
+    ) as exc:
+        _raise_repository_http(exc)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.put(

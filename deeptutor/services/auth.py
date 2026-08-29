@@ -152,6 +152,23 @@ def add_user(username: str, plain_password: str, role: str = "user") -> None:
     logger.info("User '%s' saved with role=%r", username, record.get("role", "user"))
 
 
+def create_user(username: str, plain_password: str, role: str = "user") -> dict | None:
+    """Create a local user exactly once; return ``None`` on a username conflict."""
+
+    from deeptutor.multi_user.identity import create_user as _create_user
+
+    if username == AUTH_USERNAME and bool(AUTH_PASSWORD_HASH):
+        return None
+    record = _create_user(
+        username,
+        hash_password(plain_password),
+        role=role,  # type: ignore[arg-type]
+    )
+    if record is not None:
+        logger.info("User '%s' created with role=%r", username, record.get("role", "user"))
+    return record
+
+
 def list_users() -> list[dict]:
     """Return a list of user info dicts (username, role, created_at) — no hashes."""
     from deeptutor.multi_user.identity import list_user_info

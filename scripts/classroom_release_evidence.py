@@ -68,6 +68,12 @@ from platform_preflight_contract import (
     PHASES as PREFLIGHT_PHASES,
 )
 from render_platform_compose import validate_image_lock_bindings  # noqa: E402
+from tenant_isolation_contract import (  # noqa: E402
+    MAX_TENANT_ISOLATION_REPORT_BYTES,
+    derive_tenant_isolation_checks,
+    parse_tenant_isolation_report,
+    tenant_isolation_command_record,
+)
 from verify_classroom_release import (  # noqa: E402
     ARTIFACT_SCHEMA_VERSION,
     EVIDENCE_SCHEMA_VERSION,
@@ -75,9 +81,11 @@ from verify_classroom_release import (  # noqa: E402
     RECEIPT_CONTRACTS,
     derive_capacity_profile_receipt_checks,
     derive_capacity_profile_tenant_id,
+    derive_capacity_profile_tenant_ids,
     derive_classroom_exports_receipt_checks,
     derive_platform_preflight_receipt_checks,
     derive_probe_checks,
+    derive_tenant_isolation_receipt_checks,
     probe_provenance_error,
     read_capacity_profile_attestation_artifact,
     read_runtime_attestation_artifact,
@@ -116,6 +124,7 @@ _DIRECT_RECEIPT_EVIDENCE = frozenset(("source_head", "image_digests"))
 _PROBE_CLEANUP_MARGIN_SECONDS = 30
 _CAPACITY_STDERR_LIMIT_BYTES = 64 * 1024
 _CLASSROOM_EXPORT_STDERR_LIMIT_BYTES = 64 * 1024
+_TENANT_ISOLATION_STDERR_LIMIT_BYTES = 64 * 1024
 
 
 def _candidate(candidate_root: Path) -> dict[str, Any]:
@@ -372,6 +381,41 @@ def _run_capacity_profile(
             or os.fstat(stderr_buffer.fileno()).st_size > _CAPACITY_STDERR_LIMIT_BYTES
         ):
             raise subprocess.SubprocessError("capacity profile output is too large")
+        stdout_buffer.seek(0)
+        stderr_buffer.seek(0)
+        return subprocess.CompletedProcess(
+            arguments,
+            completed.returncode,
+            stdout_buffer.read().decode("utf-8", errors="strict"),
+            stderr_buffer.read().decode("utf-8", errors="strict"),
+        )
+
+
+def _run_tenant_isolation(
+    arguments: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    timeout: int,
+) -> subprocess.CompletedProcess[str]:
+    with (
+        tempfile.TemporaryFile(mode="w+b") as stdout_buffer,
+        tempfile.TemporaryFile(mode="w+b") as stderr_buffer,
+    ):
+        completed = subprocess.run(
+            arguments,
+            cwd=cwd,
+            env=env,
+            stdout=stdout_buffer,
+            stderr=stderr_buffer,
+            check=False,
+            timeout=timeout,
+        )
+        if (
+            os.fstat(stdout_buffer.fileno()).st_size > MAX_TENANT_ISOLATION_REPORT_BYTES
+            or os.fstat(stderr_buffer.fileno()).st_size > _TENANT_ISOLATION_STDERR_LIMIT_BYTES
+        ):
+            raise subprocess.SubprocessError("tenant isolation output is too large")
         stdout_buffer.seek(0)
         stderr_buffer.seek(0)
         return subprocess.CompletedProcess(
@@ -823,6 +867,55 @@ class _ClassroomPublicationBoundary:
         self.leases.clear()
 
 
+class _TenantPublicationBoundary(_ClassroomPublicationBoundary):
+    _FIXED_NAMES = ("runtime", "artifacts", "staging")
+
+    @classmethod
+    def open(cls, root: Path, attempt_id: str) -> _TenantPublicationBoundary:
+        boundary = cls(Path(os.path.abspath(root)))
+        try:
+            _assert_classroom_fixed_parents(boundary.root)
+            if os.name == "nt":
+                root_handle, root_identity = _open_windows_directory_handle(
+                    boundary.root,
+                    deletable=True,
+                )
+            else:
+                root_handle, root_identity = _open_posix_directory_path_no_follow(boundary.root)
+            boundary.leases["bundle"] = _ClassroomDirectoryLease(
+                path=boundary.root,
+                handle=root_handle,
+                identity=root_identity,
+            )
+
+            existing = {name: os.path.lexists(boundary.root / name) for name in cls._FIXED_NAMES}
+            _assert_classroom_fixed_parents(boundary.root)
+            for name in cls._FIXED_NAMES:
+                boundary.leases[name] = _open_classroom_directory_relative(
+                    boundary.leases["bundle"],
+                    name=name,
+                    path=boundary.root / name,
+                    create=not existing[name],
+                )
+
+            staging_name = f"tenant-isolation-{attempt_id}"
+            staging = boundary.root / "staging" / staging_name
+            if os.path.lexists(staging):
+                raise ValueError("tenant isolation staging already exists")
+            boundary.leases["staging/attempt"] = _open_classroom_directory_relative(
+                boundary.leases["staging"],
+                name=staging_name,
+                path=staging,
+                create=True,
+            )
+            boundary.staging = staging
+            boundary.assert_unchanged()
+            return boundary
+        except BaseException:
+            boundary.close()
+            raise
+
+
 def _create_classroom_json_staging(
     boundary: _ClassroomPublicationBoundary,
     *,
@@ -974,9 +1067,10 @@ def _classroom_publication_parent(
     parents = {
         boundary.root / "runtime": "runtime",
         boundary.root / "artifacts": "artifacts",
-        boundary.root / "raw" / "classroom-exports": "raw/classroom-exports",
         boundary.staging: "staging/attempt",
     }
+    if "raw/classroom-exports" in boundary.leases:
+        parents[boundary.root / "raw" / "classroom-exports"] = "raw/classroom-exports"
     key = parents.get(path.parent)
     if key is None:
         raise ValueError("classroom export publication path is invalid")
@@ -1045,9 +1139,12 @@ def _remove_classroom_entries(
     parent_leases = {
         boundary.root / "runtime": boundary.leases["runtime"],
         boundary.root / "artifacts": boundary.leases["artifacts"],
-        boundary.root / "raw" / "classroom-exports": boundary.leases["raw/classroom-exports"],
         boundary.staging: boundary.leases["staging/attempt"],
     }
+    if "raw/classroom-exports" in boundary.leases:
+        parent_leases[boundary.root / "raw" / "classroom-exports"] = boundary.leases[
+            "raw/classroom-exports"
+        ]
     failures: list[Exception] = []
     for path, expected_identity in entries.items():
         try:
@@ -2566,6 +2663,392 @@ def write_capacity_profile_receipt(
         raise
 
 
+def write_tenant_isolation_receipt(
+    *,
+    candidate_root: Path,
+    bundle_root: Path,
+    release_run: Mapping[str, object],
+    timeout_seconds: int,
+    runner: CommandRunner = _run_tenant_isolation,
+) -> dict[str, object]:
+    """Run the fixed tenant-isolation probe and publish its proof marker last."""
+
+    if (
+        not isinstance(timeout_seconds, int)
+        or isinstance(timeout_seconds, bool)
+        or timeout_seconds <= _PROBE_CLEANUP_MARGIN_SECONDS
+    ):
+        raise ValueError("tenant isolation timeout is invalid")
+    token = os.environ.get("YFEISTAI_LIVE_FIXTURE_TOKEN")
+    if not isinstance(token, str) or not token.strip():
+        raise ValueError("tenant isolation live fixture token is unavailable")
+    secrets = tuple(
+        value.encode("utf-8", errors="strict") for value in {token, token.strip()} if value
+    )
+    root = Path(os.path.abspath(bundle_root))
+    candidate_path = Path(os.path.abspath(candidate_root))
+    _assert_no_link_ancestors(root)
+    _assert_no_link_ancestors(candidate_path)
+    proof_path = root / "runtime" / "tenant-isolation-attestation.json"
+    receipt_path = root / "artifacts" / "tenant_isolation.json"
+    if any(os.path.lexists(path) for path in (proof_path, receipt_path)):
+        raise ValueError("tenant isolation evidence already exists")
+
+    candidate = _candidate(candidate_path)
+    bound_run = _release_run(release_run)
+    runtime_path = root / "runtime" / "runtime-attestation.json"
+    runtime_body, runtime_sha256 = read_runtime_attestation_artifact(
+        runtime_path,
+        bundle_root=root,
+    )
+    runtime = validate_runtime_attestation(
+        runtime_path,
+        bundle_root=root,
+        candidate_root=candidate_path,
+        candidate=candidate,
+        release_run=bound_run,
+        expected_sha256=runtime_sha256,
+    )
+    base_url = runtime.get("baseUrl")
+    if not isinstance(base_url, str):
+        raise ValueError("tenant isolation runtime URL is invalid")
+
+    capacity_path = root / "runtime" / "capacity-profile-attestation.json"
+    capacity_body, capacity_sha256 = read_capacity_profile_attestation_artifact(
+        capacity_path,
+        bundle_root=root,
+    )
+    capacity_tenant_ids = derive_capacity_profile_tenant_ids(
+        capacity_body,
+        bundle_root=root,
+        candidate_root=candidate_path,
+        candidate=candidate,
+        release_run=bound_run,
+    )
+    if len(capacity_tenant_ids) < 2:
+        raise ValueError("tenant isolation capacity tenant pair is unavailable")
+    selected_tenant_ids = capacity_tenant_ids[:2]
+    if len(set(selected_tenant_ids)) != 2 or selected_tenant_ids != tuple(
+        sorted(selected_tenant_ids)
+    ):
+        raise ValueError("tenant isolation capacity tenant pair is invalid")
+
+    logical_command = tenant_isolation_command_record()
+    arguments = [
+        sys.executable,
+        str(SCRIPTS_ROOT / "tenant_isolation_probe.py"),
+        "--profile",
+        "first-release",
+    ]
+    allowed_environment = {
+        "COMSPEC",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "NO_COLOR",
+        "PATH",
+        "PATHEXT",
+        "SSL_CERT_DIR",
+        "SSL_CERT_FILE",
+        "SYSTEMDRIVE",
+        "SYSTEMROOT",
+        "TEMP",
+        "TERM",
+        "TMP",
+        "WINDIR",
+    }
+    environment = {
+        name: value for name, value in os.environ.items() if name.upper() in allowed_environment
+    }
+    environment.update(
+        {
+            "YFEISTAI_LIVE_FIXTURE_TOKEN": token,
+            "YFEISTAI_CANDIDATE_ROOT": str(candidate_path),
+            "YFEISTAI_RELEASE_RUN_ID": bound_run["runId"],
+            "YFEISTAI_ENVIRONMENT_ID": bound_run["environmentId"],
+            "YFEISTAI_TENANT_ISOLATION_TIMEOUT_SECONDS": str(
+                timeout_seconds - _PROBE_CLEANUP_MARGIN_SECONDS
+            ),
+            "YFEISTAI_CAPACITY_ATTESTATION_PATH": str(capacity_path),
+            "YFEISTAI_CAPACITY_ATTESTATION_SHA256": capacity_sha256,
+            "YFEISTAI_CAPACITY_TENANT_IDS": json.dumps(
+                selected_tenant_ids,
+                separators=(",", ":"),
+            ),
+            "WEB_BASE_URL": base_url,
+        }
+    )
+    try:
+        completed = runner(
+            arguments,
+            cwd=candidate_path,
+            env=environment,
+            timeout=timeout_seconds,
+        )
+    except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
+        raise ValueError("tenant isolation probe could not run") from exc
+    if (
+        not isinstance(completed.returncode, int)
+        or isinstance(completed.returncode, bool)
+        or completed.returncode != 0
+        or completed.args != arguments
+        or not isinstance(completed.stdout, str)
+        or completed.stderr != ""
+    ):
+        raise ValueError("tenant isolation probe did not exit cleanly")
+    try:
+        stdout = completed.stdout.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as exc:
+        raise ValueError("tenant isolation probe output is invalid") from exc
+    if any(secret in stdout for secret in secrets):
+        raise ValueError("tenant isolation probe serialized a live fixture secret")
+    report = parse_tenant_isolation_report(
+        stdout,
+        candidate=candidate,
+        release_run=bound_run,
+        expected_base_url=base_url,
+        expected_capacity_report_sha256=capacity_sha256,
+        expected_capacity_tenant_ids=selected_tenant_ids,
+        forbidden_secret_values=secrets,
+    )
+    checks = derive_tenant_isolation_checks(report)
+    if any(value is not True for value in checks.values()):
+        raise ValueError("tenant isolation probe did not prove isolation")
+    observed_at = report.get("observedAt")
+    if not isinstance(observed_at, str) or not _valid_observed_at(observed_at):
+        raise ValueError("tenant isolation observedAt is invalid")
+
+    def assert_release_binding() -> None:
+        try:
+            candidate_after = _candidate(candidate_path)
+            runtime_after, runtime_after_sha256 = read_runtime_attestation_artifact(
+                runtime_path,
+                bundle_root=root,
+            )
+            capacity_after, capacity_after_sha256 = read_capacity_profile_attestation_artifact(
+                capacity_path,
+                bundle_root=root,
+            )
+        except ValueError as exc:
+            raise ValueError("tenant isolation release binding changed") from exc
+        if (
+            candidate_after != candidate
+            or runtime_after != runtime_body
+            or runtime_after_sha256 != runtime_sha256
+            or capacity_after != capacity_body
+            or capacity_after_sha256 != capacity_sha256
+        ):
+            raise ValueError("tenant isolation release binding changed")
+        validate_runtime_attestation(
+            runtime_path,
+            bundle_root=root,
+            candidate_root=candidate_path,
+            candidate=candidate,
+            release_run=bound_run,
+            expected_base_url=base_url,
+            expected_sha256=runtime_sha256,
+        )
+        replayed_tenant_ids = derive_capacity_profile_tenant_ids(
+            capacity_after,
+            bundle_root=root,
+            candidate_root=candidate_path,
+            candidate=candidate,
+            release_run=bound_run,
+        )
+        if replayed_tenant_ids[:2] != selected_tenant_ids:
+            raise ValueError("tenant isolation capacity tenant pair changed")
+
+    assert_release_binding()
+    proof = {
+        "schemaVersion": 1,
+        "candidate": candidate,
+        "releaseRun": bound_run,
+        "observedAt": observed_at,
+        "baseUrl": base_url,
+        "runtimeAttestation": {
+            "artifact": "runtime/runtime-attestation.json",
+            "sha256": runtime_sha256,
+        },
+        "capacityAttestation": {
+            "artifact": "runtime/capacity-profile-attestation.json",
+            "sha256": capacity_sha256,
+        },
+        "execution": {
+            "command": logical_command,
+            "nativeExit": 0,
+            "stdout": completed.stdout,
+            "stdoutSha256": hashlib.sha256(stdout).hexdigest(),
+            "stderr": "",
+        },
+        "summary": {"checks": checks},
+    }
+    attempt_id = uuid.uuid4().hex
+    boundary = _TenantPublicationBoundary.open(root, attempt_id)
+    staging = boundary.staging
+    staged_proof = staging / "tenant-isolation-attestation.json"
+    staged_receipt = staging / "tenant_isolation.json"
+    proof_handle: BinaryIO | None = None
+    receipt_handle: BinaryIO | None = None
+    proof_identity: tuple[int, int] | None = None
+    receipt_identity: tuple[int, int] | None = None
+    published: dict[str, tuple[Path, tuple[int, int]]] = {}
+    archive_artifacts: dict[str, Path] = {}
+    try:
+        boundary.assert_unchanged()
+        proof_handle, proof_identity, proof_body = _create_classroom_json_staging(
+            boundary,
+            parent_key="staging/attempt",
+            path=staged_proof,
+            document=proof,
+        )
+        if any(secret in proof_body for secret in secrets):
+            raise ValueError("tenant isolation proof contains a live fixture secret")
+        proof_sha256 = hashlib.sha256(proof_body).hexdigest()
+        replayed_checks, replayed_observed_at = derive_tenant_isolation_receipt_checks(
+            proof_body,
+            bundle_root=root,
+            candidate_root=candidate_path,
+            candidate=candidate,
+            release_run=bound_run,
+        )
+        if replayed_checks != checks or replayed_observed_at != observed_at:
+            raise ValueError("tenant isolation proof replay changed")
+        receipt = _pass_receipt_from_candidate(
+            candidate=candidate,
+            release_run=bound_run,
+            evidence="tenant_isolation",
+            observed_at=observed_at,
+            native_exit=0,
+            checks=replayed_checks,
+            provenance={
+                "tenantIsolationAttestation": {
+                    "artifact": "runtime/tenant-isolation-attestation.json",
+                    "sha256": proof_sha256,
+                }
+            },
+        )
+        receipt_handle, receipt_identity, receipt_body = _create_classroom_json_staging(
+            boundary,
+            parent_key="staging/attempt",
+            path=staged_receipt,
+            document=receipt,
+        )
+        if any(secret in receipt_body for secret in secrets):
+            raise ValueError("tenant isolation receipt contains a live fixture secret")
+        archive_artifacts = {
+            "proof": staged_proof,
+            "receipt": staged_receipt,
+        }
+        assert_release_binding()
+        boundary.assert_unchanged()
+        if any(os.path.lexists(path) for path in (proof_path, receipt_path)):
+            raise ValueError("tenant isolation publication target appeared concurrently")
+        for name, staged, target, source_handle, expected_body, expected_identity in (
+            (
+                "receipt",
+                staged_receipt,
+                receipt_path,
+                receipt_handle,
+                receipt_body,
+                receipt_identity,
+            ),
+            (
+                "proof",
+                staged_proof,
+                proof_path,
+                proof_handle,
+                proof_body,
+                proof_identity,
+            ),
+        ):
+            boundary.assert_unchanged()
+            assert source_handle is not None
+            assert expected_identity is not None
+            published[f"published-{name}"] = (target, expected_identity)
+            _publish_classroom_no_replace(
+                boundary,
+                staged,
+                target,
+                source_handle=source_handle,
+            )
+            boundary.assert_unchanged()
+            _assert_published_classroom_receipt(
+                target,
+                expected_body=expected_body,
+                expected_identity=expected_identity,
+                label=f"tenant isolation {name}",
+            )
+            assert_release_binding()
+        boundary.assert_unchanged()
+        return receipt
+    except BaseException as original_error:
+        if proof_handle is not None:
+            proof_handle.close()
+            proof_handle = None
+        if receipt_handle is not None:
+            receipt_handle.close()
+            receipt_handle = None
+        cleanup_error: Exception | None = None
+        try:
+            _remove_classroom_entries(
+                boundary,
+                {path: identity for path, identity in published.values()},
+                label="tenant isolation formal evidence",
+            )
+        except Exception as exc:
+            cleanup_error = exc
+        archive_error: Exception | None = None
+        if isinstance(original_error, Exception):
+            try:
+                boundary.assert_unchanged()
+                _record_probe_failure(
+                    bundle_root=root,
+                    evidence="tenant-isolation",
+                    recipe="live-first-release",
+                    attempt_id=attempt_id,
+                    reason="tenant isolation execution or publication failed",
+                    native_exit=0,
+                    artifacts=archive_artifacts,
+                )
+            except Exception as exc:
+                archive_error = exc
+        if archive_error is not None:
+            if cleanup_error is not None:
+                archive_error.add_note(f"formal evidence retraction also failed: {cleanup_error}")
+            raise original_error from archive_error
+        if cleanup_error is not None:
+            raise original_error from cleanup_error
+        raise
+    finally:
+        if proof_handle is not None:
+            proof_handle.close()
+        if receipt_handle is not None:
+            receipt_handle.close()
+        active_error = sys.exception()
+        staging_cleanup_error: Exception | None = None
+        try:
+            _remove_classroom_entries(
+                boundary,
+                {
+                    staged_proof: proof_identity,
+                    staged_receipt: receipt_identity,
+                },
+                label="tenant isolation staging evidence",
+            )
+        except Exception as exc:
+            staging_cleanup_error = exc
+            if active_error is not None:
+                active_error.add_note(f"staging evidence cleanup failed: {exc}")
+        finally:
+            boundary.close()
+            try:
+                staging.rmdir()
+            except OSError:
+                pass
+        if staging_cleanup_error is not None and active_error is None:
+            raise staging_cleanup_error
+
+
 def write_classroom_exports_receipt(
     *,
     candidate_root: Path,
@@ -3181,6 +3664,13 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     capacity_profile.add_argument("--environment-id", required=True)
     capacity_profile.add_argument("--timeout-seconds", type=int, required=True)
 
+    tenant_isolation = commands.add_parser("tenant-isolation")
+    tenant_isolation.add_argument("--candidate-root", type=Path, required=True)
+    tenant_isolation.add_argument("--bundle-root", type=Path, required=True)
+    tenant_isolation.add_argument("--run-id", required=True)
+    tenant_isolation.add_argument("--environment-id", required=True)
+    tenant_isolation.add_argument("--timeout-seconds", type=int, required=True)
+
     classroom_exports = commands.add_parser("classroom-exports")
     classroom_exports.add_argument("--candidate-root", type=Path, required=True)
     classroom_exports.add_argument("--bundle-root", type=Path, required=True)
@@ -3260,6 +3750,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             timeout_seconds=args.timeout_seconds,
         )
         print(args.bundle_root / "runtime" / "capacity-profile-attestation.json")
+        return 0
+    elif args.command == "tenant-isolation":
+        write_tenant_isolation_receipt(
+            candidate_root=args.candidate_root,
+            bundle_root=args.bundle_root,
+            release_run=release_run,
+            timeout_seconds=args.timeout_seconds,
+        )
+        print(args.bundle_root / "runtime" / "tenant-isolation-attestation.json")
         return 0
     elif args.command == "classroom-exports":
         write_classroom_exports_receipt(

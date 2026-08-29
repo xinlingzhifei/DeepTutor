@@ -12,7 +12,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 import pytest
-from sqlalchemy import make_url, select, text, update
+from sqlalchemy import func, make_url, select, text, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from testcontainers.community.postgres import PostgresContainer
 
@@ -36,6 +36,7 @@ from deeptutor.teaching.models import (
     TenantSchemaState,
     TenantStorageCredential,
 )
+from deeptutor.teaching.models.platform import RoleGrant as RoleGrantModel
 from deeptutor.teaching.object_store import (
     LocalClassroomArtifactStore,
     ObjectStoreAccessDenied,
@@ -721,6 +722,80 @@ def _exercise_audit_log(harness: IsolationHarness) -> BoundaryObservation:
             f"{JOB_A}:0",
         ),
     )
+
+
+def test_exact_member_delete_cascades_only_its_tenant_grants(
+    tenant_database: TenantDatabase,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = PlatformSettings(
+        enabled=True,
+        database_url=SecretStr(tenant_database.url),
+    )
+    monkeypatch.setattr(database_module, "load_platform_settings", lambda: settings)
+    user_id = "cleanup-member-shared-user"
+
+    async def exercise() -> tuple[int, int, int, int]:
+        engine = create_async_engine(tenant_database.url)
+        factory = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with factory() as session:
+                async with session.begin():
+                    for tenant_id in (TENANT_A, TENANT_B):
+                        session.add(
+                            TenantMembership(
+                                tenant_id=tenant_id,
+                                user_id=user_id,
+                                status="active",
+                            )
+                        )
+                    await session.flush()
+                    for tenant_id in (TENANT_A, TENANT_B):
+                        session.add(
+                            RoleGrantModel(
+                                tenant_id=tenant_id,
+                                user_id=user_id,
+                                role="student",
+                                scope_type="tenant",
+                                scope_id=tenant_id,
+                            )
+                        )
+            await TenantRepository().delete_member(TENANT_A, user_id)
+            async with factory() as session:
+                membership_counts = []
+                grant_counts = []
+                for tenant_id in (TENANT_A, TENANT_B):
+                    membership_counts.append(
+                        int(
+                            await session.scalar(
+                                select(func.count())
+                                .select_from(TenantMembership)
+                                .where(
+                                    TenantMembership.tenant_id == tenant_id,
+                                    TenantMembership.user_id == user_id,
+                                )
+                            )
+                            or 0
+                        )
+                    )
+                    grant_counts.append(
+                        int(
+                            await session.scalar(
+                                select(func.count())
+                                .select_from(RoleGrantModel)
+                                .where(
+                                    RoleGrantModel.tenant_id == tenant_id,
+                                    RoleGrantModel.user_id == user_id,
+                                )
+                            )
+                            or 0
+                        )
+                    )
+                return (*membership_counts, *grant_counts)
+        finally:
+            await engine.dispose()
+
+    assert asyncio.run(exercise()) == (0, 1, 0, 1)
 
 
 ACCEPTANCE_MATRIX = (

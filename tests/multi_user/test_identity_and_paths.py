@@ -1,4 +1,7 @@
+from concurrent.futures import ThreadPoolExecutor
+import os
 from pathlib import Path
+import threading
 
 import pytest
 
@@ -34,6 +37,77 @@ def test_delete_user_compares_and_returns_the_locked_identity(mu_isolated_root):
     assert identity.load_users()["alice"]["id"] == record["id"]
     assert identity.delete_user("alice", expected_user_id=record["id"]) == record["id"]
     assert "alice" not in identity.load_users()
+
+
+def test_create_user_is_atomic_create_only_under_concurrency(mu_isolated_root):
+    barrier = threading.Barrier(2)
+
+    def create(hashed_password: str):
+        barrier.wait(timeout=5)
+        return identity.create_user(
+            "isolation-fixture",
+            hashed_password,
+            role="user",
+        )
+
+    password_hashes = ("$2b$12$first", "$2b$12$second")
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = tuple(executor.map(create, password_hashes))
+
+    created = [result for result in results if result is not None]
+    assert len(created) == 1
+    stored = identity.load_users()["isolation-fixture"]
+    assert stored == created[0]
+    assert stored["hash"] in password_hashes
+
+
+def test_create_user_fails_closed_without_replacing_a_malformed_store(
+    mu_isolated_root,
+):
+    identity.USERS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    malformed = b'{"alice":'
+    identity.USERS_FILE.write_bytes(malformed)
+
+    with pytest.raises(identity.UserStoreUnavailable):
+        identity.create_user("isolation-fixture", "$2b$12$new", role="user")
+
+    assert identity.USERS_FILE.read_bytes() == malformed
+
+
+def test_create_user_preserves_existing_store_when_atomic_publish_fails(
+    mu_isolated_root,
+    monkeypatch,
+):
+    identity.save_user("alice", "$2b$12$existing", role="admin")
+    before = identity.USERS_FILE.read_bytes()
+
+    def fail_replace(_source, _target):
+        raise OSError("simulated atomic publish failure")
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="simulated atomic publish failure"):
+        identity.create_user("isolation-fixture", "$2b$12$new", role="user")
+
+    assert identity.USERS_FILE.read_bytes() == before
+
+
+def test_create_user_stages_the_identity_store_with_owner_only_permissions(
+    mu_isolated_root,
+    monkeypatch,
+):
+    real_open = os.open
+    observed_modes: list[int] = []
+
+    def capture_open(path, flags, mode=0o777):
+        observed_modes.append(mode)
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(os, "open", capture_open)
+
+    identity.create_user("isolation-fixture", "$2b$12$new", role="user")
+
+    assert observed_modes == [0o600]
 
 
 def test_path_service_uses_current_user_scope(tmp_path, monkeypatch):

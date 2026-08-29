@@ -62,6 +62,13 @@ def _load_classroom_export_support():
     )
 
 
+def _load_tenant_isolation_support():
+    return _load_path(
+        "tenant_isolation_contract_support_for_release_evidence",
+        ROOT / "tests" / "scripts" / "test_tenant_isolation_contract.py",
+    )
+
+
 def _teacher_playwright_report() -> dict[str, object]:
     file = "tests/e2e/classroom-first-release.live.spec.ts"
     return {
@@ -2354,6 +2361,39 @@ def _write_capacity_dependency(
     )
 
 
+def _tenant_isolation_report(
+    candidate: dict[str, object],
+    *,
+    capacity_sha256: str,
+    tenant_ids: tuple[str, str] = ("tenant-00", "tenant-01"),
+) -> tuple[object, dict[str, object]]:
+    support = _load_tenant_isolation_support()
+    report = json.loads(json.dumps(support._report()))
+    original_owner, original_foreign = support.CAPACITY_TENANT_IDS
+    owner_tenant_id, foreign_tenant_id = tenant_ids
+    report.update(
+        candidate=candidate,
+        releaseRun=RELEASE_RUN,
+        baseUrl=BASE_URL,
+        capacityProof={
+            "reportSha256": capacity_sha256,
+            "tenantIds": list(tenant_ids),
+        },
+    )
+    for principal in report["principals"]:
+        principal["tenantId"] = (
+            owner_tenant_id if principal["tenantId"] == original_owner else foreign_tenant_id
+        )
+    report["crossTenantPrincipal"]["tenantId"] = foreign_tenant_id
+    for observation in report["observations"]:
+        observation["target"]["ownerTenantId"] = owner_tenant_id
+        for operation in observation["operations"]:
+            operation["tenantId"] = (
+                owner_tenant_id if operation["tenantId"] == original_owner else foreign_tenant_id
+            )
+    return support, report
+
+
 def _classroom_export_runner(
     module,
     candidate: dict[str, object],
@@ -2993,6 +3033,260 @@ def test_release_evidence_cli_runs_fixed_classroom_exports_producer(
     }
     assert capsys.readouterr().out == (
         f"{bundle_root / 'runtime' / 'classroom-exports-attestation.json'}\n"
+    )
+
+
+def test_tenant_isolation_receipt_replays_capacity_pair_and_publishes_proof_last(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_evidence_module()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    _write_capacity_dependency(module, candidate_root, candidate, monkeypatch)
+    capacity_path = candidate_root / "runtime" / "capacity-profile-attestation.json"
+    capacity_sha256 = hashlib.sha256(capacity_path.read_bytes()).hexdigest()
+    token = "tenant-isolation-token-must-not-be-serialized"
+    monkeypatch.setenv("YFEISTAI_LIVE_FIXTURE_TOKEN", token)
+    monkeypatch.setenv("COMPOSE_FILE", "attacker-compose.yml")
+    calls: list[dict[str, object]] = []
+    publications: list[str] = []
+    real_publish = module._publish_classroom_no_replace
+
+    def runner(arguments, *, cwd, env, timeout):
+        support, report = _tenant_isolation_report(
+            candidate,
+            capacity_sha256=capacity_sha256,
+        )
+        calls.append(
+            {
+                "arguments": arguments,
+                "cwd": cwd,
+                "env": env,
+                "timeout": timeout,
+            }
+        )
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            support._module().canonical_tenant_isolation_report(report).decode("utf-8"),
+            "",
+        )
+
+    def record_publication(boundary, source: Path, target: Path, *, source_handle) -> None:
+        real_publish(boundary, source, target, source_handle=source_handle)
+        publications.append(target.relative_to(candidate_root).as_posix())
+
+    monkeypatch.setattr(module, "_publish_classroom_no_replace", record_publication)
+    receipt = module.write_tenant_isolation_receipt(
+        candidate_root=candidate_root,
+        bundle_root=candidate_root,
+        release_run=RELEASE_RUN,
+        timeout_seconds=600,
+        runner=runner,
+    )
+
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["cwd"] == candidate_root.resolve()
+    assert call["timeout"] == 600
+    assert call["arguments"][-2:] == ["--profile", "first-release"]
+    assert call["env"]["YFEISTAI_LIVE_FIXTURE_TOKEN"] == token
+    assert call["env"]["YFEISTAI_CANDIDATE_ROOT"] == str(candidate_root.resolve())
+    assert call["env"]["YFEISTAI_RELEASE_RUN_ID"] == RELEASE_RUN["runId"]
+    assert call["env"]["YFEISTAI_ENVIRONMENT_ID"] == RELEASE_RUN["environmentId"]
+    assert call["env"]["YFEISTAI_TENANT_ISOLATION_TIMEOUT_SECONDS"] == "570"
+    assert call["env"]["YFEISTAI_CAPACITY_ATTESTATION_PATH"] == str(capacity_path)
+    assert call["env"]["YFEISTAI_CAPACITY_ATTESTATION_SHA256"] == capacity_sha256
+    assert json.loads(call["env"]["YFEISTAI_CAPACITY_TENANT_IDS"]) == [
+        "tenant-00",
+        "tenant-01",
+    ]
+    assert call["env"]["WEB_BASE_URL"] == BASE_URL
+    assert "COMPOSE_FILE" not in call["env"]
+
+    receipt_path = candidate_root / "artifacts" / "tenant_isolation.json"
+    proof_path = candidate_root / "runtime" / "tenant-isolation-attestation.json"
+    assert publications == [
+        "artifacts/tenant_isolation.json",
+        "runtime/tenant-isolation-attestation.json",
+    ]
+    assert receipt == json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["evidence"] == "tenant_isolation"
+    assert receipt["receipt"]["producer"] == "tenant-isolation-probe"
+    assert receipt["receipt"]["result"]["checks"] == {
+        "databaseIsolated": True,
+        "objectsIsolated": True,
+        "exportsIsolated": True,
+        "eventsIsolated": True,
+    }
+    proof_sha256 = hashlib.sha256(proof_path.read_bytes()).hexdigest()
+    assert receipt["provenance"] == {
+        "tenantIsolationAttestation": {
+            "artifact": "runtime/tenant-isolation-attestation.json",
+            "sha256": proof_sha256,
+        }
+    }
+    proof = json.loads(proof_path.read_text(encoding="utf-8"))
+    assert proof["capacityAttestation"] == {
+        "artifact": "runtime/capacity-profile-attestation.json",
+        "sha256": capacity_sha256,
+    }
+    assert proof["execution"]["command"] == module.tenant_isolation_command_record()
+    assert proof["summary"]["checks"] == receipt["receipt"]["result"]["checks"]
+    assert json.loads(proof["execution"]["stdout"])["capacityProof"] == {
+        "reportSha256": capacity_sha256,
+        "tenantIds": ["tenant-00", "tenant-01"],
+    }
+    assert token not in receipt_path.read_text(encoding="utf-8")
+    assert token not in proof_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("case", "message"),
+    (
+        ("secret", "secret"),
+        ("tenant-pair-drift", "capacity|tenant"),
+    ),
+    ids=("secret", "tenant-pair-drift"),
+)
+def test_tenant_isolation_rejects_secret_or_capacity_tenant_pair_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    message: str,
+) -> None:
+    module = _load_evidence_module()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    _write_capacity_dependency(module, candidate_root, candidate, monkeypatch)
+    capacity_path = candidate_root / "runtime" / "capacity-profile-attestation.json"
+    capacity_sha256 = hashlib.sha256(capacity_path.read_bytes()).hexdigest()
+    token = "tenant-isolation-secret-must-not-be-archived"
+    monkeypatch.setenv("YFEISTAI_LIVE_FIXTURE_TOKEN", token)
+
+    def runner(arguments, *, cwd, env, timeout):
+        del cwd, env, timeout
+        support, report = _tenant_isolation_report(
+            candidate,
+            capacity_sha256=capacity_sha256,
+        )
+        if case == "secret":
+            report["principals"][0]["actorId"] = token
+        else:
+            report["capacityProof"]["tenantIds"] = ["tenant-01", "tenant-02"]
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            support._module().canonical_tenant_isolation_report(report).decode("utf-8"),
+            "",
+        )
+
+    with pytest.raises(ValueError, match=message):
+        module.write_tenant_isolation_receipt(
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            timeout_seconds=600,
+            runner=runner,
+        )
+
+    assert not (candidate_root / "artifacts" / "tenant_isolation.json").exists()
+    assert not (candidate_root / "runtime" / "tenant-isolation-attestation.json").exists()
+    if case == "secret":
+        assert not any(
+            token.encode("utf-8") in path.read_bytes()
+            for path in candidate_root.rglob("*")
+            if path.is_file()
+        )
+
+
+def test_tenant_isolation_publication_failure_leaves_no_formal_receipt_or_proof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_evidence_module()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    _write_capacity_dependency(module, candidate_root, candidate, monkeypatch)
+    capacity_path = candidate_root / "runtime" / "capacity-profile-attestation.json"
+    capacity_sha256 = hashlib.sha256(capacity_path.read_bytes()).hexdigest()
+    monkeypatch.setenv("YFEISTAI_LIVE_FIXTURE_TOKEN", "tenant-isolation-token")
+    proof_path = candidate_root / "runtime" / "tenant-isolation-attestation.json"
+    receipt_path = candidate_root / "artifacts" / "tenant_isolation.json"
+    real_publish = module._publish_classroom_no_replace
+
+    def runner(arguments, *, cwd, env, timeout):
+        del cwd, env, timeout
+        support, report = _tenant_isolation_report(
+            candidate,
+            capacity_sha256=capacity_sha256,
+        )
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            support._module().canonical_tenant_isolation_report(report).decode("utf-8"),
+            "",
+        )
+
+    def fail_proof(boundary, source: Path, target: Path, *, source_handle) -> None:
+        if target == proof_path:
+            raise OSError("simulated tenant isolation proof publication failure")
+        real_publish(boundary, source, target, source_handle=source_handle)
+
+    monkeypatch.setattr(module, "_publish_classroom_no_replace", fail_proof)
+    with pytest.raises(OSError, match="simulated tenant isolation proof publication failure"):
+        module.write_tenant_isolation_receipt(
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            timeout_seconds=600,
+            runner=runner,
+        )
+
+    assert not proof_path.exists()
+    assert not receipt_path.exists()
+    assert not list(candidate_root.rglob("*.staging"))
+
+
+def test_release_evidence_cli_runs_fixed_tenant_isolation_producer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = _load_evidence_module()
+    candidate_root = tmp_path / "candidate"
+    bundle_root = tmp_path / "bundle"
+    captured: dict[str, object] = {}
+
+    def write_receipt(**arguments: object) -> dict[str, object]:
+        captured.update(arguments)
+        return {}
+
+    monkeypatch.setattr(module, "write_tenant_isolation_receipt", write_receipt, raising=False)
+    assert (
+        module.main(
+            [
+                "tenant-isolation",
+                "--candidate-root",
+                str(candidate_root),
+                "--bundle-root",
+                str(bundle_root),
+                "--run-id",
+                RELEASE_RUN["runId"],
+                "--environment-id",
+                RELEASE_RUN["environmentId"],
+                "--timeout-seconds",
+                "600",
+            ]
+        )
+        == 0
+    )
+    assert captured == {
+        "candidate_root": candidate_root,
+        "bundle_root": bundle_root,
+        "release_run": RELEASE_RUN,
+        "timeout_seconds": 600,
+    }
+    assert capsys.readouterr().out == (
+        f"{bundle_root / 'runtime' / 'tenant-isolation-attestation.json'}\n"
     )
 
 

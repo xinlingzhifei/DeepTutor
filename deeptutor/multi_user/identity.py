@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import json
 import logging
+import os
 from pathlib import Path
 import secrets
 import threading
@@ -21,7 +22,7 @@ logger = logging.getLogger(__name__)
 # process FastAPI deployments (the ``deeptutor start`` launcher) are fully covered;
 # multi-worker deployments still race and must rely on an external user store
 # (e.g. PocketBase), which is documented in the multi-user README.
-_USERS_WRITE_LOCK = threading.Lock()
+_USERS_WRITE_LOCK = threading.RLock()
 
 AUTH_DIR = SYSTEM_ROOT / "auth"
 USERS_FILE = AUTH_DIR / "users.json"
@@ -32,6 +33,10 @@ LEGACY_SECRET_FILE = PROJECT_ROOT / "data" / "user" / "auth_secret"
 
 class UserIdentityConflict(RuntimeError):
     """The username no longer resolves to the identity the caller observed."""
+
+
+class UserStoreUnavailable(RuntimeError):
+    """The persisted identity store cannot be safely used for a mutation."""
 
 
 def new_user_id() -> str:
@@ -86,7 +91,56 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 def _write_users(users: dict[str, dict[str, Any]]) -> None:
     USERS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    USERS_FILE.write_text(json.dumps(users, indent=2, ensure_ascii=False), encoding="utf-8")
+    body = json.dumps(users, indent=2, ensure_ascii=False)
+    temporary = USERS_FILE.with_name(f".{USERS_FILE.name}.{uuid4().hex}.tmp")
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        try:
+            handle = os.fdopen(descriptor, "w", encoding="utf-8", newline="")
+        except BaseException:
+            os.close(descriptor)
+            raise
+        with handle:
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, USERS_FILE)
+    except BaseException:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _load_users_for_update() -> dict[str, dict[str, Any]]:
+    """Load every existing identity or reject the mutation without writing."""
+
+    migrate_legacy_multi_user_tree()
+    source = USERS_FILE if USERS_FILE.exists() else LEGACY_USERS_FILE
+    if not source.exists():
+        return {}
+    try:
+        loaded = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise UserStoreUnavailable("identity store is unavailable") from exc
+    if not isinstance(loaded, dict):
+        raise UserStoreUnavailable("identity store is unavailable")
+
+    canonical: dict[str, dict[str, Any]] = {}
+    for index, (username, value) in enumerate(loaded.items()):
+        role: Role = "admin" if index == 0 else "user"
+        if isinstance(value, dict) and str(value.get("role") or "") in {"admin", "user"}:
+            role = str(value.get("role"))  # type: ignore[assignment]
+        record = _canonical_record(str(username), value, default_role=role)
+        if record is None:
+            raise UserStoreUnavailable("identity store is unavailable")
+        canonical[str(username)] = record
+    return canonical
 
 
 def _migrate_legacy_users() -> dict[str, dict[str, Any]] | None:
@@ -163,7 +217,7 @@ def _env_admin_record(password_hash: str) -> dict[str, Any]:
     }
 
 
-def load_users(  # nosec B107 - empty defaults mean "no env fallback supplied".
+def _load_users_unlocked(  # nosec B107 - empty defaults mean "no env fallback supplied".
     env_username: str = "",
     env_password_hash: str = "",
 ) -> dict[str, dict[str, Any]]:
@@ -210,6 +264,16 @@ def load_users(  # nosec B107 - empty defaults mean "no env fallback supplied".
     return canonical
 
 
+def load_users(  # nosec B107 - empty defaults mean "no env fallback supplied".
+    env_username: str = "",
+    env_password_hash: str = "",
+) -> dict[str, dict[str, Any]]:
+    """Load users while serializing any one-time migration write."""
+
+    with _USERS_WRITE_LOCK:
+        return _load_users_unlocked(env_username, env_password_hash)
+
+
 def save_user(username: str, hashed_password: str, role: Role = "user") -> dict[str, Any]:
     USERS_FILE.parent.mkdir(parents=True, exist_ok=True)
     # Read-modify-write must be atomic so concurrent first-time registrations
@@ -217,7 +281,7 @@ def save_user(username: str, hashed_password: str, role: Role = "user") -> dict[
     with _USERS_WRITE_LOCK:
         # Called without the env arguments on purpose: ``users`` is written back
         # to disk below, and the bootstrap admin must stay an in-memory overlay.
-        users = load_users()
+        users = _load_users_for_update()
         env_username, _ = _env_bootstrap_admin()
         # A configured bootstrap admin counts as an existing account, so the
         # first account an operator creates from /admin/users is not silently
@@ -238,6 +302,30 @@ def save_user(username: str, hashed_password: str, role: Role = "user") -> dict[
         users[username] = record
         _write_users(users)
     return record
+
+
+def create_user(
+    username: str,
+    hashed_password: str,
+    role: Role = "user",
+) -> dict[str, Any] | None:
+    """Create one local identity without ever replacing an existing username."""
+
+    with _USERS_WRITE_LOCK:
+        users = _load_users_for_update()
+        if username in users:
+            return None
+        record = {
+            "id": new_user_id(),
+            "hash": hashed_password,
+            "role": role,
+            "created_at": utc_now(),
+            "disabled": False,
+            "avatar": "",
+        }
+        users[username] = record
+        _write_users(users)
+        return record
 
 
 def list_user_info(  # nosec B107 - empty defaults mean "no env fallback supplied".
@@ -274,7 +362,7 @@ def delete_user(username: str, *, expected_user_id: str) -> str | None:
     if not USERS_FILE.exists():
         return None
     with _USERS_WRITE_LOCK:
-        users = load_users()
+        users = _load_users_for_update()
         record = users.get(username)
         if record is None:
             return None
@@ -291,7 +379,7 @@ def set_avatar(username: str, avatar: str) -> bool:
     if not USERS_FILE.exists():
         return False
     with _USERS_WRITE_LOCK:
-        users = load_users()
+        users = _load_users_for_update()
         if username not in users:
             return False
         users[username]["avatar"] = avatar
@@ -349,11 +437,12 @@ def set_role(username: str, role: Role) -> bool:
         raise ValueError("role must be 'admin' or 'user'")
     if not USERS_FILE.exists():
         return False
-    users = load_users()
-    if username not in users:
-        return False
-    users[username]["role"] = role
-    _write_users(users)
+    with _USERS_WRITE_LOCK:
+        users = _load_users_for_update()
+        if username not in users:
+            return False
+        users[username]["role"] = role
+        _write_users(users)
     return True
 
 

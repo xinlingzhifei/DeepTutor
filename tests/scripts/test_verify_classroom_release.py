@@ -52,6 +52,22 @@ def _load_classroom_export_support():
         sys.modules.pop(spec.name, None)
 
 
+def _load_tenant_isolation_support():
+    path = Path(__file__).parent / "test_tenant_isolation_contract.py"
+    spec = importlib.util.spec_from_file_location(
+        "tenant_isolation_contract_support_for_release_verifier",
+        path,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        sys.modules.pop(spec.name, None)
+
+
 def _candidate(source_head: str) -> dict[str, object]:
     return {
         "sourceRepository": _SOURCE_REPOSITORY,
@@ -81,6 +97,15 @@ def test_classroom_exports_uses_the_fixed_export_probe_contract() -> None:
     assert module.RECEIPT_CONTRACTS["classroom_exports"] == (
         "classroom-export-probe",
         ("zipOpened", "pptxOpened", "offlineHtmlOpened", "mp4Opened"),
+    )
+
+
+def test_tenant_isolation_uses_the_fixed_probe_contract() -> None:
+    module = _load_verifier()
+
+    assert module.RECEIPT_CONTRACTS["tenant_isolation"] == (
+        "tenant-isolation-probe",
+        ("databaseIsolated", "objectsIsolated", "exportsIsolated", "eventsIsolated"),
     )
 
 
@@ -434,6 +459,96 @@ def _write_probe_proof(
         return {
             "capacityAttestation": {
                 "artifact": "runtime/capacity-profile-attestation.json",
+                "sha256": hashlib.sha256(attestation_path.read_bytes()).hexdigest(),
+            }
+        }
+    if evidence == "tenant_isolation":
+        support = _load_tenant_isolation_support()
+        contract = support._module()
+        runtime_path = tmp_path / "runtime" / "runtime-attestation.json"
+        capacity_path = tmp_path / "runtime" / "capacity-profile-attestation.json"
+        capacity_body = capacity_path.read_bytes()
+        capacity_sha256 = hashlib.sha256(capacity_body).hexdigest()
+        capacity_document = json.loads(capacity_body)
+        capacity_execution = capacity_document["execution"]
+        assert isinstance(capacity_execution, dict)
+        capacity_report = json.loads(str(capacity_execution["stdout"]))
+        capacity_completions = capacity_report["sessionCompletions"]
+        assert isinstance(capacity_completions, list)
+        capacity_tenant_ids = tuple(
+            sorted(
+                {
+                    str(completion["tenantId"])
+                    for completion in capacity_completions
+                    if isinstance(completion, dict)
+                }
+            )
+        )
+        selected_tenant_ids = capacity_tenant_ids[:2]
+        assert selected_tenant_ids == tuple(sorted(selected_tenant_ids))
+        report = support._replace_string(
+            support._report(),
+            support.OWNER_TENANT_ID,
+            selected_tenant_ids[0],
+        )
+        report = support._replace_string(
+            report,
+            support.FOREIGN_TENANT_ID,
+            selected_tenant_ids[1],
+        )
+        assert isinstance(report, dict)
+        report.update(
+            candidate=candidate,
+            releaseRun=_RELEASE_RUN,
+            observedAt="2026-08-24T00:00:00Z",
+            capacityProof={
+                "reportSha256": capacity_sha256,
+                "tenantIds": list(selected_tenant_ids),
+            },
+        )
+        report_body = contract.canonical_tenant_isolation_report(report)
+        parsed = contract.parse_tenant_isolation_report(
+            report_body,
+            candidate=candidate,
+            release_run=_RELEASE_RUN,
+            expected_base_url="https://candidate.example.test",
+            expected_capacity_report_sha256=capacity_sha256,
+            expected_capacity_tenant_ids=selected_tenant_ids,
+            forbidden_secret_values=(),
+        )
+        assert contract.derive_tenant_isolation_checks(parsed) == {
+            "databaseIsolated": True,
+            "objectsIsolated": True,
+            "exportsIsolated": True,
+            "eventsIsolated": True,
+        }
+        attestation = {
+            "schemaVersion": 1,
+            "candidate": candidate,
+            "releaseRun": _RELEASE_RUN,
+            "observedAt": report["observedAt"],
+            "baseUrl": report["baseUrl"],
+            "runtimeAttestation": {
+                "artifact": "runtime/runtime-attestation.json",
+                "sha256": hashlib.sha256(runtime_path.read_bytes()).hexdigest(),
+            },
+            "capacityAttestation": {
+                "artifact": "runtime/capacity-profile-attestation.json",
+                "sha256": capacity_sha256,
+            },
+            "execution": {
+                "command": contract.tenant_isolation_command_record(),
+                "nativeExit": 0,
+                "stdout": report_body.decode("utf-8"),
+                "stdoutSha256": hashlib.sha256(report_body).hexdigest(),
+                "stderr": "",
+            },
+        }
+        attestation_path = tmp_path / "runtime" / "tenant-isolation-attestation.json"
+        attestation_path.write_text(json.dumps(attestation, sort_keys=True), encoding="utf-8")
+        return {
+            "tenantIsolationAttestation": {
+                "artifact": "runtime/tenant-isolation-attestation.json",
                 "sha256": hashlib.sha256(attestation_path.read_bytes()).hexdigest(),
             }
         }
@@ -1449,6 +1564,43 @@ def test_file_runtime_rejects_self_attested_classroom_exports_without_bound_prov
     )
 
 
+def test_file_runtime_rejects_self_attested_tenant_isolation_without_bound_provenance(
+    tmp_path: Path,
+) -> None:
+    module = _load_verifier()
+    manifest, evidence_map, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    evidence_entry = evidence_map["tenant_isolation"]
+    assert isinstance(evidence_entry, dict)
+    artifact_path = tmp_path / str(evidence_entry["artifact"])
+    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    artifact.pop("provenance")
+    artifact_body = json.dumps(artifact, sort_keys=True).encode()
+    artifact_path.write_bytes(artifact_body)
+    evidence_entry["artifactSha256"] = hashlib.sha256(artifact_body).hexdigest()
+    manifest.write_text(
+        json.dumps(_manifest_document(module, candidate, evidence_map)),
+        encoding="utf-8",
+    )
+
+    result = module.verify(
+        module.FileReleaseRuntime(
+            manifest,
+            expected_source_head="a" * 40,
+            candidate_root=tmp_path,
+        )
+    )
+
+    assert result.layers["tenant_isolation"].status == "fail"
+    assert (
+        "tenant isolation execution proof is missing or invalid"
+        in result.layers["tenant_isolation"].detail
+    )
+
+
 @pytest.mark.parametrize("case", ("missing", "tampered", "symlink", "dangling", "extra"))
 def test_file_runtime_rejects_invalid_classroom_export_raw_boundaries(
     tmp_path: Path,
@@ -1658,6 +1810,88 @@ def test_classroom_export_replay_rejects_secret_bearing_deflated_member(
     with pytest.raises(ValueError, match="live fixture token"):
         module.derive_classroom_exports_receipt_checks(
             proof_body,
+            bundle_root=tmp_path,
+            candidate_root=tmp_path,
+            candidate=candidate,
+            release_run=_RELEASE_RUN,
+        )
+
+
+def _capacity_profile_proof(
+    tmp_path: Path,
+    module,
+) -> tuple[bytes, dict[str, object]]:
+    candidate = _candidate("a" * 40)
+    module.PROJECT_ROOT = tmp_path
+    _write_candidate_files(tmp_path, candidate)
+    _write_probe_proof(tmp_path, module, candidate, "capacity_profile")
+    return (
+        (tmp_path / "runtime" / "capacity-profile-attestation.json").read_bytes(),
+        candidate,
+    )
+
+
+def test_derive_capacity_profile_tenant_ids_replays_all_executed_tenants(
+    tmp_path: Path,
+) -> None:
+    module = _load_verifier()
+    proof_body, candidate = _capacity_profile_proof(tmp_path, module)
+
+    tenant_ids = module.derive_capacity_profile_tenant_ids(
+        proof_body,
+        bundle_root=tmp_path,
+        candidate_root=tmp_path,
+        candidate=candidate,
+        release_run=_RELEASE_RUN,
+    )
+
+    assert tenant_ids == tuple(f"tenant-{index:02d}" for index in range(50))
+
+
+def test_derive_capacity_profile_tenant_ids_rejects_non_true_checks_and_tampering(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_verifier()
+    proof_body, candidate = _capacity_profile_proof(tmp_path, module)
+    replay_checks = module.derive_capacity_profile_receipt_checks
+    checks, observed_at = replay_checks(
+        proof_body,
+        bundle_root=tmp_path,
+        candidate_root=tmp_path,
+        candidate=candidate,
+        release_run=_RELEASE_RUN,
+    )
+
+    for rejected_check in checks:
+        rejected_checks = {name: True for name in checks}
+        rejected_checks[rejected_check] = False
+
+        def replay_with_rejected_check(*_args, **_kwargs):
+            return rejected_checks, observed_at
+
+        monkeypatch.setattr(
+            module,
+            "derive_capacity_profile_receipt_checks",
+            replay_with_rejected_check,
+        )
+        with pytest.raises(ValueError, match="capacity execution proof checks"):
+            module.derive_capacity_profile_tenant_ids(
+                proof_body,
+                bundle_root=tmp_path,
+                candidate_root=tmp_path,
+                candidate=candidate,
+                release_run=_RELEASE_RUN,
+            )
+
+    monkeypatch.setattr(module, "derive_capacity_profile_receipt_checks", replay_checks)
+    tampered = json.loads(proof_body)
+    tampered["summary"]["checks"]["thresholdsPassed"] = False
+    tampered_body = json.dumps(tampered, sort_keys=True).encode("utf-8")
+
+    with pytest.raises(ValueError, match="capacity execution proof"):
+        module.derive_capacity_profile_tenant_ids(
+            tampered_body,
             bundle_root=tmp_path,
             candidate_root=tmp_path,
             candidate=candidate,
@@ -1881,6 +2115,201 @@ def _rebind_capacity_proof(
         json.dumps(_manifest_document(module, candidate, evidence_map)),
         encoding="utf-8",
     )
+
+
+def _rebind_tenant_isolation_proof(
+    tmp_path: Path,
+    module,
+    manifest: Path,
+    evidence_map: dict[str, object],
+    candidate: dict[str, object],
+    proof: dict[str, object],
+) -> None:
+    proof_path = tmp_path / "runtime" / "tenant-isolation-attestation.json"
+    proof_body = json.dumps(proof, sort_keys=True).encode("utf-8")
+    proof_path.write_bytes(proof_body)
+    evidence_entry = evidence_map["tenant_isolation"]
+    assert isinstance(evidence_entry, dict)
+    artifact_path = tmp_path / str(evidence_entry["artifact"])
+    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    artifact["provenance"]["tenantIsolationAttestation"]["sha256"] = hashlib.sha256(
+        proof_body
+    ).hexdigest()
+    artifact_body = json.dumps(artifact, sort_keys=True).encode("utf-8")
+    artifact_path.write_bytes(artifact_body)
+    evidence_entry["artifactSha256"] = hashlib.sha256(artifact_body).hexdigest()
+    manifest.write_text(
+        json.dumps(_manifest_document(module, candidate, evidence_map)),
+        encoding="utf-8",
+    )
+
+
+def test_derive_tenant_isolation_receipt_checks_replays_runtime_capacity_and_strict_report(
+    tmp_path: Path,
+) -> None:
+    module = _load_verifier()
+    _manifest, _evidence_map, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    proof_body = (tmp_path / "runtime" / "tenant-isolation-attestation.json").read_bytes()
+
+    checks, observed_at = module.derive_tenant_isolation_receipt_checks(
+        proof_body,
+        bundle_root=tmp_path,
+        candidate_root=tmp_path,
+        candidate=candidate,
+        release_run=_RELEASE_RUN,
+    )
+
+    assert checks == {
+        "databaseIsolated": True,
+        "objectsIsolated": True,
+        "exportsIsolated": True,
+        "eventsIsolated": True,
+    }
+    assert observed_at == "2026-08-24T00:00:00Z"
+
+
+@pytest.mark.parametrize("dependency", ("runtime", "capacity"))
+def test_file_runtime_rejects_rehashed_tenant_isolation_dependency_proof_tampering(
+    tmp_path: Path,
+    dependency: str,
+) -> None:
+    module = _load_verifier()
+    manifest, evidence_map, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    runtime_path = tmp_path / "runtime" / "runtime-attestation.json"
+    runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+    if dependency == "runtime":
+        runtime["project"] = "attacker-project"
+    runtime_body = json.dumps(runtime, sort_keys=True).encode("utf-8")
+    runtime_path.write_bytes(runtime_body)
+    runtime_sha256 = hashlib.sha256(runtime_body).hexdigest()
+
+    capacity_path = tmp_path / "runtime" / "capacity-profile-attestation.json"
+    capacity = json.loads(capacity_path.read_text(encoding="utf-8"))
+    capacity["runtimeAttestation"]["sha256"] = runtime_sha256
+    if dependency == "capacity":
+        capacity["summary"]["checks"]["thresholdsPassed"] = False
+    capacity_body = json.dumps(capacity, sort_keys=True).encode("utf-8")
+    capacity_path.write_bytes(capacity_body)
+    capacity_sha256 = hashlib.sha256(capacity_body).hexdigest()
+
+    tenant_path = tmp_path / "runtime" / "tenant-isolation-attestation.json"
+    tenant_proof = json.loads(tenant_path.read_text(encoding="utf-8"))
+    tenant_proof["runtimeAttestation"]["sha256"] = runtime_sha256
+    tenant_proof["capacityAttestation"]["sha256"] = capacity_sha256
+    report = json.loads(tenant_proof["execution"]["stdout"])
+    report["capacityProof"]["reportSha256"] = capacity_sha256
+    contract = _load_tenant_isolation_support()._module()
+    report_body = contract.canonical_tenant_isolation_report(report)
+    tenant_proof["execution"]["stdout"] = report_body.decode("utf-8")
+    tenant_proof["execution"]["stdoutSha256"] = hashlib.sha256(report_body).hexdigest()
+    _rebind_tenant_isolation_proof(
+        tmp_path,
+        module,
+        manifest,
+        evidence_map,
+        candidate,
+        tenant_proof,
+    )
+
+    result = module.verify(
+        module.FileReleaseRuntime(
+            manifest,
+            expected_source_head="a" * 40,
+            candidate_root=tmp_path,
+        )
+    )
+
+    assert result.layers["tenant_isolation"].status == "fail"
+    assert dependency in result.layers["tenant_isolation"].detail.lower()
+
+
+def test_file_runtime_rejects_rehashed_tampered_tenant_isolation_proof(
+    tmp_path: Path,
+) -> None:
+    module = _load_verifier()
+    manifest, evidence_map, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    proof_path = tmp_path / "runtime" / "tenant-isolation-attestation.json"
+    proof = json.loads(proof_path.read_text(encoding="utf-8"))
+    report = json.loads(proof["execution"]["stdout"])
+    database = next(item for item in report["observations"] if item["layer"] == "database")
+    owner_after = next(
+        item for item in database["operations"] if item["name"] == "owner-policy-after"
+    )
+    owner_after["stateSha256"] = "c" * 64
+    contract = _load_tenant_isolation_support()._module()
+    report_body = contract.canonical_tenant_isolation_report(report)
+    proof["execution"]["stdout"] = report_body.decode("utf-8")
+    proof["execution"]["stdoutSha256"] = hashlib.sha256(report_body).hexdigest()
+    _rebind_tenant_isolation_proof(
+        tmp_path,
+        module,
+        manifest,
+        evidence_map,
+        candidate,
+        proof,
+    )
+
+    result = module.verify(
+        module.FileReleaseRuntime(
+            manifest,
+            expected_source_head="a" * 40,
+            candidate_root=tmp_path,
+        )
+    )
+
+    assert result.layers["tenant_isolation"].status == "fail"
+    assert "tenant isolation" in result.layers["tenant_isolation"].detail.lower()
+
+
+def test_file_runtime_rejects_tenant_isolation_capacity_pair_drift(
+    tmp_path: Path,
+) -> None:
+    module = _load_verifier()
+    manifest, evidence_map, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    proof_path = tmp_path / "runtime" / "tenant-isolation-attestation.json"
+    proof = json.loads(proof_path.read_text(encoding="utf-8"))
+    report = json.loads(proof["execution"]["stdout"])
+    tenant_ids = report["capacityProof"]["tenantIds"]
+    report["capacityProof"]["tenantIds"] = list(reversed(tenant_ids))
+    contract = _load_tenant_isolation_support()._module()
+    report_body = contract.canonical_tenant_isolation_report(report)
+    proof["execution"]["stdout"] = report_body.decode("utf-8")
+    proof["execution"]["stdoutSha256"] = hashlib.sha256(report_body).hexdigest()
+    _rebind_tenant_isolation_proof(
+        tmp_path,
+        module,
+        manifest,
+        evidence_map,
+        candidate,
+        proof,
+    )
+
+    result = module.verify(
+        module.FileReleaseRuntime(
+            manifest,
+            expected_source_head="a" * 40,
+            candidate_root=tmp_path,
+        )
+    )
+
+    assert result.layers["tenant_isolation"].status == "fail"
+    assert "capacity" in result.layers["tenant_isolation"].detail.lower()
 
 
 def test_file_runtime_rejects_tampered_learning_event_receipt_even_when_rehashed(
@@ -2155,6 +2584,39 @@ def test_capacity_profile_proof_is_read_through_fixed_no_follow_boundary(
         proof,
         label="capacity execution attestation",
     ) == (expected_body, "runtime/capacity-profile-attestation.json")
+
+
+def test_tenant_isolation_proof_is_read_through_fixed_no_follow_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_verifier()
+    _manifest, evidence_map, _candidate_document = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    evidence_entry = evidence_map["tenant_isolation"]
+    assert isinstance(evidence_entry, dict)
+    artifact_path = tmp_path / str(evidence_entry["artifact"])
+    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    proof = artifact["provenance"]["tenantIsolationAttestation"]
+    proof_path = tmp_path / proof["artifact"]
+    expected_body = proof_path.read_bytes()
+    original_read_bytes = Path.read_bytes
+
+    def reject_check_then_open(path: Path) -> bytes:
+        if path.resolve() == proof_path.resolve():
+            pytest.fail("tenant isolation proof must use the fixed no-follow reader")
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", reject_check_then_open)
+
+    assert module._proof_bytes(
+        tmp_path,
+        proof,
+        label="tenant isolation attestation",
+    ) == (expected_body, "runtime/tenant-isolation-attestation.json")
 
 
 def test_capacity_profile_proof_rejects_oversized_fixed_artifact(

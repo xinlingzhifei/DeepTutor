@@ -40,6 +40,7 @@ from deeptutor.services.auth import (
     authenticate,
     authenticate_pb,
     create_token,
+    create_user,
     decode_token,
     delete_user,
     get_user_info,
@@ -347,7 +348,9 @@ async def ws_require_auth(ws: WebSocket) -> _CtxToken | _WsAuthFailed:
     payload = (
         decode_token(token, fresh=True)
         if token and POCKETBASE_ENABLED
-        else decode_token(token) if token else None
+        else decode_token(token)
+        if token
+        else None
     )
     if not payload:
         await ws.close(code=4001)
@@ -934,9 +937,18 @@ async def get_avatar_image(
 # ---------------------------------------------------------------------------
 
 
+def _require_local_multi_user_backend() -> None:
+    if POCKETBASE_ENABLED:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Multi-user administration is unavailable in PocketBase mode",
+        )
+
+
 @router.get("/users", response_model=list[UserInfo])
 async def get_users(_: TokenPayload = Depends(require_admin)) -> list[UserInfo]:
     """List all registered users. Requires admin role."""
+    _require_local_multi_user_backend()
     return [UserInfo(**u) for u in list_users()]
 
 
@@ -956,41 +968,16 @@ async def admin_create_user(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Auth is disabled — user creation is not available.",
         )
+    _require_local_multi_user_backend()
 
-    if POCKETBASE_ENABLED:
-        result = register_pb(username=body.username, email=body.username, password=body.password)
-        if not result:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Failed to create user — username may already be taken.",
-            )
-        logger.info(
-            f"Admin '{current.username if current else 'local'}' created PocketBase user "
-            f"'{body.username}'"
-        )
-        return {
-            "ok": True,
-            "user_id": result.get("id", ""),
-            "username": body.username,
-            "role": "user",
-            "is_admin": False,
-        }
-
-    existing = {u["username"] for u in list_users()}
-    if body.username in existing:
+    record = create_user(body.username, body.password, role="user")
+    if record is None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Username already taken",
         )
-
-    add_user(body.username, body.password)
-    user_id = ""
-    role = "user"
-    for item in list_users():
-        if item.get("username") == body.username:
-            user_id = str(item.get("id") or "")
-            role = str(item.get("role") or "user")
-            break
+    user_id = str(record.get("id") or "")
+    role = str(record.get("role") or "user")
     logger.info(
         f"Admin '{current.username if current else 'local'}' created user '{body.username}' "
         f"(role={role!r})"
@@ -1011,6 +998,7 @@ async def remove_user(
     current: TokenPayload = Depends(require_admin),
 ) -> dict:
     """Delete a user. Admins cannot delete their own account."""
+    _require_local_multi_user_backend()
     if current and username == current.username:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -1048,6 +1036,7 @@ async def update_user_role(
     current: TokenPayload = Depends(require_admin),
 ) -> dict:
     """Change a user's role. Admins cannot change their own role."""
+    _require_local_multi_user_backend()
     if current and username == current.username:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

@@ -225,6 +225,103 @@ def test_avatar_serving_headers_and_visibility(profile_client):
     assert "private" in response.headers["cache-control"]
 
 
+@pytest.mark.parametrize(
+    ("method", "path", "json_body"),
+    (
+        ("GET", "/api/v1/auth/users", None),
+        (
+            "POST",
+            "/api/v1/auth/users",
+            {"username": "pocketbase-fixture", "password": "fixture-password"},
+        ),
+        (
+            "DELETE",
+            "/api/v1/auth/users/bob",
+            {"expected_user_id": "u_" + "b" * 32},
+        ),
+        ("PUT", "/api/v1/auth/users/bob/role", {"role": "admin"}),
+    ),
+)
+def test_admin_multi_user_routes_fail_closed_in_pocketbase_mode(
+    profile_client,
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+    path: str,
+    json_body: dict[str, object] | None,
+) -> None:
+    import deeptutor.api.routers.auth as auth_router
+
+    client, _ = profile_client
+    monkeypatch.setattr(auth_router, "POCKETBASE_ENABLED", True)
+
+    def unexpected_backend_call(*_args, **_kwargs):
+        pytest.fail("PocketBase multi-user administration must fail before backend access")
+
+    for name in ("list_users", "register_pb", "create_user", "delete_user", "set_role"):
+        monkeypatch.setattr(auth_router, name, unexpected_backend_call)
+
+    request: dict[str, object] = {"headers": _auth("admin-token")}
+    if json_body is not None:
+        request["json"] = json_body
+    response = client.request(method, path, **request)
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": "Multi-user administration is unavailable in PocketBase mode"
+    }
+
+
+def test_admin_user_creation_is_create_only(profile_client):
+    from deeptutor.multi_user.identity import load_users
+    from deeptutor.services.auth import verify_password
+
+    client, _ = profile_client
+    first = client.post(
+        "/api/v1/auth/users",
+        headers=_auth("admin-token"),
+        json={"username": "isolation-fixture", "password": "first-password"},
+    )
+    assert first.status_code == 201
+    first_user_id = first.json()["user_id"]
+
+    conflict = client.post(
+        "/api/v1/auth/users",
+        headers=_auth("admin-token"),
+        json={"username": "isolation-fixture", "password": "second-password"},
+    )
+
+    assert conflict.status_code == 409
+    assert conflict.json() == {"detail": "Username already taken"}
+    stored = load_users()["isolation-fixture"]
+    assert stored["id"] == first_user_id
+    assert verify_password("first-password", stored["hash"])
+    assert not verify_password("second-password", stored["hash"])
+
+
+def test_admin_user_creation_delegates_conflicts_to_atomic_store(
+    profile_client,
+    monkeypatch,
+):
+    import deeptutor.api.routers.auth as auth_router
+
+    client, _ = profile_client
+    monkeypatch.setattr(auth_router, "create_user", lambda *_args, **_kwargs: None)
+
+    def fail_legacy_upsert(*_args, **_kwargs):
+        pytest.fail("admin user creation must not fall back to an upsert")
+
+    monkeypatch.setattr(auth_router, "add_user", fail_legacy_upsert)
+
+    response = client.post(
+        "/api/v1/auth/users",
+        headers=_auth("admin-token"),
+        json={"username": "isolation-fixture", "password": "first-password"},
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Username already taken"}
+
+
 def test_admin_user_deletion_removes_avatar_file(profile_client):
     """Deleting an account must not leave its avatar image orphaned on disk."""
     from deeptutor.multi_user.identity import get_avatar_file

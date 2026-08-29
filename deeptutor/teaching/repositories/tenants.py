@@ -59,6 +59,10 @@ class TenantAccessDeniedError(TenantRepositoryError):
     """The user has no active membership for the requested tenant."""
 
 
+class TenantMemberNotFoundError(TenantRepositoryError):
+    """The exact tenant membership selected for cleanup does not exist."""
+
+
 class TenantNotActiveError(TenantRepositoryError):
     """The tenant exists but is not selectable."""
 
@@ -171,8 +175,7 @@ def build_tenant_access_statement(
         )
         .join(
             TenantSchemaState,
-            (TenantSchemaState.tenant_id == Tenant.id)
-            & (TenantSchemaState.status == "active"),
+            (TenantSchemaState.tenant_id == Tenant.id) & (TenantSchemaState.status == "active"),
         )
         .where(
             Tenant.id == tenant_id,
@@ -255,6 +258,31 @@ def build_active_tenant_lock_statement(tenant_id: str) -> Select[Any]:
             Tenant.status == "active",
         )
         .with_for_update()
+    )
+
+
+def build_tenant_lock_statement(tenant_id: str) -> Select[Any]:
+    return select(Tenant.id).where(Tenant.id == tenant_id).with_for_update()
+
+
+def build_membership_lock_statement(
+    tenant_id: str,
+    user_id: str,
+) -> Select[Any]:
+    return (
+        select(TenantMembership.user_id)
+        .where(
+            TenantMembership.tenant_id == tenant_id,
+            TenantMembership.user_id == user_id,
+        )
+        .with_for_update()
+    )
+
+
+def build_membership_delete_statement(tenant_id: str, user_id: str) -> Any:
+    return delete(TenantMembership).where(
+        TenantMembership.tenant_id == tenant_id,
+        TenantMembership.user_id == user_id,
     )
 
 
@@ -497,8 +525,7 @@ def build_activation_lock_statement(
                     TenantStorageCredential.status == "active",
                     TenantStorageCredential.secret_ref != "",
                     TenantStorageCredential.access_key_fingerprint != "",
-                    TenantStorageState.credential_secret_ref
-                    == TenantStorageCredential.secret_ref,
+                    TenantStorageState.credential_secret_ref == TenantStorageCredential.secret_ref,
                     TenantStorageState.credential_fingerprint
                     == TenantStorageCredential.access_key_fingerprint,
                 ),
@@ -855,6 +882,25 @@ class TenantRepository:
             user_id,
             _tenant_role_grants(tenant_id, roles),
         )
+
+    async def delete_member(self, tenant_id: str, user_id: str) -> None:
+        """Delete one exact membership and its cascading grants transactionally."""
+
+        async with platform_session() as session:
+            async with session.begin():
+                tenant = await session.scalar(build_tenant_lock_statement(tenant_id))
+                if tenant is None:
+                    raise TenantNotFoundError(tenant_id)
+                membership = await session.scalar(
+                    build_membership_lock_statement(tenant_id, user_id)
+                )
+                if membership is None:
+                    raise TenantMemberNotFoundError(f"{tenant_id}:{user_id}")
+                result = await session.execute(
+                    build_membership_delete_statement(tenant_id, user_id)
+                )
+                _expect_single_update(result, "tenant membership delete")
+                await session.flush()
 
     async def upsert_member_with_scoped_grants(
         self,
