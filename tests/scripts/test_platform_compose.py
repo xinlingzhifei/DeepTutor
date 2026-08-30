@@ -771,6 +771,7 @@ def test_private_platform_workflow_installs_receipt_dependencies_before_recordin
     assert "python-pptx==1.0.2" in command
     assert "pydantic==2.13.3" in command
     assert "PyYAML==6.0.3" in command
+    assert "cryptography==47.0.0" in command
 
 
 def test_image_lock_writer_binds_source_head_release_tag_and_custom_digests(
