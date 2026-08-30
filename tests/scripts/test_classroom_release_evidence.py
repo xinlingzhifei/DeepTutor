@@ -24,6 +24,27 @@ RELEASE_RUN = {
 BASE_URL = "https://candidate.example.test"
 
 
+def test_release_evidence_cli_bootstraps_project_root_from_clean_python_path(
+    tmp_path: Path,
+) -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-P",
+            str(ROOT / "scripts" / "classroom_release_evidence.py"),
+            "--help",
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "usage:" in result.stdout.lower()
+
+
 def _load_path(name: str, path: Path):
     spec = importlib.util.spec_from_file_location(name, path)
     assert spec and spec.loader

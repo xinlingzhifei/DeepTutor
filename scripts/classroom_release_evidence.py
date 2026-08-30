@@ -24,8 +24,10 @@ from urllib.parse import urlsplit
 import uuid
 
 SCRIPTS_ROOT = Path(__file__).resolve().parent
-if str(SCRIPTS_ROOT) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS_ROOT))
+PROJECT_ROOT = SCRIPTS_ROOT.parent
+for import_root in (PROJECT_ROOT, SCRIPTS_ROOT):
+    if str(import_root) not in sys.path:
+        sys.path.insert(0, str(import_root))
 
 from backup_restore_contract import derive_backup_restore_checks  # noqa: E402
 from capacity_profile_contract import (  # noqa: E402
