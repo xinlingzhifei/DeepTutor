@@ -282,6 +282,7 @@ class GenerationJobRequest:
     request_id: str
     idempotency_key: str
     request_sha256: str
+    data_plane_mode: str | None
     data_plane_route_id: str
     provider_profile_id: str
     worker_pool_ref: str
@@ -303,6 +304,8 @@ class GenerationJobRequest:
         _required(self.request_id, "request_id", 64)
         _required(self.idempotency_key, "idempotency_key", 128)
         _opaque_route_id(self.data_plane_route_id)
+        if self.data_plane_mode not in {None, "shared", "dedicated"}:
+            raise ValueError("data_plane_mode is invalid")
         _required(self.provider_profile_id, "provider_profile_id", 63)
         _required(self.worker_pool_ref, "worker_pool_ref", 128)
         _required(self.queue_ref, "queue_ref", 128)
@@ -473,12 +476,14 @@ class GenerationJobDetails:
     resource_class_id: str | None
     public_request_sha256: str | None
     request_sha256: str
+    data_plane_mode: str | None
     data_plane_route_id: str
     provider_profile_id: str
     worker_pool_ref: str
     queue_ref: str
     request_payload: str
     progress_percent: int
+    attempt_count: int
     waiting_reason: str | None
     cancel_requested: bool
     error_category: str | None
@@ -756,6 +761,7 @@ class SqlAlchemyGenerationJobRepository:
                     resource_class_id=request.resource_class_id,
                     public_request_sha256=request.public_request_sha256,
                     request_sha256=request.request_sha256,
+                    data_plane_mode=None,
                     data_plane_route_id=request.data_plane_route_id,
                     provider_profile_id=request.provider_profile_id,
                     worker_pool_ref=request.worker_pool_ref,
@@ -889,14 +895,18 @@ class SqlAlchemyGenerationJobRepository:
                     if export_id is not None:
                         await self._bind_export_job(session, request, export_id)
                     return self._record(existing)
-                if not await lock_active_job_binding(
+                if request.data_plane_mode not in {"shared", "dedicated"}:
+                    raise DataPlaneBindingUnavailable()
+                locked_binding = await lock_active_job_binding(
                     session,
                     tenant_id=request.tenant_id,
                     data_plane_route_id=request.data_plane_route_id,
                     provider_profile_id=request.provider_profile_id,
                     worker_pool_ref=request.worker_pool_ref,
                     queue_ref=request.queue_ref,
-                ):
+                    data_plane_mode=request.data_plane_mode,
+                )
+                if locked_binding is None:
                     raise DataPlaneBindingUnavailable()
                 balance = await self._quota_balance(session, request.tenant_id)
                 reserve_quota(
@@ -924,10 +934,11 @@ class SqlAlchemyGenerationJobRepository:
                     resource_class_id=request.resource_class_id,
                     public_request_sha256=request.public_request_sha256,
                     request_sha256=request.request_sha256.lower(),
-                    data_plane_route_id=request.data_plane_route_id,
-                    provider_profile_id=request.provider_profile_id,
-                    worker_pool_ref=request.worker_pool_ref,
-                    queue_ref=request.queue_ref,
+                    data_plane_mode=locked_binding.data_plane_mode,
+                    data_plane_route_id=locked_binding.data_plane_route_id,
+                    provider_profile_id=locked_binding.provider_profile_id,
+                    worker_pool_ref=locked_binding.worker_pool_ref,
+                    queue_ref=locked_binding.queue_ref,
                     request_payload=request.request_payload,
                     max_attempts=request.max_attempts,
                     retry_of_job_id=request.retry_of_job_id,
@@ -966,10 +977,10 @@ class SqlAlchemyGenerationJobRepository:
                         job_id=request.job_id,
                         job_kind=request.job_kind,
                         phase=request.phase,
-                        data_plane_route_id=request.data_plane_route_id,
-                        provider_profile_id=request.provider_profile_id,
-                        worker_pool_ref=request.worker_pool_ref,
-                        queue_ref=request.queue_ref,
+                        data_plane_route_id=locked_binding.data_plane_route_id,
+                        provider_profile_id=locked_binding.provider_profile_id,
+                        worker_pool_ref=locked_binding.worker_pool_ref,
+                        queue_ref=locked_binding.queue_ref,
                         slot_pool=request.slot_pool,
                         priority=request.priority_rank,
                         event_type="generation_job.ready",
@@ -1025,6 +1036,7 @@ class SqlAlchemyGenerationJobRepository:
             and existing.resource_course_id == request.resource_course_id
             and existing.resource_class_id == request.resource_class_id
             and existing.request_sha256 == request.request_sha256.lower()
+            and existing.data_plane_mode == request.data_plane_mode
             and existing.data_plane_route_id == request.data_plane_route_id
             and existing.provider_profile_id == request.provider_profile_id
             and existing.worker_pool_ref == request.worker_pool_ref
@@ -1140,14 +1152,18 @@ class SqlAlchemyGenerationJobRepository:
                     or parsed_payload.get("dataPlaneRouteId") != job.data_plane_route_id
                 ):
                     raise ValueError("confirmed request identity does not match the job")
-                if not await lock_active_job_binding(
+                if job.data_plane_mode not in {"shared", "dedicated"}:
+                    raise DataPlaneBindingUnavailable()
+                locked_binding = await lock_active_job_binding(
                     session,
                     tenant_id=tenant_id,
                     data_plane_route_id=job.data_plane_route_id,
                     provider_profile_id=job.provider_profile_id,
                     worker_pool_ref=job.worker_pool_ref,
                     queue_ref=job.queue_ref,
-                ):
+                    data_plane_mode=job.data_plane_mode,
+                )
+                if locked_binding is None:
                     raise DataPlaneBindingUnavailable()
                 old_queue = await session.scalar(
                     select(GenerationQueue.job_id)
@@ -1256,12 +1272,14 @@ class SqlAlchemyGenerationJobRepository:
                 resource_class_id=job.resource_class_id,
                 public_request_sha256=job.public_request_sha256,
                 request_sha256=job.request_sha256,
+                data_plane_mode=job.data_plane_mode,
                 data_plane_route_id=job.data_plane_route_id,
                 provider_profile_id=job.provider_profile_id,
                 worker_pool_ref=job.worker_pool_ref,
                 queue_ref=job.queue_ref,
                 request_payload=job.request_payload,
                 progress_percent=job.progress_percent,
+                attempt_count=job.attempt_count,
                 waiting_reason=job.waiting_reason,
                 cancel_requested=job.cancel_requested,
                 error_category=job.error_category,
@@ -2466,10 +2484,7 @@ class SqlAlchemyGenerationJobRepository:
                             SET status = :terminal_status,
                                 error_category = :error_category,
                                 error_code = :error_code,
-                                canceled_at = CASE
-                                    WHEN :terminal_status = 'canceled' THEN :now
-                                    ELSE NULL
-                                END,
+                                canceled_at = :canceled_at,
                                 completed_at = :now,
                                 waiting_reason = NULL,
                                 lease_owner = NULL,
@@ -2485,6 +2500,7 @@ class SqlAlchemyGenerationJobRepository:
                         ),
                         {
                             "terminal_status": terminal_status,
+                            "canceled_at": now if terminal_status == "canceled" else None,
                             "error_category": (
                                 "canceled" if terminal_status == "canceled" else "worker_lost"
                             ),

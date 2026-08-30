@@ -251,9 +251,7 @@ class _Repository:
             raise ClassroomConfirmationConflict("confirmed outline conflicts")
         first_confirmation = current.confirmed_outline_sha256 is None
         if expected_revision is not None:
-            required_revision = (
-                expected_revision if first_confirmation else expected_revision + 1
-            )
+            required_revision = expected_revision if first_confirmation else expected_revision + 1
             if current.revision != required_revision:
                 raise ClassroomConfirmationConflict("confirmed outline conflicts")
         self.records[asset_id] = replace(
@@ -922,9 +920,7 @@ async def test_review_bound_confirmation_retries_after_content_requeue_failure()
     service, repository, generation = _service(context)
     created = await service.create(context, _request())
     reviewed_revision = created.revision
-    reviewed_sha256 = canonical_outline_sha256(
-        OutlineBundle.model_validate(created.outline)
-    )
+    reviewed_sha256 = canonical_outline_sha256(OutlineBundle.model_validate(created.outline))
     generation.content_error = RuntimeError("queue unavailable")
 
     with pytest.raises(RuntimeError, match="queue unavailable"):
@@ -957,9 +953,7 @@ async def test_review_bound_confirmation_recovery_rejects_tampered_confirmed_out
     service, repository, generation = _service(context)
     created = await service.create(context, _request())
     reviewed_revision = created.revision
-    reviewed_sha256 = canonical_outline_sha256(
-        OutlineBundle.model_validate(created.outline)
-    )
+    reviewed_sha256 = canonical_outline_sha256(OutlineBundle.model_validate(created.outline))
     generation.content_error = RuntimeError("queue unavailable")
     with pytest.raises(RuntimeError, match="queue unavailable"):
         await service.confirm_outline(
@@ -1056,13 +1050,15 @@ async def test_batch_gateway_recovers_confirmation_after_precommit_requeue_failu
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     context = _context()
-    service, batch_repository, repository, generation, created = (
-        await _batch_confirmation_recovery_fixture(context, monkeypatch)
-    )
+    (
+        service,
+        batch_repository,
+        repository,
+        generation,
+        created,
+    ) = await _batch_confirmation_recovery_fixture(context, monkeypatch)
     reviewed_revision = created.revision
-    reviewed_sha256 = canonical_outline_sha256(
-        OutlineBundle.model_validate(created.outline)
-    )
+    reviewed_sha256 = canonical_outline_sha256(OutlineBundle.model_validate(created.outline))
     generation.content_error = RuntimeError("content requeue failed before commit")
 
     with pytest.raises(RuntimeError, match="before commit"):
@@ -1098,13 +1094,15 @@ async def test_batch_gateway_recovery_rejects_tampered_persisted_confirmation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     context = _context()
-    service, batch_repository, repository, generation, created = (
-        await _batch_confirmation_recovery_fixture(context, monkeypatch)
-    )
+    (
+        service,
+        batch_repository,
+        repository,
+        generation,
+        created,
+    ) = await _batch_confirmation_recovery_fixture(context, monkeypatch)
     reviewed_revision = created.revision
-    reviewed_sha256 = canonical_outline_sha256(
-        OutlineBundle.model_validate(created.outline)
-    )
+    reviewed_sha256 = canonical_outline_sha256(OutlineBundle.model_validate(created.outline))
     generation.content_error = RuntimeError("content requeue failed before commit")
     with pytest.raises(RuntimeError, match="before commit"):
         await service.confirm_outline(
@@ -1285,12 +1283,14 @@ def _generation_details(
         resource_class_id=created.class_id,
         public_request_sha256=hashlib.sha256(payload.encode()).hexdigest(),
         request_sha256=hashlib.sha256(payload.encode()).hexdigest(),
+        data_plane_mode="shared",
         data_plane_route_id="route-a",
         provider_profile_id="provider-a",
         worker_pool_ref="workers-a",
         queue_ref="queue-a",
         request_payload=payload,
         progress_percent=50,
+        attempt_count=0,
         waiting_reason=None,
         cancel_requested=False,
         error_category=None,
@@ -1668,8 +1668,7 @@ async def test_authorized_draft_media_read_falls_back_to_exact_bound_version_med
     media_id = "generated-media-1"
     body = b"\x89PNG\r\n\x1a\ngenerated"
     object_key = (
-        f"tenants/{context.tenant_id}/classrooms/{created.asset_id}/versions/1/"
-        f"media/{media_id}.png"
+        f"tenants/{context.tenant_id}/classrooms/{created.asset_id}/versions/1/media/{media_id}.png"
     )
     repository.version_media[(created.asset_id, media_id)] = SimpleNamespace(
         id=media_id,

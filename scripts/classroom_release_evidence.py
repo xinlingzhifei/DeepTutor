@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable, Mapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import errno
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -16,13 +18,16 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any, BinaryIO, Protocol
+from urllib.parse import urlsplit
 import uuid
 
 SCRIPTS_ROOT = Path(__file__).resolve().parent
 if str(SCRIPTS_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_ROOT))
 
+from backup_restore_contract import derive_backup_restore_checks  # noqa: E402
 from capacity_profile_contract import (  # noqa: E402
     MAX_CAPACITY_REPORT_BYTES,
     capacity_profile_command_record,
@@ -54,12 +59,25 @@ from classroom_runtime_attestation import (  # noqa: E402
     _open_windows_directory_relative,
     _open_windows_regular_file_relative,
     _rename_windows_file_relative,
+    _windows_handle_identity,
     resolve_fixed_docker,
 )
+from gateway_public_contract import (  # noqa: E402
+    derive_gateway_public_checks,
+    parse_gateway_candidate_networks,
+    parse_gateway_public_report,
+    signed_gateway_observer_policy,
+)
+from gateway_trust_contract import verify_gateway_trust_pair  # noqa: E402
 from openmaic_smoke_contract import (  # noqa: E402
     MAX_OPENMAIC_SMOKE_REPORT_BYTES,
+    derive_openmaic_dedicated_outage_checks,
+    derive_openmaic_dedicated_plane_checks,
     derive_openmaic_shared_plane_checks,
+    openmaic_dedicated_plane_command_record,
     openmaic_shared_plane_command_record,
+    parse_openmaic_dedicated_outage_attestation,
+    parse_openmaic_shared_ingress_observer_attestation,
     parse_openmaic_smoke_report,
 )
 from platform_preflight_contract import (  # noqa: E402
@@ -85,6 +103,8 @@ from verify_classroom_release import (  # noqa: E402
     EVIDENCE_SCHEMA_VERSION,
     PROBE_RECIPES,
     RECEIPT_CONTRACTS,
+    _replay_openmaic_dedicated_outage_attempt_marker,
+    derive_backup_restore_receipt_checks,
     derive_capacity_profile_receipt_checks,
     derive_capacity_profile_tenant_id,
     derive_capacity_profile_tenant_ids,
@@ -93,6 +113,7 @@ from verify_classroom_release import (  # noqa: E402
     derive_probe_checks,
     derive_tenant_isolation_receipt_checks,
     probe_provenance_error,
+    read_backup_restore_report_artifact,
     read_capacity_profile_attestation_artifact,
     read_runtime_attestation_artifact,
     validate_runtime_attestation,
@@ -100,6 +121,7 @@ from verify_classroom_release import (  # noqa: E402
 
 _RELEASE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _OBSERVED_AT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _GITHUB_REMOTE = re.compile(
     r"^(?:https://github\.com/|ssh://git@github\.com/|git@github\.com:)"
     r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?$"
@@ -132,6 +154,40 @@ _CAPACITY_STDERR_LIMIT_BYTES = 64 * 1024
 _CLASSROOM_EXPORT_STDERR_LIMIT_BYTES = 64 * 1024
 _TENANT_ISOLATION_STDERR_LIMIT_BYTES = 64 * 1024
 _OPENMAIC_SMOKE_STDERR_LIMIT_BYTES = 64 * 1024
+_GATEWAY_DOCKER_PROJECT = "yfeistai-platform"
+_GATEWAY_DOCKER_CONTEXT = "default"
+_GATEWAY_DOCKER_CONTEXT_ARGUMENTS = [
+    "context",
+    "inspect",
+    _GATEWAY_DOCKER_CONTEXT,
+    "--format",
+    "{{json .Endpoints.docker.Host}}",
+]
+_GATEWAY_DOCKER_INFO_ARGUMENTS = [
+    "info",
+    "--format",
+    '{"serverId":{{json .ID}},"osType":{{json .OSType}}}',
+]
+_GATEWAY_DOCKER_PS_ARGUMENTS = [
+    "ps",
+    "-a",
+    "--no-trunc",
+    "--filter",
+    f"label=com.docker.compose.project={_GATEWAY_DOCKER_PROJECT}",
+    "--format",
+    "{{json .ID}}",
+]
+_GATEWAY_DOCKER_INSPECT_FORMAT = (
+    '{"containerId":{{json .Id}},'
+    '"project":{{json (index .Config.Labels "com.docker.compose.project")}},'
+    '"service":{{json (index .Config.Labels "com.docker.compose.service")}},'
+    '"networkMode":{{json .HostConfig.NetworkMode}},'
+    '"networks":{{json .NetworkSettings.Networks}},'
+    '"publishedPorts":{{json .NetworkSettings.Ports}}}'
+)
+_GATEWAY_DOCKER_HOST_IDENTITY_ENV = "YFEISTAI_GATEWAY_DOCKER_HOST_IDENTITY_SHA256"
+_GATEWAY_MAX_INPUT_BYTES = 1024 * 1024
+_GATEWAY_MAX_DOCKER_OUTPUT_BYTES = 1024 * 1024
 
 
 def _candidate(candidate_root: Path) -> dict[str, Any]:
@@ -220,10 +276,603 @@ def _atomic_write_json(path: Path, document: Mapping[str, object]) -> None:
             staged.unlink(missing_ok=True)
 
 
+@dataclass(frozen=True, slots=True)
+class _ManifestPublicationContext:
+    boundary: Any
+    source: Path
+    source_handle: BinaryIO
+
+
+_MANIFEST_PUBLICATION_CONTEXT: ContextVar[_ManifestPublicationContext | None] = ContextVar(
+    "manifest_publication_context",
+    default=None,
+)
+
+
 def _publish_no_replace(source: Path, target: Path) -> None:
     """Publish one staged regular file without replacing an existing target."""
 
+    manifest_context = _MANIFEST_PUBLICATION_CONTEXT.get()
+    if manifest_context is not None:
+        if Path(source) != manifest_context.source:
+            raise ValueError("manifest publication source is outside the held boundary")
+        _publish_manifest_no_replace(
+            manifest_context.boundary,
+            Path(target),
+            source_handle=manifest_context.source_handle,
+        )
+        return
+    gateway_context = _GATEWAY_PUBLICATION_CONTEXT.get()
+    if gateway_context is not None:
+        source_handle = gateway_context.source_handles.get(Path(source))
+        if source_handle is None:
+            raise ValueError("gateway publication source is outside the held boundary")
+        _publish_classroom_no_replace(
+            gateway_context.boundary,
+            Path(source),
+            Path(target),
+            source_handle=source_handle,
+        )
+        return
     os.link(source, target, follow_symlinks=False)
+
+
+def _fsync_directory(path: Path) -> None:
+    manifest_context = _MANIFEST_PUBLICATION_CONTEXT.get()
+    if manifest_context is not None:
+        boundary = manifest_context.boundary
+        if Path(path) != boundary.root:
+            raise ValueError("manifest publication directory is outside the held boundary")
+        if os.name != "nt":
+            os.fsync(int(boundary.leases["bundle"].handle))
+        return
+    if os.name == "nt":
+        return
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    descriptor = os.open(Path(path), flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+@dataclass(frozen=True, slots=True)
+class _GatewayPublicationContext:
+    boundary: Any
+    source_handles: Mapping[Path, BinaryIO]
+
+
+_GATEWAY_PUBLICATION_CONTEXT: ContextVar[_GatewayPublicationContext | None] = ContextVar(
+    "gateway_publication_context",
+    default=None,
+)
+_GATEWAY_STAGING_BOUNDARY: ContextVar[Any | None] = ContextVar(
+    "gateway_staging_boundary",
+    default=None,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _GatewayPinnedInput:
+    path: Path
+    body: bytes
+    identity: tuple[int, int]
+
+    def assert_unchanged(self, *, label: str) -> None:
+        current = _read_gateway_input(self.path, label=label)
+        if current.identity != self.identity or current.body != self.body:
+            raise ValueError(f"gateway {label} changed during observation")
+
+
+def _read_gateway_input(path: Path, *, label: str) -> _GatewayPinnedInput:
+    """Read one fixed regular file while rejecting link and replacement races."""
+
+    candidate = Path(os.path.abspath(path))
+    try:
+        _assert_no_link_ancestors(candidate)
+        if _is_link_or_reparse(candidate):
+            raise ValueError("link")
+        before = os.stat(candidate, follow_symlinks=False)
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_CLOEXEC", 0)
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(candidate, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode) or not stat.S_ISREG(opened.st_mode):
+                raise ValueError("regular file")
+            if _file_identity(before) != _file_identity(opened):
+                raise ValueError("identity")
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                chunk = os.read(descriptor, min(64 * 1024, _GATEWAY_MAX_INPUT_BYTES - total + 1))
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > _GATEWAY_MAX_INPUT_BYTES:
+                    raise ValueError("size")
+                chunks.append(chunk)
+            body = b"".join(chunks)
+        finally:
+            os.close(descriptor)
+        _assert_no_link_ancestors(candidate)
+        after = os.stat(candidate, follow_symlinks=False)
+        if _file_identity(after) != _file_identity(opened):
+            raise ValueError("identity")
+    except (OSError, ValueError) as exc:
+        raise ValueError(
+            f"gateway {label} must use a stable regular no-follow boundary; "
+            "symlink or reparse input is forbidden"
+        ) from exc
+    return _GatewayPinnedInput(candidate, body, _file_identity(opened))
+
+
+def _gateway_docker_host_identity_sha256(value: object) -> str:
+    if not isinstance(value, str) or _SHA256.fullmatch(value) is None or value == "0" * 64:
+        raise ValueError("gateway Docker host identity is unavailable or invalid")
+    return value
+
+
+def _gateway_expected_docker_host_identity_sha256(value: object) -> str:
+    by_upper = {name.upper(): item for name, item in os.environ.items()}
+    environment_value = by_upper.get(_GATEWAY_DOCKER_HOST_IDENTITY_ENV)
+    supplied = [item for item in (value, environment_value) if item is not None]
+    if not supplied:
+        raise ValueError("gateway Docker host identity is unavailable or invalid")
+    validated = [_gateway_docker_host_identity_sha256(item) for item in supplied]
+    if len(set(validated)) != 1:
+        raise ValueError("gateway Docker host identity inputs do not match")
+    return validated[0]
+
+
+def _gateway_runtime_host_identity(
+    runtime: Mapping[str, object],
+    *,
+    expected_sha256: str,
+) -> dict[str, str]:
+    raw = runtime.get("dockerHostIdentity")
+    if (
+        not isinstance(raw, dict)
+        or set(raw)
+        != {
+            "context",
+            "endpoint",
+            "serverId",
+            "dockerHostIdentitySha256",
+        }
+        or raw.get("context") != _GATEWAY_DOCKER_CONTEXT
+        or not isinstance(raw.get("endpoint"), str)
+        or not raw["endpoint"]
+        or raw["endpoint"] != raw["endpoint"].strip()
+        or not isinstance(raw.get("serverId"), str)
+        or not raw["serverId"]
+        or raw["serverId"] != raw["serverId"].strip()
+        or raw.get("dockerHostIdentitySha256") != expected_sha256
+    ):
+        raise ValueError("gateway Docker host identity is invalid")
+    return {
+        "context": raw["context"],
+        "endpoint": raw["endpoint"],
+        "serverId": raw["serverId"],
+        "dockerHostIdentitySha256": raw["dockerHostIdentitySha256"],
+    }
+
+
+def _gateway_child_environment() -> dict[str, str]:
+    allowed = {
+        "COMSPEC",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "NO_COLOR",
+        "PATH",
+        "PATHEXT",
+        "SYSTEMDRIVE",
+        "SYSTEMROOT",
+        "TEMP",
+        "TERM",
+        "TMP",
+        "WINDIR",
+    }
+    by_upper = {name.upper(): value for name, value in os.environ.items()}
+    return {name: by_upper[name] for name in allowed if name in by_upper}
+
+
+def _run_gateway_docker(
+    arguments: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    timeout: int,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        arguments,
+        cwd=cwd,
+        env=env,
+        timeout=timeout,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _gateway_command_stdout(
+    completed: subprocess.CompletedProcess[str],
+    *,
+    arguments: list[str],
+) -> str:
+    if (
+        type(completed.returncode) is not int
+        or completed.returncode != 0
+        or completed.args != arguments
+        or not isinstance(completed.stdout, str)
+        or completed.stderr != ""
+    ):
+        raise ValueError("gateway Docker observation command did not exit cleanly")
+    try:
+        body = completed.stdout.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as exc:
+        raise ValueError("gateway Docker observation output is invalid") from exc
+    if len(body) > _GATEWAY_MAX_DOCKER_OUTPUT_BYTES:
+        raise ValueError("gateway Docker observation output is invalid")
+    return completed.stdout
+
+
+def _gateway_command_record(arguments: list[str], stdout: str) -> dict[str, object]:
+    return {
+        "argv": [
+            "docker",
+            "--config",
+            "<isolated-docker-config>",
+            "--context",
+            _GATEWAY_DOCKER_CONTEXT,
+            *arguments,
+        ],
+        "nativeExit": 0,
+        "stdout": stdout,
+        "stdoutSha256": hashlib.sha256(stdout.encode("utf-8")).hexdigest(),
+    }
+
+
+def _gateway_runtime_containers(runtime: Mapping[str, object]) -> dict[str, str]:
+    rows = runtime.get("containers")
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("gateway runtime container identity is invalid")
+    containers: dict[str, str] = {}
+    for row in rows:
+        container_id = row.get("containerId") if isinstance(row, dict) else None
+        service = row.get("service") if isinstance(row, dict) else None
+        project = row.get("project") if isinstance(row, dict) else None
+        if (
+            not isinstance(container_id, str)
+            or not container_id
+            or not isinstance(service, str)
+            or not service
+            or project != _GATEWAY_DOCKER_PROJECT
+            or container_id in containers
+        ):
+            raise ValueError("gateway runtime container identity is invalid")
+        containers[container_id] = service
+    if tuple(containers.values()).count("gateway") != 1:
+        raise ValueError("gateway runtime container identity is invalid")
+    return containers
+
+
+def _gateway_published_ports(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, dict):
+        raise ValueError("gateway Docker published ports are invalid")
+    published: list[dict[str, object]] = []
+    for target, bindings in value.items():
+        match = re.fullmatch(r"([1-9][0-9]{0,4})/(tcp|udp)", str(target))
+        if match is None:
+            raise ValueError("gateway Docker published ports are invalid")
+        if bindings is None:
+            continue
+        if not isinstance(bindings, list):
+            raise ValueError("gateway Docker published ports are invalid")
+        for binding in bindings:
+            if not isinstance(binding, dict) or set(binding) != {"HostIp", "HostPort"}:
+                raise ValueError("gateway Docker published ports are invalid")
+            host_ip = binding.get("HostIp")
+            host_port = binding.get("HostPort")
+            try:
+                parsed_host_port = int(host_port)
+            except (TypeError, ValueError):
+                raise ValueError("gateway Docker published ports are invalid") from None
+            if not isinstance(host_ip, str) or not host_ip or not 1 <= parsed_host_port <= 65535:
+                raise ValueError("gateway Docker published ports are invalid")
+            published.append(
+                {
+                    "containerPort": int(match.group(1)),
+                    "hostIp": host_ip,
+                    "hostPort": parsed_host_port,
+                    "protocol": match.group(2),
+                }
+            )
+    return sorted(
+        published,
+        key=lambda row: (
+            row["containerPort"],
+            row["hostIp"],
+            row["hostPort"],
+            row["protocol"],
+        ),
+    )
+
+
+def _gateway_attached_networks(value: object) -> list[str]:
+    if not isinstance(value, dict) or not value:
+        raise ValueError("gateway Docker network set is invalid")
+    if any(
+        not isinstance(name, str)
+        or not name
+        or name != name.strip()
+        or not isinstance(details, dict)
+        for name, details in value.items()
+    ):
+        raise ValueError("gateway Docker network set is invalid")
+    return sorted(value)
+
+
+def _gateway_observation_round(
+    *,
+    docker: Path,
+    docker_config: Path,
+    candidate_root: Path,
+    deadline_monotonic: float,
+    runner: CommandRunner,
+    runtime_containers: Mapping[str, str],
+    expected_service_networks: Mapping[str, Sequence[str]],
+) -> tuple[dict[str, str], list[dict[str, object]], list[dict[str, object]]]:
+    prefix = [
+        str(docker),
+        "--config",
+        str(docker_config),
+        "--context",
+        _GATEWAY_DOCKER_CONTEXT,
+    ]
+    environment = _gateway_child_environment()
+    commands: list[dict[str, object]] = []
+
+    def execute(arguments: list[str]) -> str:
+        full_arguments = [*prefix, *arguments]
+        remaining = deadline_monotonic - time.monotonic()
+        if not math.isfinite(remaining) or remaining <= 0:
+            raise ValueError("gateway Docker observation deadline expired")
+        command_timeout = max(1, math.floor(remaining))
+        try:
+            completed = runner(
+                full_arguments,
+                cwd=candidate_root,
+                env=environment,
+                timeout=command_timeout,
+            )
+        except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
+            raise ValueError("gateway Docker observation command could not run") from exc
+        stdout = _gateway_command_stdout(completed, arguments=full_arguments)
+        commands.append(_gateway_command_record(arguments, stdout))
+        return stdout
+
+    def observe_daemon() -> dict[str, str]:
+        try:
+            endpoint = json.loads(execute(_GATEWAY_DOCKER_CONTEXT_ARGUMENTS))
+            daemon = json.loads(execute(_GATEWAY_DOCKER_INFO_ARGUMENTS))
+        except json.JSONDecodeError as exc:
+            raise ValueError("gateway Docker daemon identity is invalid") from exc
+        if not isinstance(endpoint, str) or not endpoint or endpoint != endpoint.strip():
+            raise ValueError("gateway Docker daemon endpoint is invalid")
+        if (
+            not isinstance(daemon, dict)
+            or set(daemon) != {"serverId", "osType"}
+            or not isinstance(daemon.get("serverId"), str)
+            or not daemon["serverId"]
+            or daemon.get("osType") != "linux"
+        ):
+            raise ValueError("gateway Docker daemon identity is invalid")
+        return {
+            "context": _GATEWAY_DOCKER_CONTEXT,
+            "endpoint": endpoint,
+            "serverId": daemon["serverId"],
+            "osType": daemon["osType"],
+        }
+
+    daemon_before = observe_daemon()
+
+    ps_stdout = execute(_GATEWAY_DOCKER_PS_ARGUMENTS)
+    try:
+        observed_ids = [json.loads(line) for line in ps_stdout.splitlines()]
+    except json.JSONDecodeError as exc:
+        raise ValueError("gateway Docker observation commands are invalid") from exc
+    expected_ids = sorted(runtime_containers)
+    if observed_ids != expected_ids:
+        raise ValueError("gateway Docker container identity is invalid")
+
+    snapshot: list[dict[str, object]] = []
+    for container_id in expected_ids:
+        arguments = [
+            "container",
+            "inspect",
+            "--format",
+            _GATEWAY_DOCKER_INSPECT_FORMAT,
+            container_id,
+        ]
+        try:
+            row = json.loads(execute(arguments))
+        except json.JSONDecodeError as exc:
+            raise ValueError("gateway Docker container identity is invalid") from exc
+        expected_service = runtime_containers[container_id]
+        if (
+            not isinstance(row, dict)
+            or set(row)
+            != {
+                "containerId",
+                "project",
+                "service",
+                "networkMode",
+                "networks",
+                "publishedPorts",
+            }
+            or row.get("containerId") != container_id
+            or row.get("project") != _GATEWAY_DOCKER_PROJECT
+            or row.get("service") != expected_service
+        ):
+            raise ValueError("gateway Docker container identity is invalid")
+        expected_networks = expected_service_networks.get(expected_service)
+        if not isinstance(expected_networks, Sequence) or isinstance(
+            expected_networks, (str, bytes)
+        ):
+            raise ValueError("gateway candidate Compose network set is invalid")
+        network_mode = row.get("networkMode")
+        if not isinstance(network_mode, str) or network_mode not in expected_networks:
+            raise ValueError("gateway Docker network mode is invalid")
+        networks = _gateway_attached_networks(row.get("networks"))
+        if networks != sorted(expected_networks):
+            raise ValueError("gateway Docker network set is invalid")
+        published_ports = _gateway_published_ports(row.get("publishedPorts"))
+        expected_ports = (
+            [
+                {
+                    "containerPort": port,
+                    "hostIp": "0.0.0.0",
+                    "hostPort": port,
+                    "protocol": "tcp",
+                }
+                for port in (80, 443)
+            ]
+            if expected_service == "gateway"
+            else []
+        )
+        if published_ports != expected_ports:
+            raise ValueError("gateway Docker published ports are invalid")
+        snapshot.append(
+            {
+                "containerId": container_id,
+                "project": _GATEWAY_DOCKER_PROJECT,
+                "service": expected_service,
+                "networkMode": network_mode,
+                "networks": networks,
+                "publishedPorts": published_ports,
+            }
+        )
+    daemon_after = observe_daemon()
+    if daemon_after != daemon_before:
+        raise ValueError("gateway Docker daemon identity changed during observation round")
+    return (
+        daemon_before,
+        snapshot,
+        commands,
+    )
+
+
+def _stage_gateway_json(
+    parent: Path, document: Mapping[str, object]
+) -> tuple[Path, bytes, tuple[int, int]]:
+    gateway_boundary = _GATEWAY_STAGING_BOUNDARY.get()
+    if gateway_boundary is not None:
+        parent_path = Path(parent)
+        if parent_path == gateway_boundary.root / "runtime":
+            parent_key = "runtime"
+        elif parent_path == gateway_boundary.root / "artifacts":
+            parent_key = "artifacts"
+        else:
+            raise ValueError("gateway staging path is outside the held boundary")
+        staged = parent_path / f".gateway-only-public-{uuid.uuid4().hex}.tmp"
+        identity: tuple[int, int] | None = None
+        handle: BinaryIO | None = None
+        try:
+            handle, identity, body = _create_classroom_json_staging(
+                gateway_boundary,
+                parent_key=parent_key,
+                path=staged,
+                document=document,
+            )
+            handle.close()
+            handle = None
+            return staged, body, identity
+        except BaseException:
+            if handle is not None:
+                handle.close()
+            try:
+                _remove_classroom_entries(
+                    gateway_boundary,
+                    {staged: identity},
+                    label="gateway staging evidence",
+                )
+            except Exception as cleanup_error:
+                active_error = sys.exception()
+                if active_error is not None:
+                    active_error.add_note(f"gateway staging cleanup failed: {cleanup_error}")
+            raise
+
+    body = _json_bytes(document)
+    staged: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=".gateway-only-public-",
+            suffix=".tmp",
+            dir=parent,
+            delete=False,
+        ) as handle:
+            staged = Path(handle.name)
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+            identity = _file_identity(os.fstat(handle.fileno()))
+        return staged, body, identity
+    except BaseException:
+        if staged is not None:
+            staged.unlink(missing_ok=True)
+        raise
+
+
+def _stage_gateway_json_bound(
+    boundary: _GatewayPublicationBoundary,
+    parent: Path,
+    document: Mapping[str, object],
+) -> tuple[Path, bytes, tuple[int, int]]:
+    token = _GATEWAY_STAGING_BOUNDARY.set(boundary)
+    try:
+        return _stage_gateway_json(parent, document)
+    finally:
+        _GATEWAY_STAGING_BOUNDARY.reset(token)
+
+
+def _assert_gateway_published(
+    path: Path,
+    *,
+    body: bytes,
+    identity: tuple[int, int],
+) -> None:
+    pinned = _read_gateway_input(path, label="published evidence")
+    if pinned.identity != identity or pinned.body != body:
+        raise ValueError("gateway published evidence changed")
+
+
+def _open_gateway_staged_input(
+    boundary: _GatewayPublicationBoundary,
+    path: Path,
+    *,
+    body: bytes,
+    identity: tuple[int, int],
+) -> BinaryIO:
+    parent = _classroom_publication_parent(boundary, path)
+    handle = _open_classroom_artifact_relative(parent, path.name)
+    try:
+        details = os.fstat(handle.fileno())
+        staged_body = handle.read()
+        handle.seek(0)
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or _file_identity(details) != identity
+            or staged_body != body
+        ):
+            raise ValueError("gateway staged evidence changed")
+        return handle
+    except BaseException:
+        handle.close()
+        raise
 
 
 def write_pass_receipt(
@@ -909,6 +1558,300 @@ class _ClassroomPublicationBoundary:
         self.leases.clear()
 
 
+class _GatewayPublicationBoundary:
+    def __init__(self, root: Path, candidate_root: Path) -> None:
+        self.root = Path(root)
+        self.candidate_root = Path(candidate_root)
+        self.leases: dict[str, _ClassroomDirectoryLease] = {}
+        self.staging: Path | None = None
+        self._committed = False
+
+    @staticmethod
+    def _open_root(path: Path) -> _ClassroomDirectoryLease:
+        if os.name == "nt":
+            if not path.is_absolute() or not path.anchor:
+                raise ValueError("gateway directory lease path is invalid")
+            handle, identity = _open_windows_directory_handle(
+                Path(path.anchor),
+                deletable=True,
+            )
+            try:
+                for component in path.relative_to(path.anchor).parts:
+                    opened, opened_identity = _open_windows_directory_relative(
+                        handle,
+                        component,
+                    )
+                    previous = handle
+                    handle = opened
+                    identity = opened_identity
+                    _close_windows_handle(previous)
+            except BaseException:
+                _close_windows_handle(handle)
+                raise
+        else:
+            handle, identity = _open_posix_directory_path_no_follow(path)
+        return _ClassroomDirectoryLease(path=path, handle=handle, identity=identity)
+
+    @classmethod
+    def open(
+        cls,
+        root: Path,
+        candidate_root: Path,
+    ) -> _GatewayPublicationBoundary:
+        boundary = cls(
+            Path(os.path.abspath(root)),
+            Path(os.path.abspath(candidate_root)),
+        )
+        try:
+            boundary.leases["bundle"] = cls._open_root(boundary.root)
+            boundary.leases["candidate"] = cls._open_root(boundary.candidate_root)
+            for key, parent_key, name, path in (
+                ("raw", "bundle", "raw", boundary.root / "raw"),
+                ("runtime", "bundle", "runtime", boundary.root / "runtime"),
+                (
+                    "candidate/deploy",
+                    "candidate",
+                    "deploy",
+                    boundary.candidate_root / "deploy",
+                ),
+            ):
+                try:
+                    boundary.leases[key] = _open_classroom_directory_relative(
+                        boundary.leases[parent_key],
+                        name=name,
+                        path=path,
+                        create=False,
+                    )
+                except (OSError, ValueError) as exc:
+                    raise ValueError(
+                        "gateway no-follow directory boundary cannot be opened"
+                    ) from exc
+            boundary.assert_unchanged()
+            return boundary
+        except BaseException:
+            boundary.close(suppress_errors=True)
+            raise
+
+    def __enter__(self) -> _GatewayPublicationBoundary:
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> bool:
+        try:
+            self.close()
+        except BaseException as close_error:
+            if exc_value is None and not self._committed:
+                raise
+            if exc_value is not None and hasattr(exc_value, "add_note"):
+                exc_value.add_note(f"gateway directory lease cleanup failed: {close_error}")
+        return False
+
+    def mark_committed(self) -> None:
+        self._committed = True
+
+    def ensure_publication_parents(self) -> None:
+        if "artifacts" in self.leases:
+            self.assert_unchanged()
+            return
+        path = self.root / "artifacts"
+        exists = os.path.lexists(path)
+        if exists:
+            try:
+                details = os.stat(path, follow_symlinks=False)
+            except OSError as exc:
+                raise ValueError("gateway publication boundary is unavailable") from exc
+            if not stat.S_ISDIR(details.st_mode) or _is_link_or_reparse(path):
+                raise ValueError("gateway publication boundary uses a reparse point")
+        try:
+            self.leases["artifacts"] = _open_classroom_directory_relative(
+                self.leases["bundle"],
+                name="artifacts",
+                path=path,
+                create=not exists,
+            )
+            self.assert_unchanged()
+        except BaseException:
+            lease = self.leases.pop("artifacts", None)
+            if lease is not None:
+                if os.name == "nt":
+                    _close_windows_handle(lease.handle)
+                else:
+                    os.close(int(lease.handle))
+            raise
+
+    def assert_unchanged(self) -> None:
+        relative_parents = {
+            "raw": ("bundle", "raw"),
+            "runtime": ("bundle", "runtime"),
+            "artifacts": ("bundle", "artifacts"),
+            "candidate/deploy": ("candidate", "deploy"),
+        }
+        for key, lease in self.leases.items():
+            reopened: object | int | None = None
+            try:
+                if os.name == "nt":
+                    if key in {"bundle", "candidate"}:
+                        reopened_lease = self._open_root(lease.path)
+                        reopened = reopened_lease.handle
+                        identity = reopened_lease.identity
+                    else:
+                        parent_key, name = relative_parents[key]
+                        reopened, identity = _open_windows_directory_relative(
+                            self.leases[parent_key].handle,
+                            name,
+                        )
+                else:
+                    held_details = os.fstat(int(lease.handle))
+                    if (
+                        not stat.S_ISDIR(held_details.st_mode)
+                        or _file_identity(held_details) != lease.identity
+                    ):
+                        raise ValueError("gateway directory lease changed")
+                    if key in {"bundle", "candidate"}:
+                        reopened, identity = _open_posix_directory_path_no_follow(lease.path)
+                    else:
+                        parent_key, name = relative_parents[key]
+                        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+                        reopened = os.open(
+                            name,
+                            flags,
+                            dir_fd=int(self.leases[parent_key].handle),
+                        )
+                        details = os.fstat(reopened)
+                        if not stat.S_ISDIR(details.st_mode):
+                            raise ValueError("gateway directory lease changed")
+                        identity = _file_identity(details)
+                if identity != lease.identity:
+                    raise ValueError("gateway directory lease changed")
+            except (OSError, ValueError, KeyError) as exc:
+                raise ValueError("gateway directory boundary changed") from exc
+            finally:
+                if reopened is not None:
+                    if os.name == "nt":
+                        _close_windows_handle(reopened)
+                    else:
+                        os.close(int(reopened))
+
+    def close(self, *, suppress_errors: bool = False) -> None:
+        errors: list[OSError] = []
+        for lease in reversed(tuple(self.leases.values())):
+            try:
+                if os.name == "nt":
+                    _close_windows_handle(lease.handle)
+                else:
+                    os.close(int(lease.handle))
+            except OSError as exc:
+                errors.append(exc)
+        self.leases.clear()
+        if errors and not suppress_errors:
+            raise errors[0]
+
+
+class _BackupRestorePublicationBoundary(_ClassroomPublicationBoundary):
+    def __init__(self, root: Path) -> None:
+        super().__init__(root)
+        self._committed = False
+
+    @classmethod
+    def open(cls, root: Path) -> _BackupRestorePublicationBoundary:
+        boundary = cls(Path(os.path.abspath(root)))
+        try:
+            boundary.leases["bundle"] = _GatewayPublicationBoundary._open_root(boundary.root)
+            for key, parent_key, name, path, create in (
+                (
+                    "runtime",
+                    "bundle",
+                    "runtime",
+                    boundary.root / "runtime",
+                    False,
+                ),
+                (
+                    "runtime/backup-restore",
+                    "runtime",
+                    "backup-restore",
+                    boundary.root / "runtime" / "backup-restore",
+                    False,
+                ),
+                (
+                    "artifacts",
+                    "bundle",
+                    "artifacts",
+                    boundary.root / "artifacts",
+                    not os.path.lexists(boundary.root / "artifacts"),
+                ),
+            ):
+                boundary.leases[key] = _open_classroom_directory_relative(
+                    boundary.leases[parent_key],
+                    name=name,
+                    path=path,
+                    create=create,
+                )
+            boundary.assert_unchanged()
+            return boundary
+        except BaseException:
+            boundary.close()
+            raise
+
+    def assert_unchanged(self) -> None:
+        relative_parents = {
+            "runtime": ("bundle", "runtime"),
+            "runtime/backup-restore": ("runtime", "backup-restore"),
+            "artifacts": ("bundle", "artifacts"),
+        }
+        for key, lease in self.leases.items():
+            reopened: _ClassroomDirectoryLease | object | int | None = None
+            try:
+                held_identity = (
+                    _windows_handle_identity(lease.handle, directory=True)
+                    if os.name == "nt"
+                    else _file_identity(os.fstat(int(lease.handle)))
+                )
+                if held_identity != lease.identity:
+                    raise ValueError("backup restore publication directory changed")
+                if key == "bundle":
+                    reopened = _GatewayPublicationBoundary._open_root(lease.path)
+                    identity = reopened.identity
+                else:
+                    parent_key, name = relative_parents[key]
+                    if os.name == "nt":
+                        reopened, identity = _open_windows_directory_relative(
+                            self.leases[parent_key].handle,
+                            name,
+                        )
+                    else:
+                        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+                        reopened = os.open(
+                            name,
+                            flags,
+                            dir_fd=int(self.leases[parent_key].handle),
+                        )
+                        details = os.fstat(reopened)
+                        if not stat.S_ISDIR(details.st_mode):
+                            raise ValueError("backup restore publication directory changed")
+                        identity = _file_identity(details)
+                if identity != lease.identity:
+                    raise ValueError("backup restore publication directory changed")
+            except (OSError, ValueError, KeyError) as exc:
+                raise ValueError("backup restore publication directory changed") from exc
+            finally:
+                if isinstance(reopened, _ClassroomDirectoryLease):
+                    if os.name == "nt":
+                        _close_windows_handle(reopened.handle)
+                    else:
+                        os.close(int(reopened.handle))
+                elif reopened is not None:
+                    if os.name == "nt":
+                        _close_windows_handle(reopened)
+                    else:
+                        os.close(int(reopened))
+
+    def mark_committed(self) -> None:
+        self._committed = True
+
+    @property
+    def committed(self) -> bool:
+        return self._committed
+
+
 class _TenantPublicationBoundary(_ClassroomPublicationBoundary):
     _FIXED_NAMES = ("runtime", "artifacts", "staging")
 
@@ -1124,8 +2067,9 @@ def _classroom_publication_parent(
     parents = {
         boundary.root / "runtime": "runtime",
         boundary.root / "artifacts": "artifacts",
-        boundary.staging: "staging/attempt",
     }
+    if boundary.staging is not None and "staging/attempt" in boundary.leases:
+        parents[boundary.staging] = "staging/attempt"
     if "raw/classroom-exports" in boundary.leases:
         parents[boundary.root / "raw" / "classroom-exports"] = "raw/classroom-exports"
     key = parents.get(path.parent)
@@ -1248,8 +2192,9 @@ def _remove_classroom_entries(
     parent_leases = {
         boundary.root / "runtime": boundary.leases["runtime"],
         boundary.root / "artifacts": boundary.leases["artifacts"],
-        boundary.staging: boundary.leases["staging/attempt"],
     }
+    if boundary.staging is not None and "staging/attempt" in boundary.leases:
+        parent_leases[boundary.staging] = boundary.leases["staging/attempt"]
     if "raw/classroom-exports" in boundary.leases:
         parent_leases[boundary.root / "raw" / "classroom-exports"] = boundary.leases[
             "raw/classroom-exports"
@@ -1508,6 +2453,62 @@ def _relocate_windows_bundle_file(
             _close_windows_handle(handle)
 
 
+def _discard_windows_bundle_file(
+    source: Path,
+    *,
+    bundle_root: Path,
+    bundle_handle: object,
+) -> bool:
+    import msvcrt
+
+    relative = _bundle_relative_file(source, bundle_root=bundle_root)
+    directory_handles: list[object] = []
+    current = bundle_handle
+    source_handle: object | None = None
+    descriptor: int | None = None
+    try:
+        try:
+            for component in relative.parts[:-1]:
+                current, _identity = _open_windows_directory_relative(current, component)
+                directory_handles.append(current)
+            source_handle, _identity = _open_windows_regular_file_relative(
+                current,
+                relative.name,
+                share_access=0x00000001 | 0x00000002 | 0x00000004,
+                deletable=True,
+            )
+        except FileNotFoundError:
+            return False
+        handle_value = getattr(source_handle, "value", source_handle)
+        descriptor = msvcrt.open_osfhandle(
+            int(handle_value),
+            os.O_RDONLY | os.O_BINARY,
+        )
+        source_handle = None
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError("sensitive probe artifact is not a regular file")
+        _delete_windows_file_on_close(msvcrt.get_osfhandle(descriptor))
+        os.close(descriptor)
+        descriptor = None
+        try:
+            recreated, _identity = _open_windows_regular_file_relative(
+                current,
+                relative.name,
+                share_access=0x00000001 | 0x00000002 | 0x00000004,
+            )
+        except FileNotFoundError:
+            return True
+        _close_windows_handle(recreated)
+        raise ValueError("sensitive probe artifact reappeared during cleanup")
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if source_handle is not None:
+            _close_windows_handle(source_handle)
+        for handle in reversed(directory_handles):
+            _close_windows_handle(handle)
+
+
 def _record_probe_failure_windows(
     *,
     root: Path,
@@ -1677,6 +2678,69 @@ def _relocate_posix_bundle_file(
             os.close(file_descriptor)
 
 
+def _discard_posix_bundle_file(
+    source: Path,
+    *,
+    bundle_root: Path,
+    bundle_fd: int,
+) -> bool:
+    relative = _bundle_relative_file(source, bundle_root=bundle_root)
+    directory_fds: list[int] = []
+    current = bundle_fd
+    source_file: int | None = None
+    try:
+        try:
+            directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+            for component in relative.parts[:-1]:
+                current = os.open(component, directory_flags, dir_fd=current)
+                directory_fds.append(current)
+            source_file = os.open(
+                relative.name,
+                os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=current,
+            )
+        except FileNotFoundError:
+            return False
+        if not stat.S_ISREG(os.fstat(source_file).st_mode):
+            raise ValueError("sensitive probe artifact is not a regular file")
+        os.unlink(relative.name, dir_fd=current)
+        os.fsync(current)
+        try:
+            os.stat(relative.name, dir_fd=current, follow_symlinks=False)
+        except FileNotFoundError:
+            return True
+        raise ValueError("sensitive probe artifact reappeared during cleanup")
+    finally:
+        if source_file is not None:
+            os.close(source_file)
+        for file_descriptor in reversed(directory_fds):
+            os.close(file_descriptor)
+
+
+def _discard_sensitive_probe_artifact(path: Path, *, bundle_root: Path) -> None:
+    root = Path(bundle_root).resolve()
+    if os.name == "nt":
+        bundle_handle, _identity = _open_windows_directory_handle(root, deletable=True)
+        try:
+            _discard_windows_bundle_file(
+                Path(path),
+                bundle_root=root,
+                bundle_handle=bundle_handle,
+            )
+        finally:
+            _close_windows_handle(bundle_handle)
+        return
+    bundle_fd, _identity = _open_posix_directory_path_no_follow(root)
+    try:
+        _discard_posix_bundle_file(
+            Path(path),
+            bundle_root=root,
+            bundle_fd=bundle_fd,
+        )
+    finally:
+        os.close(bundle_fd)
+
+
 def _write_posix_new_file(directory_fd: int, name: str, body: bytes) -> None:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
     file_descriptor = os.open(name, flags, 0o600, dir_fd=directory_fd)
@@ -1795,6 +2859,29 @@ def _record_probe_failure(
     return root / "failures" / evidence / attempt_id
 
 
+def _record_playwright_probe_failure(
+    *,
+    bundle_root: Path,
+    evidence: str,
+    recipe: str,
+    attempt_id: str,
+    reason: str,
+    native_exit: int | None,
+    raw_report: Path,
+    artifacts: Mapping[str, Path] | None = None,
+) -> Path:
+    _discard_sensitive_probe_artifact(raw_report, bundle_root=bundle_root)
+    return _record_probe_failure(
+        bundle_root=bundle_root,
+        evidence=evidence,
+        recipe=recipe,
+        attempt_id=attempt_id,
+        reason=reason,
+        native_exit=native_exit,
+        artifacts={} if artifacts is None else artifacts,
+    )
+
+
 def run_probe_receipt(
     output_path: Path,
     *,
@@ -1891,50 +2978,50 @@ def run_probe_receipt(
             timeout=timeout_seconds,
         )
     except subprocess.TimeoutExpired:
-        _record_probe_failure(
+        _record_playwright_probe_failure(
             bundle_root=bundle_root,
             evidence=evidence,
             recipe=recipe,
             attempt_id=attempt_id,
             reason="outer probe deadline expired",
             native_exit=None,
-            artifacts={"raw": staged_report},
+            raw_report=staged_report,
         )
         raise
     native_exit = completed.returncode
     if not isinstance(native_exit, int) or isinstance(native_exit, bool):
-        _record_probe_failure(
+        _record_playwright_probe_failure(
             bundle_root=bundle_root,
             evidence=evidence,
             recipe=recipe,
             attempt_id=attempt_id,
             reason="probe native exit is invalid",
             native_exit=None,
-            artifacts={"raw": staged_report},
+            raw_report=staged_report,
         )
         raise ValueError("probe native exit is invalid")
     if native_exit != 0:
-        _record_probe_failure(
+        _record_playwright_probe_failure(
             bundle_root=bundle_root,
             evidence=evidence,
             recipe=recipe,
             attempt_id=attempt_id,
             reason="probe native exit does not prove passing evidence",
             native_exit=native_exit,
-            artifacts={"raw": staged_report},
+            raw_report=staged_report,
         )
         raise ValueError(f"probe native exit {native_exit} does not prove passing evidence")
     try:
         raw_body = staged_report.read_bytes()
     except OSError as exc:
-        _record_probe_failure(
+        _record_playwright_probe_failure(
             bundle_root=bundle_root,
             evidence=evidence,
             recipe=recipe,
             attempt_id=attempt_id,
             reason="probe raw report is unavailable",
             native_exit=native_exit,
-            artifacts={"raw": staged_report},
+            raw_report=staged_report,
         )
         raise ValueError("probe raw report is unavailable") from exc
     try:
@@ -1968,14 +3055,14 @@ def run_probe_receipt(
             expected_sha256=attestation_sha256,
         )
     except ValueError:
-        _record_probe_failure(
+        _record_playwright_probe_failure(
             bundle_root=bundle_root,
             evidence=evidence,
             recipe=recipe,
             attempt_id=attempt_id,
             reason="probe raw report or candidate validation failed",
             native_exit=native_exit,
-            artifacts={"raw": staged_report},
+            raw_report=staged_report,
         )
         raise
     command_record = probe_command_record(evidence)
@@ -2020,15 +3107,15 @@ def run_probe_receipt(
             },
         )
     except Exception:
-        _record_probe_failure(
+        _record_playwright_probe_failure(
             bundle_root=bundle_root,
             evidence=evidence,
             recipe=recipe,
             attempt_id=attempt_id,
             reason="probe proof publication failed",
             native_exit=native_exit,
+            raw_report=resolved_report if resolved_report.exists() else staged_report,
             artifacts={
-                "raw": resolved_report if resolved_report.exists() else staged_report,
                 "execution": resolved_execution,
                 "receipt": resolved_output,
             },
@@ -2772,34 +3859,137 @@ def write_capacity_profile_receipt(
         raise
 
 
-def write_openmaic_shared_plane_receipt(
+def _parse_bound_openmaic_dedicated_outage_attestation(
+    body: bytes,
     *,
+    bundle_root: Path,
+    candidate: Mapping[str, object],
+    release_run: Mapping[str, str],
+    expected_base_url: str,
+    expected_runtime_attestation_sha256: str,
+    expected_observer_attestation_sha256: str,
+    expected_observer_id: str,
+    expected_observer_origin: str,
+    expected_shared_ingress_control_origin: str,
+    expected_tenant_id: str,
+    expected_docker_host_identity_sha256: str,
+) -> dict[str, object]:
+    """Replay the archived marker, then validate its bound outage receipt."""
+
+    try:
+        document = json.loads(body)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("OpenMAIC dedicated outage attestation is invalid") from exc
+    fixture = document.get("fixture") if isinstance(document, dict) else None
+    provenance = document.get("provenance") if isinstance(document, dict) else None
+    outage = document.get("outage") if isinstance(document, dict) else None
+    marker_reference = fixture.get("attemptMarker") if isinstance(fixture, dict) else None
+    route_id = outage.get("routeId") if isinstance(outage, dict) else None
+    if (
+        not isinstance(provenance, dict)
+        or provenance.get("attemptMarker") != marker_reference
+        or not isinstance(route_id, str)
+        or _SHA256.fullmatch(expected_docker_host_identity_sha256) is None
+        or expected_docker_host_identity_sha256 == "0" * 64
+    ):
+        raise ValueError("OpenMAIC dedicated outage attestation is invalid")
+    replayed = _replay_openmaic_dedicated_outage_attempt_marker(
+        bundle_root,
+        marker_reference,
+        candidate=candidate,
+        release_run=release_run,
+        expected_observer_attestation_sha256=expected_observer_attestation_sha256,
+        expected_observer_id=expected_observer_id,
+        expected_observer_origin=expected_observer_origin,
+        expected_shared_ingress_control_origin=expected_shared_ingress_control_origin,
+        expected_tenant_id=expected_tenant_id,
+        expected_route_id=route_id,
+        return_body=True,
+    )
+    if not isinstance(replayed, tuple):
+        raise ValueError("OpenMAIC dedicated outage attempt marker is invalid")
+    _marker, marker_body = replayed
+    return parse_openmaic_dedicated_outage_attestation(
+        body,
+        candidate=candidate,
+        release_run=release_run,
+        expected_base_url=expected_base_url,
+        expected_runtime_attestation_sha256=expected_runtime_attestation_sha256,
+        expected_observer_attestation_sha256=expected_observer_attestation_sha256,
+        expected_observer_id=expected_observer_id,
+        expected_observer_origin=expected_observer_origin,
+        expected_shared_ingress_control_origin=(expected_shared_ingress_control_origin),
+        expected_tenant_id=expected_tenant_id,
+        attempt_marker_body=marker_body,
+        expected_docker_host_identity_sha256=(expected_docker_host_identity_sha256),
+    )
+
+
+def _write_openmaic_plane_receipt(
+    *,
+    plane: str,
     candidate_root: Path,
     bundle_root: Path,
     release_run: Mapping[str, object],
     timeout_seconds: int,
     runner: CommandRunner = _run_openmaic_smoke,
+    expected_outage_docker_host_identity_sha256: str | None = None,
 ) -> dict[str, object]:
-    """Run the fixed shared-plane smoke and publish its proof marker last."""
+    """Run one fixed OpenMAIC plane smoke and publish its proof marker last."""
+
+    if plane == "shared":
+        evidence = "openmaic_shared_plane"
+        proof_name = "openmaic-shared-plane-attestation.json"
+        receipt_name = "openmaic_shared_plane.json"
+        provenance_key = "openmaicSharedPlaneAttestation"
+        logical_command = openmaic_shared_plane_command_record()
+        derive_checks = derive_openmaic_shared_plane_checks
+        expected_smoke_checks = {"sharedGenerationPassed": True}
+        expected_receipt_checks = expected_smoke_checks
+    elif plane == "dedicated":
+        evidence = "openmaic_dedicated_plane"
+        proof_name = "openmaic-dedicated-plane-attestation.json"
+        receipt_name = "openmaic_dedicated_plane.json"
+        provenance_key = "openmaicDedicatedPlaneAttestation"
+        logical_command = openmaic_dedicated_plane_command_record()
+        derive_checks = derive_openmaic_dedicated_plane_checks
+        expected_smoke_checks = {
+            "dedicatedGenerationPassed": True,
+            "noSharedClientIssued": True,
+        }
+        expected_receipt_checks = {
+            **expected_smoke_checks,
+            "noSharedFallback": True,
+        }
+    else:
+        raise ValueError("OpenMAIC evidence plane is invalid")
+    label = f"OpenMAIC {plane}-plane"
+    staging_prefix = f"openmaic-{plane}-plane"
 
     if (
         not isinstance(timeout_seconds, int)
         or isinstance(timeout_seconds, bool)
         or timeout_seconds <= _PROBE_CLEANUP_MARGIN_SECONDS
     ):
-        raise ValueError("OpenMAIC shared-plane timeout is invalid")
+        raise ValueError(f"{label} timeout is invalid")
     token = os.environ.get("YFEISTAI_LIVE_FIXTURE_TOKEN")
     if not isinstance(token, str) or not token.strip():
-        raise ValueError("OpenMAIC shared-plane live fixture token is unavailable")
+        raise ValueError(f"{label} live fixture token is unavailable")
+    dedicated_tenant_id: str | None = None
+    if plane == "dedicated":
+        raw_tenant_id = os.environ.get("YFEISTAI_DEDICATED_TENANT_ID")
+        if not isinstance(raw_tenant_id, str) or _RELEASE_ID.fullmatch(raw_tenant_id) is None:
+            raise ValueError("OpenMAIC dedicated-plane tenant ID is unavailable or invalid")
+        dedicated_tenant_id = raw_tenant_id
     secrets = tuple(
         value.encode("utf-8", errors="strict") for value in {token, token.strip()} if value
     )
     root = Path(os.path.abspath(bundle_root))
     candidate_path = Path(candidate_root).resolve()
-    proof_path = root / "runtime" / "openmaic-shared-plane-attestation.json"
-    receipt_path = root / "artifacts" / "openmaic_shared_plane.json"
+    proof_path = root / "runtime" / proof_name
+    receipt_path = root / "artifacts" / receipt_name
     if any(os.path.lexists(path) for path in (proof_path, receipt_path)):
-        raise ValueError("OpenMAIC shared-plane evidence already exists")
+        raise ValueError(f"{label} evidence already exists")
 
     candidate = _candidate(candidate_path)
     bound_run = _release_run(release_run)
@@ -2818,14 +4008,81 @@ def write_openmaic_shared_plane_receipt(
     )
     base_url = runtime.get("baseUrl")
     if not isinstance(base_url, str):
-        raise ValueError("OpenMAIC shared-plane runtime URL is invalid")
+        raise ValueError(f"{label} runtime URL is invalid")
 
-    logical_command = openmaic_shared_plane_command_record()
+    outage_path: Path | None = None
+    outage_body: bytes | None = None
+    outage_sha256: str | None = None
+    outage_checks: dict[str, bool] = {}
+    observer_path: Path | None = None
+    observer_body: bytes | None = None
+    observer_sha256: str | None = None
+    observer_id: str | None = None
+    observer_origin: str | None = None
+    control_origin: str | None = None
+    if dedicated_tenant_id is not None:
+        if (
+            not isinstance(expected_outage_docker_host_identity_sha256, str)
+            or _SHA256.fullmatch(expected_outage_docker_host_identity_sha256) is None
+            or expected_outage_docker_host_identity_sha256 == "0" * 64
+        ):
+            raise ValueError(
+                "OpenMAIC dedicated outage Docker host identity is unavailable or invalid"
+            )
+        observer_path = root / "runtime" / "openmaic-shared-ingress-observer-attestation.json"
+        try:
+            observer_body = observer_path.read_bytes()
+            observer = parse_openmaic_shared_ingress_observer_attestation(
+                observer_body,
+                release_run=bound_run,
+            )
+        except (OSError, ValueError) as exc:
+            raise ValueError("OpenMAIC shared-ingress observer attestation is invalid") from exc
+        observer_sha256 = hashlib.sha256(observer_body).hexdigest()
+        observer_details = observer.get("observer")
+        if not isinstance(observer_details, dict):
+            raise ValueError("OpenMAIC shared-ingress observer attestation is invalid")
+        observer_id = observer_details.get("observerId")
+        observer_url = observer_details.get("observerUrl")
+        control_url = observer_details.get("sharedIngressControlUrl")
+        if not all(isinstance(value, str) for value in (observer_id, observer_url, control_url)):
+            raise ValueError("OpenMAIC shared-ingress observer attestation is invalid")
+        parsed_observer_url = urlsplit(observer_url)
+        parsed_control_url = urlsplit(control_url)
+        observer_origin = f"{parsed_observer_url.scheme}://{parsed_observer_url.netloc}"
+        control_origin = f"{parsed_control_url.scheme}://{parsed_control_url.netloc}"
+        outage_path = root / "runtime" / "openmaic-dedicated-outage-attestation.json"
+        try:
+            outage_body = outage_path.read_bytes()
+        except OSError as exc:
+            raise ValueError("OpenMAIC dedicated outage attestation is unavailable") from exc
+        try:
+            outage_report = _parse_bound_openmaic_dedicated_outage_attestation(
+                outage_body,
+                bundle_root=root,
+                candidate=candidate,
+                release_run=bound_run,
+                expected_base_url=base_url,
+                expected_runtime_attestation_sha256=runtime_sha256,
+                expected_observer_attestation_sha256=observer_sha256,
+                expected_observer_id=observer_id,
+                expected_observer_origin=observer_origin,
+                expected_shared_ingress_control_origin=control_origin,
+                expected_tenant_id=dedicated_tenant_id,
+                expected_docker_host_identity_sha256=(expected_outage_docker_host_identity_sha256),
+            )
+        except ValueError as exc:
+            raise ValueError("OpenMAIC dedicated outage attestation is invalid") from exc
+        outage_checks = derive_openmaic_dedicated_outage_checks(outage_report)
+        if outage_checks != {"noSharedFallback": True}:
+            raise ValueError("OpenMAIC dedicated outage attestation did not prove no fallback")
+        outage_sha256 = hashlib.sha256(outage_body).hexdigest()
+
     arguments = [
         sys.executable,
         str(SCRIPTS_ROOT / "openmaic_smoke_probe.py"),
         "--plane",
-        "shared",
+        plane,
         "--profile",
         "first-release",
     ]
@@ -2862,6 +4119,8 @@ def write_openmaic_shared_plane_receipt(
             "WEB_BASE_URL": base_url,
         }
     )
+    if dedicated_tenant_id is not None:
+        environment["YFEISTAI_DEDICATED_TENANT_ID"] = dedicated_tenant_id
     try:
         completed = runner(
             arguments,
@@ -2870,7 +4129,7 @@ def write_openmaic_shared_plane_receipt(
             timeout=timeout_seconds,
         )
     except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
-        raise ValueError("OpenMAIC shared-plane probe could not run") from exc
+        raise ValueError(f"{label} probe could not run") from exc
     if (
         not isinstance(completed.returncode, int)
         or isinstance(completed.returncode, bool)
@@ -2879,13 +4138,13 @@ def write_openmaic_shared_plane_receipt(
         or not isinstance(completed.stdout, str)
         or completed.stderr != ""
     ):
-        raise ValueError("OpenMAIC shared-plane probe did not exit cleanly")
+        raise ValueError(f"{label} probe did not exit cleanly")
     try:
         stdout = completed.stdout.encode("utf-8", errors="strict")
     except UnicodeEncodeError as exc:
-        raise ValueError("OpenMAIC shared-plane probe output is invalid") from exc
+        raise ValueError(f"{label} probe output is invalid") from exc
     if len(stdout) > MAX_OPENMAIC_SMOKE_REPORT_BYTES or any(secret in stdout for secret in secrets):
-        raise ValueError("OpenMAIC shared-plane probe output is invalid or contains a secret")
+        raise ValueError(f"{label} probe output is invalid or contains a secret")
     report = parse_openmaic_smoke_report(
         stdout,
         candidate=candidate,
@@ -2893,10 +4152,14 @@ def write_openmaic_shared_plane_receipt(
         expected_base_url=base_url,
         expected_runtime_attestation_sha256=runtime_sha256,
         forbidden_secret_values=secrets,
+        expected_plane=plane,
     )
-    checks = derive_openmaic_shared_plane_checks(report)
-    if checks != {"sharedGenerationPassed": True}:
-        raise ValueError("OpenMAIC shared-plane probe did not prove materialized generation")
+    smoke_checks = derive_checks(report)
+    if smoke_checks != expected_smoke_checks:
+        raise ValueError(f"{label} probe did not prove materialized generation")
+    checks = {**smoke_checks, **outage_checks}
+    if checks != expected_receipt_checks:
+        raise ValueError(f"{label} evidence checks are incomplete")
     observed_at = report.get("observedAt")
     fixture = report.get("fixture")
     binding = report.get("binding")
@@ -2908,7 +4171,11 @@ def write_openmaic_shared_plane_receipt(
         or not isinstance(binding, dict)
         or not isinstance(generation, dict)
     ):
-        raise ValueError("OpenMAIC shared-plane report summary is invalid")
+        raise ValueError(f"{label} report summary is invalid")
+    if dedicated_tenant_id is not None and fixture.get("tenantId") != dedicated_tenant_id:
+        raise ValueError(
+            "OpenMAIC dedicated-plane report tenant does not match the requested tenant"
+        )
 
     def assert_release_binding() -> None:
         try:
@@ -2918,13 +4185,13 @@ def write_openmaic_shared_plane_receipt(
                 bundle_root=root,
             )
         except ValueError as exc:
-            raise ValueError("OpenMAIC shared-plane release binding changed") from exc
+            raise ValueError(f"{label} release binding changed") from exc
         if (
             candidate_after != candidate
             or runtime_after != runtime_body
             or runtime_after_sha256 != runtime_sha256
         ):
-            raise ValueError("OpenMAIC shared-plane release binding changed")
+            raise ValueError(f"{label} release binding changed")
         validate_runtime_attestation(
             runtime_path,
             bundle_root=root,
@@ -2934,6 +4201,46 @@ def write_openmaic_shared_plane_receipt(
             expected_base_url=base_url,
             expected_sha256=runtime_sha256,
         )
+        if outage_path is not None:
+            assert outage_body is not None
+            assert observer_path is not None
+            assert observer_body is not None
+            assert observer_sha256 is not None
+            assert observer_id is not None
+            assert observer_origin is not None
+            assert control_origin is not None
+            try:
+                outage_after = outage_path.read_bytes()
+                observer_after = observer_path.read_bytes()
+            except OSError as exc:
+                raise ValueError("OpenMAIC dedicated outage release binding changed") from exc
+            if outage_after != outage_body or observer_after != observer_body:
+                raise ValueError("OpenMAIC dedicated outage release binding changed")
+            try:
+                parse_openmaic_shared_ingress_observer_attestation(
+                    observer_after,
+                    release_run=bound_run,
+                )
+                replayed_outage = _parse_bound_openmaic_dedicated_outage_attestation(
+                    outage_after,
+                    bundle_root=root,
+                    candidate=candidate,
+                    release_run=bound_run,
+                    expected_base_url=base_url,
+                    expected_runtime_attestation_sha256=runtime_sha256,
+                    expected_observer_attestation_sha256=observer_sha256,
+                    expected_observer_id=observer_id,
+                    expected_observer_origin=observer_origin,
+                    expected_shared_ingress_control_origin=control_origin,
+                    expected_tenant_id=dedicated_tenant_id,
+                    expected_docker_host_identity_sha256=(
+                        expected_outage_docker_host_identity_sha256
+                    ),
+                )
+            except ValueError as exc:
+                raise ValueError("OpenMAIC dedicated outage release binding changed") from exc
+            if derive_openmaic_dedicated_outage_checks(replayed_outage) != outage_checks:
+                raise ValueError("OpenMAIC dedicated outage release binding changed")
 
     assert_release_binding()
     proof = {
@@ -2957,21 +4264,21 @@ def write_openmaic_shared_plane_receipt(
             "fixture": json.loads(json.dumps(fixture)),
             "binding": json.loads(json.dumps(binding)),
             "generation": json.loads(json.dumps(generation)),
-            "checks": checks,
+            "checks": smoke_checks,
         },
     }
     attempt_id = uuid.uuid4().hex
     boundary = _TenantPublicationBoundary.open(
         root,
         attempt_id,
-        staging_prefix="openmaic-shared-plane",
+        staging_prefix=staging_prefix,
     )
     staging = boundary.staging
     if staging is None:
         boundary.close()
-        raise ValueError("OpenMAIC shared-plane staging is unavailable")
-    staged_proof = staging / "openmaic-shared-plane-attestation.json"
-    staged_receipt = staging / "openmaic_shared_plane.json"
+        raise ValueError(f"{label} staging is unavailable")
+    staged_proof = staging / proof_name
+    staged_receipt = staging / receipt_name
     proof_handle: BinaryIO | None = None
     receipt_handle: BinaryIO | None = None
     proof_identity: tuple[int, int] | None = None
@@ -2990,19 +4297,31 @@ def write_openmaic_shared_plane_receipt(
             document=proof,
         )
         proof_sha256 = hashlib.sha256(proof_body).hexdigest()
+        provenance = {
+            provenance_key: {
+                "artifact": f"runtime/{proof_name}",
+                "sha256": proof_sha256,
+            }
+        }
+        if outage_path is not None:
+            assert outage_sha256 is not None
+            assert observer_sha256 is not None
+            provenance["openmaicDedicatedOutageAttestation"] = {
+                "artifact": "runtime/openmaic-dedicated-outage-attestation.json",
+                "sha256": outage_sha256,
+            }
+            provenance["openmaicSharedIngressObserverAttestation"] = {
+                "artifact": "runtime/openmaic-shared-ingress-observer-attestation.json",
+                "sha256": observer_sha256,
+            }
         receipt = _pass_receipt_from_candidate(
             candidate=candidate,
             release_run=bound_run,
-            evidence="openmaic_shared_plane",
+            evidence=evidence,
             observed_at=observed_at,
             native_exit=0,
             checks=checks,
-            provenance={
-                "openmaicSharedPlaneAttestation": {
-                    "artifact": "runtime/openmaic-shared-plane-attestation.json",
-                    "sha256": proof_sha256,
-                }
-            },
+            provenance=provenance,
         )
         receipt_handle, receipt_identity, receipt_body = _create_classroom_json_staging(
             boundary,
@@ -3011,7 +4330,7 @@ def write_openmaic_shared_plane_receipt(
             document=receipt,
         )
         if any(secret in proof_body or secret in receipt_body for secret in secrets):
-            raise ValueError("OpenMAIC shared-plane evidence contains a live fixture token")
+            raise ValueError(f"{label} evidence contains a live fixture token")
         replayed_report = parse_openmaic_smoke_report(
             stdout,
             candidate=candidate,
@@ -3019,16 +4338,14 @@ def write_openmaic_shared_plane_receipt(
             expected_base_url=base_url,
             expected_runtime_attestation_sha256=runtime_sha256,
             forbidden_secret_values=secrets,
+            expected_plane=plane,
         )
-        if (
-            replayed_report != report
-            or derive_openmaic_shared_plane_checks(replayed_report) != checks
-        ):
-            raise ValueError("OpenMAIC shared-plane proof replay changed")
+        if replayed_report != report or derive_checks(replayed_report) != smoke_checks:
+            raise ValueError(f"{label} proof replay changed")
         assert_release_binding()
         boundary.assert_unchanged()
         if any(os.path.lexists(path) for path in (proof_path, receipt_path)):
-            raise ValueError("OpenMAIC shared-plane publication target appeared concurrently")
+            raise ValueError(f"{label} publication target appeared concurrently")
         for name, staged, target, source_handle, expected_body, expected_identity in (
             (
                 "receipt",
@@ -3063,7 +4380,7 @@ def write_openmaic_shared_plane_receipt(
                 target,
                 expected_body=expected_body,
                 expected_identity=expected_identity,
-                label=f"OpenMAIC shared-plane {name}",
+                label=f"{label} {name}",
             )
             assert_release_binding()
         boundary.assert_unchanged()
@@ -3081,7 +4398,7 @@ def write_openmaic_shared_plane_receipt(
             _remove_classroom_entries(
                 boundary,
                 {path: identity for path, identity in published.values()},
-                label="OpenMAIC shared-plane formal evidence",
+                label=f"{label} formal evidence",
             )
         except Exception as exc:
             cleanup_error = exc
@@ -3091,10 +4408,10 @@ def write_openmaic_shared_plane_receipt(
                 boundary.assert_unchanged()
                 _record_probe_failure(
                     bundle_root=root,
-                    evidence="openmaic-shared-plane",
+                    evidence=staging_prefix,
                     recipe="live-first-release",
                     attempt_id=attempt_id,
-                    reason="OpenMAIC shared-plane execution or publication failed",
+                    reason=f"{label} execution or publication failed",
                     native_exit=0,
                     artifacts=archive_artifacts,
                 )
@@ -3121,7 +4438,7 @@ def write_openmaic_shared_plane_receipt(
                     staged_proof: proof_identity,
                     staged_receipt: receipt_identity,
                 },
-                label="OpenMAIC shared-plane staging evidence",
+                label=f"{label} staging evidence",
             )
         except Exception as exc:
             staging_cleanup_error = exc
@@ -3135,6 +4452,690 @@ def write_openmaic_shared_plane_receipt(
                 pass
         if staging_cleanup_error is not None and active_error is None:
             raise staging_cleanup_error
+
+
+def write_openmaic_shared_plane_receipt(
+    *,
+    candidate_root: Path,
+    bundle_root: Path,
+    release_run: Mapping[str, object],
+    timeout_seconds: int,
+    runner: CommandRunner = _run_openmaic_smoke,
+) -> dict[str, object]:
+    """Run the fixed shared-plane smoke and publish its proof marker last."""
+
+    return _write_openmaic_plane_receipt(
+        plane="shared",
+        candidate_root=candidate_root,
+        bundle_root=bundle_root,
+        release_run=release_run,
+        timeout_seconds=timeout_seconds,
+        runner=runner,
+    )
+
+
+def _publish_backup_restore_receipt(
+    boundary: _BackupRestorePublicationBoundary,
+    document: Mapping[str, object],
+) -> dict[str, object]:
+    target = boundary.root / "artifacts" / "backup_restore.json"
+    staged = target.parent / f".backup-restore-{uuid.uuid4().hex}.tmp"
+    staged_handle: BinaryIO | None = None
+    staged_identity: tuple[int, int] | None = None
+    published: dict[Path, tuple[int, int]] = {}
+    committed = False
+    primary_error: BaseException | None = None
+    try:
+        boundary.assert_unchanged()
+        staged_handle, staged_identity, body = _create_classroom_json_staging(
+            boundary,
+            parent_key="artifacts",
+            path=staged,
+            document=document,
+        )
+        boundary.assert_unchanged()
+        try:
+            _publish_classroom_no_replace(
+                boundary,
+                staged,
+                target,
+                source_handle=staged_handle,
+            )
+        except OSError as exc:
+            if (
+                isinstance(exc, FileExistsError)
+                or exc.errno in {errno.EEXIST, 80, 183}
+                or getattr(exc, "winerror", None) in {80, 183}
+            ):
+                raise FileExistsError("backup restore receipt already exists") from exc
+            raise
+        published[target] = staged_identity
+        _assert_published_classroom_receipt_relative(
+            boundary,
+            target,
+            expected_body=body,
+            expected_identity=staged_identity,
+            label="backup restore receipt",
+        )
+        boundary.assert_unchanged()
+        if os.name != "nt":
+            os.fsync(int(boundary.leases["artifacts"].handle))
+        boundary.assert_unchanged()
+        boundary.mark_committed()
+        committed = True
+        return dict(document)
+    except BaseException as error:
+        primary_error = error
+        if staged_handle is not None:
+            try:
+                staged_handle.close()
+            except BaseException as cleanup_error:
+                error.add_note(f"backup restore staging cleanup failed: {cleanup_error}")
+            staged_handle = None
+        try:
+            _remove_classroom_entries(
+                boundary,
+                published,
+                label="backup restore formal evidence",
+            )
+        except BaseException as cleanup_error:
+            error.add_note(f"backup restore formal evidence cleanup failed: {cleanup_error}")
+        raise
+    finally:
+        cleanup_errors: list[BaseException] = []
+        if staged_handle is not None:
+            try:
+                staged_handle.close()
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+        if staged_identity is not None:
+            try:
+                _remove_classroom_entries(
+                    boundary,
+                    {staged: staged_identity},
+                    label="backup restore staging evidence",
+                )
+            except BaseException as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+        if cleanup_errors:
+            if primary_error is not None:
+                for cleanup_error in cleanup_errors:
+                    primary_error.add_note(
+                        f"backup restore staging cleanup failed: {cleanup_error}"
+                    )
+            elif not committed:
+                raise cleanup_errors[0]
+
+
+def write_backup_restore_receipt(
+    *,
+    candidate_root: Path,
+    bundle_root: Path,
+    release_run: Mapping[str, object],
+    database_ownership: str,
+    object_namespace_ownership: str,
+) -> dict[str, object]:
+    """Wrap one completed fixed backup/restore probe in a formal receipt."""
+
+    if (
+        database_ownership != "runner-owned-disposable"
+        or object_namespace_ownership != "runner-owned-disposable"
+    ):
+        raise ValueError("backup restore release targets must be runner-owned disposable")
+    candidate = _candidate(candidate_root)
+    bound_run = _release_run(release_run)
+    root = Path(os.path.abspath(bundle_root))
+    boundary = _BackupRestorePublicationBoundary.open(root)
+    try:
+        boundary.assert_unchanged()
+        report_path = root / "runtime" / "backup-restore" / "backup-restore-report.json"
+        report_body, report_sha256 = read_backup_restore_report_artifact(
+            report_path,
+            bundle_root=root,
+        )
+        checks, observed_at = derive_backup_restore_receipt_checks(
+            report_body,
+            bundle_root=root,
+            candidate_root=candidate_root,
+            candidate=candidate,
+            release_run=bound_run,
+            expected_database_ownership=database_ownership,
+            expected_object_namespace_ownership=object_namespace_ownership,
+        )
+        boundary.assert_unchanged()
+        if checks != derive_backup_restore_checks(json.loads(report_body)):
+            raise ValueError("backup restore receipt checks are inconsistent")
+        document = _pass_receipt_from_candidate(
+            candidate=candidate,
+            release_run=bound_run,
+            evidence="backup_restore",
+            observed_at=observed_at,
+            native_exit=0,
+            checks=checks,
+            provenance={
+                "backupRestoreReport": {
+                    "artifact": "runtime/backup-restore/backup-restore-report.json",
+                    "sha256": report_sha256,
+                }
+            },
+        )
+        return _publish_backup_restore_receipt(boundary, document)
+    finally:
+        active_error = sys.exception()
+        try:
+            boundary.close()
+        except BaseException as cleanup_error:
+            if active_error is not None:
+                active_error.add_note(
+                    f"backup restore publication boundary cleanup failed: {cleanup_error}"
+                )
+            elif not boundary.committed:
+                raise
+
+
+def write_openmaic_dedicated_plane_receipt(
+    *,
+    candidate_root: Path,
+    bundle_root: Path,
+    release_run: Mapping[str, object],
+    timeout_seconds: int,
+    expected_outage_docker_host_identity_sha256: str,
+    runner: CommandRunner = _run_openmaic_smoke,
+) -> dict[str, object]:
+    """Run the fixed dedicated-plane smoke and publish its proof marker last."""
+
+    return _write_openmaic_plane_receipt(
+        plane="dedicated",
+        candidate_root=candidate_root,
+        bundle_root=bundle_root,
+        release_run=release_run,
+        timeout_seconds=timeout_seconds,
+        runner=runner,
+        expected_outage_docker_host_identity_sha256=(expected_outage_docker_host_identity_sha256),
+    )
+
+
+def write_gateway_only_public_receipt(
+    *,
+    candidate_root: Path,
+    bundle_root: Path,
+    release_run: Mapping[str, object],
+    timeout_seconds: int,
+    expected_docker_host_identity_sha256: str | None = None,
+    trusted_keyring_path: Path | None = None,
+    expected_trusted_keyring_sha256: str | None = None,
+    expected_observer_challenge: str | None = None,
+    expected_host_challenge: str | None = None,
+    trusted_now: str | None = None,
+    runner: CommandRunner = _run_gateway_docker,
+    docker_resolver: Callable[[], Path] = resolve_fixed_docker,
+) -> dict[str, object]:
+    """Replay the external probe and bind it to two fixed Docker observations."""
+
+    if (
+        not isinstance(timeout_seconds, int)
+        or isinstance(timeout_seconds, bool)
+        or timeout_seconds <= 0
+    ):
+        raise ValueError("gateway observation timeout is invalid")
+    started_monotonic = time.monotonic()
+    deadline_monotonic = started_monotonic + timeout_seconds
+    if not math.isfinite(started_monotonic) or not math.isfinite(deadline_monotonic):
+        raise ValueError("gateway observation deadline is invalid")
+    expected_host_identity_sha256 = _gateway_expected_docker_host_identity_sha256(
+        expected_docker_host_identity_sha256
+    )
+    if not isinstance(trusted_keyring_path, (str, os.PathLike)):
+        raise ValueError("gateway trust keyring path is unavailable or invalid")
+    normalized_trusted_keyring_path = Path(trusted_keyring_path)
+    root = Path(os.path.abspath(bundle_root))
+    candidate_path = Path(os.path.abspath(candidate_root))
+    with _GatewayPublicationBoundary.open(root, candidate_path) as boundary:
+        return _write_gateway_only_public_receipt_bound(
+            root=root,
+            candidate_path=candidate_path,
+            release_run=release_run,
+            deadline_monotonic=deadline_monotonic,
+            expected_host_identity_sha256=expected_host_identity_sha256,
+            trusted_keyring_path=normalized_trusted_keyring_path,
+            expected_trusted_keyring_sha256=expected_trusted_keyring_sha256,
+            expected_observer_challenge=expected_observer_challenge,
+            expected_host_challenge=expected_host_challenge,
+            trusted_now=trusted_now,
+            boundary=boundary,
+            runner=runner,
+            docker_resolver=docker_resolver,
+        )
+
+
+def _write_gateway_only_public_receipt_bound(
+    *,
+    root: Path,
+    candidate_path: Path,
+    release_run: Mapping[str, object],
+    deadline_monotonic: float,
+    expected_host_identity_sha256: str,
+    trusted_keyring_path: Path,
+    expected_trusted_keyring_sha256: str | None,
+    expected_observer_challenge: str | None,
+    expected_host_challenge: str | None,
+    trusted_now: str | None,
+    boundary: _GatewayPublicationBoundary,
+    runner: CommandRunner,
+    docker_resolver: Callable[[], Path],
+) -> dict[str, object]:
+    bound_run = _release_run(release_run)
+    proof_path = root / "runtime" / "gateway-only-public-attestation.json"
+    receipt_path = root / "artifacts" / "gateway_only_public.json"
+    report_path = root / "raw" / "gateway-public-observation.json"
+    observer_path = root / "runtime" / "gateway-external-observer-attestation.json"
+    observer_envelope_path = root / "runtime" / "gateway-observer-trust-envelope.json"
+    host_envelope_path = root / "runtime" / "gateway-host-provisioner-trust-envelope.json"
+    host_receipt_path = root / "runtime" / "gateway-docker-host-provisioning-receipt.json"
+    runtime_path = root / "runtime" / "runtime-attestation.json"
+    candidate_inputs = (
+        candidate_path / "deploy" / "image-lock.json",
+        candidate_path / "docker-compose.platform.yml",
+        candidate_path / "docker-compose.data-plane.yml",
+    )
+    if any(os.path.lexists(path) for path in (proof_path, receipt_path)):
+        raise ValueError("gateway-only-public evidence already exists")
+
+    pinned_inputs = {
+        "external observation": _read_gateway_input(
+            report_path,
+            label="external observation",
+        ),
+        "observer attestation": _read_gateway_input(
+            observer_path,
+            label="observer attestation",
+        ),
+        "trust observer envelope": _read_gateway_input(
+            observer_envelope_path,
+            label="trust observer envelope",
+        ),
+        "trust host-provisioner envelope": _read_gateway_input(
+            host_envelope_path,
+            label="trust host-provisioner envelope",
+        ),
+        "trust host provisioning receipt": _read_gateway_input(
+            host_receipt_path,
+            label="trust host provisioning receipt",
+        ),
+        "runtime attestation": _read_gateway_input(
+            runtime_path,
+            label="runtime attestation",
+        ),
+        "candidate image lock": _read_gateway_input(
+            candidate_inputs[0],
+            label="candidate image lock",
+        ),
+        "candidate platform Compose": _read_gateway_input(
+            candidate_inputs[1],
+            label="candidate platform Compose",
+        ),
+        "candidate data-plane Compose": _read_gateway_input(
+            candidate_inputs[2],
+            label="candidate data-plane Compose",
+        ),
+    }
+    boundary.assert_unchanged()
+    candidate = _candidate(candidate_path)
+    verified_trust = verify_gateway_trust_pair(
+        observer_envelope_body=pinned_inputs["trust observer envelope"].body,
+        host_envelope_body=pinned_inputs["trust host-provisioner envelope"].body,
+        observer_artifact_body=pinned_inputs["observer attestation"].body,
+        host_receipt_body=pinned_inputs["trust host provisioning receipt"].body,
+        trusted_keyring_path=trusted_keyring_path,
+        expected_trusted_keyring_sha256=expected_trusted_keyring_sha256,
+        candidate_root=candidate_path,
+        candidate=candidate,
+        release_run=bound_run,
+        expected_environment_id=bound_run["environmentId"],
+        expected_observer_challenge=expected_observer_challenge,
+        expected_host_challenge=expected_host_challenge,
+        trusted_now=trusted_now,
+    )
+    observer_trust_payload = verified_trust.get("observer")
+    if not isinstance(observer_trust_payload, Mapping):
+        raise ValueError("gateway signed observer policy is invalid")
+    observer_policy = signed_gateway_observer_policy(
+        pinned_inputs["observer attestation"].body,
+        observer_trust_payload,
+    )
+    host_receipt = verified_trust.get("hostReceipt")
+    trusted_host = host_receipt.get("host") if isinstance(host_receipt, dict) else None
+    host_receipt_sha256 = hashlib.sha256(
+        pinned_inputs["trust host provisioning receipt"].body
+    ).hexdigest()
+    if host_receipt_sha256 != expected_host_identity_sha256:
+        raise ValueError(
+            "gateway trust host receipt digest does not match expected Docker host identity"
+        )
+    if not isinstance(trusted_host, dict):
+        raise ValueError("gateway trust host receipt identity is invalid")
+    trusted_daemon = {
+        "context": trusted_host.get("dockerContext"),
+        "endpoint": trusted_host.get("dockerEndpoint"),
+        "serverId": trusted_host.get("dockerServerId"),
+        "osType": trusted_host.get("osType"),
+    }
+    runtime_body, runtime_sha256 = read_runtime_attestation_artifact(
+        runtime_path,
+        bundle_root=root,
+    )
+    if runtime_body != pinned_inputs["runtime attestation"].body:
+        raise ValueError("gateway runtime attestation identity changed")
+    runtime = validate_runtime_attestation(
+        runtime_path,
+        bundle_root=root,
+        candidate_root=candidate_path,
+        candidate=candidate,
+        release_run=bound_run,
+        expected_sha256=runtime_sha256,
+        expected_docker_host_identity_sha256=expected_host_identity_sha256,
+    )
+    runtime_host_identity = _gateway_runtime_host_identity(
+        runtime,
+        expected_sha256=expected_host_identity_sha256,
+    )
+    if runtime_host_identity != {
+        "context": trusted_daemon["context"],
+        "endpoint": trusted_daemon["endpoint"],
+        "serverId": trusted_daemon["serverId"],
+        "dockerHostIdentitySha256": host_receipt_sha256,
+    }:
+        raise ValueError("gateway trust host receipt does not match runtime identity")
+    base_url = runtime.get("baseUrl") if isinstance(runtime, dict) else None
+    if not isinstance(base_url, str):
+        raise ValueError("gateway runtime base URL is invalid")
+    report = parse_gateway_public_report(
+        pinned_inputs["external observation"].body,
+        observer_attestation_body=pinned_inputs["observer attestation"].body,
+        candidate=candidate,
+        release_run=bound_run,
+        expected_base_url=base_url,
+        expected_runtime_attestation_sha256=runtime_sha256,
+        expected_observer_id=observer_policy["expected_observer_id"],
+        expected_observer_origin=observer_policy["expected_observer_origin"],
+        expected_attestation_sha256=observer_policy["expected_attestation_sha256"],
+        trusted_now=trusted_now,
+        run_started_at=observer_policy["run_started_at"],
+        run_ended_at=observer_policy["run_ended_at"],
+    )
+    checks = derive_gateway_public_checks(report)
+    if checks != {"gatewayPublic": True, "internalPortsClosed": True}:
+        raise ValueError("gateway external observation did not prove the fixed policy")
+    runtime_containers = _gateway_runtime_containers(runtime)
+    expected_service_networks = parse_gateway_candidate_networks(
+        pinned_inputs["candidate platform Compose"].body,
+        docker_project=_GATEWAY_DOCKER_PROJECT,
+        expected_services=tuple(runtime_containers.values()),
+    )
+    docker = Path(docker_resolver())
+    if not docker.is_absolute():
+        raise ValueError("gateway trusted Docker CLI is invalid")
+
+    with tempfile.TemporaryDirectory(prefix="yfeistai-gateway-docker-") as raw_config:
+        docker_config = Path(raw_config)
+        before_daemon, before_snapshot, before_commands = _gateway_observation_round(
+            docker=docker,
+            docker_config=docker_config,
+            candidate_root=candidate_path,
+            deadline_monotonic=deadline_monotonic,
+            runner=runner,
+            runtime_containers=runtime_containers,
+            expected_service_networks=expected_service_networks,
+        )
+        after_daemon, after_snapshot, after_commands = _gateway_observation_round(
+            docker=docker,
+            docker_config=docker_config,
+            candidate_root=candidate_path,
+            deadline_monotonic=deadline_monotonic,
+            runner=runner,
+            runtime_containers=runtime_containers,
+            expected_service_networks=expected_service_networks,
+        )
+    if before_daemon["endpoint"] != after_daemon["endpoint"]:
+        raise ValueError("gateway Docker daemon endpoint changed")
+    if (
+        before_daemon["serverId"] != after_daemon["serverId"]
+        or before_daemon["osType"] != after_daemon["osType"]
+    ):
+        raise ValueError("gateway Docker daemon identity changed")
+    if before_daemon != trusted_daemon:
+        raise ValueError("gateway Docker host identity is invalid")
+    if before_snapshot != after_snapshot:
+        raise ValueError("gateway Docker container identity changed")
+
+    boundary.assert_unchanged()
+    for label, pinned in pinned_inputs.items():
+        pinned.assert_unchanged(label=label)
+        boundary.assert_unchanged()
+    if _candidate(candidate_path) != candidate:
+        raise ValueError("gateway candidate binding changed during observation")
+    runtime_after, runtime_after_sha256 = read_runtime_attestation_artifact(
+        runtime_path,
+        bundle_root=root,
+    )
+    if runtime_after != runtime_body or runtime_after_sha256 != runtime_sha256:
+        raise ValueError("gateway runtime attestation changed during observation")
+    validate_runtime_attestation(
+        runtime_path,
+        bundle_root=root,
+        candidate_root=candidate_path,
+        candidate=candidate,
+        release_run=bound_run,
+        expected_base_url=base_url,
+        expected_sha256=runtime_sha256,
+        expected_docker_host_identity_sha256=expected_host_identity_sha256,
+    )
+    replayed = parse_gateway_public_report(
+        pinned_inputs["external observation"].body,
+        observer_attestation_body=pinned_inputs["observer attestation"].body,
+        candidate=candidate,
+        release_run=bound_run,
+        expected_base_url=base_url,
+        expected_runtime_attestation_sha256=runtime_sha256,
+        expected_observer_id=observer_policy["expected_observer_id"],
+        expected_observer_origin=observer_policy["expected_observer_origin"],
+        expected_attestation_sha256=observer_policy["expected_attestation_sha256"],
+        trusted_now=trusted_now,
+        run_started_at=observer_policy["run_started_at"],
+        run_ended_at=observer_policy["run_ended_at"],
+    )
+    if replayed != report or derive_gateway_public_checks(replayed) != checks:
+        raise ValueError("gateway external observation replay changed")
+    boundary.assert_unchanged()
+
+    observed_at = report.get("observedAt")
+    if not isinstance(observed_at, str):
+        raise ValueError("gateway external observation timestamp is invalid")
+    proof: dict[str, object] = {
+        "schemaVersion": 1,
+        "candidate": candidate,
+        "releaseRun": bound_run,
+        "observedAt": observed_at,
+        "baseUrl": base_url,
+        "runtimeAttestation": {
+            "artifact": "runtime/runtime-attestation.json",
+            "sha256": runtime_sha256,
+        },
+        "observerAttestation": {
+            "artifact": "runtime/gateway-external-observer-attestation.json",
+            "sha256": hashlib.sha256(pinned_inputs["observer attestation"].body).hexdigest(),
+        },
+        "externalObservation": {
+            "artifact": "raw/gateway-public-observation.json",
+            "sha256": hashlib.sha256(pinned_inputs["external observation"].body).hexdigest(),
+        },
+        "trustPair": {
+            "observerEnvelope": {
+                "artifact": "runtime/gateway-observer-trust-envelope.json",
+                "sha256": hashlib.sha256(pinned_inputs["trust observer envelope"].body).hexdigest(),
+            },
+            "hostProvisionerEnvelope": {
+                "artifact": "runtime/gateway-host-provisioner-trust-envelope.json",
+                "sha256": hashlib.sha256(
+                    pinned_inputs["trust host-provisioner envelope"].body
+                ).hexdigest(),
+            },
+            "hostProvisioningReceipt": {
+                "artifact": "runtime/gateway-docker-host-provisioning-receipt.json",
+                "sha256": host_receipt_sha256,
+            },
+        },
+        "docker": {
+            "project": _GATEWAY_DOCKER_PROJECT,
+            "daemon": {
+                **before_daemon,
+                "dockerHostIdentitySha256": expected_host_identity_sha256,
+            },
+            "beforeSnapshot": before_snapshot,
+            "afterSnapshot": after_snapshot,
+            "commands": [*before_commands, *after_commands],
+        },
+        "summary": {"checks": checks},
+    }
+    boundary.ensure_publication_parents()
+    boundary.assert_unchanged()
+    staged_receipt: Path | None = None
+    staged_proof: Path | None = None
+    receipt_handle: BinaryIO | None = None
+    proof_handle: BinaryIO | None = None
+    receipt_identity: tuple[int, int] | None = None
+    proof_identity: tuple[int, int] | None = None
+    published: dict[Path, tuple[int, int]] = {}
+    committed = False
+    try:
+        staged_proof, proof_body, proof_identity = _stage_gateway_json_bound(
+            boundary,
+            proof_path.parent,
+            proof,
+        )
+        boundary.assert_unchanged()
+        proof_handle = _open_gateway_staged_input(
+            boundary,
+            staged_proof,
+            body=proof_body,
+            identity=proof_identity,
+        )
+        receipt = _pass_receipt_from_candidate(
+            candidate=candidate,
+            release_run=bound_run,
+            evidence="gateway_only_public",
+            observed_at=observed_at,
+            native_exit=0,
+            checks=checks,
+            provenance={
+                "gatewayOnlyPublicAttestation": {
+                    "artifact": "runtime/gateway-only-public-attestation.json",
+                    "sha256": hashlib.sha256(proof_body).hexdigest(),
+                }
+            },
+        )
+        staged_receipt, receipt_body, receipt_identity = _stage_gateway_json_bound(
+            boundary,
+            receipt_path.parent,
+            receipt,
+        )
+        boundary.assert_unchanged()
+        receipt_handle = _open_gateway_staged_input(
+            boundary,
+            staged_receipt,
+            body=receipt_body,
+            identity=receipt_identity,
+        )
+        publication_context = _GATEWAY_PUBLICATION_CONTEXT.set(
+            _GatewayPublicationContext(
+                boundary=boundary,
+                source_handles={
+                    staged_receipt: receipt_handle,
+                    staged_proof: proof_handle,
+                },
+            )
+        )
+        try:
+            for staged, target, body, identity in (
+                (staged_receipt, receipt_path, receipt_body, receipt_identity),
+                (staged_proof, proof_path, proof_body, proof_identity),
+            ):
+                boundary.assert_unchanged()
+                if os.path.lexists(target):
+                    raise ValueError("gateway-only-public publication target appeared concurrently")
+                published[target] = identity
+                _publish_no_replace(staged, target)
+                _assert_gateway_published(target, body=body, identity=identity)
+                _assert_published_classroom_receipt_relative(
+                    boundary,
+                    target,
+                    expected_body=body,
+                    expected_identity=identity,
+                    label="gateway-only-public evidence",
+                )
+                boundary.assert_unchanged()
+        finally:
+            _GATEWAY_PUBLICATION_CONTEXT.reset(publication_context)
+        boundary.assert_unchanged()
+        boundary.mark_committed()
+        committed = True
+        return receipt
+    except BaseException as original_error:
+        cleanup_errors: list[Exception] = []
+        if receipt_handle is not None:
+            try:
+                receipt_handle.close()
+            except Exception as exc:
+                cleanup_errors.append(exc)
+            receipt_handle = None
+        if proof_handle is not None:
+            try:
+                proof_handle.close()
+            except Exception as exc:
+                cleanup_errors.append(exc)
+            proof_handle = None
+        try:
+            _remove_classroom_entries(
+                boundary,
+                published,
+                label="gateway formal evidence",
+            )
+        except Exception as cleanup_error:
+            cleanup_errors.append(cleanup_error)
+        for cleanup_error in cleanup_errors:
+            original_error.add_note(f"gateway formal evidence cleanup failed: {cleanup_error}")
+        raise
+    finally:
+        active_error = sys.exception()
+        staging_cleanup_errors: list[Exception] = []
+        for handle in (receipt_handle, proof_handle):
+            if handle is not None:
+                try:
+                    handle.close()
+                except Exception as exc:
+                    staging_cleanup_errors.append(exc)
+        staged_entries = {
+            staged: identity
+            for staged, identity in (
+                (staged_receipt, receipt_identity),
+                (staged_proof, proof_identity),
+            )
+            if staged is not None
+        }
+        try:
+            _remove_classroom_entries(
+                boundary,
+                staged_entries,
+                label="gateway staging evidence",
+            )
+        except Exception as exc:
+            staging_cleanup_errors.append(exc)
+        if staging_cleanup_errors:
+            if active_error is not None:
+                for cleanup_error in staging_cleanup_errors:
+                    active_error.add_note(f"gateway staging cleanup failed: {cleanup_error}")
+            elif not committed:
+                raise staging_cleanup_errors[0]
 
 
 def write_tenant_isolation_receipt(
@@ -3996,6 +5997,182 @@ def write_classroom_exports_receipt(
             pass
 
 
+class _ManifestPublicationBoundary:
+    def __init__(self, root: Path, lease: _ClassroomDirectoryLease) -> None:
+        self.root = root
+        self.leases = {"bundle": lease}
+
+    @classmethod
+    def open(cls, root: Path) -> _ManifestPublicationBoundary:
+        path = Path(os.path.abspath(root))
+        try:
+            lease = _GatewayPublicationBoundary._open_root(path)
+        except (OSError, ValueError) as exc:
+            raise ValueError("release manifest bundle boundary cannot be opened") from exc
+        boundary = cls(path, lease)
+        try:
+            boundary.assert_unchanged()
+            return boundary
+        except BaseException:
+            boundary.close()
+            raise
+
+    def assert_unchanged(self) -> None:
+        lease = self.leases["bundle"]
+        reopened: _ClassroomDirectoryLease | None = None
+        try:
+            held_identity = (
+                _windows_handle_identity(lease.handle, directory=True)
+                if os.name == "nt"
+                else _file_identity(os.fstat(int(lease.handle)))
+            )
+            reopened = _GatewayPublicationBoundary._open_root(self.root)
+            if held_identity != lease.identity or reopened.identity != lease.identity:
+                raise ValueError("release manifest bundle boundary changed")
+        except (OSError, ValueError) as exc:
+            raise ValueError("release manifest bundle boundary changed") from exc
+        finally:
+            if reopened is not None:
+                if os.name == "nt":
+                    _close_windows_handle(reopened.handle)
+                else:
+                    os.close(int(reopened.handle))
+
+    def close(self) -> None:
+        lease = self.leases.pop("bundle", None)
+        if lease is None:
+            return
+        if os.name == "nt":
+            _close_windows_handle(lease.handle)
+        else:
+            os.close(int(lease.handle))
+
+
+def _publish_manifest_no_replace(
+    boundary: _ManifestPublicationBoundary,
+    target: Path,
+    *,
+    source_handle: BinaryIO,
+) -> None:
+    if target.parent != boundary.root or Path(target.name).name != target.name or not target.name:
+        raise ValueError("release manifest publication target is invalid")
+    if os.name == "nt":
+        import msvcrt
+
+        _link_windows_file_relative(
+            msvcrt.get_osfhandle(source_handle.fileno()),
+            boundary.leases["bundle"].handle,
+            target.name,
+        )
+    else:
+        _link_posix_file_descriptor(
+            source_handle.fileno(),
+            int(boundary.leases["bundle"].handle),
+            target.name,
+        )
+
+
+def _assert_manifest_published(
+    boundary: _ManifestPublicationBoundary,
+    target: Path,
+    *,
+    expected_body: bytes,
+    expected_identity: tuple[int, int],
+) -> None:
+    if target.parent != boundary.root or Path(target.name).name != target.name or not target.name:
+        raise ValueError("published release manifest target is invalid")
+    handle: object | int | None = None
+    descriptor: int | None = None
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle, _native_identity = _open_windows_regular_file_relative(
+                boundary.leases["bundle"].handle,
+                target.name,
+                share_access=0x00000001 | 0x00000002 | 0x00000004,
+            )
+            handle_value = getattr(handle, "value", handle)
+            descriptor = msvcrt.open_osfhandle(
+                int(handle_value),
+                os.O_RDONLY | os.O_BINARY,
+            )
+            handle = None
+            details = os.fstat(descriptor)
+            identity = _file_identity(details)
+            with os.fdopen(descriptor, "rb", closefd=True) as opened:
+                descriptor = None
+                body = opened.read(len(expected_body) + 1)
+        else:
+            descriptor = os.open(
+                target.name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=int(boundary.leases["bundle"].handle),
+            )
+            handle = descriptor
+            details = os.fstat(descriptor)
+            identity = _file_identity(details)
+            with os.fdopen(descriptor, "rb", closefd=False) as opened:
+                body = opened.read(len(expected_body) + 1)
+        if identity != expected_identity or body != expected_body:
+            raise ValueError("published release manifest changed")
+    except (OSError, ValueError) as exc:
+        raise ValueError("published release manifest changed") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if handle is not None:
+            if os.name == "nt":
+                _close_windows_handle(handle)
+            else:
+                os.close(int(handle))
+
+
+def _remove_manifest_staging(
+    boundary: _ManifestPublicationBoundary,
+    path: Path,
+    *,
+    expected_identity: tuple[int, int],
+) -> None:
+    if path.parent != boundary.root or Path(path.name).name != path.name or not path.name:
+        raise ValueError("release manifest staging path is invalid")
+    if os.name == "nt":
+        import msvcrt
+
+        handle: object | None = None
+        descriptor: int | None = None
+        try:
+            handle, _identity = _open_windows_regular_file_relative(
+                boundary.leases["bundle"].handle,
+                path.name,
+                share_access=0x00000001 | 0x00000002 | 0x00000004,
+                deletable=True,
+            )
+            handle_value = getattr(handle, "value", handle)
+            descriptor = msvcrt.open_osfhandle(
+                int(handle_value),
+                os.O_RDONLY | os.O_BINARY,
+            )
+            handle = None
+            if _file_identity(os.fstat(descriptor)) != expected_identity:
+                raise ValueError("release manifest staging file changed")
+            _delete_windows_file_on_close(msvcrt.get_osfhandle(descriptor))
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            if handle is not None:
+                _close_windows_handle(handle)
+        return
+    details = os.stat(
+        path.name,
+        dir_fd=int(boundary.leases["bundle"].handle),
+        follow_symlinks=False,
+    )
+    if not stat.S_ISREG(details.st_mode) or _file_identity(details) != expected_identity:
+        raise ValueError("release manifest staging file changed")
+    os.unlink(path.name, dir_fd=int(boundary.leases["bundle"].handle))
+
+
 def _validated_receipt(
     path: Path,
     *,
@@ -4004,6 +6181,17 @@ def _validated_receipt(
     release_run: Mapping[str, str],
     bundle_root: Path,
     candidate_root: Path,
+    expected_outage_docker_host_identity_sha256: str | None = None,
+    expected_gateway_docker_host_identity_sha256: str | None = None,
+    trusted_keyring_path: Path | None = None,
+    expected_trusted_keyring_sha256: str | None = None,
+    expected_observer_challenge: str | None = None,
+    expected_host_challenge: str | None = None,
+    trusted_now: str | None = None,
+    expected_openmaic_observer_attestation_sha256: str | None = None,
+    expected_openmaic_observer_id: str | None = None,
+    expected_openmaic_observer_origin: str | None = None,
+    expected_openmaic_shared_ingress_control_origin: str | None = None,
 ) -> tuple[dict[str, object], bytes, str]:
     try:
         body = path.read_bytes()
@@ -4039,6 +6227,15 @@ def _validated_receipt(
     if not isinstance(checks, dict):
         raise ValueError("receipt is invalid")
     _validate_pass_result(evidence, native_exit=native_exit, checks=checks)
+    gateway_trust_arguments: dict[str, object] = {}
+    if evidence == "gateway_only_public":
+        gateway_trust_arguments = {
+            "trusted_keyring_path": trusted_keyring_path,
+            "expected_trusted_keyring_sha256": expected_trusted_keyring_sha256,
+            "expected_observer_challenge": expected_observer_challenge,
+            "expected_host_challenge": expected_host_challenge,
+            "trusted_now": trusted_now,
+        }
     provenance_error = probe_provenance_error(
         document,
         evidence=evidence,
@@ -4046,6 +6243,17 @@ def _validated_receipt(
         release_run=release_run,
         bundle_root=bundle_root,
         candidate_root=candidate_root,
+        expected_outage_docker_host_identity_sha256=(expected_outage_docker_host_identity_sha256),
+        expected_gateway_docker_host_identity_sha256=(expected_gateway_docker_host_identity_sha256),
+        expected_openmaic_observer_attestation_sha256=(
+            expected_openmaic_observer_attestation_sha256
+        ),
+        expected_openmaic_observer_id=expected_openmaic_observer_id,
+        expected_openmaic_observer_origin=expected_openmaic_observer_origin,
+        expected_openmaic_shared_ingress_control_origin=(
+            expected_openmaic_shared_ingress_control_origin
+        ),
+        **gateway_trust_arguments,
     )
     if provenance_error is not None:
         raise ValueError(provenance_error)
@@ -4058,44 +6266,182 @@ def assemble_manifest(
     candidate_root: Path,
     release_run: Mapping[str, object],
     receipt_paths: Mapping[str, Path],
+    expected_outage_docker_host_identity_sha256: str | None = None,
+    expected_gateway_docker_host_identity_sha256: str | None = None,
+    trusted_keyring_path: Path | None = None,
+    expected_trusted_keyring_sha256: str | None = None,
+    expected_observer_challenge: str | None = None,
+    expected_host_challenge: str | None = None,
+    trusted_now: str | None = None,
+    expected_openmaic_observer_attestation_sha256: str | None = None,
+    expected_openmaic_observer_id: str | None = None,
+    expected_openmaic_observer_origin: str | None = None,
+    expected_openmaic_shared_ingress_control_origin: str | None = None,
 ) -> dict[str, object]:
     """Validate receipt bytes and publish their schema-v3 manifest last."""
-    candidate = _candidate(candidate_root)
-    bound_run = _release_run(release_run)
-    target = Path(output_path)
-    resolved_target = target.resolve()
-    bundle_root = resolved_target.parent
-    evidence_entries: dict[str, object] = {}
-    for evidence, raw_path in receipt_paths.items():
-        receipt_path = Path(raw_path).resolve()
-        if receipt_path == resolved_target:
+    target = Path(os.path.abspath(output_path))
+    if Path(target.name).name != target.name or not target.name:
+        raise ValueError("release manifest output path is invalid")
+    bundle_root = target.parent
+    candidate_path = Path(os.path.abspath(candidate_root))
+    boundary = _ManifestPublicationBoundary.open(bundle_root)
+    staged: Path | None = None
+    staged_handle: BinaryIO | None = None
+    staged_identity: tuple[int, int] | None = None
+    committed = False
+    primary_error: BaseException | None = None
+    try:
+        boundary.assert_unchanged()
+        if any(Path(os.path.abspath(raw_path)) == target for raw_path in receipt_paths.values()):
             raise ValueError("receipt path must not be the manifest output path")
-        try:
-            relative_path = receipt_path.relative_to(bundle_root)
-        except ValueError as exc:
-            raise ValueError("receipt is outside the evidence bundle") from exc
-        _document, body, producer = _validated_receipt(
-            receipt_path,
-            evidence=evidence,
-            candidate=candidate,
-            release_run=bound_run,
-            bundle_root=bundle_root,
-            candidate_root=candidate_root,
-        )
-        evidence_entries[evidence] = {
-            "status": "pass",
-            "detail": f"{evidence} verified by {producer}",
-            "artifact": relative_path.as_posix(),
-            "artifactSha256": hashlib.sha256(body).hexdigest(),
+        if os.path.lexists(target):
+            raise FileExistsError("release manifest already exists")
+        candidate = _candidate(candidate_path)
+        boundary.assert_unchanged()
+        bound_run = _release_run(release_run)
+        expected_gateway_identity = expected_gateway_docker_host_identity_sha256
+        if "gateway_only_public" in receipt_paths:
+            expected_gateway_identity = _gateway_expected_docker_host_identity_sha256(
+                expected_gateway_identity
+            )
+        evidence_entries: dict[str, object] = {}
+        for evidence, raw_path in receipt_paths.items():
+            boundary.assert_unchanged()
+            receipt_path = Path(os.path.abspath(raw_path))
+            if receipt_path == target:
+                raise ValueError("receipt path must not be the manifest output path")
+            try:
+                relative_path = receipt_path.relative_to(bundle_root)
+            except ValueError as exc:
+                raise ValueError("receipt is outside the evidence bundle") from exc
+            _document, body, producer = _validated_receipt(
+                receipt_path,
+                evidence=evidence,
+                candidate=candidate,
+                release_run=bound_run,
+                bundle_root=bundle_root,
+                candidate_root=candidate_path,
+                expected_outage_docker_host_identity_sha256=(
+                    expected_outage_docker_host_identity_sha256
+                ),
+                expected_gateway_docker_host_identity_sha256=expected_gateway_identity,
+                trusted_keyring_path=trusted_keyring_path,
+                expected_trusted_keyring_sha256=expected_trusted_keyring_sha256,
+                expected_observer_challenge=expected_observer_challenge,
+                expected_host_challenge=expected_host_challenge,
+                trusted_now=trusted_now,
+                expected_openmaic_observer_attestation_sha256=(
+                    expected_openmaic_observer_attestation_sha256
+                ),
+                expected_openmaic_observer_id=expected_openmaic_observer_id,
+                expected_openmaic_observer_origin=expected_openmaic_observer_origin,
+                expected_openmaic_shared_ingress_control_origin=(
+                    expected_openmaic_shared_ingress_control_origin
+                ),
+            )
+            boundary.assert_unchanged()
+            evidence_entries[evidence] = {
+                "status": "pass",
+                "detail": f"{evidence} verified by {producer}",
+                "artifact": relative_path.as_posix(),
+                "artifactSha256": hashlib.sha256(body).hexdigest(),
+            }
+        manifest: dict[str, object] = {
+            "schemaVersion": EVIDENCE_SCHEMA_VERSION,
+            "candidate": candidate,
+            "releaseRun": bound_run,
+            "evidence": evidence_entries,
         }
-    manifest: dict[str, object] = {
-        "schemaVersion": EVIDENCE_SCHEMA_VERSION,
-        "candidate": candidate,
-        "releaseRun": bound_run,
-        "evidence": evidence_entries,
-    }
-    _atomic_write_json(target, manifest)
-    return manifest
+        boundary.assert_unchanged()
+        staged = bundle_root / f".{target.name}.{uuid.uuid4().hex}.tmp"
+        staged_handle, staged_identity, staged_body = _create_classroom_json_staging(
+            boundary,
+            parent_key="bundle",
+            path=staged,
+            document=manifest,
+        )
+        if os.name == "nt":
+            import msvcrt
+
+            staged_handle.close()
+            native_handle: object | None = None
+            descriptor: int | None = None
+            try:
+                native_handle, _reopened_identity = _open_windows_regular_file_relative(
+                    boundary.leases["bundle"].handle,
+                    staged.name,
+                    share_access=0x00000001 | 0x00000002 | 0x00000004,
+                )
+                handle_value = getattr(native_handle, "value", native_handle)
+                descriptor = msvcrt.open_osfhandle(
+                    int(handle_value),
+                    os.O_RDONLY | os.O_BINARY,
+                )
+                native_handle = None
+                staged_handle = os.fdopen(descriptor, "rb")
+                descriptor = None
+                if _file_identity(os.fstat(staged_handle.fileno())) != staged_identity:
+                    raise ValueError("release manifest staging file changed")
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
+                if native_handle is not None:
+                    _close_windows_handle(native_handle)
+        boundary.assert_unchanged()
+        publication_context = _MANIFEST_PUBLICATION_CONTEXT.set(
+            _ManifestPublicationContext(
+                boundary=boundary,
+                source=staged,
+                source_handle=staged_handle,
+            )
+        )
+        try:
+            if os.path.lexists(target):
+                raise FileExistsError("release manifest already exists")
+            _publish_no_replace(staged, target)
+            committed = True
+            _assert_manifest_published(
+                boundary,
+                target,
+                expected_body=staged_body,
+                expected_identity=staged_identity,
+            )
+            boundary.assert_unchanged()
+            _fsync_directory(bundle_root)
+        finally:
+            _MANIFEST_PUBLICATION_CONTEXT.reset(publication_context)
+        return manifest
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        cleanup_errors: list[BaseException] = []
+        if staged_handle is not None:
+            try:
+                staged_handle.close()
+            except BaseException as error:
+                cleanup_errors.append(error)
+        if staged is not None and staged_identity is not None:
+            try:
+                _remove_manifest_staging(
+                    boundary,
+                    staged,
+                    expected_identity=staged_identity,
+                )
+            except BaseException as error:
+                cleanup_errors.append(error)
+        try:
+            boundary.close()
+        except BaseException as error:
+            cleanup_errors.append(error)
+        if cleanup_errors:
+            if primary_error is not None:
+                for cleanup_error in cleanup_errors:
+                    primary_error.add_note(
+                        f"release manifest staging cleanup failed: {cleanup_error}"
+                    )
+            elif not committed:
+                raise cleanup_errors[0]
 
 
 def _add_common_receipt_arguments(parser: argparse.ArgumentParser) -> None:
@@ -4104,6 +6450,29 @@ def _add_common_receipt_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--environment-id", required=True)
     parser.add_argument("--observed-at", required=True)
+
+
+def _add_gateway_trust_arguments(
+    parser: argparse.ArgumentParser,
+    *,
+    required: bool,
+) -> None:
+    parser.add_argument("--gateway-trust-keyring", type=Path, required=required)
+    parser.add_argument("--gateway-trust-keyring-sha256", required=required)
+    parser.add_argument("--gateway-observer-challenge", required=required)
+    parser.add_argument("--gateway-host-challenge", required=required)
+    parser.add_argument("--gateway-trusted-now", required=required)
+
+
+def _add_openmaic_observer_trust_arguments(
+    parser: argparse.ArgumentParser,
+    *,
+    required: bool,
+) -> None:
+    parser.add_argument("--openmaic-observer-attestation-sha256", required=required)
+    parser.add_argument("--openmaic-observer-id", required=required)
+    parser.add_argument("--openmaic-observer-origin", required=required)
+    parser.add_argument("--openmaic-shared-ingress-control-origin", required=required)
 
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
@@ -4152,12 +6521,51 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     openmaic_shared_plane.add_argument("--environment-id", required=True)
     openmaic_shared_plane.add_argument("--timeout-seconds", type=int, required=True)
 
+    openmaic_dedicated_plane = commands.add_parser("openmaic-dedicated-plane")
+    openmaic_dedicated_plane.add_argument("--candidate-root", type=Path, required=True)
+    openmaic_dedicated_plane.add_argument("--bundle-root", type=Path, required=True)
+    openmaic_dedicated_plane.add_argument("--run-id", required=True)
+    openmaic_dedicated_plane.add_argument("--environment-id", required=True)
+    openmaic_dedicated_plane.add_argument("--timeout-seconds", type=int, required=True)
+    openmaic_dedicated_plane.add_argument(
+        "--outage-docker-host-identity-sha256",
+        required=True,
+    )
+
+    gateway_only_public = commands.add_parser("gateway-only-public")
+    gateway_only_public.add_argument("--candidate-root", type=Path, required=True)
+    gateway_only_public.add_argument("--bundle-root", type=Path, required=True)
+    gateway_only_public.add_argument("--run-id", required=True)
+    gateway_only_public.add_argument("--environment-id", required=True)
+    gateway_only_public.add_argument("--timeout-seconds", type=int, required=True)
+    gateway_only_public.add_argument(
+        "--docker-host-identity-sha256",
+        required=True,
+    )
+    _add_gateway_trust_arguments(gateway_only_public, required=True)
+
     classroom_exports = commands.add_parser("classroom-exports")
     classroom_exports.add_argument("--candidate-root", type=Path, required=True)
     classroom_exports.add_argument("--bundle-root", type=Path, required=True)
     classroom_exports.add_argument("--run-id", required=True)
     classroom_exports.add_argument("--environment-id", required=True)
     classroom_exports.add_argument("--timeout-seconds", type=int, required=True)
+
+    backup_restore = commands.add_parser("backup-restore")
+    backup_restore.add_argument("--candidate-root", type=Path, required=True)
+    backup_restore.add_argument("--bundle-root", type=Path, required=True)
+    backup_restore.add_argument("--run-id", required=True)
+    backup_restore.add_argument("--environment-id", required=True)
+    backup_restore.add_argument(
+        "--database-ownership",
+        choices=("runner-owned-disposable",),
+        required=True,
+    )
+    backup_restore.add_argument(
+        "--object-namespace-ownership",
+        choices=("runner-owned-disposable",),
+        required=True,
+    )
 
     produce = commands.add_parser("produce")
     _add_common_receipt_arguments(produce)
@@ -4173,7 +6581,50 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     assemble.add_argument("--run-id", required=True)
     assemble.add_argument("--environment-id", required=True)
     assemble.add_argument("--receipt", action="append", required=True)
-    return parser.parse_args(argv)
+    assemble.add_argument("--outage-docker-host-identity-sha256")
+    assemble.add_argument("--gateway-docker-host-identity-sha256")
+    _add_gateway_trust_arguments(assemble, required=False)
+    _add_openmaic_observer_trust_arguments(assemble, required=False)
+    args = parser.parse_args(argv)
+    if args.command == "assemble":
+        try:
+            receipt_paths = _receipt_paths(args.receipt)
+        except ValueError as exc:
+            parser.error(str(exc))
+        if "gateway_only_public" in receipt_paths:
+            required_trust_arguments = {
+                "--gateway-trust-keyring": args.gateway_trust_keyring,
+                "--gateway-trust-keyring-sha256": args.gateway_trust_keyring_sha256,
+                "--gateway-observer-challenge": args.gateway_observer_challenge,
+                "--gateway-host-challenge": args.gateway_host_challenge,
+                "--gateway-trusted-now": args.gateway_trusted_now,
+            }
+            missing = [
+                option for option, value in required_trust_arguments.items() if value is None
+            ]
+            if missing:
+                parser.error(
+                    "assemble with gateway_only_public receipt requires " + ", ".join(missing)
+                )
+        if "openmaic_dedicated_plane" in receipt_paths:
+            required_observer_arguments = {
+                "--openmaic-observer-attestation-sha256": (
+                    args.openmaic_observer_attestation_sha256
+                ),
+                "--openmaic-observer-id": args.openmaic_observer_id,
+                "--openmaic-observer-origin": args.openmaic_observer_origin,
+                "--openmaic-shared-ingress-control-origin": (
+                    args.openmaic_shared_ingress_control_origin
+                ),
+            }
+            missing = [
+                option for option, value in required_observer_arguments.items() if value is None
+            ]
+            if missing:
+                parser.error(
+                    "assemble with openmaic_dedicated_plane receipt requires " + ", ".join(missing)
+                )
+    return args
 
 
 def _receipt_paths(values: Sequence[str]) -> dict[str, Path]:
@@ -4250,6 +6701,31 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         print(args.bundle_root / "runtime" / "openmaic-shared-plane-attestation.json")
         return 0
+    elif args.command == "openmaic-dedicated-plane":
+        write_openmaic_dedicated_plane_receipt(
+            candidate_root=args.candidate_root,
+            bundle_root=args.bundle_root,
+            release_run=release_run,
+            timeout_seconds=args.timeout_seconds,
+            expected_outage_docker_host_identity_sha256=(args.outage_docker_host_identity_sha256),
+        )
+        print(args.bundle_root / "runtime" / "openmaic-dedicated-plane-attestation.json")
+        return 0
+    elif args.command == "gateway-only-public":
+        write_gateway_only_public_receipt(
+            candidate_root=args.candidate_root,
+            bundle_root=args.bundle_root,
+            release_run=release_run,
+            timeout_seconds=args.timeout_seconds,
+            expected_docker_host_identity_sha256=(args.docker_host_identity_sha256),
+            trusted_keyring_path=args.gateway_trust_keyring,
+            expected_trusted_keyring_sha256=(args.gateway_trust_keyring_sha256),
+            expected_observer_challenge=args.gateway_observer_challenge,
+            expected_host_challenge=args.gateway_host_challenge,
+            trusted_now=args.gateway_trusted_now,
+        )
+        print(args.bundle_root / "runtime" / "gateway-only-public-attestation.json")
+        return 0
     elif args.command == "classroom-exports":
         write_classroom_exports_receipt(
             candidate_root=args.candidate_root,
@@ -4258,6 +6734,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             timeout_seconds=args.timeout_seconds,
         )
         print(args.bundle_root / "runtime" / "classroom-exports-attestation.json")
+        return 0
+    elif args.command == "backup-restore":
+        write_backup_restore_receipt(
+            candidate_root=args.candidate_root,
+            bundle_root=args.bundle_root,
+            release_run=release_run,
+            database_ownership=args.database_ownership,
+            object_namespace_ownership=args.object_namespace_ownership,
+        )
+        print(args.bundle_root / "artifacts" / "backup_restore.json")
         return 0
     elif args.command == "produce":
         recipe, _expected_count = PROBE_RECIPES[args.evidence]
@@ -4276,11 +6762,46 @@ def main(argv: Sequence[str] | None = None) -> int:
             timeout_seconds=args.timeout_seconds,
         )
     else:
+        receipt_paths = _receipt_paths(args.receipt)
+        assemble_arguments: dict[str, object] = {
+            "candidate_root": args.candidate_root,
+            "release_run": release_run,
+            "receipt_paths": receipt_paths,
+        }
+        if args.outage_docker_host_identity_sha256 is not None:
+            assemble_arguments["expected_outage_docker_host_identity_sha256"] = (
+                args.outage_docker_host_identity_sha256
+            )
+        if args.gateway_docker_host_identity_sha256 is not None:
+            assemble_arguments["expected_gateway_docker_host_identity_sha256"] = (
+                args.gateway_docker_host_identity_sha256
+            )
+        if "gateway_only_public" in receipt_paths:
+            assemble_arguments.update(
+                {
+                    "trusted_keyring_path": args.gateway_trust_keyring,
+                    "expected_trusted_keyring_sha256": args.gateway_trust_keyring_sha256,
+                    "expected_observer_challenge": args.gateway_observer_challenge,
+                    "expected_host_challenge": args.gateway_host_challenge,
+                    "trusted_now": args.gateway_trusted_now,
+                }
+            )
+        if "openmaic_dedicated_plane" in receipt_paths:
+            assemble_arguments.update(
+                {
+                    "expected_openmaic_observer_attestation_sha256": (
+                        args.openmaic_observer_attestation_sha256
+                    ),
+                    "expected_openmaic_observer_id": args.openmaic_observer_id,
+                    "expected_openmaic_observer_origin": args.openmaic_observer_origin,
+                    "expected_openmaic_shared_ingress_control_origin": (
+                        args.openmaic_shared_ingress_control_origin
+                    ),
+                }
+            )
         assemble_manifest(
             args.output,
-            candidate_root=args.candidate_root,
-            release_run=release_run,
-            receipt_paths=_receipt_paths(args.receipt),
+            **assemble_arguments,
         )
     print(args.output)
     return 0

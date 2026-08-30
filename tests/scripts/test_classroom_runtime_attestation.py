@@ -8,6 +8,7 @@ from pathlib import Path
 import stat
 import subprocess
 import sys
+from types import SimpleNamespace
 from typing import Callable
 
 import pytest
@@ -131,6 +132,10 @@ def _candidate_root(tmp_path: Path) -> tuple[Path, dict[str, str]]:
     (root / "docker-compose.platform.yml").write_text(
         json.dumps({"services": compose_services}), encoding="utf-8"
     )
+    (root / "docker-compose.yml").write_text(json.dumps({"services": {}}), encoding="utf-8")
+    settings = root / "data" / "user" / "settings"
+    settings.mkdir(parents=True)
+    (settings / "docker.env").write_text("", encoding="utf-8")
     return root, service_images
 
 
@@ -141,6 +146,33 @@ def _repo_digest(reference: str) -> str:
 
 def _local_image_id(reference: str) -> str:
     return "sha256:local-" + hashlib.sha256(reference.encode()).hexdigest()
+
+
+def _compose_config_hash(service: str) -> str:
+    return hashlib.sha256(f"compose:{service}".encode()).hexdigest()
+
+
+def _compose_config(references: dict[str, str]) -> dict[str, object]:
+    return {
+        "name": "yfeistai-platform",
+        "services": {
+            service: {
+                "image": reference,
+                "restart": SERVICES[service]["restart"],
+                "privileged": False,
+                "cap_add": [],
+                "cap_drop": [],
+                "environment": {},
+                "volumes": [],
+                "secrets": [],
+                "configs": [],
+            }
+            for service, reference in references.items()
+        },
+        "volumes": {},
+        "secrets": {},
+        "configs": {},
+    }
 
 
 def _container(service: str, reference: str) -> dict[str, object]:
@@ -158,11 +190,18 @@ def _container(service: str, reference: str) -> dict[str, object]:
         "Image": _local_image_id(reference),
         "Config": {
             "Image": reference,
+            "Cmd": None,
+            "Entrypoint": None,
+            "User": "",
+            "Env": [],
             "Labels": {
                 "com.docker.compose.project": "yfeistai-platform",
                 "com.docker.compose.service": service,
+                "com.docker.compose.config-hash": _compose_config_hash(service),
             },
         },
+        "HostConfig": {"Privileged": False, "CapAdd": None, "CapDrop": None},
+        "Mounts": [],
         "State": state,
     }
 
@@ -180,6 +219,15 @@ def _minimal_container(raw: dict[str, object]) -> dict[str, object]:
         "configImage": config["Image"],
         "project": labels["com.docker.compose.project"],
         "service": labels["com.docker.compose.service"],
+        "configHash": labels["com.docker.compose.config-hash"],
+        "privileged": raw["HostConfig"]["Privileged"],
+        "mounts": raw["Mounts"],
+        "capAdd": raw["HostConfig"]["CapAdd"],
+        "capDrop": raw["HostConfig"]["CapDrop"],
+        "command": config["Cmd"],
+        "entrypoint": config["Entrypoint"],
+        "user": config["User"],
+        "environment": config["Env"],
         "state": state["Status"],
         "running": state["Running"],
         "restarting": state["Restarting"],
@@ -200,6 +248,13 @@ class FakeDocker:
         self.ps_count = 0
         self.repo_digest_overrides: dict[str, list[str]] = {}
         self.image_id_overrides: dict[str, str] = {}
+        self.image_command_overrides: dict[str, list[str] | None] = {}
+        self.image_entrypoint_overrides: dict[str, list[str] | None] = {}
+        self.image_user_overrides: dict[str, str] = {}
+        self.image_environment_overrides: dict[str, list[str]] = {}
+        self.image_volume_overrides: dict[str, dict[str, object] | None] = {}
+        self.compose_config = _compose_config(references)
+        self.compose_hash_overrides: dict[str, str] = {}
         self.fail_prefix: list[str] | None = None
         self.on_call: Callable[[int], None] | None = None
 
@@ -216,7 +271,16 @@ class FakeDocker:
             and docker_arguments[: len(self.fail_prefix)] == self.fail_prefix
         ):
             return subprocess.CompletedProcess(arguments, 17, stdout=b"native failure", stderr=b"")
-        if docker_arguments[0] == "ps":
+        if docker_arguments[0] == "compose":
+            if docker_arguments[-3:] == ["config", "--format", "json"]:
+                body = json.dumps(self.compose_config).encode()
+            else:
+                assert docker_arguments[-3:] == ["config", "--hash", "*"]
+                body = "".join(
+                    f"{service} {self.compose_hash_overrides.get(service, _compose_config_hash(service))}\n"
+                    for service in sorted(self.references)
+                ).encode()
+        elif docker_arguments[0] == "ps":
             self.ps_count += 1
             containers = (
                 self.after_by_id
@@ -245,6 +309,11 @@ class FakeDocker:
                         "repoDigests": self.repo_digest_overrides.get(
                             reference, [_repo_digest(reference)]
                         ),
+                        "command": self.image_command_overrides.get(reference),
+                        "entrypoint": self.image_entrypoint_overrides.get(reference),
+                        "user": self.image_user_overrides.get(reference, ""),
+                        "environment": self.image_environment_overrides.get(reference, []),
+                        "volumes": self.image_volume_overrides.get(reference),
                     }
                 ]
             )[1:-1].encode()
@@ -322,7 +391,8 @@ def test_stable_runtime_is_attested_with_only_fixed_read_only_docker_commands(
         == 2
     )
     assert all(
-        command[:2] in (["container", "inspect"], ["image", "inspect"]) or command[0] == "ps"
+        command[:2] in (["container", "inspect"], ["image", "inspect"])
+        or command[0] in {"compose", "ps"}
         for command in commands
     )
     assert not any(
@@ -364,6 +434,264 @@ def test_stable_runtime_is_attested_with_only_fixed_read_only_docker_commands(
         serialized = json.dumps(command["argv"])
         assert "<isolated-docker-config>" in serialized
         assert str(tmp_path) not in serialized
+
+
+def test_runtime_attestation_binds_effective_security_without_persisting_environment_values(
+    tmp_path: Path,
+) -> None:
+    candidate_root, references = _candidate_root(tmp_path)
+    runner = FakeDocker(references)
+    services = runner.compose_config["services"]
+    assert isinstance(services, dict)
+    deeptutor = services["deeptutor"]
+    assert isinstance(deeptutor, dict)
+    bind_source = str((candidate_root / "data").resolve())
+    secret_source = str((candidate_root / "secrets" / "ticket").resolve())
+    deeptutor.update(
+        {
+            "cap_add": ["NET_ADMIN"],
+            "cap_drop": ["ALL"],
+            "command": ["python", "-m", "deeptutor"],
+            "entrypoint": None,
+            "user": "1000:1000",
+            "environment": {"SERVICE_TOKEN": "super-secret"},
+            "volumes": [
+                {
+                    "type": "bind",
+                    "source": bind_source,
+                    "target": "/app/data",
+                    "read_only": True,
+                },
+                {
+                    "type": "volume",
+                    "source": "cache",
+                    "target": "/cache",
+                    "read_only": False,
+                },
+            ],
+            "secrets": [{"source": "ticket", "target": "ticket.txt"}],
+        }
+    )
+    runner.compose_config["volumes"] = {"cache": {"name": "fixed-cache"}}
+    runner.compose_config["secrets"] = {"ticket": {"file": secret_source}}
+    teaching_migrate = services["teaching-migrate"]
+    assert isinstance(teaching_migrate, dict)
+    teaching_migrate["volumes"] = [
+        {
+            "type": "volume",
+            "source": "cache",
+            "target": "/cache",
+            "read_only": False,
+        }
+    ]
+    reference = references["deeptutor"]
+    runner.image_entrypoint_overrides[reference] = ["/image-entrypoint"]
+    runner.image_user_overrides[reference] = "999:999"
+    runner.image_environment_overrides[reference] = [
+        "PATH=/usr/bin",
+        "BASE_TOKEN=image-secret",
+    ]
+    runner.image_volume_overrides[reference] = {"/cache": {}}
+    container = runner.by_id["container-deeptutor"]
+    config = container["Config"]
+    assert isinstance(config, dict)
+    config.update(
+        {
+            "Cmd": ["python", "-m", "deeptutor"],
+            "Entrypoint": ["/image-entrypoint"],
+            "User": "1000:1000",
+            "Env": [
+                "PATH=/usr/bin",
+                "BASE_TOKEN=image-secret",
+                "SERVICE_TOKEN=super-secret",
+            ],
+        }
+    )
+    teaching_migrate_config = runner.by_id["container-teaching-migrate"]["Config"]
+    assert isinstance(teaching_migrate_config, dict)
+    teaching_migrate_config.update(
+        {
+            "Entrypoint": ["/image-entrypoint"],
+            "User": "999:999",
+            "Env": ["PATH=/usr/bin", "BASE_TOKEN=image-secret"],
+        }
+    )
+    container["HostConfig"] = {
+        "Privileged": False,
+        "CapAdd": ["CAP_NET_ADMIN"],
+        "CapDrop": ["CAP_ALL"],
+    }
+    container["Mounts"] = [
+        {
+            "Type": "bind",
+            "Source": bind_source,
+            "Destination": "/app/data",
+            "RW": False,
+            "Propagation": "rprivate",
+        },
+        {
+            "Type": "volume",
+            "Source": "fixed-cache",
+            "Destination": "/cache",
+            "RW": True,
+            "Propagation": "",
+        },
+        {
+            "Type": "bind",
+            "Source": secret_source,
+            "Destination": "/run/secrets/ticket.txt",
+            "RW": False,
+            "Propagation": "rprivate",
+        },
+    ]
+    runner.by_id["container-teaching-migrate"]["Mounts"] = [
+        {
+            "Type": "volume",
+            "Source": "fixed-cache",
+            "Destination": "/cache",
+            "RW": True,
+            "Propagation": "",
+        }
+    ]
+
+    path = _produce(tmp_path, runner)
+    body = path.read_bytes()
+
+    assert b"super-secret" not in body
+    assert b"image-secret" not in body
+    report = json.loads(body)
+    bound = next(item for item in report["containers"] if item["service"] == "deeptutor")
+    assert bound["security"]["capAdd"] == ["NET_ADMIN"]
+    assert bound["security"]["capDrop"] == ["ALL"]
+    assert len(bound["security"]["environmentSha256"]) == 64
+
+
+def test_runtime_attestation_uses_candidate_base_with_deployment_env_and_project_root(
+    tmp_path: Path,
+) -> None:
+    candidate_root, references = _candidate_root(tmp_path)
+    deployment_root = tmp_path / "deployment"
+    settings = deployment_root / "data" / "user" / "settings"
+    settings.mkdir(parents=True)
+    (settings / "docker.env").write_text("PORT=8001\n", encoding="utf-8")
+    runner = FakeDocker(references)
+    docker = tmp_path / "trusted" / "docker.exe"
+    docker.parent.mkdir()
+    docker.write_bytes(b"docker")
+
+    module = _load_module()
+    module.produce_runtime_attestation(
+        candidate_root=candidate_root,
+        deployment_root=deployment_root,
+        bundle_root=tmp_path / "bundle",
+        release_run=RELEASE_RUN,
+        observed_at="2026-08-25T00:00:00Z",
+        base_url="https://candidate.example.test",
+        runner=runner,
+        docker_resolver=lambda: docker,
+        environ={"SystemRoot": "C:/Windows"},
+    )
+
+    compose = next(
+        arguments[5:] for arguments, _options in runner.calls if arguments[5] == "compose"
+    )
+    assert str(settings / "docker.env") in compose
+    assert str(deployment_root.resolve()) in compose
+    assert str(candidate_root / "docker-compose.yml") in compose
+    assert str(candidate_root / "docker-compose.platform.yml") in compose
+    assert all(options["cwd"] == deployment_root.resolve() for _args, options in runner.calls)
+
+
+def test_attestation_rejects_forged_compose_hash_label(tmp_path: Path) -> None:
+    _candidate, references = _candidate_root(tmp_path)
+    runner = FakeDocker(references)
+    runner.compose_hash_overrides["deeptutor"] = "0" * 64
+
+    with pytest.raises(ValueError, match="security-sensitive"):
+        _produce(tmp_path, runner)
+
+
+def test_runtime_attestation_uses_one_decreasing_deadline_for_all_docker_commands(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_module()
+    candidate_root, references = _candidate_root(tmp_path)
+    bundle_root = tmp_path / "bundle"
+    docker = tmp_path / "trusted" / "docker.exe"
+    docker.parent.mkdir()
+    docker.write_bytes(b"docker")
+    fake_docker = FakeDocker(references)
+    now = [100.0]
+    timeouts: list[float] = []
+
+    def monotonic() -> float:
+        return now[0]
+
+    def runner(arguments: list[str], **options: object):
+        timeout = options.get("timeout")
+        assert isinstance(timeout, (int, float)) and not isinstance(timeout, bool)
+        timeouts.append(float(timeout))
+        completed = fake_docker(arguments, **options)
+        now[0] += 1.0
+        return completed
+
+    monkeypatch.setattr(module, "time", SimpleNamespace(monotonic=monotonic), raising=False)
+
+    module.produce_runtime_attestation(
+        candidate_root=candidate_root,
+        bundle_root=bundle_root,
+        release_run=RELEASE_RUN,
+        observed_at="2026-08-25T00:00:00Z",
+        base_url="https://candidate.example.test",
+        timeout_seconds=60,
+        runner=runner,
+        docker_resolver=lambda: docker,
+        environ={"SystemRoot": "C:/Windows"},
+    )
+
+    assert timeouts == [min(30, 60 - index) for index in range(len(fake_docker.calls))]
+    assert (bundle_root / "runtime" / "runtime-attestation.json").is_file()
+
+
+def test_runtime_attestation_rejects_exhausted_deadline_before_next_docker_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_module()
+    candidate_root, references = _candidate_root(tmp_path)
+    bundle_root = tmp_path / "bundle"
+    docker = tmp_path / "trusted" / "docker.exe"
+    docker.parent.mkdir()
+    docker.write_bytes(b"docker")
+    fake_docker = FakeDocker(references)
+    now = [200.0]
+
+    def monotonic() -> float:
+        return now[0]
+
+    def runner(arguments: list[str], **options: object):
+        completed = fake_docker(arguments, **options)
+        now[0] = 204.0
+        return completed
+
+    monkeypatch.setattr(module, "time", SimpleNamespace(monotonic=monotonic), raising=False)
+
+    with pytest.raises(ValueError, match="deadline|budget|timeout"):
+        module.produce_runtime_attestation(
+            candidate_root=candidate_root,
+            bundle_root=bundle_root,
+            release_run=RELEASE_RUN,
+            observed_at="2026-08-25T00:00:00Z",
+            base_url="https://candidate.example.test",
+            timeout_seconds=3,
+            runner=runner,
+            docker_resolver=lambda: docker,
+            environ={"SystemRoot": "C:/Windows"},
+        )
+
+    assert len(fake_docker.calls) == 1
+    assert not (bundle_root / "runtime" / "runtime-attestation.json").exists()
 
 
 def _produce(tmp_path: Path, runner: FakeDocker, *, module=None) -> Path:
@@ -816,6 +1144,49 @@ def test_attestation_rejects_missing_or_extra_enabled_service(tmp_path: Path, ca
 
 
 @pytest.mark.parametrize(
+    "drift",
+    ("privileged", "host-bind", "cap-add", "command", "environment", "user"),
+)
+def test_attestation_rejects_security_sensitive_runtime_config_drift(
+    tmp_path: Path,
+    drift: str,
+) -> None:
+    _candidate, references = _candidate_root(tmp_path)
+    runner = FakeDocker(references)
+    container = runner.by_id["container-deeptutor"]
+    config = container["Config"]
+    assert isinstance(config, dict)
+    if drift == "privileged":
+        container["HostConfig"] = {"Privileged": True, "CapAdd": None, "CapDrop": None}
+    elif drift == "host-bind":
+        container["Mounts"] = [
+            {
+                "Type": "bind",
+                "Source": "C:/attacker",
+                "Destination": "/host",
+                "RW": True,
+                "Propagation": "rprivate",
+            }
+        ]
+    elif drift == "cap-add":
+        container["HostConfig"] = {
+            "Privileged": False,
+            "CapAdd": ["SYS_ADMIN"],
+            "CapDrop": None,
+        }
+    elif drift == "command":
+        config["Cmd"] = ["python", "-c", "unexpected"]
+    elif drift == "environment":
+        config["Env"] = ["UNEXPECTED_RUNTIME_OVERRIDE=1"]
+    else:
+        config["User"] = "0"
+    with pytest.raises(ValueError, match="security-sensitive"):
+        _produce(tmp_path, runner)
+
+    assert not (tmp_path / "bundle" / "runtime" / "runtime-attestation.json").exists()
+
+
+@pytest.mark.parametrize(
     "case",
     (
         "wrong-config-image",
@@ -1228,7 +1599,7 @@ def test_attestation_replace_boundary_race_cannot_publish_in_moved_runtime(
 
 
 @pytest.mark.parametrize("prior_canonical", (False, True))
-@pytest.mark.parametrize("contract_file", ("lock", "compose"))
+@pytest.mark.parametrize("contract_file", ("lock", "platform-compose", "base-compose"))
 def test_attestation_publish_time_contract_drift_rolls_back_canonical(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1241,11 +1612,11 @@ def test_attestation_publish_time_contract_drift_rolls_back_canonical(
     canonical = runtime_root / "runtime-attestation.json"
     if prior_canonical:
         canonical.write_bytes(b"existing canonical")
-    contract_path = (
-        candidate_root / "deploy" / "image-lock.json"
-        if contract_file == "lock"
-        else candidate_root / "docker-compose.platform.yml"
-    )
+    contract_path = {
+        "lock": candidate_root / "deploy" / "image-lock.json",
+        "platform-compose": candidate_root / "docker-compose.platform.yml",
+        "base-compose": candidate_root / "docker-compose.yml",
+    }[contract_file]
     module = _load_module()
     real_replace = module._RuntimeDirectoryGuard.replace
     original_contract = contract_path.read_bytes()
@@ -1276,6 +1647,55 @@ def test_attestation_publish_time_contract_drift_rolls_back_canonical(
     else:
         assert not mutation_blocked
         assert contract_path.read_bytes() == original_contract + b"\n"
+    if prior_canonical:
+        assert canonical.read_bytes() == b"existing canonical"
+    else:
+        assert not canonical.exists()
+    assert list(runtime_root.glob(".docker-config-*")) == []
+
+
+@pytest.mark.parametrize("prior_canonical", (False, True))
+def test_attestation_publish_time_deployment_env_drift_rolls_back_canonical(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    prior_canonical: bool,
+) -> None:
+    candidate_root, references = _candidate_root(tmp_path)
+    runtime_root = tmp_path / "bundle" / "runtime"
+    runtime_root.mkdir(parents=True)
+    canonical = runtime_root / "runtime-attestation.json"
+    if prior_canonical:
+        canonical.write_bytes(b"existing canonical")
+    contract_path = candidate_root / "data" / "user" / "settings" / "docker.env"
+    module = _load_module()
+    real_replace = module._RuntimeDirectoryGuard.replace
+    original_contract = contract_path.read_bytes()
+    mutation_attempted = False
+    mutation_blocked = False
+
+    def replace_and_mutate_contract(guard, source: str, target: str) -> None:
+        nonlocal mutation_attempted, mutation_blocked
+        if Path(target).name == canonical.name and not mutation_attempted:
+            mutation_attempted = True
+            try:
+                contract_path.write_bytes(original_contract + b"PORT=9999\n")
+            except OSError as exc:
+                mutation_blocked = True
+                raise ValueError("deployment contract mutation was blocked") from exc
+        real_replace(guard, source, target)
+
+    monkeypatch.setattr(module._RuntimeDirectoryGuard, "replace", replace_and_mutate_contract)
+
+    with pytest.raises(ValueError, match="deployment|contract|changed"):
+        _produce(tmp_path, FakeDocker(references), module=module)
+
+    assert mutation_attempted
+    if os.name == "nt":
+        assert mutation_blocked
+        assert contract_path.read_bytes() == original_contract
+    else:
+        assert not mutation_blocked
+        assert contract_path.read_bytes() == original_contract + b"PORT=9999\n"
     if prior_canonical:
         assert canonical.read_bytes() == b"existing canonical"
     else:
@@ -1994,6 +2414,109 @@ def test_shared_verifier_rejects_attestation_fact_tampering(tmp_path: Path, case
     verifier = _load_verifier()
 
     with pytest.raises(ValueError):
+        verifier.validate_runtime_attestation(
+            path,
+            bundle_root=tmp_path / "bundle",
+            candidate_root=candidate_root,
+            candidate=CANDIDATE,
+            release_run=RELEASE_RUN,
+            expected_base_url="https://candidate.example.test",
+            expected_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        )
+
+
+@pytest.mark.parametrize(
+    "drift",
+    (
+        "config-hash",
+        "privileged",
+        "host-bind",
+        "cap-add",
+        "command",
+        "entrypoint",
+        "user",
+        "environment",
+    ),
+)
+def test_shared_verifier_rejects_self_consistent_rehashed_security_drift(
+    tmp_path: Path,
+    drift: str,
+) -> None:
+    candidate_root, references = _candidate_root(tmp_path)
+    path = _produce(tmp_path, FakeDocker(references))
+    producer = _load_module()
+    document = json.loads(path.read_text(encoding="utf-8"))
+    commands = document["commands"]
+    containers = document["containers"]
+    assert isinstance(commands, list) and isinstance(containers, list)
+
+    mutated_fact = None
+    matching_records = 0
+    for record in commands:
+        if not isinstance(record, dict) or not isinstance(record.get("stdout"), str):
+            continue
+        try:
+            raw_fact = json.loads(record["stdout"])
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(raw_fact, dict) or raw_fact.get("service") != "deeptutor":
+            continue
+        matching_records += 1
+        if drift == "config-hash":
+            raw_fact["configHash"] = "f" * 64
+        elif drift == "privileged":
+            raw_fact["privileged"] = True
+        elif drift == "host-bind":
+            raw_fact["mounts"] = [
+                {
+                    "Type": "bind",
+                    "Source": "C:/attacker",
+                    "Destination": "/host",
+                    "RW": True,
+                    "Propagation": "rprivate",
+                }
+            ]
+        elif drift == "cap-add":
+            raw_fact["capAdd"] = ["SYS_ADMIN"]
+        elif drift == "command":
+            raw_fact["command"] = ["python", "-c", "unexpected"]
+        elif drift == "entrypoint":
+            raw_fact["entrypoint"] = ["/attacker-entrypoint"]
+        elif drift == "user":
+            raw_fact["user"] = "0"
+        else:
+            environment_hashes = raw_fact["environmentHashes"]
+            assert isinstance(environment_hashes, dict)
+            environment_hashes["ATTACKER_RUNTIME_OVERRIDE"] = "f" * 64
+        record["stdout"] = producer._canonical_json_bytes(raw_fact).decode("utf-8")
+        record["stdoutSha256"] = hashlib.sha256(record["stdout"].encode()).hexdigest()
+        mutated_fact = producer._container_fact(raw_fact)
+
+    assert matching_records == 2 and isinstance(mutated_fact, dict)
+    mutated_security = mutated_fact["security"]
+    reported = next(
+        container
+        for container in containers
+        if isinstance(container, dict) and container.get("service") == "deeptutor"
+    )
+    reported["security"] = mutated_security
+    security_sha256 = hashlib.sha256(
+        json.dumps(mutated_security, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    for snapshot_name in ("beforeSnapshot", "afterSnapshot"):
+        snapshot = document[snapshot_name]
+        assert isinstance(snapshot, list)
+        row = next(
+            item
+            for item in snapshot
+            if isinstance(item, dict) and item.get("service") == "deeptutor"
+        )
+        row["securitySha256"] = security_sha256
+
+    path.write_text(json.dumps(document), encoding="utf-8")
+    verifier = _load_verifier()
+
+    with pytest.raises(ValueError, match="container facts are invalid"):
         verifier.validate_runtime_attestation(
             path,
             bundle_root=tmp_path / "bundle",

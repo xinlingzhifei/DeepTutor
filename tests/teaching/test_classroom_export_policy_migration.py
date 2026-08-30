@@ -13,7 +13,7 @@ def test_classroom_export_policy_mutations_have_persisted_revisions() -> None:
         / "20260828_0022_classroom_export_policy_cas.py"
     )
 
-    assert TEACHING_MIGRATION_HEAD_REVISION == "20260828_0022"
+    assert TEACHING_MIGRATION_HEAD_REVISION == "20260830_0023"
     source = migration.read_text(encoding="utf-8")
     assert 'revision: str = "20260828_0022"' in source
     assert 'down_revision: str | None = "20260827_0021"' in source

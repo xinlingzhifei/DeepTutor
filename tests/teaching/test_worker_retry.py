@@ -30,6 +30,7 @@ def test_retry_categories_and_backoff_are_bounded() -> None:
         "source_snapshot_invalid",
         "contract_invalid",
         "confirmed_outline_hash_mismatch",
+        "data_plane_unavailable",
     }
     assert retry_delay_seconds(1) == 1
     assert retry_delay_seconds(2) == 2
@@ -68,6 +69,318 @@ def test_engine_terminal_codes_use_the_fixed_retry_taxonomy(
     assert failure.retryable is retryable
 
 
+@pytest.mark.parametrize(
+    "error_kind",
+    [
+        "route-unavailable",
+        "route-configuration-unavailable",
+        "service-secret-unavailable",
+    ],
+)
+@pytest.mark.parametrize(
+    ("mode", "expected_code"),
+    [
+        ("shared", "data_plane_unavailable"),
+        ("dedicated", "dedicated_data_plane_unavailable"),
+    ],
+)
+def test_data_plane_setup_failures_use_mode_aware_non_retryable_codes(
+    error_kind: str,
+    mode: str,
+    expected_code: str,
+) -> None:
+    from deeptutor.teaching.job_errors import classify_worker_error
+    from deeptutor.teaching.openmaic.auth import ServiceSecretUnavailable
+    from deeptutor.teaching.openmaic.data_planes import (
+        DataPlaneConfigurationUnavailable,
+        DataPlaneUnavailable,
+    )
+
+    errors = {
+        "route-unavailable": DataPlaneUnavailable(),
+        "route-configuration-unavailable": DataPlaneConfigurationUnavailable(),
+        "service-secret-unavailable": ServiceSecretUnavailable(),
+    }
+
+    failure = classify_worker_error(errors[error_kind], data_plane_mode=mode)
+
+    assert failure.category == "data_plane_unavailable"
+    assert failure.code == expected_code
+    assert not failure.retryable
+
+
+def test_programming_value_error_is_not_misclassified_as_data_plane_unavailable() -> None:
+    from deeptutor.teaching.job_errors import classify_worker_error
+
+    failure = classify_worker_error(
+        ValueError("unrelated programming defect"),
+        data_plane_mode="dedicated",
+    )
+
+    assert failure.category == "contract_invalid"
+    assert failure.code == "worker_contract_invalid"
+    assert not failure.retryable
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_code"),
+    [
+        ("shared", "openmaic_unavailable"),
+        ("dedicated", "dedicated_data_plane_unavailable"),
+    ],
+)
+def test_transport_unavailability_keeps_retry_policy_with_mode_aware_code(
+    mode: str,
+    expected_code: str,
+) -> None:
+    from deeptutor.teaching.job_errors import classify_worker_error
+    from deeptutor.teaching.openmaic.client import OpenMAICUnavailable
+
+    failure = classify_worker_error(
+        OpenMAICUnavailable(),
+        data_plane_mode=mode,
+    )
+
+    assert failure.category == "engine_unavailable"
+    assert failure.code == expected_code
+    assert failure.retryable
+
+
+@pytest.mark.asyncio
+async def test_dedicated_worker_fails_route_unavailability_with_stable_terminal_code() -> None:
+    from deeptutor.teaching.contracts import GenerationRequest, canonical_json_bytes
+    from deeptutor.teaching.openmaic.data_planes import DataPlaneUnavailable
+    from deeptutor.teaching.repositories.jobs import ClaimedJobPayload
+    from deeptutor.teaching.scheduler import ClaimedGenerationJob
+    from deeptutor.teaching.worker import GenerationWorker
+    from tests.teaching.test_contracts import valid_generation_request
+
+    request = valid_generation_request()
+    payload = canonical_json_bytes(GenerationRequest.model_validate(request)).decode()
+    claim = ClaimedGenerationJob(
+        tenant_id="tenant-1",
+        job_id="job-1",
+        job_kind="generation",
+        phase="outline",
+        status="generating_outline",
+        slot_pool="generation",
+        data_plane_mode="dedicated",
+        data_plane_route_id="dedicated-tenant-1",
+        provider_profile_id="provider-tenant-1",
+        worker_pool_ref="generation-tenant-1",
+        queue_ref="openmaic.tenant-1",
+        attempt_count=1,
+        lease_owner="dedicated-worker-1",
+        lease_token="a" * 64,
+        lease_expires_at=datetime(2030, 1, 1, tzinfo=timezone.utc),
+        global_slot_id=1,
+        tenant_slot_id=2,
+    )
+
+    class Scheduler:
+        async def claim(self, *_args, **_kwargs):
+            return claim
+
+    class Repository:
+        def __init__(self) -> None:
+            self.failures: list[tuple[str, str]] = []
+            self.retries: list[tuple[str, str]] = []
+
+        async def load_claimed_payload(self, _claim):
+            return ClaimedJobPayload(
+                request_payload=payload,
+                request_sha256=hashlib.sha256(payload.encode()).hexdigest(),
+                idempotency_key="key-1",
+                export_format=None,
+                cancel_requested=False,
+                dsl_repair_attempts=0,
+            )
+
+        async def heartbeat_claim(self, *_args, **_kwargs):
+            return None
+
+        async def fail_claim(self, _claim, *, error_category, error_code):
+            self.failures.append((error_category, error_code))
+
+        async def retry_claim(self, _claim, *, error_category, error_code, **_kwargs):
+            self.retries.append((error_category, error_code))
+
+    class Clients:
+        async def client_for_claim(self, _claim):
+            raise DataPlaneUnavailable()
+
+    repository = Repository()
+    worker = GenerationWorker(
+        scheduler=Scheduler(),
+        repository=repository,
+        clients=Clients(),
+        stores=object(),
+        worker_id="dedicated-worker-1",
+    )
+
+    assert await worker.run_once(
+        slot_pool="generation",
+        data_plane_route_id="dedicated-tenant-1",
+        provider_profile_id="provider-tenant-1",
+        worker_pool_ref="generation-tenant-1",
+        queue_ref="openmaic.tenant-1",
+    )
+    assert repository.failures == [("data_plane_unavailable", "dedicated_data_plane_unavailable")]
+    assert repository.retries == []
+
+
+@pytest.mark.asyncio
+async def test_worker_heartbeats_claim_before_client_selection_and_submission() -> None:
+    from deeptutor.teaching.contracts import GenerationRequest, canonical_json_bytes
+    from deeptutor.teaching.openmaic.client import EngineJob
+    from deeptutor.teaching.repositories.jobs import ClaimedJobPayload
+    from deeptutor.teaching.scheduler import ClaimedGenerationJob
+    from deeptutor.teaching.worker import GenerationWorker
+    from tests.teaching.test_contracts import valid_generation_request
+
+    request = valid_generation_request()
+    payload = canonical_json_bytes(GenerationRequest.model_validate(request)).decode()
+    claim = ClaimedGenerationJob(
+        tenant_id="tenant-1",
+        job_id="job-1",
+        job_kind="generation",
+        phase="outline",
+        status="generating_outline",
+        slot_pool="generation",
+        data_plane_mode="shared",
+        data_plane_route_id="shared-primary",
+        provider_profile_id="provider-default",
+        worker_pool_ref="shared-generation",
+        queue_ref="openmaic.shared",
+        attempt_count=1,
+        lease_owner="worker-1",
+        lease_token="a" * 64,
+        lease_expires_at=datetime(2030, 1, 1, tzinfo=timezone.utc),
+        global_slot_id=1,
+        tenant_slot_id=2,
+    )
+    events: list[str] = []
+
+    class Repository:
+        async def load_claimed_payload(self, _claim):
+            events.append("payload")
+            return ClaimedJobPayload(
+                request_payload=payload,
+                request_sha256=hashlib.sha256(payload.encode()).hexdigest(),
+                idempotency_key="key-1",
+                export_format=None,
+                cancel_requested=False,
+                dsl_repair_attempts=0,
+            )
+
+        async def heartbeat_claim(self, _claim, *, lease_seconds):
+            assert lease_seconds > 0
+            events.append("heartbeat")
+
+        async def complete_outline(self, _claim, *, result_payload):
+            assert result_payload
+            events.append("complete")
+
+    class Client:
+        async def submit_outline(self, _request):
+            events.append("submit")
+            return EngineJob(
+                tenant_id="tenant-1",
+                job_id="job-1",
+                kind="outline",
+                status="succeeded",
+                payload={"result": {"outline": _draft_outline()}},
+            )
+
+    class Clients:
+        async def client_for_claim(self, _claim):
+            events.append("client")
+            return Client()
+
+    async def blocked_sleep(_seconds: float) -> None:
+        await asyncio.Future()
+
+    worker = GenerationWorker(
+        scheduler=object(),
+        repository=Repository(),
+        clients=Clients(),
+        stores=object(),
+        worker_id="worker-1",
+        sleep=blocked_sleep,
+    )
+
+    await worker._run_claim(claim)
+
+    assert events == ["payload", "heartbeat", "client", "submit", "complete"]
+
+
+@pytest.mark.asyncio
+async def test_worker_initial_heartbeat_lease_loss_prevents_client_resolution() -> None:
+    from deeptutor.teaching.contracts import GenerationRequest, canonical_json_bytes
+    from deeptutor.teaching.repositories.jobs import ClaimedJobPayload, JobLeaseLost
+    from deeptutor.teaching.scheduler import ClaimedGenerationJob
+    from deeptutor.teaching.worker import GenerationWorker
+    from tests.teaching.test_contracts import valid_generation_request
+
+    request = valid_generation_request()
+    payload = canonical_json_bytes(GenerationRequest.model_validate(request)).decode()
+    claim = ClaimedGenerationJob(
+        tenant_id="tenant-1",
+        job_id="job-1",
+        job_kind="generation",
+        phase="outline",
+        status="generating_outline",
+        slot_pool="generation",
+        data_plane_mode="dedicated",
+        data_plane_route_id="dedicated-tenant-1",
+        provider_profile_id="provider-tenant-1",
+        worker_pool_ref="generation-tenant-1",
+        queue_ref="openmaic.tenant-1",
+        attempt_count=1,
+        lease_owner="worker-1",
+        lease_token="a" * 64,
+        lease_expires_at=datetime(2030, 1, 1, tzinfo=timezone.utc),
+        global_slot_id=1,
+        tenant_slot_id=2,
+    )
+    events: list[str] = []
+
+    class Repository:
+        async def load_claimed_payload(self, _claim):
+            events.append("payload")
+            return ClaimedJobPayload(
+                request_payload=payload,
+                request_sha256=hashlib.sha256(payload.encode()).hexdigest(),
+                idempotency_key="key-1",
+                export_format=None,
+                cancel_requested=False,
+                dsl_repair_attempts=0,
+            )
+
+        async def heartbeat_claim(self, _claim, *, lease_seconds):
+            assert lease_seconds > 0
+            events.append("heartbeat")
+            raise JobLeaseLost("lease expired before external work")
+
+    class Clients:
+        async def client_for_claim(self, _claim):
+            events.append("client")
+            raise AssertionError("lost lease must prevent client resolution")
+
+    worker = GenerationWorker(
+        scheduler=object(),
+        repository=Repository(),
+        clients=Clients(),
+        stores=object(),
+        worker_id="worker-1",
+    )
+
+    with pytest.raises(JobLeaseLost, match="lease expired before external work"):
+        await worker._run_claim(claim)
+
+    assert events == ["payload", "heartbeat"]
+
+
 def test_worker_constants_lock_the_lease_protocol() -> None:
     from deeptutor.teaching.worker import HEARTBEAT_SECONDS, LEASE_SECONDS
 
@@ -92,6 +405,7 @@ def _run_outline_worker(result: dict[str, object]):
         phase="outline",
         status="generating_outline",
         slot_pool="generation",
+        data_plane_mode="shared",
         data_plane_route_id="shared-primary",
         provider_profile_id="provider-default",
         worker_pool_ref="shared-generation",
@@ -130,7 +444,7 @@ def _run_outline_worker(result: dict[str, object]):
             self.failures.append((error_category, error_code))
 
         async def heartbeat_claim(self, *_args, **_kwargs):
-            raise AssertionError("short test must not need a heartbeat")
+            return None
 
     class Client:
         async def submit_outline(self, _request):
@@ -306,6 +620,7 @@ def test_explicit_retry_requires_a_new_job_identity() -> None:
         request_id="request-old",
         idempotency_key="key-old",
         request_sha256=original_sha,
+        data_plane_mode="shared",
         data_plane_route_id="shared-primary",
         provider_profile_id="provider-default",
         worker_pool_ref="shared-generation",
@@ -368,6 +683,7 @@ def test_bad_manifest_fails_before_store_or_version_finalization() -> None:
         phase="content",
         status="generating_content",
         slot_pool="generation",
+        data_plane_mode="shared",
         data_plane_route_id="shared-primary",
         provider_profile_id="provider-default",
         worker_pool_ref="shared-generation",
@@ -414,7 +730,7 @@ def test_bad_manifest_fails_before_store_or_version_finalization() -> None:
             self.failures.append((error_category, error_code, artifact_validation_reason))
 
         async def heartbeat_claim(self, *_args, **_kwargs):
-            raise AssertionError("short test must not need a heartbeat")
+            return None
 
         async def finalize_generation(self, *_args, **_kwargs):
             self.finalized += 1
@@ -646,6 +962,7 @@ async def test_output_promotion_counts_a_declared_artifact_missing_on_first_stre
         phase="content",
         status="materializing",
         slot_pool="generation",
+        data_plane_mode="shared",
         data_plane_route_id="shared-primary",
         provider_profile_id="provider-default",
         worker_pool_ref="shared-generation",

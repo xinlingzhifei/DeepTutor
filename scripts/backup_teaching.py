@@ -39,6 +39,39 @@ _PG_ENVIRONMENT_ALLOWLIST = (
 )
 
 
+async def _await_owned_operation(operation: Awaitable[Any]) -> Any:
+    async def run_operation() -> Any:
+        return await operation
+
+    operation_task = asyncio.create_task(run_operation())
+    first_cancellation: asyncio.CancelledError | None = None
+    while not operation_task.done():
+        try:
+            await asyncio.shield(operation_task)
+        except asyncio.CancelledError as cancellation:
+            if first_cancellation is None:
+                first_cancellation = cancellation
+            current_task = asyncio.current_task()
+            if current_task is not None:
+                current_task.uncancel()
+    try:
+        result = operation_task.result()
+    except BaseException as operation_failure:
+        if first_cancellation is not None:
+            first_cancellation.add_note(
+                f"owned operation failed: {type(operation_failure).__name__}"
+            )
+            raise first_cancellation
+        raise
+    if first_cancellation is not None:
+        raise first_cancellation
+    return result
+
+
+async def _await_owned_cleanup(cleanup: Awaitable[None]) -> None:
+    await _await_owned_operation(cleanup)
+
+
 def _set_private_mode(path: Path, mode: int) -> None:
     if os.name != "nt":
         os.chmod(path, mode)
@@ -238,6 +271,89 @@ def object_store_identity_sha256(namespace_id: str, bucket: str) -> str:
             }
         )
     ).hexdigest()
+
+
+def canonical_object_store_endpoint(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > 2048
+        or any(ord(character) < 0x20 for character in value)
+    ):
+        raise ValueError("object store endpoint is invalid")
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        raise ValueError("object store endpoint is invalid") from None
+    scheme = parsed.scheme.lower()
+    hostname = parsed.hostname
+    if (
+        scheme not in {"http", "https"}
+        or not isinstance(hostname, str)
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("object store endpoint is invalid")
+    canonical_host = hostname.lower()
+    if ":" in canonical_host:
+        canonical_host = f"[{canonical_host}]"
+    if port is not None and not (
+        (scheme == "http" and port == 80) or (scheme == "https" and port == 443)
+    ):
+        canonical_host = f"{canonical_host}:{port}"
+    return f"{scheme}://{canonical_host}"
+
+
+def physical_object_store_identity_sha256(
+    endpoint: object,
+    region: object,
+    bucket: object,
+    owner_id_sha256: object,
+) -> str:
+    if (
+        not isinstance(region, str)
+        or not region
+        or region != region.strip()
+        or len(region) > 191
+        or any(ord(character) < 0x20 for character in region)
+        or not isinstance(bucket, str)
+        or not bucket
+        or bucket != bucket.strip()
+        or "/" in bucket
+        or "\x00" in bucket
+        or not isinstance(owner_id_sha256, str)
+        or _SHA256.fullmatch(owner_id_sha256) is None
+        or owner_id_sha256 == "0" * 64
+    ):
+        raise ValueError("object store physical identity is invalid")
+    return hashlib.sha256(
+        _canonical_json(
+            {
+                "bucket": bucket,
+                "endpoint": canonical_object_store_endpoint(endpoint),
+                "ownerIdSha256": owner_id_sha256,
+                "region": region.lower(),
+            }
+        )
+    ).hexdigest()
+
+
+def _require_object_store_owner_id(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > 1024
+        or any(ord(character) < 0x20 for character in value)
+    ):
+        raise ValueError("source object store owner is invalid")
+    return value
 
 
 def _payload_file_for_key(key: str) -> str:
@@ -591,7 +707,7 @@ class MinioVersionedObjectStore:
         return tuple(sorted(versions))
 
     async def enumerate_object_versions(self) -> tuple[VersionedObject, ...]:
-        return await asyncio.to_thread(self._enumerate_object_versions)
+        return await _await_owned_operation(asyncio.to_thread(self._enumerate_object_versions))
 
     def _read_object_version(self, source: VersionedObject, destination: Path) -> None:
         target = Path(destination)
@@ -613,11 +729,28 @@ class MinioVersionedObjectStore:
                     handle.write(chunk)
             _set_private_mode(target, _PRIVATE_FILE_MODE)
         finally:
-            response.close()
-            response.release_conn()
+            primary_failure = sys.exception()
+            cleanup_failure: BaseException | None = None
+            for cleanup, failure_note in (
+                (response.close, "object response close cleanup failed"),
+                (response.release_conn, "object response release cleanup failed"),
+            ):
+                try:
+                    cleanup()
+                except BaseException as failure:
+                    if primary_failure is not None:
+                        primary_failure.add_note(failure_note)
+                    elif cleanup_failure is None:
+                        cleanup_failure = failure
+                    else:
+                        cleanup_failure.add_note(failure_note)
+            if primary_failure is None and cleanup_failure is not None:
+                raise cleanup_failure
 
     async def read_object_version(self, source: VersionedObject, destination: Path) -> None:
-        await asyncio.to_thread(self._read_object_version, source, Path(destination))
+        await _await_owned_operation(
+            asyncio.to_thread(self._read_object_version, source, Path(destination))
+        )
 
 
 @dataclass(frozen=True, slots=True, order=True)
@@ -778,6 +911,11 @@ async def _dump_postgres_snapshot(
         )
         if not isinstance(database_oid, str) or not database_oid:
             raise ValueError("PostgreSQL database identity is unavailable")
+        system_identifier = await connection.fetchval(
+            "SELECT system_identifier::text FROM pg_control_system()"
+        )
+        if not isinstance(system_identifier, str) or not system_identifier:
+            raise ValueError("PostgreSQL system identity is unavailable")
         platform_schema_revision = await connection.fetchval(
             "SELECT version_num FROM platform.alembic_version"
         )
@@ -946,10 +1084,9 @@ async def _dump_postgres_snapshot(
                     )
                 database_object_references[object_key] = reference
         identity_payload = {
-            "databaseHost": config.database_host,
-            "databasePort": config.database_port,
             "databaseName": config.database_name,
             "databaseOid": database_oid,
+            "systemIdentifier": system_identifier,
         }
         facts = TeachingBackupFacts(
             database_identity_sha256=hashlib.sha256(_canonical_json(identity_payload)).hexdigest(),
@@ -961,17 +1098,19 @@ async def _dump_postgres_snapshot(
                 database_object_references[key] for key in sorted(database_object_references)
             ),
         )
-        await asyncio.to_thread(
-            run_pg_dump,
-            pg_dump=pg_dump,
-            destination=Path(destination),
-            host=config.database_host,
-            port=config.database_port,
-            database=config.database_name,
-            user=config.database_user,
-            password=password,
-            snapshot_id=snapshot_id,
-            runner=runner,
+        await _await_owned_operation(
+            asyncio.to_thread(
+                run_pg_dump,
+                pg_dump=pg_dump,
+                destination=Path(destination),
+                host=config.database_host,
+                port=config.database_port,
+                database=config.database_name,
+                user=config.database_user,
+                password=password,
+                snapshot_id=snapshot_id,
+                runner=runner,
+            )
         )
         dump = Path(destination)
         if dump.is_symlink() or not dump.is_file():
@@ -980,12 +1119,22 @@ async def _dump_postgres_snapshot(
         finished = True
         return facts
     finally:
+        primary_failure = sys.exception()
         if started and not finished:
             try:
-                await transaction.rollback()
-            except Exception:
-                pass
-        await connection.close()
+                await _await_owned_cleanup(transaction.rollback())
+            except BaseException:
+                if primary_failure is not None:
+                    primary_failure.add_note("PostgreSQL snapshot rollback cleanup failed")
+                else:
+                    raise
+        try:
+            await _await_owned_cleanup(connection.close())
+        except BaseException:
+            if primary_failure is not None:
+                primary_failure.add_note("PostgreSQL snapshot connection cleanup failed")
+            else:
+                raise
 
 
 @dataclass(frozen=True, slots=True)
@@ -1046,6 +1195,7 @@ def write_backup_manifest(
     classroom_versions_count: int,
     learning_events_count: int,
     created_at: datetime,
+    source_object_store_identity_sha256: str | None = None,
 ) -> BackupManifest:
     requested_output = Path(output_dir)
     if requested_output.is_symlink() or not requested_output.is_dir():
@@ -1088,9 +1238,16 @@ def write_backup_manifest(
         object_inventory_file=inventory_path.name,
         object_inventory_sha256=hashlib.sha256(inventory_bytes).hexdigest(),
         object_count=len(entries),
-        source_object_store_identity_sha256=object_store_identity_sha256(
-            source_object_store_namespace_id,
-            source_object_store_bucket,
+        source_object_store_identity_sha256=(
+            object_store_identity_sha256(
+                source_object_store_namespace_id,
+                source_object_store_bucket,
+            )
+            if source_object_store_identity_sha256 is None
+            else _require_digest(
+                source_object_store_identity_sha256,
+                "source object store identity sha256",
+            )
         ),
         platform_schema_revision=platform_schema_revision,
         schema_revisions=dict(sorted(schema_revisions.items())),
@@ -1155,6 +1312,9 @@ async def create_restorable_teaching_backup(
     dump_database: Callable[[Path], Awaitable[TeachingBackupFacts]],
     enumerate_object_versions: Callable[[], Awaitable[Iterable[VersionedObject]]],
     read_object_version: Callable[[VersionedObject, Path], Awaitable[None]],
+    observe_source_object_store_owner_id: Callable[[], Awaitable[str]],
+    source_object_store_endpoint: str,
+    source_object_store_region: str,
     source_object_store_namespace_id: str,
     source_object_store_bucket: str,
     created_at: datetime | None = None,
@@ -1178,6 +1338,20 @@ async def create_restorable_teaching_backup(
         raise FileExistsError(output)
     if staging.exists() or staging.is_symlink():
         raise FileExistsError(staging)
+    try:
+        owner_id = _require_object_store_owner_id(await observe_source_object_store_owner_id())
+        source_object_store_identity_sha256 = physical_object_store_identity_sha256(
+            source_object_store_endpoint,
+            source_object_store_region,
+            source_object_store_bucket,
+            hashlib.sha256(owner_id.encode("utf-8")).hexdigest(),
+        )
+        object_store_identity_sha256(
+            source_object_store_namespace_id,
+            source_object_store_bucket,
+        )
+    except ValueError:
+        raise ValueError("source object store identity is invalid") from None
     _create_private_directory(staging)
 
     database_dump = staging / "database.dump"
@@ -1248,6 +1422,21 @@ async def create_restorable_teaching_backup(
         ):
             raise ValueError("database object receipt does not match versioned payload")
 
+    try:
+        final_owner_id = _require_object_store_owner_id(
+            await observe_source_object_store_owner_id()
+        )
+        final_source_object_store_identity_sha256 = physical_object_store_identity_sha256(
+            source_object_store_endpoint,
+            source_object_store_region,
+            source_object_store_bucket,
+            hashlib.sha256(final_owner_id.encode("utf-8")).hexdigest(),
+        )
+    except ValueError:
+        raise ValueError("source object store identity changed during capture") from None
+    if final_source_object_store_identity_sha256 != source_object_store_identity_sha256:
+        raise ValueError("source object store identity changed during capture")
+
     manifest = write_backup_manifest(
         staging,
         database_dump=database_dump,
@@ -1260,6 +1449,7 @@ async def create_restorable_teaching_backup(
         classroom_versions_count=facts.classroom_versions_count,
         learning_events_count=facts.learning_events_count,
         created_at=created_at or datetime.now(timezone.utc),
+        source_object_store_identity_sha256=source_object_store_identity_sha256,
     )
     if output.exists() or output.is_symlink():
         raise FileExistsError(output)
@@ -1487,6 +1677,7 @@ async def run_operator_backup(
     pg_dump: Path,
     created_at: datetime | None = None,
 ) -> BackupManifest:
+    import boto3
     from minio import Minio
 
     config = load_operator_backup_config(config_path)
@@ -1500,6 +1691,13 @@ async def run_operator_backup(
         region=config.object_store_region,
     )
     object_store = MinioVersionedObjectStore(client, bucket=config.object_store_bucket)
+    owner_client = boto3.client(
+        "s3",
+        endpoint_url=config.object_store_endpoint,
+        region_name=config.object_store_region,
+        aws_access_key_id=secrets.minio_access_key,
+        aws_secret_access_key=secrets.minio_secret_key,
+    )
 
     async def dump_database(destination: Path) -> TeachingBackupFacts:
         return await _dump_postgres_snapshot(
@@ -1509,15 +1707,44 @@ async def run_operator_backup(
             pg_dump=pg_dump,
         )
 
-    return await create_restorable_teaching_backup(
-        output_dir,
-        dump_database=dump_database,
-        enumerate_object_versions=object_store.enumerate_object_versions,
-        read_object_version=object_store.read_object_version,
-        source_object_store_namespace_id=config.object_store_namespace_id,
-        source_object_store_bucket=config.object_store_bucket,
-        created_at=created_at,
-    )
+    async def observe_source_object_store_owner_id() -> str:
+        try:
+            response = await _await_owned_operation(
+                asyncio.to_thread(
+                    owner_client.get_bucket_acl,
+                    Bucket=config.object_store_bucket,
+                )
+            )
+            owner = response["Owner"]
+            owner_id = owner["ID"]
+        except (KeyError, TypeError, AttributeError):
+            raise ValueError("source object store owner is invalid") from None
+        except Exception:
+            raise RuntimeError("source object store owner could not be observed") from None
+        return _require_object_store_owner_id(owner_id)
+
+    try:
+        return await create_restorable_teaching_backup(
+            output_dir,
+            dump_database=dump_database,
+            enumerate_object_versions=object_store.enumerate_object_versions,
+            read_object_version=object_store.read_object_version,
+            observe_source_object_store_owner_id=observe_source_object_store_owner_id,
+            source_object_store_endpoint=config.object_store_endpoint,
+            source_object_store_region=config.object_store_region,
+            source_object_store_namespace_id=config.object_store_namespace_id,
+            source_object_store_bucket=config.object_store_bucket,
+            created_at=created_at,
+        )
+    finally:
+        primary_failure = sys.exception()
+        try:
+            await _await_owned_cleanup(asyncio.to_thread(owner_client.close))
+        except BaseException:
+            if primary_failure is not None:
+                primary_failure.add_note("owner client cleanup failed")
+            else:
+                raise
 
 
 def _backup_argument_parser() -> argparse.ArgumentParser:

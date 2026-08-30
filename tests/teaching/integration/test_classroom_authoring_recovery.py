@@ -234,7 +234,7 @@ async def test_postgres_authoring_recovery_is_durable_and_atomically_bound(
                     {"schema_name": schema_name},
                 )
             )
-        assert revision == "20260828_0022"
+        assert revision == "20260830_0023"
         assert {
             "creation_idempotency_key",
             "creation_request_sha256",

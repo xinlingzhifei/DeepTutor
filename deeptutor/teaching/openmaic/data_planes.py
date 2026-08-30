@@ -3,9 +3,24 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 from typing import Literal, NoReturn, Protocol
 
 DataPlaneMode = Literal["shared", "dedicated"]
+DataPlaneAttemptDecision = Literal["selected", "unavailable"]
+ROUTE_BINDING_CONFIG_REVISION = "route-binding-v1"
+
+
+def _digest_configuration(kind: str, values: tuple[str | None, ...]) -> str:
+    payload = bytearray(f"{ROUTE_BINDING_CONFIG_REVISION}\n{kind}\n".encode())
+    for value in values:
+        if value is None:
+            payload.extend(b"N")
+            continue
+        encoded = value.encode("utf-8")
+        payload.extend(f"S{len(encoded)}:".encode())
+        payload.extend(encoded)
+    return hashlib.sha256(payload).hexdigest()
 
 
 class DataPlaneUnavailable(RuntimeError):
@@ -13,6 +28,20 @@ class DataPlaneUnavailable(RuntimeError):
 
     def __init__(self) -> None:
         super().__init__("data plane is unavailable")
+
+
+class DataPlaneConfigurationUnavailable(RuntimeError):
+    """The selected OpenMAIC data plane has unusable persisted configuration."""
+
+    def __init__(self) -> None:
+        super().__init__("data plane configuration is unavailable")
+
+
+class JobRouteAttemptConflict(RuntimeError):
+    """One claimed job attempt was already recorded with different facts."""
+
+    def __init__(self) -> None:
+        super().__init__("job route attempt conflicts with persisted facts")
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +104,29 @@ class DataPlaneSelection:
     mode: DataPlaneMode
     worker_pool_ref: str
     queue_ref: str
+    config_revision: str = ""
+    route_config_digest: str = ""
+    provider_config_digest: str = ""
+
+
+def route_config_digest(route: DataPlaneRouteRecord) -> str:
+    """Bind the mutable route endpoint without exposing it in audit evidence."""
+
+    return _digest_configuration("route", (route.base_url,))
+
+
+def provider_config_digest(profile: ProviderProfileRecord) -> str:
+    """Bind mutable provider endpoint/secret metadata without persisting it."""
+
+    return _digest_configuration(
+        "provider",
+        (
+            profile.provider_type,
+            profile.model_name,
+            profile.api_base_url,
+            profile.secret_ref,
+        ),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +139,21 @@ class DataPlaneDecision:
     mode: DataPlaneMode | None
     decision: Literal["selected", "unavailable"]
     reason_code: str
+
+
+@dataclass(frozen=True, slots=True)
+class JobRouteAttemptSummary:
+    """Validated aggregate of every persisted route attempt for one job."""
+
+    data_plane_mode: DataPlaneMode
+    attempt_count: int
+    shared_attempt_count: int
+    dedicated_attempt_count: int
+    selected_attempt_count: int
+    unavailable_attempt_count: int
+    last_attempt_phase: Literal["outline", "content", "export"]
+    last_attempt_decision: DataPlaneAttemptDecision
+    final_phase_selected: bool
 
 
 class DataPlaneSelectionRepository(Protocol):
@@ -218,6 +285,9 @@ class DataPlaneSelector:
             mode=route.mode,
             worker_pool_ref=route.worker_pool,
             queue_ref=route.queue_name,
+            config_revision=ROUTE_BINDING_CONFIG_REVISION,
+            route_config_digest=route_config_digest(route),
+            provider_config_digest=provider_config_digest(profile),
         )
         await self._repository.record_decision(
             DataPlaneDecision(

@@ -53,6 +53,7 @@ from .learning import (
 from .platform import (
     AuditLog,
     DataPlaneRoute,
+    GenerationRouteAttempt,
     PlatformBase,
     ProviderProfile,
     RoleGrant,
@@ -105,6 +106,7 @@ __all__ = [
     "DataPlaneRoute",
     "Enrollment",
     "GenerationJob",
+    "GenerationRouteAttempt",
     "GenerationQueue",
     "GenerationSlot",
     "InvalidClassroomTransition",

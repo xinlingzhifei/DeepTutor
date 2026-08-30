@@ -27,9 +27,14 @@ from deeptutor.teaching.object_store import (
 from deeptutor.teaching.openmaic.auth import (
     SERVICE_SECRET_PATH,
     MountedServiceSecretResolver,
+    ServiceSecretUnavailable,
 )
 from deeptutor.teaching.openmaic.client import OpenMAICClient, OpenMAICClientFactory
-from deeptutor.teaching.openmaic.data_planes import DataPlaneSelection, DataPlaneUnavailable
+from deeptutor.teaching.openmaic.data_planes import (
+    DataPlaneConfigurationUnavailable,
+    DataPlaneSelection,
+    DataPlaneUnavailable,
+)
 from deeptutor.teaching.provisioning_worker import build_provisioning_worker
 from deeptutor.teaching.repositories.data_planes import SqlAlchemyDataPlaneRepository
 from deeptutor.teaching.repositories.jobs import (
@@ -202,18 +207,61 @@ class RuntimeOpenMAICClients:
         return client
 
     async def client_for_claim(self, claim) -> OpenMAICClient:
-        selection = await self._selection(
+        try:
+            if claim.data_plane_mode != self._boundary.mode:
+                raise DataPlaneUnavailable()
+            selection = await self._selection(
+                tenant_id=claim.tenant_id,
+                data_plane_route_id=claim.data_plane_route_id,
+                provider_profile_id=claim.provider_profile_id,
+                worker_pool_ref=claim.worker_pool_ref,
+                queue_ref=claim.queue_ref,
+            )
+            if selection.mode != claim.data_plane_mode:
+                raise DataPlaneUnavailable()
+            client = await self._client(
+                selection=selection,
+                job_id=claim.job_id,
+                phase=claim.phase,
+            )
+        except (
+            DataPlaneConfigurationUnavailable,
+            DataPlaneUnavailable,
+            ServiceSecretUnavailable,
+        ):
+            await self._repository.record_job_route_attempt(
+                tenant_id=claim.tenant_id,
+                job_id=claim.job_id,
+                phase=claim.phase,
+                attempt_count=claim.attempt_count,
+                mode=claim.data_plane_mode,
+                data_plane_route_id=claim.data_plane_route_id,
+                provider_profile_id=claim.provider_profile_id,
+                worker_pool_ref=claim.worker_pool_ref,
+                queue_ref=claim.queue_ref,
+                worker_id=claim.lease_owner,
+                lease_token=claim.lease_token,
+                outcome="unavailable",
+            )
+            raise
+        await self._repository.record_job_route_attempt(
             tenant_id=claim.tenant_id,
+            job_id=claim.job_id,
+            phase=claim.phase,
+            attempt_count=claim.attempt_count,
+            mode=claim.data_plane_mode,
             data_plane_route_id=claim.data_plane_route_id,
             provider_profile_id=claim.provider_profile_id,
             worker_pool_ref=claim.worker_pool_ref,
             queue_ref=claim.queue_ref,
+            worker_id=claim.lease_owner,
+            lease_token=claim.lease_token,
+            outcome="selected",
+            config_revision=selection.config_revision,
+            route_config_digest=selection.route_config_digest,
+            provider_config_digest=selection.provider_config_digest,
         )
-        return await self._client(
-            selection=selection,
-            job_id=claim.job_id,
-            phase=claim.phase,
-        )
+        return client
 
     async def client_for_cancellation(
         self,

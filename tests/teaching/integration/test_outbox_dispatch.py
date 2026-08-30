@@ -90,6 +90,7 @@ def _request(tenant_id: str, job_id: str) -> GenerationJobRequest:
         classroom_draft_id="draft-1",
         batch_id=None,
         request_sha256=hashlib.sha256(b"{}").hexdigest(),
+        data_plane_mode="shared",
         data_plane_route_id="shared-primary",
         provider_profile_id="platform-default",
         worker_pool_ref="shared-generation",
@@ -852,10 +853,6 @@ def test_dispatch_conflict_does_not_record_a_queued_lifecycle_entry(
     async def scenario() -> None:
         engine = create_async_engine(generation_database.url, poolclass=NullPool)
         session_factory = async_sessionmaker(engine, expire_on_commit=False)
-        translated_engine = engine.execution_options(
-            schema_translate_map={"tenant": tenant_schema_name(tenant_id)}
-        )
-        tenant_sessions = async_sessionmaker(translated_engine, expire_on_commit=False)
         try:
             await _insert_active_tenant(engine, tenant_id)
             repository = SqlAlchemyGenerationJobRepository(engine)
@@ -865,18 +862,18 @@ def test_dispatch_conflict_does_not_record_a_queued_lifecycle_entry(
                 units=10,
             )
             await repository.create_job_and_reserve(_request(tenant_id, job_id))
-            async with tenant_sessions() as session:
+            async with session_factory() as session:
                 async with session.begin():
-                    job = await session.scalar(
-                        select(GenerationJob)
+                    message = await session.scalar(
+                        select(OutboxMessage)
                         .where(
-                            GenerationJob.tenant_id == tenant_id,
-                            GenerationJob.id == job_id,
+                            OutboxMessage.tenant_id == tenant_id,
+                            OutboxMessage.job_id == job_id,
                         )
                         .with_for_update()
                     )
-                    assert job is not None
-                    job.worker_pool_ref = "mismatched-worker-pool"
+                    assert message is not None
+                    message.worker_pool_ref = "mismatched-worker-pool"
 
             async with session_factory() as session:
                 message = await session.scalar(
@@ -1856,6 +1853,7 @@ def test_content_requeue_requires_the_outline_queue_and_slots_to_be_released(
                             classroom_draft_id="draft-1",
                             batch_id=None,
                             request_sha256="c" * 64,
+                            data_plane_mode="shared",
                             data_plane_route_id="shared-primary",
                             provider_profile_id="platform-default",
                             worker_pool_ref="shared-generation",

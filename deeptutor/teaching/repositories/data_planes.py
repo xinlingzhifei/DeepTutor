@@ -2,29 +2,176 @@
 
 from __future__ import annotations
 
-from typing import cast
+from collections.abc import Sequence
+from typing import Literal, cast
 
-from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy import and_, func, or_, select, text, update
+from sqlalchemy.exc import DBAPIError
 
 from deeptutor.teaching.database import platform_session
 from deeptutor.teaching.models import (
     AuditLog,
     DataPlaneRoute,
+    GenerationRouteAttempt,
     ProviderProfile,
     Tenant,
 )
 from deeptutor.teaching.openmaic.data_planes import (
+    ROUTE_BINDING_CONFIG_REVISION,
+    DataPlaneAttemptDecision,
     DataPlaneDecision,
     DataPlaneMode,
     DataPlaneResolution,
     DataPlaneRouteRecord,
     DataPlaneSelection,
     DedicatedDataPlaneHealthInventory,
+    JobRouteAttemptConflict,
+    JobRouteAttemptSummary,
     ProviderProfileRecord,
+    provider_config_digest,
+    route_config_digest,
 )
+from deeptutor.teaching.repositories.jobs import JobLeaseLost
 
 _AUDIT_ACTION_PREFIX = "teaching.data_plane"
 _AUDIT_RESOURCE_PREFIX = "data_plane_route"
+
+
+def _required_route_attempt_value(value: str, name: str, max_length: int) -> None:
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or len(value) > max_length
+        or "\n" in value
+        or "\r" in value
+    ):
+        raise ValueError(f"{name} is invalid")
+
+
+def _valid_nonzero_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and value != "0" * 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _route_attempt_sqlstate(error: DBAPIError) -> str | None:
+    candidate: BaseException | None = error.orig
+    for _ in range(3):
+        if candidate is None:
+            return None
+        sqlstate = getattr(candidate, "sqlstate", None)
+        if isinstance(sqlstate, str):
+            return sqlstate
+        candidate = candidate.__cause__ or candidate.__context__
+    return None
+
+
+_RECORD_ROUTE_ATTEMPT = text(
+    """
+    SELECT platform.record_generation_route_attempt(
+        :tenant_id,
+        :job_id,
+        :phase,
+        :attempt_count,
+        :data_plane_mode,
+        :data_plane_route_id,
+        :provider_profile_id,
+        :worker_pool_ref,
+        :queue_ref,
+        :worker_id,
+        :lease_token,
+        :decision,
+        :config_revision,
+        :route_config_digest,
+        :provider_config_digest
+    )
+    """
+)
+_READ_ROUTE_ATTEMPTS = text(
+    """
+    SELECT * FROM platform.read_generation_route_attempts(
+        :tenant_id,
+        :job_id,
+        :data_plane_mode,
+        :data_plane_route_id,
+        :provider_profile_id,
+        :worker_pool_ref,
+        :queue_ref
+    )
+    """
+)
+
+
+def _validated_route_attempt_counts(
+    attempts: Sequence[GenerationRouteAttempt],
+    *,
+    phase: str,
+    expected_attempt_count: int,
+    expected_data_plane_mode: DataPlaneMode,
+    expected_route_id: str,
+    expected_provider_profile_id: str,
+    expected_worker_pool_ref: str,
+    expected_queue_ref: str,
+) -> tuple[int, int] | None:
+    if len(attempts) != expected_attempt_count:
+        return None
+    if phase not in {"outline", "content", "export"}:
+        return None
+
+    selected_attempt_count = 0
+    unavailable_attempt_count = 0
+    content_started = False
+    for expected_number, attempt in enumerate(attempts, start=1):
+        if phase == "content":
+            if attempt.phase == "content":
+                content_started = True
+            elif attempt.phase != "outline" or content_started:
+                return None
+        elif attempt.phase != phase:
+            return None
+        if (
+            attempt.attempt_count != expected_number
+            or attempt.data_plane_mode != expected_data_plane_mode
+            or attempt.data_plane_route_id != expected_route_id
+            or attempt.provider_profile_id != expected_provider_profile_id
+            or attempt.worker_pool_ref != expected_worker_pool_ref
+            or attempt.queue_ref != expected_queue_ref
+            or not attempt.worker_id.strip()
+            or attempt.decision not in {"selected", "unavailable"}
+            or (
+                attempt.decision == "selected"
+                and (
+                    attempt.config_revision != ROUTE_BINDING_CONFIG_REVISION
+                    or not _valid_nonzero_sha256(attempt.route_config_digest)
+                    or not _valid_nonzero_sha256(attempt.provider_config_digest)
+                )
+            )
+            or (
+                attempt.decision == "unavailable"
+                and any(
+                    value is not None
+                    for value in (
+                        attempt.config_revision,
+                        attempt.route_config_digest,
+                        attempt.provider_config_digest,
+                    )
+                )
+            )
+        ):
+            return None
+        if attempt.decision == "selected":
+            selected_attempt_count += 1
+        else:
+            unavailable_attempt_count += 1
+
+    if phase == "content" and not content_started:
+        return None
+    if selected_attempt_count + unavailable_attempt_count != expected_attempt_count:
+        return None
+    return selected_attempt_count, unavailable_attempt_count
 
 
 def _route_record(route: DataPlaneRoute) -> DataPlaneRouteRecord:
@@ -221,6 +368,175 @@ class SqlAlchemyDataPlaneRepository:
                     )
                 )
 
+    async def record_job_route_attempt(
+        self,
+        *,
+        tenant_id: str,
+        job_id: str,
+        phase: str,
+        attempt_count: int,
+        mode: DataPlaneMode,
+        data_plane_route_id: str,
+        provider_profile_id: str,
+        worker_pool_ref: str,
+        queue_ref: str,
+        worker_id: str,
+        lease_token: str,
+        outcome: DataPlaneAttemptDecision,
+        config_revision: str | None = None,
+        route_config_digest: str | None = None,
+        provider_config_digest: str | None = None,
+    ) -> None:
+        """Persist one worker claim's attempted plane before exposing a client."""
+
+        for value, name, max_length in (
+            (tenant_id, "tenant_id", 64),
+            (job_id, "job_id", 64),
+            (phase, "phase", 16),
+            (data_plane_route_id, "data_plane_route_id", 63),
+            (provider_profile_id, "provider_profile_id", 63),
+            (worker_pool_ref, "worker_pool_ref", 128),
+            (queue_ref, "queue_ref", 128),
+            (worker_id, "worker_id", 128),
+            (lease_token, "lease_token", 64),
+        ):
+            _required_route_attempt_value(value, name, max_length)
+        if (
+            isinstance(attempt_count, bool)
+            or not isinstance(attempt_count, int)
+            or attempt_count <= 0
+        ):
+            raise ValueError("attempt_count must be a positive integer")
+        if mode not in {"shared", "dedicated"}:
+            raise ValueError("mode is invalid")
+        if phase not in {"outline", "content", "export"}:
+            raise ValueError("phase is invalid")
+        if outcome not in {"selected", "unavailable"}:
+            raise ValueError("outcome is invalid")
+        if outcome == "selected":
+            if config_revision != ROUTE_BINDING_CONFIG_REVISION:
+                raise ValueError("config_revision is invalid")
+            for value, name in (
+                (route_config_digest, "route_config_digest"),
+                (provider_config_digest, "provider_config_digest"),
+            ):
+                if not _valid_nonzero_sha256(value):
+                    raise ValueError(f"{name} is invalid")
+        elif any(
+            value is not None
+            for value in (config_revision, route_config_digest, provider_config_digest)
+        ):
+            raise ValueError("unavailable route attempt cannot claim configuration")
+
+        parameters = {
+            "tenant_id": tenant_id,
+            "job_id": job_id,
+            "phase": phase,
+            "attempt_count": attempt_count,
+            "data_plane_mode": mode,
+            "data_plane_route_id": data_plane_route_id,
+            "provider_profile_id": provider_profile_id,
+            "worker_pool_ref": worker_pool_ref,
+            "queue_ref": queue_ref,
+            "worker_id": worker_id,
+            "decision": outcome,
+            "lease_token": lease_token,
+            "config_revision": config_revision,
+            "route_config_digest": route_config_digest,
+            "provider_config_digest": provider_config_digest,
+        }
+        try:
+            async with platform_session() as session:
+                async with session.begin():
+                    recorded = await session.scalar(_RECORD_ROUTE_ATTEMPT, parameters)
+                    if recorded is not True:
+                        raise RuntimeError("database did not confirm route attempt evidence")
+        except DBAPIError as exc:
+            sqlstate = _route_attempt_sqlstate(exc)
+            if sqlstate == "PGR01":
+                raise ValueError("route attempt was rejected by database validation") from None
+            if sqlstate == "PGR02":
+                raise JobLeaseLost("route attempt lease fence no longer matches") from None
+            if sqlstate == "PGR03":
+                raise JobRouteAttemptConflict() from None
+            raise RuntimeError("route attempt evidence write failed") from None
+
+    async def resolve_job_route_audit(
+        self,
+        tenant_id: str,
+        job_id: str,
+        *,
+        phase: str,
+        expected_attempt_count: int,
+        expected_data_plane_mode: DataPlaneMode,
+        expected_route_id: str,
+        expected_provider_profile_id: str,
+        expected_worker_pool_ref: str,
+        expected_queue_ref: str,
+    ) -> JobRouteAttemptSummary | None:
+        """Validate a complete 1..N job-bound route-attempt history."""
+
+        if (
+            isinstance(expected_attempt_count, bool)
+            or not isinstance(expected_attempt_count, int)
+            or expected_attempt_count <= 0
+        ):
+            raise ValueError("expected_attempt_count must be a positive integer")
+        if expected_data_plane_mode not in {"shared", "dedicated"}:
+            return None
+
+        async with platform_session() as session:
+            result = await session.execute(
+                _READ_ROUTE_ATTEMPTS,
+                {
+                    "tenant_id": tenant_id,
+                    "job_id": job_id,
+                    "data_plane_mode": expected_data_plane_mode,
+                    "data_plane_route_id": expected_route_id,
+                    "provider_profile_id": expected_provider_profile_id,
+                    "worker_pool_ref": expected_worker_pool_ref,
+                    "queue_ref": expected_queue_ref,
+                },
+            )
+            attempts = [GenerationRouteAttempt(**dict(row)) for row in result.mappings().all()]
+        counts = _validated_route_attempt_counts(
+            attempts,
+            phase=phase,
+            expected_attempt_count=expected_attempt_count,
+            expected_data_plane_mode=expected_data_plane_mode,
+            expected_route_id=expected_route_id,
+            expected_provider_profile_id=expected_provider_profile_id,
+            expected_worker_pool_ref=expected_worker_pool_ref,
+            expected_queue_ref=expected_queue_ref,
+        )
+        if counts is None:
+            return None
+        selected_attempt_count, unavailable_attempt_count = counts
+        last_attempt = attempts[-1]
+        return JobRouteAttemptSummary(
+            data_plane_mode=expected_data_plane_mode,
+            attempt_count=expected_attempt_count,
+            shared_attempt_count=(
+                expected_attempt_count if expected_data_plane_mode == "shared" else 0
+            ),
+            dedicated_attempt_count=(
+                expected_attempt_count if expected_data_plane_mode == "dedicated" else 0
+            ),
+            selected_attempt_count=selected_attempt_count,
+            unavailable_attempt_count=unavailable_attempt_count,
+            last_attempt_phase=cast(
+                Literal["outline", "content", "export"],
+                last_attempt.phase,
+            ),
+            last_attempt_decision=cast(
+                DataPlaneAttemptDecision,
+                last_attempt.decision,
+            ),
+            final_phase_selected=(
+                last_attempt.phase == phase and last_attempt.decision == "selected"
+            ),
+        )
+
     async def resolve_bound_profile(
         self,
         selection: DataPlaneSelection,
@@ -257,7 +573,12 @@ class SqlAlchemyDataPlaneRepository:
                     ProviderProfile.status == "active",
                 )
             )
-            return _profile_record(profile) if profile is not None else None
+            if profile is None or selection.config_revision != ROUTE_BINDING_CONFIG_REVISION:
+                return None
+            record = _profile_record(profile)
+            if provider_config_digest(record) != selection.provider_config_digest:
+                return None
+            return record
 
     async def resolve_bound_route(
         self,
@@ -289,6 +610,9 @@ class SqlAlchemyDataPlaneRepository:
             or profile.tenant_id != expected_tenant_id
             or profile.owner_key != expected_owner_key
             or profile.status != "active"
+            or selection.config_revision != ROUTE_BINDING_CONFIG_REVISION
+            or route_config_digest(route) != selection.route_config_digest
+            or provider_config_digest(profile) != selection.provider_config_digest
         ):
             return None
         return route
@@ -329,6 +653,9 @@ class SqlAlchemyDataPlaneRepository:
             mode=route.mode,
             worker_pool_ref=route.worker_pool,
             queue_ref=route.queue_name,
+            config_revision=ROUTE_BINDING_CONFIG_REVISION,
+            route_config_digest=route_config_digest(route),
+            provider_config_digest=provider_config_digest(profile),
         )
 
     async def set_health(self, route_id: str, health_status: str) -> bool:

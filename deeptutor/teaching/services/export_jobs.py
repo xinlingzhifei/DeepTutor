@@ -85,6 +85,7 @@ class SqlAlchemyExportJobGateway:
                 request_id=command.job_id,
                 idempotency_key=command.job_id,
                 request_sha256=hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+                data_plane_mode=selection.mode,
                 data_plane_route_id=selection.route_ref,
                 provider_profile_id=selection.provider_profile_ref,
                 worker_pool_ref=selection.worker_pool_ref,

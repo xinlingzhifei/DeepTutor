@@ -47,6 +47,7 @@ def test_model_metadata_uses_only_platform_and_logical_tenant_schemas():
         "platform.audit_log",
         "platform.data_plane_routes",
         "platform.generation_queue",
+        "platform.generation_route_attempts",
         "platform.generation_slots",
         "platform.outbox_messages",
         "platform.provider_profiles",

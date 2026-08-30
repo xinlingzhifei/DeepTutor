@@ -126,6 +126,7 @@ class GenerationJob(TenantBase):
     resource_class_id: Mapped[str | None] = mapped_column(String(64))
     public_request_sha256: Mapped[str | None] = mapped_column(String(64))
     request_sha256: Mapped[str] = mapped_column(String(64))
+    data_plane_mode: Mapped[str | None] = mapped_column(String(16))
     data_plane_route_id: Mapped[str] = mapped_column(String(63))
     provider_profile_id: Mapped[str] = mapped_column(String(63))
     worker_pool_ref: Mapped[str] = mapped_column(String(128))
@@ -193,6 +194,10 @@ class GenerationJob(TenantBase):
         CheckConstraint(
             "visibility IN ('private', 'class', 'tenant')",
             name="visibility",
+        ),
+        CheckConstraint(
+            "data_plane_mode IS NULL OR data_plane_mode IN ('shared', 'dedicated')",
+            name="data_plane_mode",
         ),
         CheckConstraint("priority >= 0", name="priority"),
         CheckConstraint("quota_units > 0", name="quota_units"),

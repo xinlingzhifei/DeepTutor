@@ -120,7 +120,16 @@ class _BatchRepository:
         records = (self.batch,) if self.batch is not None else ()
         return records[offset : offset + limit]
 
-    async def bind_item(self, batch_id, item_id, *, generation_job_id, classroom_draft_id, classroom_asset_id, status):
+    async def bind_item(
+        self,
+        batch_id,
+        item_id,
+        *,
+        generation_job_id,
+        classroom_draft_id,
+        classroom_asset_id,
+        status,
+    ):
         assert self.batch is not None
         self.batch = replace(
             self.batch,
@@ -214,9 +223,7 @@ class _BatchRepository:
                     classroom_draft_id=(
                         None if new_status == "failed" else f"draft-{item_id}-retry"
                     ),
-                    classroom_asset_id=(
-                        None if new_status == "failed" else f"asset-{item_id}"
-                    ),
+                    classroom_asset_id=(None if new_status == "failed" else f"asset-{item_id}"),
                     status=new_status,
                 )
                 if candidate.id == item_id
@@ -270,9 +277,7 @@ class _Classrooms:
         expected_outline_sha256,
     ):
         record = self.records[asset_id]
-        self.confirmation_bindings.append(
-            (asset_id, expected_revision, expected_outline_sha256)
-        )
+        self.confirmation_bindings.append((asset_id, expected_revision, expected_outline_sha256))
         if asset_id in self.edit_on_confirm:
             record.revision += 1
             raise BatchOutlineConflict("outline changed while confirming")
@@ -349,9 +354,7 @@ async def test_batch_gateway_terminalizes_quota_failure_but_preserves_data_plane
     monkeypatch.setattr(
         gateway,
         "_service",
-        lambda **kwargs: _FailingClassroomService(
-            ClassroomPreflightRejected("invalid brief")
-        ),
+        lambda **kwargs: _FailingClassroomService(ClassroomPreflightRejected("invalid brief")),
     )
     with pytest.raises(BatchItemRejected):
         await gateway.create(
@@ -450,8 +453,7 @@ async def test_batch_request_validation_finishes_before_repository_side_effects(
         ),
         (
             tuple(
-                BatchItemInput(f"item-{index}", _request(f"valid-{index}"))
-                for index in range(101)
+                BatchItemInput(f"item-{index}", _request(f"valid-{index}")) for index in range(101)
             ),
             "batch-request-too-many",
         ),
@@ -637,9 +639,7 @@ async def test_bulk_confirmation_only_advances_selected_reviewed_outlines() -> N
     )
 
     assert [item.status for item in updated.items] == ["queued", "awaiting_confirmation"]
-    assert classrooms.confirmation_bindings == [
-        ("asset-a", 3, canonical_outline_sha256(outline))
-    ]
+    assert classrooms.confirmation_bindings == [("asset-a", 3, canonical_outline_sha256(outline))]
 
 
 @pytest.mark.asyncio
@@ -717,9 +717,7 @@ async def test_batch_confirmation_recovers_the_same_review_after_content_queue_f
     )
 
     assert recovered.items[0].status == "queued"
-    assert classrooms.confirmation_bindings == [
-        ("asset-a", reviewed_revision, reviewed_sha256)
-    ]
+    assert classrooms.confirmation_bindings == [("asset-a", reviewed_revision, reviewed_sha256)]
 
 
 @pytest.mark.asyncio
@@ -856,6 +854,7 @@ async def test_production_batch_generation_binds_low_priority_and_batch_id() -> 
     class _Selector:
         async def resolve(self, tenant_id):
             return SimpleNamespace(
+                mode="shared",
                 route_ref="route-a",
                 provider_profile_ref="provider-a",
                 worker_pool_ref="worker-a",
@@ -930,8 +929,7 @@ class _PermissionCheckingClassrooms(_Classrooms):
             class_id="class-a",
         )
         if not any(
-            grant.allows_resource("classroom.edit", resource)
-            for grant in context.permissions
+            grant.allows_resource("classroom.edit", resource) for grant in context.permissions
         ):
             return None
         return await super().get(context, asset_id)

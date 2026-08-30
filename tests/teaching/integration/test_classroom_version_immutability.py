@@ -216,6 +216,7 @@ async def repository_context(generation_database) -> RepositoryContext:
             request_id=f"request-{suffix}",
             idempotency_key=f"idempotency-{suffix}",
             request_sha256=hashlib.sha256(payload.encode()).hexdigest(),
+            data_plane_mode="shared",
             data_plane_route_id=ROUTE_ID,
             provider_profile_id=PROVIDER_ID,
             worker_pool_ref=WORKER_POOL,
@@ -397,6 +398,7 @@ async def prepare_generation(
             request_id=f"request-{job_id}",
             idempotency_key=f"idempotency-{job_id}",
             request_sha256=hashlib.sha256(payload.encode()).hexdigest(),
+            data_plane_mode="shared",
             data_plane_route_id=ROUTE_ID,
             provider_profile_id=PROVIDER_ID,
             worker_pool_ref=WORKER_POOL,
@@ -511,8 +513,8 @@ async def test_plan02_versions_are_backfilled_to_stable_assets(generation_databa
                     )
                 )
                 await session.flush()
-                session.add(
-                    GenerationJob(
+                await session.execute(
+                    insert(GenerationJob.__table__).values(
                         id=job_id,
                         tenant_id=tenant_id,
                         job_kind="generation",

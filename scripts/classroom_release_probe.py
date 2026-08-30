@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import base64
 from collections.abc import Callable, Mapping, Sequence
+import json
 import os
 from pathlib import Path
 import re
@@ -21,6 +23,7 @@ if str(SCRIPTS_ROOT) not in sys.path:
 from classroom_release_probe_contract import (  # noqa: E402
     EVIDENCE_GREP,
     probe_command_descriptor,
+    validate_playwright_persistence_boundary,
 )
 
 TIMEOUT_EXIT = 124
@@ -248,6 +251,31 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _secret_fingerprints(secret: str) -> tuple[bytes, ...]:
+    raw = secret.encode("utf-8")
+    encoded = base64.b64encode(raw)
+    urlsafe = base64.urlsafe_b64encode(raw)
+    escaped = json.dumps(secret, ensure_ascii=True)[1:-1].encode("ascii")
+    fingerprints = {
+        raw,
+        encoded,
+        encoded.rstrip(b"="),
+        urlsafe,
+        urlsafe.rstrip(b"="),
+        raw.hex().encode("ascii"),
+        escaped,
+    }
+    return tuple(sorted((item for item in fingerprints if item), key=len, reverse=True))
+
+
+def _validate_persistable_playwright_output(raw: bytes) -> None:
+    try:
+        document = json.loads(raw)
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Playwright JSON reporter output is invalid") from exc
+    validate_playwright_persistence_boundary(document)
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -277,6 +305,17 @@ def main(
         raise ValueError("Playwright stdout is unavailable")
     if not isinstance(completed.returncode, int) or isinstance(completed.returncode, bool):
         raise ValueError("Playwright native exit is invalid")
+    if any(
+        fingerprint in completed.stdout
+        for fingerprint in _secret_fingerprints(required["YFEISTAI_LIVE_FIXTURE_TOKEN"])
+    ):
+        raise ValueError("Playwright output contains live secret")
+    if completed.returncode != 0:
+        return completed.returncode
+    try:
+        _validate_persistable_playwright_output(completed.stdout)
+    except ValueError as exc:
+        raise ValueError("Playwright output contains unsafe data carrier") from exc
     _atomic_write(Path(required["YFEISTAI_EVIDENCE_REPORT"]), completed.stdout)
     return completed.returncode
 

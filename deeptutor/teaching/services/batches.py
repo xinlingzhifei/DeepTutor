@@ -285,14 +285,13 @@ class BatchJobGateway(Protocol):
         job_id: str,
     ) -> object: ...
 
+
 _ITEM_TRANSITIONS = {
     "queued": frozenset(
         {"queued", "running", "awaiting_confirmation", "succeeded", "failed", "canceled"}
     ),
     "running": frozenset({"running", "awaiting_confirmation", "succeeded", "failed", "canceled"}),
-    "awaiting_confirmation": frozenset(
-        {"awaiting_confirmation", "queued", "failed", "canceled"}
-    ),
+    "awaiting_confirmation": frozenset({"awaiting_confirmation", "queued", "failed", "canceled"}),
     "succeeded": frozenset({"succeeded"}),
     "failed": frozenset({"failed"}),
     "canceled": frozenset({"canceled"}),
@@ -429,10 +428,7 @@ class SqlAlchemyBatchRepository:
         batch: BatchJob,
     ) -> BatchJobRecord:
         rows = await self._item_rows(session, batch.id)
-        items = tuple(
-            self._item_record(batch.id, row[0], row[1], row[2], row[3])
-            for row in rows
-        )
+        items = tuple(self._item_record(batch.id, row[0], row[1], row[2], row[3]) for row in rows)
         if len(items) != batch.item_count:
             raise BatchPersistenceError("stored batch item count is invalid")
         return BatchJobRecord(
@@ -589,11 +585,7 @@ class SqlAlchemyBatchRepository:
         actor_id: str,
         item_ids: tuple[str, ...],
     ) -> BatchJobRecord:
-        if (
-            _BATCH_ID_PATTERN.fullmatch(batch_id) is None
-            or not actor_id
-            or len(actor_id) > 128
-        ):
+        if _BATCH_ID_PATTERN.fullmatch(batch_id) is None or not actor_id or len(actor_id) > 128:
             raise ValueError("batch identity is invalid")
         expected_ids = tuple(
             self._physical_item_id(batch_id, ordinal, item_id)
@@ -621,14 +613,10 @@ class SqlAlchemyBatchRepository:
                         )
                     )
                     if len(matching_batches) > 1:
-                        raise BatchPersistenceError(
-                            "stored batch idempotency state is invalid"
-                        )
+                        raise BatchPersistenceError("stored batch idempotency state is invalid")
                     batch = matching_batches[0] if matching_batches else None
                     if batch is not None and batch.id != batch_id:
-                        raise BatchIdempotencyConflict(
-                            "batch idempotency key conflicts"
-                        )
+                        raise BatchIdempotencyConflict("batch idempotency key conflicts")
                     if batch is None:
                         batch = BatchJob(
                             id=batch_id,
@@ -666,9 +654,7 @@ class SqlAlchemyBatchRepository:
                             )
                         )
                         if batch.actor_id != actor_id or stored_ids != expected_ids:
-                            raise BatchIdempotencyConflict(
-                                "batch idempotency key conflicts"
-                            )
+                            raise BatchIdempotencyConflict("batch idempotency key conflicts")
                     return await self._record(session, batch)
         except IntegrityError as exc:
             raise BatchPersistenceError("batch persistence conflicts") from exc
@@ -702,13 +688,9 @@ class SqlAlchemyBatchRepository:
             return ()
         allowed_conditions = []
         if scope.course_ids:
-            allowed_conditions.append(
-                GenerationJob.resource_course_id.in_(scope.course_ids)
-            )
+            allowed_conditions.append(GenerationJob.resource_course_id.in_(scope.course_ids))
         if scope.class_ids:
-            allowed_conditions.append(
-                GenerationJob.resource_class_id.in_(scope.class_ids)
-            )
+            allowed_conditions.append(GenerationJob.resource_class_id.in_(scope.class_ids))
         unauthorized_conditions = [
             GenerationJob.id.is_(None),
             GenerationJob.resource_course_id.is_(None),
@@ -961,13 +943,8 @@ class SqlAlchemyBatchRepository:
                             .with_for_update()
                         )
                         if draft is None or draft.generation_job_id != new_job_id:
-                            raise BatchPersistenceError(
-                                "batch retry draft is unavailable"
-                            )
-                    elif (
-                        job.status != "failed"
-                        or job.error_code != "batch_item_rejected"
-                    ):
+                            raise BatchPersistenceError("batch retry draft is unavailable")
+                    elif job.status != "failed" or job.error_code != "batch_item_rejected":
                         raise BatchPersistenceError("batch retry draft is unavailable")
                     if item.status != target_status:
                         item_changed = self._transition_item(item, target_status)
@@ -1004,10 +981,7 @@ class SqlAlchemyBatchRepository:
                     }:
                         raise BatchPersistenceError("batch retry draft is unavailable")
                     draft.generation_job_id = new_job_id
-                elif (
-                    job.status != "failed"
-                    or job.error_code != "batch_item_rejected"
-                ):
+                elif job.status != "failed" or job.error_code != "batch_item_rejected":
                     raise BatchPersistenceError("batch retry draft is unavailable")
                 item.generation_job_id = new_job_id
                 item.classroom_draft_id = job.classroom_draft_id
@@ -1145,6 +1119,7 @@ def _generation_job_request(details: GenerationJobDetails) -> GenerationJobReque
         request_id=details.request_id,
         idempotency_key=details.idempotency_key,
         request_sha256=details.request_sha256,
+        data_plane_mode=details.data_plane_mode,
         data_plane_route_id=details.data_plane_route_id,
         provider_profile_id=details.provider_profile_id,
         worker_pool_ref=details.worker_pool_ref,
@@ -1255,6 +1230,7 @@ class SqlAlchemyBatchJobGateway:
             request_id=f"request-{digest[:48]}",
             idempotency_key=f"batch-rejected-{digest}",
             request_sha256=request_sha256,
+            data_plane_mode=None,
             data_plane_route_id="batch-rejected",
             provider_profile_id="batch-rejected",
             worker_pool_ref="batch-rejected",
@@ -1298,7 +1274,8 @@ class SqlAlchemyBatchJobGateway:
             raise BatchPersistenceError("stored rejected batch input is invalid") from None
         if (
             not isinstance(envelope, Mapping)
-            or set(envelope) != {
+            or set(envelope)
+            != {
                 "schemaVersion",
                 "kind",
                 "tenantId",
@@ -1310,8 +1287,7 @@ class SqlAlchemyBatchJobGateway:
             or envelope["kind"] != "batch_classroom_rejected"
             or envelope["tenantId"] != context.tenant_id
             or envelope["batchId"] != details.batch_id
-            or canonical_json_bytes(envelope).decode("utf-8")
-            != details.request_payload
+            or canonical_json_bytes(envelope).decode("utf-8") != details.request_payload
             or not hmac.compare_digest(
                 hashlib.sha256(details.request_payload.encode()).hexdigest(),
                 details.request_sha256,
@@ -1345,8 +1321,7 @@ class SqlAlchemyBatchJobGateway:
 def _normalized_classroom_request(request: object) -> dict[str, object]:
     source_ref = getattr(request, "source_ref", None)
     if source_ref is not None and (
-        not isinstance(source_ref, str)
-        or _SAFE_SOURCE_REF_PATTERN.fullmatch(source_ref) is None
+        not isinstance(source_ref, str) or _SAFE_SOURCE_REF_PATTERN.fullmatch(source_ref) is None
     ):
         raise ValueError("batch source reference is invalid")
     points = []
@@ -1445,12 +1420,8 @@ def _batch_id(
             }
             for item in items
         ]
-        key_digest = hashlib.sha256(
-            f"{context.tenant_id}\0{idempotency_key}".encode()
-        ).hexdigest()
-        request_digest = hashlib.sha256(
-            canonical_json_bytes(normalized_items)
-        ).hexdigest()
+        key_digest = hashlib.sha256(f"{context.tenant_id}\0{idempotency_key}".encode()).hexdigest()
+        request_digest = hashlib.sha256(canonical_json_bytes(normalized_items)).hexdigest()
     except (AttributeError, TypeError, ValueError):
         raise InvalidBatchRequest("batch item request is invalid") from None
     return f"batch-{key_digest[:20]}-{request_digest[:32]}"
@@ -1482,10 +1453,7 @@ def _allows_create(context: TenantContext, request: object) -> bool:
         course_id=str(getattr(request, "course_id")),
         class_id=str(getattr(request, "class_id")),
     )
-    return any(
-        grant.allows_resource("classroom.create", resource)
-        for grant in context.permissions
-    )
+    return any(grant.allows_resource("classroom.create", resource) for grant in context.permissions)
 
 
 class BatchService:
@@ -1546,7 +1514,9 @@ class BatchService:
                 job_id = getattr(classroom, "job_id", None)
                 draft_id = getattr(classroom, "draft_id", None)
                 asset_id = getattr(classroom, "asset_id", None)
-                if not all(isinstance(value, str) and value for value in (job_id, draft_id, asset_id)):
+                if not all(
+                    isinstance(value, str) and value for value in (job_id, draft_id, asset_id)
+                ):
                     raise InvalidBatchState("batch classroom binding is unavailable")
                 await self._repository.bind_item(
                     batch_id,
@@ -1611,10 +1581,7 @@ class BatchService:
         if not batch.items:
             return False
         for item in batch.items:
-            if (
-                item.resource_course_id is None
-                or item.resource_class_id is None
-            ):
+            if item.resource_course_id is None or item.resource_class_id is None:
                 return False
             resource = ResourceScope(
                 tenant_id=context.tenant_id,
@@ -1622,8 +1589,7 @@ class BatchService:
                 class_id=item.resource_class_id,
             )
             if not any(
-                grant.allows_resource("classroom.edit", resource)
-                for grant in context.permissions
+                grant.allows_resource("classroom.edit", resource) for grant in context.permissions
             ):
                 return False
         return True
@@ -1727,9 +1693,7 @@ class BatchService:
         confirmations: tuple[tuple[str, int, str], ...],
     ) -> BatchJobRecord:
         if not confirmations:
-            raise InvalidBatchRequest(
-                "at least one outline confirmation is required"
-            )
+            raise InvalidBatchRequest("at least one outline confirmation is required")
         if len({item_id for item_id, _, _ in confirmations}) != len(confirmations):
             raise InvalidBatchRequest("outline confirmations must be unique")
         validated = []

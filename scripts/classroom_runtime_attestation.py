@@ -9,12 +9,14 @@ from datetime import datetime
 import errno
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
 import stat
 import subprocess
 import sys
+import time
 import uuid
 
 import yaml
@@ -24,11 +26,14 @@ SCRIPTS_ROOT = Path(__file__).resolve().parent
 if str(SCRIPTS_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_ROOT))
 
+from docker_compose import platform_compose_topology_arguments  # noqa: E402
 from render_platform_compose import load_image_lock  # noqa: E402
 
 PROJECT = "yfeistai-platform"
 SCHEMA_VERSION = 1
-COMMAND_TIMEOUT_SECONDS = 30
+COMMAND_TIMEOUT_SECONDS = 300
+SINGLE_COMMAND_TIMEOUT_SECONDS = 30
+DOCKER_CONTEXT = "default"
 DOCKER_CONFIG_LOGICAL = "<isolated-docker-config>"
 WINDOWS_DOCKER_PATH = Path("C:/Program Files/Docker/Docker/resources/bin/docker.exe")
 POSIX_DOCKER_PATHS = (Path("/usr/local/bin/docker"), Path("/usr/bin/docker"))
@@ -37,7 +42,19 @@ DOCKER_LOGICAL_PREFIX = (
     "--config",
     DOCKER_CONFIG_LOGICAL,
     "--context",
-    "default",
+    DOCKER_CONTEXT,
+)
+DOCKER_CONTEXT_ARGUMENTS = (
+    "context",
+    "inspect",
+    DOCKER_CONTEXT,
+    "--format",
+    "{{json .Endpoints.docker.Host}}",
+)
+DOCKER_INFO_ARGUMENTS = (
+    "info",
+    "--format",
+    '{"serverId":{{json .ID}},"osType":{{json .OSType}}}',
 )
 PS_FORMAT = "{{json .ID}}"
 CONTAINER_INSPECT_FORMAT = (
@@ -45,11 +62,25 @@ CONTAINER_INSPECT_FORMAT = (
     '"configImage":{{json .Config.Image}},'
     '"project":{{json (index .Config.Labels "com.docker.compose.project")}},'
     '"service":{{json (index .Config.Labels "com.docker.compose.service")}},'
+    '"configHash":{{json (index .Config.Labels "com.docker.compose.config-hash")}},'
+    '"privileged":{{json .HostConfig.Privileged}},"mounts":{{json .Mounts}},'
+    '"capAdd":{{json .HostConfig.CapAdd}},"capDrop":{{json .HostConfig.CapDrop}},'
+    '"command":{{json .Config.Cmd}},"entrypoint":{{json .Config.Entrypoint}},'
+    '"user":{{json .Config.User}},"environment":{{json .Config.Env}},'
     '"state":{{json .State.Status}},"running":{{json .State.Running}},'
     '"restarting":{{json .State.Restarting}},"exitCode":{{json .State.ExitCode}},'
     '"health":{{if .State.Health}}{{json .State.Health.Status}}{{else}}"none"{{end}}}'
 )
-IMAGE_INSPECT_FORMAT = '{"imageId":{{json .Id}},"repoDigests":{{json .RepoDigests}}}'
+IMAGE_INSPECT_FORMAT = (
+    '{"imageId":{{json .Id}},"repoDigests":{{json .RepoDigests}},'
+    '"command":{{json .Config.Cmd}},"entrypoint":{{json .Config.Entrypoint}},'
+    '"user":{{json .Config.User}},"environment":{{json .Config.Env}},'
+    '"volumes":{{json .Config.Volumes}}}'
+)
+_DEPLOYMENT_ROOT_LOGICAL = "<deployment-root>"
+_CANDIDATE_ROOT_LOGICAL = "<candidate-root>"
+_COMPOSE_CONFIG_TAIL = ("config", "--format", "json")
+_COMPOSE_HASH_TAIL = ("config", "--hash", "*")
 PS_ARGUMENTS = (
     "ps",
     "-a",
@@ -60,6 +91,8 @@ PS_ARGUMENTS = (
     PS_FORMAT,
 )
 _OS_ENVIRONMENT = frozenset(("SYSTEMROOT", "WINDIR", "TEMP", "TMP", "LANG", "LC_ALL"))
+_DOCKER_HOST_IDENTITY_ENV = "YFEISTAI_GATEWAY_DOCKER_HOST_IDENTITY_SHA256"
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _RELEASE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _OBSERVED_AT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
 _REQUIRED_HEALTHY_SERVICES = frozenset(
@@ -238,6 +271,27 @@ def _child_environment(environ: Mapping[str, str]) -> dict[str, str]:
     return {name: by_upper[name] for name in _OS_ENVIRONMENT if name in by_upper and by_upper[name]}
 
 
+def _docker_host_identity_sha256(value: object) -> str:
+    if not isinstance(value, str) or _SHA256.fullmatch(value) is None or value == "0" * 64:
+        raise ValueError("Docker host identity is unavailable or invalid")
+    return value
+
+
+def _expected_docker_host_identity_sha256(
+    value: object,
+    environ: Mapping[str, str],
+) -> str | None:
+    by_upper = {name.upper(): item for name, item in environ.items()}
+    environment_value = by_upper.get(_DOCKER_HOST_IDENTITY_ENV)
+    supplied = [item for item in (value, environment_value) if item is not None]
+    if not supplied:
+        return None
+    validated = [_docker_host_identity_sha256(item) for item in supplied]
+    if len(set(validated)) != 1:
+        raise ValueError("Docker host identity inputs do not match")
+    return validated[0]
+
+
 def _run_docker(
     arguments: list[str],
     *,
@@ -271,7 +325,7 @@ def _load_candidate_token(
     token: tuple[bytes, bytes],
     *,
     expected_candidate: Mapping[str, object] | None = None,
-) -> tuple[dict[str, object], dict[str, dict[str, str]]]:
+) -> tuple[dict[str, object], dict[str, dict[str, object]]]:
     try:
         lock = load_image_lock(
             _ImmutableTextFile(token[0]),  # type: ignore[arg-type]
@@ -295,7 +349,7 @@ def _load_candidate_token(
     locked_references = {
         record["reference"] for record in images.values() if isinstance(record, dict)
     }
-    expected: dict[str, dict[str, str]] = {}
+    expected: dict[str, dict[str, object]] = {}
     for service_name, raw_service in services.items():
         if not isinstance(service_name, str) or not isinstance(raw_service, dict):
             raise ValueError("candidate runtime Compose services are invalid")
@@ -317,7 +371,7 @@ def _load_candidate_token(
     return json.loads(json.dumps(candidate)), expected
 
 
-def _load_candidate(candidate_root: Path) -> tuple[dict[str, object], dict[str, dict[str, str]]]:
+def _load_candidate(candidate_root: Path) -> tuple[dict[str, object], dict[str, dict[str, object]]]:
     root = Path(os.path.abspath(candidate_root))
     try:
         with _CandidateContractLease.open(root) as lease:
@@ -353,6 +407,227 @@ def _ps_ids(body: bytes) -> list[str]:
     return sorted(ids)
 
 
+def _compose_hashes(body: bytes) -> dict[str, str]:
+    hashes: dict[str, str] = {}
+    try:
+        for line in body.decode("utf-8").splitlines():
+            parts = line.split()
+            if len(parts) != 2:
+                raise ValueError
+            service, config_hash = parts
+            if not service or service in hashes or _SHA256.fullmatch(config_hash) is None:
+                raise ValueError
+            hashes[service] = config_hash
+    except (UnicodeError, ValueError) as exc:
+        raise ValueError("Docker Compose config hash output is invalid") from exc
+    if not hashes:
+        raise ValueError("Docker Compose config hash output is invalid")
+    return hashes
+
+
+def _runtime_compose_arguments(
+    *,
+    deployment_root: Path,
+    candidate_root: Path,
+    tail: Sequence[str],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    actual = (
+        "compose",
+        *platform_compose_topology_arguments(
+            deployment_root=deployment_root,
+            candidate_root=candidate_root,
+            env_file=deployment_root / "data" / "user" / "settings" / "docker.env",
+        ),
+        *tail,
+    )
+    logical = (
+        "compose",
+        "--env-file",
+        f"{_DEPLOYMENT_ROOT_LOGICAL}/data/user/settings/docker.env",
+        "--project-directory",
+        _DEPLOYMENT_ROOT_LOGICAL,
+        "--project-name",
+        PROJECT,
+        "-f",
+        f"{_CANDIDATE_ROOT_LOGICAL}/docker-compose.yml",
+        "-f",
+        f"{_CANDIDATE_ROOT_LOGICAL}/docker-compose.platform.yml",
+        *tail,
+    )
+    return actual, logical
+
+
+def _canonical_json_bytes(document: object) -> bytes:
+    return json.dumps(
+        document,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+
+
+def _value_sha256(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _docker_environment_hashes(raw: object, *, label: str) -> dict[str, str]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
+        raise ValueError(f"Docker {label} environment is invalid")
+    values: dict[str, str] = {}
+    for item in raw:
+        name, separator, value = item.partition("=")
+        if not separator or not name or name in values:
+            raise ValueError(f"Docker {label} environment is invalid")
+        values[name] = _value_sha256(value)
+    return dict(sorted(values.items()))
+
+
+def _compose_environment_hashes(raw: object) -> dict[str, str | None]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("Docker Compose service environment is invalid")
+    values: dict[str, str | None] = {}
+    for name, value in raw.items():
+        if (
+            not isinstance(name, str)
+            or not name
+            or (value is not None and not isinstance(value, str))
+        ):
+            raise ValueError("Docker Compose service environment is invalid")
+        values[name] = None if value is None else _value_sha256(value)
+    return dict(sorted(values.items()))
+
+
+def _environment_hash_digest(raw: object, *, label: str) -> str:
+    if not isinstance(raw, dict) or not all(
+        isinstance(name, str)
+        and name
+        and isinstance(value, str)
+        and _SHA256.fullmatch(value) is not None
+        for name, value in raw.items()
+    ):
+        raise ValueError(f"Docker {label} environment hashes are invalid")
+    return hashlib.sha256(_canonical_json_bytes(dict(sorted(raw.items())))).hexdigest()
+
+
+def _redacted_inspect_output(body: bytes, *, label: str) -> bytes:
+    document = _json_object(body, label=label)
+    if "environment" not in document or "environmentHashes" in document:
+        raise ValueError(f"Docker {label} output is invalid")
+    environment = _docker_environment_hashes(document.pop("environment"), label=label)
+    document["environmentHashes"] = environment
+    return _canonical_json_bytes(document)
+
+
+def _compose_security_projection(body: bytes) -> bytes:
+    document = _json_object(body, label="Compose config")
+    raw_services = document.get("services")
+    if not isinstance(raw_services, dict) or not raw_services:
+        raise ValueError("Docker Compose config services are invalid")
+    services: dict[str, dict[str, object]] = {}
+    for name, raw_service in raw_services.items():
+        if not isinstance(name, str) or not name or not isinstance(raw_service, dict):
+            raise ValueError("Docker Compose config services are invalid")
+        services[name] = {
+            "image": raw_service.get("image"),
+            "restart": raw_service.get("restart", "no"),
+            "profiles": raw_service.get("profiles") or [],
+            "privileged": raw_service.get("privileged", False),
+            "capAdd": raw_service.get("cap_add") or [],
+            "capDrop": raw_service.get("cap_drop") or [],
+            "command": raw_service.get("command"),
+            "entrypoint": raw_service.get("entrypoint"),
+            "user": raw_service.get("user"),
+            "environmentHashes": _compose_environment_hashes(raw_service.get("environment")),
+            "volumes": raw_service.get("volumes") or [],
+            "secrets": raw_service.get("secrets") or [],
+            "configs": raw_service.get("configs") or [],
+        }
+    projection: dict[str, object] = {"services": services}
+    for name in ("volumes", "secrets", "configs"):
+        raw = document.get(name) or {}
+        if not isinstance(raw, dict):
+            raise ValueError(f"Docker Compose config {name} are invalid")
+        projection[name] = raw
+    return _canonical_json_bytes(projection)
+
+
+def _merged_expected_services(
+    compose_security: Mapping[str, object],
+    candidate_services: Mapping[str, Mapping[str, object]],
+) -> dict[str, dict[str, object]]:
+    raw_services = compose_security.get("services")
+    if not isinstance(raw_services, dict):
+        raise ValueError("Docker Compose config services are invalid")
+    active: dict[str, dict[str, object]] = {}
+    for name, raw in raw_services.items():
+        if not isinstance(name, str) or not name or not isinstance(raw, dict):
+            raise ValueError("Docker Compose config services are invalid")
+        profiles = raw.get("profiles")
+        if not isinstance(profiles, list) or not all(
+            isinstance(profile, str) and profile for profile in profiles
+        ):
+            raise ValueError("Docker Compose service profiles are invalid")
+        if profiles:
+            continue
+        image = raw.get("image")
+        restart = raw.get("restart")
+        if not isinstance(image, str) or not image or not isinstance(restart, str) or not restart:
+            raise ValueError("Docker Compose active service is invalid")
+        active[name] = {"image": image, "restart": restart}
+    if set(active) != set(candidate_services):
+        raise ValueError("merged Docker Compose active services do not match candidate")
+    for name, expected in candidate_services.items():
+        if active[name]["image"] != expected.get("image"):
+            raise ValueError("merged Docker Compose images do not match candidate")
+    return active
+
+
+def _string_list(raw: object, *, label: str) -> list[str] | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, list) or not all(isinstance(value, str) for value in raw):
+        raise ValueError(f"Docker container inspect {label} is invalid")
+    return list(raw)
+
+
+def _mount_facts(raw: object) -> list[dict[str, object]]:
+    if not isinstance(raw, list):
+        raise ValueError("Docker container inspect mounts are invalid")
+    mounts: list[dict[str, object]] = []
+    for mount in raw:
+        if not isinstance(mount, dict):
+            raise ValueError("Docker container inspect mounts are invalid")
+        mount_type = mount.get("Type")
+        source = mount.get("Source")
+        destination = mount.get("Destination")
+        read_write = mount.get("RW")
+        propagation = mount.get("Propagation", "")
+        if (
+            mount_type not in {"bind", "volume", "tmpfs"}
+            or not isinstance(source, str)
+            or not isinstance(destination, str)
+            or not destination.startswith("/")
+            or not isinstance(read_write, bool)
+            or not isinstance(propagation, str)
+        ):
+            raise ValueError("Docker container inspect mounts are invalid")
+        mounts.append(
+            {
+                "type": mount_type,
+                "source": source,
+                "destination": destination,
+                "readOnly": not read_write,
+                "propagation": propagation,
+            }
+        )
+    return sorted(mounts, key=lambda item: (str(item["destination"]), str(item["source"])))
+
+
 def _container_fact(raw: Mapping[str, object]) -> dict[str, object]:
     if set(raw) != {
         "containerId",
@@ -360,6 +635,15 @@ def _container_fact(raw: Mapping[str, object]) -> dict[str, object]:
         "configImage",
         "project",
         "service",
+        "configHash",
+        "privileged",
+        "mounts",
+        "capAdd",
+        "capDrop",
+        "command",
+        "entrypoint",
+        "user",
+        "environmentHashes",
         "state",
         "running",
         "restarting",
@@ -377,6 +661,9 @@ def _container_fact(raw: Mapping[str, object]) -> dict[str, object]:
     restarting = raw.get("restarting")
     exit_code = raw.get("exitCode")
     health = raw.get("health")
+    config_hash = raw.get("configHash")
+    privileged = raw.get("privileged")
+    user = raw.get("user")
     if (
         not all(
             isinstance(value, str) and value
@@ -386,8 +673,25 @@ def _container_fact(raw: Mapping[str, object]) -> dict[str, object]:
         or not isinstance(restarting, bool)
         or not isinstance(exit_code, int)
         or isinstance(exit_code, bool)
+        or not isinstance(config_hash, str)
+        or _SHA256.fullmatch(config_hash) is None
+        or not isinstance(privileged, bool)
+        or not isinstance(user, str)
     ):
         raise ValueError("Docker container inspect output is invalid")
+    security = {
+        "configHash": config_hash,
+        "privileged": privileged,
+        "mounts": _mount_facts(raw.get("mounts")),
+        "capAdd": _capabilities(raw.get("capAdd"), label="container capAdd"),
+        "capDrop": _capabilities(raw.get("capDrop"), label="container capDrop"),
+        "command": _string_list(raw.get("command"), label="command"),
+        "entrypoint": _string_list(raw.get("entrypoint"), label="entrypoint"),
+        "user": user,
+        "environmentSha256": _environment_hash_digest(
+            raw.get("environmentHashes"), label="container inspect"
+        ),
+    }
     return {
         "containerId": container_id,
         "service": service,
@@ -399,6 +703,7 @@ def _container_fact(raw: Mapping[str, object]) -> dict[str, object]:
         "restarting": restarting,
         "health": health,
         "exitCode": exit_code,
+        "security": security,
     }
 
 
@@ -411,6 +716,13 @@ def _snapshot(facts: Sequence[Mapping[str, object]]) -> list[dict[str, object]]:
             "state": fact["state"],
             "health": fact["health"],
             "exitCode": fact["exitCode"],
+            "securitySha256": hashlib.sha256(
+                json.dumps(
+                    fact["security"],
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
         }
         for fact in sorted(facts, key=lambda item: str(item["service"]))
     ]
@@ -426,11 +738,243 @@ def _normalized_repo_digest(reference: str) -> str:
     return f"{repository}@{digest}"
 
 
+def _capabilities(raw: object, *, label: str) -> list[str]:
+    values = _string_list(raw, label=label) or []
+    normalized: list[str] = []
+    for value in values:
+        capability = value.upper().removeprefix("CAP_")
+        if not capability or not re.fullmatch(r"[A-Z0-9_]+", capability):
+            raise ValueError(f"Docker {label} capabilities are invalid")
+        normalized.append(capability)
+    if len(normalized) != len(set(normalized)):
+        raise ValueError(f"Docker {label} capabilities are invalid")
+    return sorted(normalized)
+
+
+def _compose_mounts(
+    service: Mapping[str, object],
+    compose_security: Mapping[str, object],
+    *,
+    image: Mapping[str, object],
+) -> list[dict[str, object]]:
+    raw_volumes = service.get("volumes")
+    if not isinstance(raw_volumes, list):
+        raise ValueError("Docker Compose service volumes are invalid")
+    top_volumes = compose_security.get("volumes")
+    top_secrets = compose_security.get("secrets")
+    top_configs = compose_security.get("configs")
+    if not all(isinstance(item, dict) for item in (top_volumes, top_secrets, top_configs)):
+        raise ValueError("Docker Compose mount declarations are invalid")
+    mounts: list[dict[str, object]] = []
+    for raw in raw_volumes:
+        if not isinstance(raw, dict):
+            raise ValueError("Docker Compose service volumes are invalid")
+        mount_type = raw.get("type")
+        source = raw.get("source", "")
+        target = raw.get("target")
+        read_only = raw.get("read_only", False)
+        if (
+            mount_type not in {"bind", "volume", "tmpfs"}
+            or not isinstance(source, str)
+            or not isinstance(target, str)
+            or not target.startswith("/")
+            or not isinstance(read_only, bool)
+        ):
+            raise ValueError("Docker Compose service volumes are invalid")
+        propagation = ""
+        expected_source: str | None = source
+        if mount_type == "bind":
+            bind = raw.get("bind") or {}
+            if not isinstance(bind, dict):
+                raise ValueError("Docker Compose bind mount is invalid")
+            propagation = bind.get("propagation", "rprivate")
+            if not isinstance(propagation, str):
+                raise ValueError("Docker Compose bind mount is invalid")
+        elif mount_type == "volume":
+            declaration = top_volumes.get(source)
+            if declaration is None:
+                expected_source = source
+            elif isinstance(declaration, dict):
+                default_name = (
+                    source if declaration.get("external") is True else f"{PROJECT}_{source}"
+                )
+                name = declaration.get("name", default_name)
+                if not isinstance(name, str) or not name:
+                    raise ValueError("Docker Compose named volume is invalid")
+                expected_source = name
+            else:
+                raise ValueError("Docker Compose named volume is invalid")
+        else:
+            expected_source = ""
+        mounts.append(
+            {
+                "type": mount_type,
+                "source": expected_source,
+                "destination": target,
+                "readOnly": read_only,
+                "propagation": propagation,
+            }
+        )
+
+    for key, default_prefix, declarations in (
+        ("secrets", "/run/secrets", top_secrets),
+        ("configs", "/", top_configs),
+    ):
+        raw_items = service.get(key)
+        if not isinstance(raw_items, list):
+            raise ValueError(f"Docker Compose service {key} are invalid")
+        for raw in raw_items:
+            if isinstance(raw, str):
+                source = raw
+                target = f"{default_prefix.rstrip('/')}/{raw}"
+            elif isinstance(raw, dict):
+                source = raw.get("source")
+                configured_target = raw.get("target")
+                if configured_target is None:
+                    target = f"{default_prefix.rstrip('/')}/{source}"
+                else:
+                    if not isinstance(configured_target, str) or not configured_target:
+                        raise ValueError(f"Docker Compose service {key} are invalid")
+                    target = (
+                        configured_target
+                        if configured_target.startswith("/")
+                        else f"{default_prefix.rstrip('/')}/{configured_target}"
+                    )
+            else:
+                raise ValueError(f"Docker Compose service {key} are invalid")
+            declaration = declarations.get(source) if isinstance(source, str) else None
+            file_path = declaration.get("file") if isinstance(declaration, dict) else None
+            if (
+                not isinstance(source, str)
+                or not source
+                or not isinstance(target, str)
+                or not target.startswith("/")
+                or not isinstance(file_path, str)
+                or not file_path
+            ):
+                raise ValueError(f"Docker Compose service {key} are invalid")
+            mounts.append(
+                {
+                    "type": "bind",
+                    "source": file_path,
+                    "destination": target,
+                    "readOnly": True,
+                    "propagation": "rprivate",
+                }
+            )
+
+    image_volumes = image.get("volumes")
+    if image_volumes is not None and not isinstance(image_volumes, dict):
+        raise ValueError("Docker image declared volumes are invalid")
+    occupied = {str(item["destination"]) for item in mounts}
+    for target in sorted(image_volumes or {}):
+        if not isinstance(target, str) or not target.startswith("/"):
+            raise ValueError("Docker image declared volumes are invalid")
+        if target not in occupied:
+            raise ValueError("Docker image declared volumes must be explicitly bound by Compose")
+    destinations = [str(item["destination"]) for item in mounts]
+    if len(destinations) != len(set(destinations)):
+        raise ValueError("Docker Compose mount destinations are duplicated")
+    return sorted(mounts, key=lambda item: str(item["destination"]))
+
+
+def _expected_security(
+    service_name: str,
+    *,
+    compose_security: Mapping[str, object],
+    image: Mapping[str, object],
+    compose_hash: str,
+) -> dict[str, object]:
+    services = compose_security.get("services")
+    service = services.get(service_name) if isinstance(services, dict) else None
+    if not isinstance(service, dict) or service.get("image") != image.get("reference"):
+        raise ValueError("Docker Compose security projection is invalid")
+    privileged = service.get("privileged")
+    user = service.get("user")
+    if not isinstance(privileged, bool) or (user is not None and not isinstance(user, str)):
+        raise ValueError("Docker Compose security projection is invalid")
+    command = service.get("command")
+    entrypoint = service.get("entrypoint")
+    if command is not None:
+        command = _string_list(command, label="Compose command")
+    else:
+        command = image.get("command")
+    if entrypoint is not None:
+        entrypoint = _string_list(entrypoint, label="Compose entrypoint")
+    else:
+        entrypoint = image.get("entrypoint")
+    expected_user = image.get("user") if user is None else user
+    if not isinstance(expected_user, str):
+        raise ValueError("Docker Compose security projection is invalid")
+    image_environment = image.get("environmentHashes")
+    compose_environment = service.get("environmentHashes")
+    if not isinstance(image_environment, dict) or not isinstance(compose_environment, dict):
+        raise ValueError("Docker Compose environment projection is invalid")
+    environment = dict(image_environment)
+    for name, value in compose_environment.items():
+        if (
+            not isinstance(name, str)
+            or not name
+            or (
+                value is not None
+                and (not isinstance(value, str) or _SHA256.fullmatch(value) is None)
+            )
+        ):
+            raise ValueError("Docker Compose environment projection is invalid")
+        if value is None:
+            environment.pop(name, None)
+        else:
+            environment[name] = value
+    return {
+        "configHash": compose_hash,
+        "privileged": privileged,
+        "mounts": _compose_mounts(service, compose_security, image=image),
+        "capAdd": _capabilities(service.get("capAdd"), label="Compose capAdd"),
+        "capDrop": _capabilities(service.get("capDrop"), label="Compose capDrop"),
+        "command": command,
+        "entrypoint": entrypoint,
+        "user": expected_user,
+        "environmentSha256": _environment_hash_digest(environment, label="expected container"),
+    }
+
+
+def _security_matches(observed: Mapping[str, object], expected: Mapping[str, object]) -> bool:
+    if set(observed) != set(expected):
+        return False
+    observed_mounts = observed.get("mounts")
+    expected_mounts = expected.get("mounts")
+    if not isinstance(observed_mounts, list) or not isinstance(expected_mounts, list):
+        return False
+    observed_without_mounts = {key: value for key, value in observed.items() if key != "mounts"}
+    expected_without_mounts = {key: value for key, value in expected.items() if key != "mounts"}
+    if observed_without_mounts != expected_without_mounts or len(observed_mounts) != len(
+        expected_mounts
+    ):
+        return False
+    for actual, wanted in zip(observed_mounts, expected_mounts, strict=True):
+        if not isinstance(actual, dict) or not isinstance(wanted, dict):
+            return False
+        if any(
+            actual.get(key) != wanted.get(key)
+            for key in ("type", "destination", "readOnly", "propagation")
+        ):
+            return False
+        expected_source = wanted.get("source")
+        if expected_source is None:
+            if not isinstance(actual.get("source"), str) or not actual["source"]:
+                return False
+        elif actual.get("source") != expected_source:
+            return False
+    return True
+
+
 def _validate_container_facts(
     facts: Sequence[Mapping[str, object]],
     *,
-    expected_services: Mapping[str, Mapping[str, str]],
+    expected_services: Mapping[str, Mapping[str, object]],
     image_facts: Mapping[str, Mapping[str, object]],
+    compose_hashes: Mapping[str, str],
+    compose_security: Mapping[str, object],
 ) -> None:
     observed_services = [str(fact["service"]) for fact in facts]
     if len(observed_services) != len(set(observed_services)) or set(observed_services) != set(
@@ -443,6 +987,20 @@ def _validate_container_facts(
         reference = expected["image"]
         if fact["project"] != PROJECT or fact["configImage"] != reference:
             raise ValueError("runtime service labels or image do not match candidate Compose")
+        security = fact.get("security")
+        if not isinstance(security, dict):
+            raise ValueError("runtime security-sensitive configuration is invalid")
+        image = image_facts.get(str(reference))
+        if not isinstance(image, Mapping):
+            raise ValueError("runtime image identity does not match the candidate digest")
+        expected_security = _expected_security(
+            service,
+            compose_security=compose_security,
+            image=image,
+            compose_hash=str(compose_hashes.get(service, "")),
+        )
+        if not _security_matches(security, expected_security):
+            raise ValueError("runtime security-sensitive configuration does not match candidate")
         one_shot = expected["restart"] == "no"
         if one_shot:
             state_is_valid = (
@@ -461,12 +1019,9 @@ def _validate_container_facts(
             raise ValueError("runtime container state does not match candidate Compose")
         if service in _REQUIRED_HEALTHY_SERVICES and fact["health"] != "healthy":
             raise ValueError("required runtime service is not healthy")
-        image = image_facts.get(reference)
-        if (
-            not isinstance(image, Mapping)
-            or fact["localImageId"] != image.get("id")
-            or _normalized_repo_digest(reference) not in image.get("repoDigests", [])
-        ):
+        if fact["localImageId"] != image.get("id") or _normalized_repo_digest(
+            reference
+        ) not in image.get("repoDigests", []):
             raise ValueError("runtime image identity does not match the candidate digest")
 
 
@@ -1036,22 +1591,110 @@ def _rename_posix_no_replace(
             error = ctypes.get_errno()
             raise OSError(error, f"cannot safely rename runtime entry: {target}")
         return
-    # Portable POSIX has no atomic rename-no-replace primitive. Reject an
-    # existing leaf before rename and rely on the immediate identity checks;
-    # a non-cooperating same-UID creation in this check-to-rename interval is
-    # the explicitly retained non-Linux platform limit.
+    # Portable POSIX lacks renameat2(RENAME_NOREPLACE), but linkat-style hard
+    # link creation is still atomic and refuses an existing target. This is
+    # valid only for the regular files published by the runtime guards;
+    # directories and platforms without dir-fd hard links fail closed.
     try:
-        os.stat(target, dir_fd=directory_fd, follow_symlinks=False)
-    except FileNotFoundError:
-        pass
-    else:
-        raise FileExistsError(errno.EEXIST, "runtime rename target already exists", target)
-    os.rename(
-        source,
-        target,
-        src_dir_fd=directory_fd,
-        dst_dir_fd=directory_fd,
-    )
+        source_details = os.stat(
+            source,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+    except OSError:
+        raise
+    if not stat.S_ISREG(source_details.st_mode):
+        raise OSError(
+            errno.ENOTSUP,
+            "atomic hard-link no-replace requires a regular file",
+            source,
+        )
+    source_identity = _file_identity(source_details)
+
+    try:
+        os.link(
+            source,
+            target,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+    except (AttributeError, NotImplementedError, TypeError) as exc:
+        raise OSError(
+            errno.ENOTSUP,
+            "atomic hard-link no-replace is unavailable",
+            target,
+        ) from exc
+
+    def remove_linked_target() -> None:
+        try:
+            target_details = os.stat(
+                target,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return
+        if (
+            not stat.S_ISREG(target_details.st_mode)
+            or _file_identity(target_details) != source_identity
+        ):
+            raise OSError(
+                errno.EIO,
+                "atomic hard-link no-replace cleanup identity changed",
+                target,
+            )
+        os.unlink(target, dir_fd=directory_fd)
+
+    try:
+        linked_source = os.stat(
+            source,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        linked_target = os.stat(
+            target,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(linked_source.st_mode)
+            or not stat.S_ISREG(linked_target.st_mode)
+            or _file_identity(linked_source) != source_identity
+            or _file_identity(linked_target) != source_identity
+        ):
+            raise OSError(
+                errno.EIO,
+                "atomic hard-link no-replace identity changed",
+                target,
+            )
+    except OSError as publication_error:
+        try:
+            remove_linked_target()
+        except OSError as cleanup_error:
+            raise OSError(
+                errno.EIO,
+                "atomic hard-link no-replace validation cleanup failed",
+                target,
+            ) from cleanup_error
+        raise publication_error
+
+    try:
+        os.unlink(source, dir_fd=directory_fd)
+    except (AttributeError, NotImplementedError, OSError, TypeError) as unlink_error:
+        try:
+            remove_linked_target()
+        except OSError as cleanup_error:
+            raise OSError(
+                errno.EIO,
+                "atomic hard-link no-replace source cleanup failed",
+                target,
+            ) from cleanup_error
+        raise OSError(
+            errno.EIO,
+            "atomic hard-link no-replace could not remove the staging name",
+            source,
+        ) from unlink_error
 
 
 def _open_posix_directory_path_no_follow(path: Path) -> tuple[int, tuple[int, int]]:
@@ -1074,12 +1717,155 @@ def _open_posix_directory_path_no_follow(path: Path) -> tuple[int, tuple[int, in
         raise
 
 
+class _DeploymentContractLease:
+    """Pin the base Compose and env-file used by the real deployment wrapper."""
+
+    def __init__(self, deployment_root: Path) -> None:
+        self.deployment_root = Path(deployment_root)
+        self.paths = (self.deployment_root / "data" / "user" / "settings" / "docker.env",)
+        self._handles: list[object | int] = []
+        self._identities: list[tuple[int, int]] = []
+        self._bodies: list[bytes] = []
+        self._directory_handles: list[int] = []
+        self._directory_identities: list[tuple[int, int]] = []
+
+    @classmethod
+    def open(cls, deployment_root: Path) -> _DeploymentContractLease:
+        lease = cls(deployment_root)
+        try:
+            for path in lease.paths:
+                if os.name == "nt":
+                    _assert_no_link_ancestors(path)
+                    handle, identity = _open_windows_regular_file_path(
+                        path, share_access=0x00000001
+                    )
+                else:
+                    directory_handle, directory_identity = _open_posix_directory_path_no_follow(
+                        path.parent
+                    )
+                    lease._directory_handles.append(directory_handle)
+                    lease._directory_identities.append(directory_identity)
+                    flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
+                    handle = os.open(path.name, flags, dir_fd=directory_handle)
+                    details = os.fstat(handle)
+                    if not stat.S_ISREG(details.st_mode):
+                        raise ValueError("deployment contract is not a regular file")
+                    identity = _file_identity(details)
+                lease._handles.append(handle)
+                lease._identities.append(identity)
+                lease._bodies.append(
+                    _read_windows_file_handle(handle)
+                    if os.name == "nt"
+                    else _read_posix_file_descriptor(int(handle))
+                )
+            lease.assert_unchanged()
+        except BaseException:
+            lease.close(suppress_errors=True)
+            raise
+        return lease
+
+    def __enter__(self) -> _DeploymentContractLease:
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> bool:
+        self.close()
+        return False
+
+    def close(self, *, suppress_errors: bool = False) -> None:
+        errors: list[OSError] = []
+        for handle in reversed(self._handles):
+            try:
+                if os.name == "nt":
+                    _close_windows_handle(handle)
+                else:
+                    os.close(int(handle))
+            except OSError as exc:
+                errors.append(exc)
+        self._handles.clear()
+        for handle in reversed(self._directory_handles):
+            try:
+                os.close(handle)
+            except OSError as exc:
+                errors.append(exc)
+        self._directory_handles.clear()
+        if errors and not suppress_errors:
+            raise errors[0]
+
+    def assert_unchanged(self) -> None:
+        if not (
+            len(self._handles) == len(self._identities) == len(self._bodies) == len(self.paths)
+        ):
+            raise ValueError("deployment contract lease is incomplete")
+        if os.name != "nt" and not (
+            len(self._directory_handles) == len(self._directory_identities) == len(self.paths)
+        ):
+            raise ValueError("deployment contract directory lease is incomplete")
+        for index, (path, handle, expected_identity, expected_body) in enumerate(
+            zip(
+                self.paths,
+                self._handles,
+                self._identities,
+                self._bodies,
+                strict=True,
+            )
+        ):
+            held_identity = (
+                _windows_handle_identity(handle, directory=False)
+                if os.name == "nt"
+                else _file_identity(os.fstat(int(handle)))
+            )
+            held_body = (
+                _read_windows_file_handle(handle)
+                if os.name == "nt"
+                else _read_posix_file_descriptor(int(handle))
+            )
+            if os.name == "nt":
+                _assert_no_link_ancestors(path)
+                current_handle, current_identity = _open_windows_regular_file_path(
+                    path, share_access=0x00000001
+                )
+                try:
+                    current_body = _read_windows_file_handle(current_handle)
+                finally:
+                    _close_windows_handle(current_handle)
+            else:
+                directory_handle = self._directory_handles[index]
+                if _file_identity(os.fstat(directory_handle)) != self._directory_identities[index]:
+                    raise ValueError("deployment contract directory lease changed")
+                current_directory, current_directory_identity = (
+                    _open_posix_directory_path_no_follow(path.parent)
+                )
+                current_handle = None
+                try:
+                    if current_directory_identity != self._directory_identities[index]:
+                        raise ValueError("deployment contract directory path changed")
+                    flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
+                    current_handle = os.open(path.name, flags, dir_fd=current_directory)
+                    details = os.fstat(current_handle)
+                    if not stat.S_ISREG(details.st_mode):
+                        raise ValueError("deployment contract path is not a regular file")
+                    current_identity = _file_identity(details)
+                    current_body = _read_posix_file_descriptor(current_handle)
+                finally:
+                    if current_handle is not None:
+                        os.close(current_handle)
+                    os.close(current_directory)
+            if (
+                held_identity != expected_identity
+                or current_identity != expected_identity
+                or held_body != expected_body
+                or current_body != expected_body
+            ):
+                raise ValueError("deployment runtime contract lease changed")
+
+
 class _CandidateContractLease:
     def __init__(self, candidate_root: Path) -> None:
         self.candidate_root = Path(candidate_root)
         self.paths = (
             self.candidate_root / "deploy" / "image-lock.json",
             self.candidate_root / "docker-compose.platform.yml",
+            self.candidate_root / "docker-compose.yml",
         )
         self._handles: list[object | int] = []
         self._identities: list[tuple[int, int]] = []
@@ -1121,6 +1907,7 @@ class _CandidateContractLease:
                 for directory_handle, name in (
                     (lease._deploy_directory_handle, "image-lock.json"),
                     (lease._candidate_directory_handle, "docker-compose.platform.yml"),
+                    (lease._candidate_directory_handle, "docker-compose.yml"),
                 ):
                     handle = os.open(name, flags, dir_fd=directory_handle)
                     lease._handles.append(handle)
@@ -1146,7 +1933,7 @@ class _CandidateContractLease:
 
     @property
     def token(self) -> tuple[bytes, bytes]:
-        if len(self._bodies) != 2:
+        if len(self._bodies) != 3:
             raise ValueError("candidate contract lease is incomplete")
         return self._bodies[0], self._bodies[1]
 
@@ -1239,6 +2026,7 @@ class _CandidateContractLease:
             locations = (
                 (current_deploy, "image-lock.json"),
                 (current_candidate, "docker-compose.platform.yml"),
+                (current_candidate, "docker-compose.yml"),
             )
             for (
                 held_handle,
@@ -1307,6 +2095,20 @@ class _CandidateContractLease:
                 os.close(current_deploy)
             if current_candidate is not None:
                 os.close(current_candidate)
+
+
+class _PublicationContractLease:
+    def __init__(
+        self,
+        candidate: _CandidateContractLease,
+        deployment: _DeploymentContractLease,
+    ) -> None:
+        self._candidate = candidate
+        self._deployment = deployment
+
+    def assert_unchanged(self) -> None:
+        self._candidate.assert_unchanged()
+        self._deployment.assert_unchanged()
 
 
 class _RuntimeDirectoryGuard:
@@ -1838,7 +2640,7 @@ class _RuntimeDirectoryGuard:
 def _atomic_write_json_windows(
     *,
     guard: _RuntimeDirectoryGuard,
-    candidate_lease: _CandidateContractLease,
+    candidate_lease: _PublicationContractLease,
     body: bytes,
 ) -> None:
     target_name = "runtime-attestation.json"
@@ -1924,7 +2726,7 @@ def _atomic_write_json_windows(
 def _atomic_write_json_posix(
     *,
     guard: _RuntimeDirectoryGuard,
-    candidate_lease: _CandidateContractLease,
+    candidate_lease: _PublicationContractLease,
     body: bytes,
 ) -> None:
     target_name = "runtime-attestation.json"
@@ -2050,7 +2852,7 @@ def _atomic_write_json_posix(
 def _atomic_write_json(
     *,
     guard: _RuntimeDirectoryGuard,
-    candidate_lease: _CandidateContractLease,
+    candidate_lease: _PublicationContractLease,
     document: Mapping[str, object],
 ) -> None:
     body = (json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode(
@@ -2073,8 +2875,9 @@ def _atomic_write_json(
 def _collect_runtime_attestation(
     *,
     root: Path,
+    deployment_root: Path,
     candidate: dict[str, object],
-    expected_services: dict[str, dict[str, str]],
+    expected_services: dict[str, dict[str, object]],
     bound_run: dict[str, str],
     observed_at: str,
     bound_base_url: str,
@@ -2084,12 +2887,21 @@ def _collect_runtime_attestation(
     guard: _RuntimeDirectoryGuard,
     docker_config: Path,
     candidate_lease: _CandidateContractLease,
+    deployment_lease: _DeploymentContractLease,
+    docker_host_identity_sha256: str | None,
+    deadline_monotonic: float,
 ) -> dict[str, object]:
     docker_config_name = docker_config.name
     command_records: list[dict[str, object]] = []
 
-    def invoke(arguments: Sequence[str]) -> bytes:
+    def invoke(
+        arguments: Sequence[str],
+        *,
+        logical_arguments: Sequence[str] | None = None,
+        stdout_transform: Callable[[bytes], bytes] | None = None,
+    ) -> bytes:
         candidate_lease.assert_unchanged()
+        deployment_lease.assert_unchanged()
         guard.assert_bound()
         guard.assert_owned_directory_empty(docker_config_name)
         argv = [
@@ -2100,15 +2912,20 @@ def _collect_runtime_attestation(
             "default",
             *arguments,
         ]
+        remaining = deadline_monotonic - time.monotonic()
+        if not math.isfinite(remaining) or remaining <= 0:
+            raise ValueError("runtime attestation Docker deadline expired")
+        command_timeout = max(1, min(SINGLE_COMMAND_TIMEOUT_SECONDS, math.ceil(remaining)))
         completed = runner(
             argv,
-            cwd=root,
+            cwd=deployment_root,
             env=child_environment,
-            timeout=COMMAND_TIMEOUT_SECONDS,
+            timeout=command_timeout,
             check=False,
             capture_output=True,
         )
         candidate_lease.assert_unchanged()
+        deployment_lease.assert_unchanged()
         native_exit = completed.returncode
         stdout = completed.stdout
         if (
@@ -2117,37 +2934,73 @@ def _collect_runtime_attestation(
             or not isinstance(stdout, bytes)
         ):
             raise ValueError("Docker native result is invalid")
+        if native_exit != 0:
+            raise ValueError("Docker native command failed")
+        recorded_stdout = stdout_transform(stdout) if stdout_transform is not None else stdout
+        if not isinstance(recorded_stdout, bytes):
+            raise ValueError("Docker stdout sanitizer result is invalid")
         try:
-            raw_stdout = stdout.decode("utf-8")
+            safe_stdout = recorded_stdout.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise ValueError("Docker stdout is not valid UTF-8") from exc
         command_records.append(
             {
-                "argv": [*DOCKER_LOGICAL_PREFIX, *arguments],
+                "argv": [
+                    *DOCKER_LOGICAL_PREFIX,
+                    *(logical_arguments if logical_arguments is not None else arguments),
+                ],
                 "nativeExit": native_exit,
-                "stdout": raw_stdout,
-                "stdoutSha256": hashlib.sha256(stdout).hexdigest(),
+                "stdout": safe_stdout,
+                "stdoutSha256": hashlib.sha256(recorded_stdout).hexdigest(),
             }
         )
-        if native_exit != 0:
-            raise ValueError("Docker native command failed")
         return stdout
+
+    def inspect_docker_host() -> dict[str, str]:
+        try:
+            endpoint = json.loads(invoke(DOCKER_CONTEXT_ARGUMENTS))
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError("Docker daemon endpoint is invalid") from exc
+        daemon = _json_object(invoke(DOCKER_INFO_ARGUMENTS), label="info")
+        if (
+            not isinstance(endpoint, str)
+            or not endpoint
+            or endpoint != endpoint.strip()
+            or set(daemon) != {"serverId", "osType"}
+            or not isinstance(daemon.get("serverId"), str)
+            or not daemon["serverId"]
+            or daemon["serverId"] != daemon["serverId"].strip()
+            or not isinstance(daemon.get("osType"), str)
+            or not daemon["osType"]
+            or daemon["osType"] != daemon["osType"].strip()
+        ):
+            raise ValueError("Docker daemon identity is invalid")
+        return {
+            "context": DOCKER_CONTEXT,
+            "endpoint": endpoint,
+            "serverId": daemon["serverId"],
+            "osType": daemon["osType"],
+        }
 
     def inspect_round() -> list[dict[str, object]]:
         ids = _ps_ids(invoke(PS_ARGUMENTS))
         facts: list[dict[str, object]] = []
         for container_id in ids:
+            raw_inspect = invoke(
+                (
+                    "container",
+                    "inspect",
+                    "--format",
+                    CONTAINER_INSPECT_FORMAT,
+                    container_id,
+                ),
+                stdout_transform=lambda body: _redacted_inspect_output(
+                    body, label="container inspect"
+                ),
+            )
             fact = _container_fact(
                 _json_object(
-                    invoke(
-                        (
-                            "container",
-                            "inspect",
-                            "--format",
-                            CONTAINER_INSPECT_FORMAT,
-                            container_id,
-                        )
-                    ),
+                    _redacted_inspect_output(raw_inspect, label="container inspect"),
                     label="container inspect",
                 )
             )
@@ -2156,43 +3009,116 @@ def _collect_runtime_attestation(
             facts.append(fact)
         return facts
 
+    candidate_expected_services = expected_services
+    compose_config_arguments, compose_config_logical = _runtime_compose_arguments(
+        deployment_root=deployment_root,
+        candidate_root=root,
+        tail=_COMPOSE_CONFIG_TAIL,
+    )
+    raw_compose_config = invoke(
+        compose_config_arguments,
+        logical_arguments=compose_config_logical,
+        stdout_transform=_compose_security_projection,
+    )
+    compose_security = _json_object(
+        _compose_security_projection(raw_compose_config), label="Compose security projection"
+    )
+    expected_services = _merged_expected_services(compose_security, candidate_expected_services)
+    compose_hash_arguments, compose_hash_logical = _runtime_compose_arguments(
+        deployment_root=deployment_root,
+        candidate_root=root,
+        tail=_COMPOSE_HASH_TAIL,
+    )
+    compose_hashes = _compose_hashes(
+        invoke(compose_hash_arguments, logical_arguments=compose_hash_logical)
+    )
+    if not set(expected_services).issubset(compose_hashes):
+        raise ValueError("Docker Compose config hashes do not cover candidate services")
+    before_host = inspect_docker_host() if docker_host_identity_sha256 is not None else None
     before_facts = inspect_round()
     image_facts: dict[str, dict[str, object]] = {}
-    for reference in sorted({service["image"] for service in expected_services.values()}):
+    references = {service["image"] for service in expected_services.values()}
+    if not all(isinstance(reference, str) for reference in references):
+        raise ValueError("candidate runtime image references are invalid")
+    for reference in sorted(str(reference) for reference in references):
+        raw_image = invoke(
+            ("image", "inspect", "--format", IMAGE_INSPECT_FORMAT, reference),
+            stdout_transform=lambda body: _redacted_inspect_output(body, label="image inspect"),
+        )
         image = _json_object(
-            invoke(("image", "inspect", "--format", IMAGE_INSPECT_FORMAT, reference)),
+            _redacted_inspect_output(raw_image, label="image inspect"),
             label="image inspect",
         )
-        if set(image) != {"imageId", "repoDigests"}:
+        if set(image) != {
+            "imageId",
+            "repoDigests",
+            "command",
+            "entrypoint",
+            "user",
+            "environmentHashes",
+            "volumes",
+        }:
             raise ValueError("Docker image inspect output is invalid")
         image_id = image.get("imageId")
         repo_digests = image.get("repoDigests")
+        image_command = _string_list(image.get("command"), label="image command")
+        image_entrypoint = _string_list(image.get("entrypoint"), label="image entrypoint")
+        image_user = image.get("user")
+        image_environment = image.get("environmentHashes")
+        image_volumes = image.get("volumes")
         if (
             not isinstance(image_id, str)
             or not image_id
             or not isinstance(repo_digests, list)
             or not all(isinstance(value, str) for value in repo_digests)
+            or not isinstance(image_user, str)
+            or not isinstance(image_environment, dict)
+            or not all(
+                isinstance(name, str)
+                and name
+                and isinstance(value, str)
+                and _SHA256.fullmatch(value) is not None
+                for name, value in image_environment.items()
+            )
+            or (image_volumes is not None and not isinstance(image_volumes, dict))
         ):
             raise ValueError("Docker image inspect output is invalid")
-        image_facts[reference] = {"id": image_id, "repoDigests": repo_digests}
+        image_facts[reference] = {
+            "id": image_id,
+            "repoDigests": repo_digests,
+            "command": image_command,
+            "entrypoint": image_entrypoint,
+            "user": image_user,
+            "environmentHashes": dict(sorted(image_environment.items())),
+            "volumes": image_volumes,
+            "reference": reference,
+        }
     after_facts = inspect_round()
+    after_host = inspect_docker_host() if docker_host_identity_sha256 is not None else None
     candidate_lease.assert_unchanged()
+    deployment_lease.assert_unchanged()
     final_candidate, final_expected_services = _load_candidate_token(candidate_lease.token)
-    if final_candidate != candidate or final_expected_services != expected_services:
+    if final_candidate != candidate or final_expected_services != candidate_expected_services:
         raise ValueError("candidate runtime contract changed during final validation")
     before_snapshot = _snapshot(before_facts)
     after_snapshot = _snapshot(after_facts)
     if before_snapshot != after_snapshot:
         raise ValueError("runtime container snapshot changed during attestation")
+    if before_host != after_host:
+        raise ValueError("Docker host identity changed during runtime attestation")
     _validate_container_facts(
         before_facts,
         expected_services=expected_services,
         image_facts=image_facts,
+        compose_hashes=compose_hashes,
+        compose_security=compose_security,
     )
     _validate_container_facts(
         after_facts,
         expected_services=expected_services,
         image_facts=image_facts,
+        compose_hashes=compose_hashes,
+        compose_security=compose_security,
     )
     containers = []
     for fact in sorted(after_facts, key=lambda item: str(item["service"])):
@@ -2216,9 +3142,16 @@ def _collect_runtime_attestation(
         "containers": containers,
         "commands": command_records,
     }
+    if before_host is not None and docker_host_identity_sha256 is not None:
+        report["dockerHostIdentity"] = {
+            "context": before_host["context"],
+            "endpoint": before_host["endpoint"],
+            "serverId": before_host["serverId"],
+            "dockerHostIdentitySha256": docker_host_identity_sha256,
+        }
     candidate_lease.assert_unchanged()
     publish_candidate, publish_expected_services = _load_candidate_token(candidate_lease.token)
-    if publish_candidate != candidate or publish_expected_services != expected_services:
+    if publish_candidate != candidate or publish_expected_services != candidate_expected_services:
         raise ValueError("candidate runtime contract changed before publication")
     return report
 
@@ -2226,6 +3159,7 @@ def _collect_runtime_attestation(
 def produce_runtime_attestation(
     *,
     candidate_root: Path,
+    deployment_root: Path | None = None,
     bundle_root: Path,
     release_run: Mapping[str, object],
     observed_at: str,
@@ -2233,9 +3167,28 @@ def produce_runtime_attestation(
     runner: Callable[..., subprocess.CompletedProcess[bytes]] = _run_docker,
     docker_resolver: Callable[[], Path] = resolve_fixed_docker,
     environ: Mapping[str, str] | None = None,
+    docker_host_identity_sha256: str | None = None,
+    timeout_seconds: float = COMMAND_TIMEOUT_SECONDS,
 ) -> dict[str, object]:
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not math.isfinite(timeout_seconds)
+        or timeout_seconds <= 0
+    ):
+        raise ValueError("runtime attestation timeout is invalid")
+    deadline_monotonic = time.monotonic() + float(timeout_seconds)
+    source_environment = os.environ if environ is None else environ
+    expected_docker_host_identity_sha256 = _expected_docker_host_identity_sha256(
+        docker_host_identity_sha256,
+        source_environment,
+    )
     root = Path(os.path.abspath(candidate_root))
-    with _CandidateContractLease.open(root) as candidate_lease:
+    deployment = Path(os.path.abspath(deployment_root or candidate_root))
+    with (
+        _CandidateContractLease.open(root) as candidate_lease,
+        _DeploymentContractLease.open(deployment) as deployment_lease,
+    ):
         candidate, expected_services = _load_candidate_token(candidate_lease.token)
         candidate_lease.assert_unchanged()
         bound_run = _release_run(release_run)
@@ -2243,13 +3196,14 @@ def produce_runtime_attestation(
             raise ValueError("runtime observedAt is invalid")
         bound_base_url = _base_url(base_url)
         docker = Path(docker_resolver())
-        child_environment = _child_environment(os.environ if environ is None else environ)
+        child_environment = _child_environment(source_environment)
         safe_bundle_root, runtime_root = _prepare_runtime_root(bundle_root)
         with _RuntimeDirectoryGuard.open(safe_bundle_root, runtime_root) as guard:
             docker_config = guard.create_empty_directory(f".docker-config-{uuid.uuid4().hex}")
             try:
                 report = _collect_runtime_attestation(
                     root=root,
+                    deployment_root=deployment,
                     candidate=candidate,
                     expected_services=expected_services,
                     bound_run=bound_run,
@@ -2261,6 +3215,9 @@ def produce_runtime_attestation(
                     guard=guard,
                     docker_config=docker_config,
                     candidate_lease=candidate_lease,
+                    deployment_lease=deployment_lease,
+                    docker_host_identity_sha256=expected_docker_host_identity_sha256,
+                    deadline_monotonic=deadline_monotonic,
                 )
             except BaseException as error:
                 try:
@@ -2277,7 +3234,7 @@ def produce_runtime_attestation(
                 raise ValueError("isolated Docker config cleanup requires recovery") from exc
             _atomic_write_json(
                 guard=guard,
-                candidate_lease=candidate_lease,
+                candidate_lease=_PublicationContractLease(candidate_lease, deployment_lease),
                 document=report,
             )
             return report
@@ -2286,11 +3243,18 @@ def produce_runtime_attestation(
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--candidate-root", type=Path, required=True)
+    parser.add_argument(
+        "--deployment-root",
+        type=Path,
+        default=SCRIPTS_ROOT.parent,
+        help="deployed source root holding docker-compose.yml and docker.env",
+    )
     parser.add_argument("--bundle-root", type=Path, required=True)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--environment-id", required=True)
     parser.add_argument("--observed-at", required=True)
     parser.add_argument("--base-url", required=True)
+    parser.add_argument("--docker-host-identity-sha256")
     return parser.parse_args(argv)
 
 
@@ -2298,10 +3262,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
     produce_runtime_attestation(
         candidate_root=args.candidate_root,
+        deployment_root=args.deployment_root,
         bundle_root=args.bundle_root,
         release_run={"runId": args.run_id, "environmentId": args.environment_id},
         observed_at=args.observed_at,
         base_url=args.base_url,
+        docker_host_identity_sha256=args.docker_host_identity_sha256,
     )
     print(Path(args.bundle_root).resolve() / "runtime" / "runtime-attestation.json")
     return 0

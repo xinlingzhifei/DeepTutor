@@ -26,6 +26,7 @@ from deeptutor.teaching.openmaic.auth import (
     signed_service_headers,
 )
 from deeptutor.teaching.openmaic.data_planes import (
+    DataPlaneConfigurationUnavailable,
     DataPlaneRouteRecord,
     DataPlaneSelection,
     DataPlaneUnavailable,
@@ -935,10 +936,14 @@ class OpenMAICClientFactory:
         route = await self._binding_repository.resolve_bound_route(selection)
         if route is None or not self._is_current_binding(selection, route):
             raise DataPlaneUnavailable()
+        try:
+            base_url = _validated_base_url(route.base_url)
+        except ValueError:
+            raise DataPlaneConfigurationUnavailable() from None
         service_secret = self._service_secret_resolver.resolve(selection)
         return OpenMAICClient(
             http_client,
-            base_url=route.base_url,
+            base_url=base_url,
             tenant_id=selection.tenant_id,
             route_id=selection.route_ref,
             service_secret=service_secret,

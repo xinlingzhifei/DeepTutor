@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -29,6 +30,8 @@ def _load_backup_module():
 _BACKUP = _load_backup_module()
 _SOURCE_OBJECT_STORE_NAMESPACE_ID = "source-minio-primary"
 _SOURCE_OBJECT_STORE_BUCKET = "source-teaching"
+_SOURCE_OBJECT_STORE_ENDPOINT = "https://source-objects.internal"
+_SOURCE_OBJECT_STORE_REGION = "us-east-1"
 _SOURCE_OBJECT_STORE_IDENTITY = _BACKUP.object_store_identity_sha256(
     _SOURCE_OBJECT_STORE_NAMESPACE_ID,
     _SOURCE_OBJECT_STORE_BUCKET,
@@ -54,6 +57,10 @@ reverify_verified_backup = _BACKUP.reverify_verified_backup
 run_pg_dump = _BACKUP.run_pg_dump
 write_backup_manifest = _BACKUP.write_backup_manifest
 dump_postgres_snapshot = _BACKUP._dump_postgres_snapshot
+
+
+async def _observe_source_object_store_owner_id() -> str:
+    return "source-owner-01"
 
 
 def _facts() -> TeachingBackupFacts:
@@ -172,6 +179,9 @@ def _create_restorable_fixture(tmp_path):
             dump_database=dump,
             enumerate_object_versions=enumerate_versions,
             read_object_version=read_version,
+            observe_source_object_store_owner_id=_observe_source_object_store_owner_id,
+            source_object_store_endpoint=_SOURCE_OBJECT_STORE_ENDPOINT,
+            source_object_store_region=_SOURCE_OBJECT_STORE_REGION,
             source_object_store_namespace_id=_SOURCE_OBJECT_STORE_NAMESPACE_ID,
             source_object_store_bucket=_SOURCE_OBJECT_STORE_BUCKET,
             created_at=datetime(2026, 8, 23, tzinfo=timezone.utc),
@@ -323,6 +333,9 @@ def test_restorable_backup_rejects_unknown_object_tenant_but_allows_zero_objects
             dump_database=dump,
             enumerate_object_versions=no_objects,
             read_object_version=unexpected_read,
+            observe_source_object_store_owner_id=_observe_source_object_store_owner_id,
+            source_object_store_endpoint=_SOURCE_OBJECT_STORE_ENDPOINT,
+            source_object_store_region=_SOURCE_OBJECT_STORE_REGION,
             source_object_store_namespace_id=_SOURCE_OBJECT_STORE_NAMESPACE_ID,
             source_object_store_bucket=_SOURCE_OBJECT_STORE_BUCKET,
         )
@@ -346,6 +359,9 @@ def test_restorable_backup_rejects_unknown_object_tenant_but_allows_zero_objects
                 dump_database=dump,
                 enumerate_object_versions=outside_tenant,
                 read_object_version=unexpected_read,
+                observe_source_object_store_owner_id=_observe_source_object_store_owner_id,
+                source_object_store_endpoint=_SOURCE_OBJECT_STORE_ENDPOINT,
+                source_object_store_region=_SOURCE_OBJECT_STORE_REGION,
                 source_object_store_namespace_id=_SOURCE_OBJECT_STORE_NAMESPACE_ID,
                 source_object_store_bucket=_SOURCE_OBJECT_STORE_BUCKET,
             )
@@ -394,6 +410,9 @@ def test_restorable_backup_rejects_missing_database_referenced_object_key(tmp_pa
                 dump_database=dump,
                 enumerate_object_versions=incomplete_objects,
                 read_object_version=unexpected_read,
+                observe_source_object_store_owner_id=_observe_source_object_store_owner_id,
+                source_object_store_endpoint=_SOURCE_OBJECT_STORE_ENDPOINT,
+                source_object_store_region=_SOURCE_OBJECT_STORE_REGION,
                 source_object_store_namespace_id=_SOURCE_OBJECT_STORE_NAMESPACE_ID,
                 source_object_store_bucket=_SOURCE_OBJECT_STORE_BUCKET,
             )
@@ -513,6 +532,9 @@ def test_restorable_backup_rejects_database_object_receipt_mismatch(
                 dump_database=dump,
                 enumerate_object_versions=enumerate_objects,
                 read_object_version=read_object,
+                observe_source_object_store_owner_id=_observe_source_object_store_owner_id,
+                source_object_store_endpoint=_SOURCE_OBJECT_STORE_ENDPOINT,
+                source_object_store_region=_SOURCE_OBJECT_STORE_REGION,
                 source_object_store_namespace_id=_SOURCE_OBJECT_STORE_NAMESPACE_ID,
                 source_object_store_bucket=_SOURCE_OBJECT_STORE_BUCKET,
             )
@@ -665,6 +687,8 @@ def test_postgres_snapshot_uses_app_secret_and_closes_transaction(tmp_path) -> N
                 return "snapshot-1"
             if "pg_database" in query:
                 return "42"
+            if "pg_control_system" in query:
+                return "7449553557289146937"
             if "platform.alembic_version" in query:
                 return "platform-revision"
             if "alembic_version" in query:
@@ -1038,6 +1062,9 @@ def test_failed_restorable_backup_publishes_with_one_directory_rename(
                 dump_database=dump,
                 enumerate_object_versions=enumerate_versions,
                 read_object_version=read,
+                observe_source_object_store_owner_id=_observe_source_object_store_owner_id,
+                source_object_store_endpoint=_SOURCE_OBJECT_STORE_ENDPOINT,
+                source_object_store_region=_SOURCE_OBJECT_STORE_REGION,
                 source_object_store_namespace_id=_SOURCE_OBJECT_STORE_NAMESPACE_ID,
                 source_object_store_bucket=_SOURCE_OBJECT_STORE_BUCKET,
             )
@@ -1279,3 +1306,623 @@ def test_backup_manifest_rejects_symlinked_output_directory(tmp_path) -> None:
         )
 
     assert not (real_output / "manifest.json").exists()
+
+
+def test_restorable_backup_rechecks_source_object_store_owner_after_capture_before_publish(
+    tmp_path,
+) -> None:
+    output = tmp_path / "backup"
+    payload = b"version-pinned-document"
+    source = _versioned_object(
+        "tenant-a",
+        "tenants/tenant-a/classrooms/a/document.json",
+        "version-2",
+        payload,
+    )
+    events: list[str] = []
+    capture_complete = False
+
+    async def observe_owner() -> str:
+        events.append("owner")
+        if len([event for event in events if event == "owner"]) == 1:
+            return "source-owner-before-capture"
+        assert capture_complete is True
+        return "source-owner-after-capture"
+
+    async def dump(path: Path) -> TeachingBackupFacts:
+        events.append("dump")
+        path.write_bytes(b"database")
+        return _facts()
+
+    async def enumerate_versions() -> tuple[VersionedObject, ...]:
+        events.append("enumerate")
+        return (source,)
+
+    async def read_version(_source: VersionedObject, path: Path) -> None:
+        nonlocal capture_complete
+        events.append("read")
+        path.write_bytes(payload)
+        capture_complete = True
+
+    with pytest.raises(ValueError, match="source object store identity changed during capture"):
+        asyncio.run(
+            create_restorable_teaching_backup(
+                output,
+                dump_database=dump,
+                enumerate_object_versions=enumerate_versions,
+                read_object_version=read_version,
+                observe_source_object_store_owner_id=observe_owner,
+                source_object_store_endpoint=_SOURCE_OBJECT_STORE_ENDPOINT,
+                source_object_store_region=_SOURCE_OBJECT_STORE_REGION,
+                source_object_store_namespace_id=_SOURCE_OBJECT_STORE_NAMESPACE_ID,
+                source_object_store_bucket=_SOURCE_OBJECT_STORE_BUCKET,
+            )
+        )
+
+    assert events == ["owner", "dump", "enumerate", "read", "owner"]
+    assert not output.exists()
+
+
+class _OperatorBackupAbort(BaseException):
+    pass
+
+
+def _operator_runtime_config() -> RuntimeConfig:
+    return RuntimeConfig(
+        database_host="postgres.internal",
+        database_port=5432,
+        database_name="deeptutor",
+        database_user="deeptutor_app",
+        object_store_endpoint=_SOURCE_OBJECT_STORE_ENDPOINT,
+        object_store_namespace_id=_SOURCE_OBJECT_STORE_NAMESPACE_ID,
+        object_store_bucket=_SOURCE_OBJECT_STORE_BUCKET,
+        object_store_region=_SOURCE_OBJECT_STORE_REGION,
+    )
+
+
+def _operator_backup_secrets() -> OperatorBackupSecrets:
+    return OperatorBackupSecrets(
+        database_password="database-password",
+        database_migration_password="migration-password",
+        minio_access_key="minio-access-key",
+        minio_secret_key="minio-secret-key",
+    )
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        pytest.param("success", id="success"),
+        pytest.param("exception", id="exception"),
+        pytest.param("base-exception", id="base-exception"),
+    ],
+)
+def test_operator_backup_closes_owned_owner_client_before_return_or_failure(
+    monkeypatch,
+    outcome: str,
+) -> None:
+    events: list[str] = []
+    result = object()
+    primary_failure: BaseException | None = None
+    if outcome == "exception":
+        primary_failure = RuntimeError("capture failed")
+    elif outcome == "base-exception":
+        primary_failure = _OperatorBackupAbort("capture aborted")
+
+    class OwnerClient:
+        def get_bucket_acl(self, *, Bucket: str) -> dict[str, object]:
+            assert Bucket == _SOURCE_OBJECT_STORE_BUCKET
+            events.append("owner-acl")
+            return {"Owner": {"ID": "source-owner-01"}}
+
+        def close(self) -> None:
+            events.append("owner-client-close")
+            if primary_failure is not None:
+                raise OSError("owner client close failed")
+
+    async def capture(_output: Path, **options: object) -> object:
+        observe_owner = options["observe_source_object_store_owner_id"]
+        assert callable(observe_owner)
+        assert await observe_owner() == "source-owner-01"
+        events.append("capture")
+        if primary_failure is not None:
+            raise primary_failure
+        return result
+
+    monkeypatch.setattr(
+        _BACKUP, "load_operator_backup_config", lambda _path: _operator_runtime_config()
+    )
+    monkeypatch.setattr(
+        _BACKUP,
+        "load_operator_backup_secrets",
+        lambda _path, _config: _operator_backup_secrets(),
+    )
+    monkeypatch.setattr(_BACKUP, "create_restorable_teaching_backup", capture)
+    monkeypatch.setattr("minio.Minio", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr("boto3.client", lambda *_args, **_kwargs: OwnerClient())
+
+    operation = _BACKUP.run_operator_backup(
+        config_path=Path("platform.json"),
+        secret_dir=Path("secrets"),
+        output_dir=Path("backup"),
+        pg_dump=Path("pg_dump"),
+    )
+    if primary_failure is None:
+        assert asyncio.run(operation) is result
+    else:
+        with pytest.raises(type(primary_failure)) as captured:
+            asyncio.run(operation)
+        assert captured.value is primary_failure
+        assert any(
+            "owner client cleanup failed" in note
+            for note in getattr(captured.value, "__notes__", ())
+        )
+
+    assert events == ["owner-acl", "capture", "owner-client-close"]
+
+
+def test_operator_backup_reconciles_owner_observation_and_client_close_before_propagating_cancellation(
+    monkeypatch,
+) -> None:
+    acl_started = threading.Event()
+    allow_acl = threading.Event()
+    acl_finished = threading.Event()
+    close_started = threading.Event()
+    allow_close = threading.Event()
+    close_finished = threading.Event()
+    events: list[str] = []
+
+    class OwnerClient:
+        def get_bucket_acl(self, *, Bucket: str) -> dict[str, object]:
+            assert Bucket == _SOURCE_OBJECT_STORE_BUCKET
+            events.append("owner-acl-start")
+            acl_started.set()
+            if not allow_acl.wait(timeout=5):
+                raise AssertionError("owner ACL observation was not released")
+            events.append("owner-acl-finish")
+            acl_finished.set()
+            return {"Owner": {"ID": "source-owner-01"}}
+
+        def close(self) -> None:
+            assert acl_finished.is_set(), "owner client closed before its ACL call reached terminal"
+            events.append("owner-client-close-start")
+            close_started.set()
+            if not allow_close.wait(timeout=5):
+                raise AssertionError("owner client close was not released")
+            events.append("owner-client-close-finish")
+            close_finished.set()
+
+    async def capture(_output: Path, **options: object) -> object:
+        observe_owner = options["observe_source_object_store_owner_id"]
+        assert callable(observe_owner)
+        await observe_owner()
+        raise AssertionError("cancelled capture must not resume")
+
+    monkeypatch.setattr(
+        _BACKUP, "load_operator_backup_config", lambda _path: _operator_runtime_config()
+    )
+    monkeypatch.setattr(
+        _BACKUP,
+        "load_operator_backup_secrets",
+        lambda _path, _config: _operator_backup_secrets(),
+    )
+    monkeypatch.setattr(_BACKUP, "create_restorable_teaching_backup", capture)
+    monkeypatch.setattr("minio.Minio", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr("boto3.client", lambda *_args, **_kwargs: OwnerClient())
+
+    async def scenario() -> None:
+        task = asyncio.create_task(
+            _BACKUP.run_operator_backup(
+                config_path=Path("platform.json"),
+                secret_dir=Path("secrets"),
+                output_dir=Path("backup"),
+                pg_dump=Path("pg_dump"),
+            )
+        )
+        try:
+            assert await asyncio.to_thread(acl_started.wait, 5)
+            task.cancel("first owner cancellation")
+            await asyncio.sleep(0)
+            assert not task.done()
+
+            allow_acl.set()
+            assert await asyncio.to_thread(acl_finished.wait, 5)
+            assert await asyncio.to_thread(close_started.wait, 5)
+            assert not task.done()
+
+            task.cancel("second owner cancellation")
+            await asyncio.sleep(0)
+            assert not task.done()
+            allow_close.set()
+            with pytest.raises(asyncio.CancelledError) as captured:
+                await task
+            assert captured.value.args == ("first owner cancellation",)
+        finally:
+            allow_acl.set()
+            allow_close.set()
+            if not task.done():
+                try:
+                    await asyncio.shield(task)
+                except BaseException:
+                    pass
+            assert await asyncio.to_thread(acl_finished.wait, 5)
+
+    asyncio.run(scenario())
+
+    assert close_finished.is_set()
+    assert events == [
+        "owner-acl-start",
+        "owner-acl-finish",
+        "owner-client-close-start",
+        "owner-client-close-finish",
+    ]
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        pytest.param("success", id="success"),
+        pytest.param("exception", id="exception"),
+        pytest.param("base-exception", id="base-exception"),
+    ],
+)
+def test_minio_object_response_cleanup_always_releases_connection_without_masking_primary(
+    tmp_path,
+    outcome: str,
+) -> None:
+    payload = b"version-pinned-document"
+    source = _versioned_object(
+        "tenant-a",
+        "tenants/tenant-a/classrooms/a/document.json",
+        "version-2",
+        payload,
+    )
+    destination = tmp_path / "payload.blob"
+    events: list[str] = []
+    primary_failure: BaseException | None = None
+    if outcome == "exception":
+        primary_failure = RuntimeError("object read failed")
+    elif outcome == "base-exception":
+        primary_failure = _OperatorBackupAbort("object read aborted")
+    close_failure = OSError("object response close failed")
+    release_failure = RuntimeError("object response release failed")
+
+    class Response:
+        remaining = payload
+
+        def read(self, _size: int) -> bytes:
+            events.append("read")
+            if primary_failure is not None:
+                raise primary_failure
+            chunk, self.remaining = self.remaining, b""
+            return chunk
+
+        def close(self) -> None:
+            events.append("close")
+            raise close_failure
+
+        def release_conn(self) -> None:
+            events.append("release")
+            raise release_failure
+
+    class Client:
+        def get_object(self, bucket: str, key: str, *, version_id: str) -> Response:
+            assert (bucket, key, version_id) == (
+                "teaching",
+                source.key,
+                source.version_id,
+            )
+            events.append("get")
+            return Response()
+
+    store = MinioVersionedObjectStore(Client(), bucket="teaching")
+    expected_failure = close_failure if primary_failure is None else primary_failure
+    with pytest.raises(type(expected_failure)) as captured:
+        asyncio.run(store.read_object_version(source, destination))
+
+    assert captured.value is expected_failure
+    notes = tuple(getattr(captured.value, "__notes__", ()))
+    assert any("object response release cleanup failed" in note for note in notes)
+    if primary_failure is not None:
+        assert any("object response close cleanup failed" in note for note in notes)
+    assert events[-2:] == ["close", "release"]
+
+
+def test_minio_object_read_waits_for_worker_and_response_cleanup_before_propagating_repeated_cancellation(
+    tmp_path,
+) -> None:
+    payload = b"version-pinned-document"
+    source = _versioned_object(
+        "tenant-a",
+        "tenants/tenant-a/classrooms/a/document.json",
+        "version-2",
+        payload,
+    )
+    read_started = threading.Event()
+    allow_read = threading.Event()
+    read_finished = threading.Event()
+    close_started = threading.Event()
+    allow_close = threading.Event()
+    close_finished = threading.Event()
+    release_finished = threading.Event()
+    events: list[str] = []
+
+    class Response:
+        remaining = payload
+
+        def read(self, _size: int) -> bytes:
+            if not self.remaining:
+                events.append("read-eof")
+                return b""
+            events.append("read-start")
+            read_started.set()
+            if not allow_read.wait(timeout=5):
+                raise AssertionError("object read was not released")
+            chunk, self.remaining = self.remaining, b""
+            events.append("read-finish")
+            read_finished.set()
+            return chunk
+
+        def close(self) -> None:
+            assert read_finished.is_set(), "response closed before its read reached terminal"
+            events.append("close-start")
+            close_started.set()
+            if not allow_close.wait(timeout=5):
+                raise AssertionError("object response close was not released")
+            events.append("close-finish")
+            close_finished.set()
+
+        def release_conn(self) -> None:
+            assert close_finished.is_set(), (
+                "connection released before response close reached terminal"
+            )
+            events.append("release")
+            release_finished.set()
+
+    class Client:
+        def get_object(self, bucket: str, key: str, *, version_id: str) -> Response:
+            assert (bucket, key, version_id) == (
+                "teaching",
+                source.key,
+                source.version_id,
+            )
+            events.append("get")
+            return Response()
+
+    store = MinioVersionedObjectStore(Client(), bucket="teaching")
+    destination = tmp_path / "payload.blob"
+
+    async def scenario() -> None:
+        task = asyncio.create_task(store.read_object_version(source, destination))
+        try:
+            assert await asyncio.to_thread(read_started.wait, 5)
+            task.cancel("first object read cancellation")
+            await asyncio.sleep(0)
+            assert not task.done()
+
+            allow_read.set()
+            assert await asyncio.to_thread(read_finished.wait, 5)
+            assert await asyncio.to_thread(close_started.wait, 5)
+            assert not task.done()
+
+            task.cancel("second object read cancellation")
+            await asyncio.sleep(0)
+            assert not task.done()
+            allow_close.set()
+            with pytest.raises(asyncio.CancelledError) as captured:
+                await task
+            assert captured.value.args == ("first object read cancellation",)
+        finally:
+            allow_read.set()
+            allow_close.set()
+            if not task.done():
+                try:
+                    await asyncio.shield(task)
+                except BaseException:
+                    pass
+            assert await asyncio.to_thread(read_finished.wait, 5)
+            assert await asyncio.to_thread(close_finished.wait, 5)
+            assert await asyncio.to_thread(release_finished.wait, 5)
+
+    asyncio.run(scenario())
+
+    assert destination.read_bytes() == payload
+    assert events == [
+        "get",
+        "read-start",
+        "read-finish",
+        "read-eof",
+        "close-start",
+        "close-finish",
+        "release",
+    ]
+
+
+def test_minio_enumeration_waits_for_worker_terminal_before_propagating_repeated_cancellation() -> (
+    None
+):
+    list_started = threading.Event()
+    allow_list = threading.Event()
+    list_finished = threading.Event()
+    events: list[str] = []
+
+    class Client:
+        def get_bucket_versioning(self, bucket: str) -> object:
+            assert bucket == "teaching"
+            events.append("versioning")
+            return SimpleNamespace(status="Enabled")
+
+        def list_objects(self, bucket: str, **options: object) -> tuple[()]:
+            assert bucket == "teaching"
+            assert options == {
+                "prefix": "tenants/",
+                "recursive": True,
+                "include_version": True,
+            }
+            events.append("list-start")
+            list_started.set()
+            if not allow_list.wait(timeout=5):
+                raise AssertionError("object enumeration was not released")
+            events.append("list-finish")
+            list_finished.set()
+            return ()
+
+    store = MinioVersionedObjectStore(Client(), bucket="teaching")
+
+    async def scenario() -> None:
+        task = asyncio.create_task(store.enumerate_object_versions())
+        try:
+            assert await asyncio.to_thread(list_started.wait, 5)
+            task.cancel("first object enumeration cancellation")
+            await asyncio.sleep(0)
+            assert not task.done()
+            task.cancel("second object enumeration cancellation")
+            await asyncio.sleep(0)
+            assert not task.done()
+            allow_list.set()
+            with pytest.raises(asyncio.CancelledError) as captured:
+                await task
+            assert captured.value.args == ("first object enumeration cancellation",)
+        finally:
+            allow_list.set()
+            if not task.done():
+                try:
+                    await asyncio.shield(task)
+                except BaseException:
+                    pass
+            assert await asyncio.to_thread(list_finished.wait, 5)
+
+    asyncio.run(scenario())
+
+    assert events == ["versioning", "list-start", "list-finish"]
+
+
+def test_postgres_snapshot_waits_for_pg_dump_terminal_before_rollback_close_and_propagating_repeated_cancellation(
+    tmp_path,
+) -> None:
+    runner_started = threading.Event()
+    allow_runner = threading.Event()
+    runner_finished = threading.Event()
+    rollback_started = asyncio.Event()
+    allow_rollback = asyncio.Event()
+    rollback_finished = asyncio.Event()
+    close_finished = asyncio.Event()
+    events: list[str] = []
+
+    class Transaction:
+        async def start(self) -> None:
+            events.append("transaction-start")
+
+        async def commit(self) -> None:
+            events.append("commit")
+
+        async def rollback(self) -> None:
+            events.append("rollback-start")
+            rollback_started.set()
+            await allow_rollback.wait()
+            events.append("rollback-finish")
+            rollback_finished.set()
+
+    class Connection:
+        def transaction(self, **options: object) -> Transaction:
+            assert options == {"isolation": "repeatable_read", "readonly": True}
+            return Transaction()
+
+        async def fetchval(self, query: str) -> object:
+            if "pg_export_snapshot" in query:
+                return "snapshot-1"
+            if "pg_database" in query:
+                return "42"
+            if "pg_control_system" in query:
+                return "7449553557289146937"
+            if "platform.alembic_version" in query:
+                return "platform-revision"
+            raise AssertionError(query)
+
+        async def fetch(self, query: str) -> tuple[()]:
+            assert "platform.tenant_schema_states" in query
+            return ()
+
+        async def close(self) -> None:
+            assert rollback_finished.is_set(), "connection closed before rollback reached terminal"
+            events.append("connection-close")
+            close_finished.set()
+
+    async def connect(**_options: object) -> Connection:
+        return Connection()
+
+    destination = tmp_path / "database.dump"
+    config = RuntimeConfig(
+        "postgres",
+        5432,
+        "yfeistai",
+        "operator",
+        "http://minio:9000",
+        _SOURCE_OBJECT_STORE_NAMESPACE_ID,
+        "teaching",
+        "us-east-1",
+    )
+
+    def runner(argv: tuple[str, ...], **_options: object) -> subprocess.CompletedProcess[str]:
+        events.append("runner-start")
+        runner_started.set()
+        if not allow_runner.wait(timeout=5):
+            raise AssertionError("pg_dump runner was not released")
+        output = next(
+            Path(argument.removeprefix("--file="))
+            for argument in argv
+            if argument.startswith("--file=")
+        )
+        output.write_bytes(b"PGDMP\x01")
+        events.append("runner-finish")
+        runner_finished.set()
+        return subprocess.CompletedProcess(argv, 0)
+
+    async def scenario() -> None:
+        task = asyncio.create_task(
+            dump_postgres_snapshot(
+                destination,
+                config=config,
+                password="APP_PASSWORD",
+                pg_dump=Path("pg_dump"),
+                connect=connect,
+                runner=runner,
+            )
+        )
+        try:
+            assert await asyncio.to_thread(runner_started.wait, 5)
+            task.cancel("first pg_dump cancellation")
+            await asyncio.sleep(0)
+            assert not task.done()
+            assert not rollback_started.is_set()
+            assert not close_finished.is_set()
+
+            allow_runner.set()
+            assert await asyncio.to_thread(runner_finished.wait, 5)
+            await asyncio.wait_for(rollback_started.wait(), timeout=5)
+            assert not task.done()
+
+            task.cancel("second pg_dump cancellation")
+            await asyncio.sleep(0)
+            assert not task.done()
+            allow_rollback.set()
+            with pytest.raises(asyncio.CancelledError) as captured:
+                await task
+            assert captured.value.args == ("first pg_dump cancellation",)
+        finally:
+            allow_runner.set()
+            allow_rollback.set()
+            if not task.done():
+                try:
+                    await asyncio.shield(task)
+                except BaseException:
+                    pass
+            assert await asyncio.to_thread(runner_finished.wait, 5)
+
+    asyncio.run(scenario())
+
+    assert rollback_finished.is_set()
+    assert close_finished.is_set()
+    assert "commit" not in events
+    assert events.index("runner-finish") < events.index("rollback-start")
+    assert events[-3:] == ["rollback-start", "rollback-finish", "connection-close"]

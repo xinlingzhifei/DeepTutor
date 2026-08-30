@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from deeptutor.teaching.openmaic.data_planes import (
+    ROUTE_BINDING_CONFIG_REVISION,
     DataPlaneDecision,
     DataPlaneResolution,
     DataPlaneRouteRecord,
@@ -14,6 +15,8 @@ from deeptutor.teaching.openmaic.data_planes import (
     DataPlaneSelector,
     DataPlaneUnavailable,
     ProviderProfileRecord,
+    provider_config_digest,
+    route_config_digest,
 )
 
 
@@ -96,7 +99,10 @@ class RecordingRepository:
 
 
 def test_standard_tenant_resolves_healthy_shared_data_plane() -> None:
-    repository = RecordingRepository(_shared_resolution("tenant-standard"))
+    resolution = _shared_resolution("tenant-standard")
+    assert resolution.route is not None
+    assert resolution.provider_profile is not None
+    repository = RecordingRepository(resolution)
     selector = DataPlaneSelector(
         settings=SimpleNamespace(enabled=True),
         repository=repository,
@@ -109,6 +115,9 @@ def test_standard_tenant_resolves_healthy_shared_data_plane() -> None:
         mode="shared",
         worker_pool_ref="shared-generation",
         queue_ref="openmaic.shared",
+        config_revision=ROUTE_BINDING_CONFIG_REVISION,
+        route_config_digest=route_config_digest(resolution.route),
+        provider_config_digest=provider_config_digest(resolution.provider_profile),
     )
     assert repository.decisions == [
         DataPlaneDecision(

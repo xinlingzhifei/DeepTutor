@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import httpx
 from pydantic import SecretStr
@@ -153,6 +154,412 @@ def test_worker_client_rejects_cross_route_before_repository_access() -> None:
         return repository.calls
 
     assert asyncio.run(run()) == 0
+
+
+@pytest.mark.asyncio
+async def test_worker_client_records_job_bound_dedicated_route_attempt() -> None:
+    from deeptutor.teaching.openmaic.data_planes import DataPlaneSelection
+    from deeptutor.teaching.processes import (
+        RuntimeOpenMAICClients,
+        WorkerRuntimeBoundary,
+    )
+
+    attempts: list[dict[str, object]] = []
+
+    class Repository:
+        async def record_job_route_attempt(self, **kwargs) -> None:
+            attempts.append(kwargs)
+
+    clients = RuntimeOpenMAICClients.__new__(RuntimeOpenMAICClients)
+    clients._boundary = WorkerRuntimeBoundary(
+        mode="dedicated",
+        route_id="dedicated-tenant-1",
+        tenant_id="tenant-1",
+    )
+    clients._repository = Repository()
+
+    async def selection(**_kwargs):
+        return DataPlaneSelection(
+            tenant_id="tenant-1",
+            route_ref="dedicated-tenant-1",
+            provider_profile_ref="provider-tenant-1",
+            mode="dedicated",
+            worker_pool_ref="generation-tenant-1",
+            queue_ref="openmaic.tenant-1",
+            config_revision="route-binding-v1",
+            route_config_digest="a" * 64,
+            provider_config_digest="b" * 64,
+        )
+
+    sentinel_client = object()
+
+    async def client(**_kwargs):
+        return sentinel_client
+
+    clients._selection = selection
+    clients._client = client
+    claim = SimpleNamespace(
+        tenant_id="tenant-1",
+        job_id="job-1",
+        phase="content",
+        attempt_count=2,
+        data_plane_mode="dedicated",
+        data_plane_route_id="dedicated-tenant-1",
+        provider_profile_id="provider-tenant-1",
+        worker_pool_ref="generation-tenant-1",
+        queue_ref="openmaic.tenant-1",
+        lease_owner="dedicated-worker-1",
+        lease_token="lease-token-1",
+    )
+
+    assert await clients.client_for_claim(claim) is sentinel_client
+    assert attempts == [
+        {
+            "tenant_id": "tenant-1",
+            "job_id": "job-1",
+            "phase": "content",
+            "attempt_count": 2,
+            "mode": "dedicated",
+            "data_plane_route_id": "dedicated-tenant-1",
+            "provider_profile_id": "provider-tenant-1",
+            "worker_pool_ref": "generation-tenant-1",
+            "queue_ref": "openmaic.tenant-1",
+            "worker_id": "dedicated-worker-1",
+            "lease_token": "lease-token-1",
+            "outcome": "selected",
+            "config_revision": "route-binding-v1",
+            "route_config_digest": "a" * 64,
+            "provider_config_digest": "b" * 64,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_worker_client_records_claim_mode_when_route_attempt_is_unavailable() -> None:
+    from deeptutor.teaching.processes import (
+        RuntimeOpenMAICClients,
+        WorkerRuntimeBoundary,
+    )
+
+    attempts: list[dict[str, object]] = []
+
+    class Repository:
+        async def record_job_route_attempt(self, **kwargs) -> None:
+            attempts.append(kwargs)
+
+    clients = RuntimeOpenMAICClients.__new__(RuntimeOpenMAICClients)
+    clients._boundary = WorkerRuntimeBoundary(
+        mode="shared",
+        route_id="shared-primary",
+        tenant_id=None,
+    )
+    clients._repository = Repository()
+
+    async def unavailable(**_kwargs):
+        raise DataPlaneUnavailable()
+
+    clients._selection = unavailable
+    claim = SimpleNamespace(
+        tenant_id="tenant-1",
+        job_id="job-1",
+        phase="content",
+        attempt_count=3,
+        data_plane_mode="dedicated",
+        data_plane_route_id="dedicated-tenant-1",
+        provider_profile_id="provider-tenant-1",
+        worker_pool_ref="generation-tenant-1",
+        queue_ref="openmaic.tenant-1",
+        lease_owner="shared-worker-1",
+        lease_token="lease-token-1",
+    )
+
+    with pytest.raises(DataPlaneUnavailable):
+        await clients.client_for_claim(claim)
+    assert attempts == [
+        {
+            "tenant_id": "tenant-1",
+            "job_id": "job-1",
+            "phase": "content",
+            "attempt_count": 3,
+            "mode": "dedicated",
+            "data_plane_route_id": "dedicated-tenant-1",
+            "provider_profile_id": "provider-tenant-1",
+            "worker_pool_ref": "generation-tenant-1",
+            "queue_ref": "openmaic.tenant-1",
+            "worker_id": "shared-worker-1",
+            "lease_token": "lease-token-1",
+            "outcome": "unavailable",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_worker_client_records_service_secret_unavailable_before_reraising() -> None:
+    from deeptutor.teaching.openmaic.auth import ServiceSecretUnavailable
+    from deeptutor.teaching.openmaic.data_planes import DataPlaneSelection
+    from deeptutor.teaching.processes import (
+        RuntimeOpenMAICClients,
+        WorkerRuntimeBoundary,
+    )
+
+    attempts: list[dict[str, object]] = []
+
+    class Repository:
+        async def record_job_route_attempt(self, **kwargs) -> None:
+            attempts.append(kwargs)
+
+    clients = RuntimeOpenMAICClients.__new__(RuntimeOpenMAICClients)
+    clients._boundary = WorkerRuntimeBoundary(
+        mode="dedicated",
+        route_id="dedicated-tenant-1",
+        tenant_id="tenant-1",
+    )
+    clients._repository = Repository()
+
+    async def selection(**_kwargs):
+        return DataPlaneSelection(
+            tenant_id="tenant-1",
+            route_ref="dedicated-tenant-1",
+            provider_profile_ref="provider-tenant-1",
+            mode="dedicated",
+            worker_pool_ref="generation-tenant-1",
+            queue_ref="openmaic.tenant-1",
+        )
+
+    unavailable = ServiceSecretUnavailable()
+
+    async def client(**_kwargs):
+        raise unavailable
+
+    clients._selection = selection
+    clients._client = client
+    claim = SimpleNamespace(
+        tenant_id="tenant-1",
+        job_id="job-1",
+        phase="content",
+        attempt_count=1,
+        data_plane_mode="dedicated",
+        data_plane_route_id="dedicated-tenant-1",
+        provider_profile_id="provider-tenant-1",
+        worker_pool_ref="generation-tenant-1",
+        queue_ref="openmaic.tenant-1",
+        lease_owner="dedicated-worker-1",
+        lease_token="lease-token-1",
+    )
+
+    with pytest.raises(ServiceSecretUnavailable) as captured:
+        await clients.client_for_claim(claim)
+
+    assert captured.value is unavailable
+    assert attempts == [
+        {
+            "tenant_id": "tenant-1",
+            "job_id": "job-1",
+            "phase": "content",
+            "attempt_count": 1,
+            "mode": "dedicated",
+            "data_plane_route_id": "dedicated-tenant-1",
+            "provider_profile_id": "provider-tenant-1",
+            "worker_pool_ref": "generation-tenant-1",
+            "queue_ref": "openmaic.tenant-1",
+            "worker_id": "dedicated-worker-1",
+            "lease_token": "lease-token-1",
+            "outcome": "unavailable",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_worker_client_records_route_configuration_unavailable_before_reraising() -> None:
+    from deeptutor.teaching.openmaic.data_planes import (
+        DataPlaneConfigurationUnavailable,
+        DataPlaneSelection,
+    )
+    from deeptutor.teaching.processes import (
+        RuntimeOpenMAICClients,
+        WorkerRuntimeBoundary,
+    )
+
+    attempts: list[dict[str, object]] = []
+
+    class Repository:
+        async def record_job_route_attempt(self, **kwargs) -> None:
+            attempts.append(kwargs)
+
+    clients = RuntimeOpenMAICClients.__new__(RuntimeOpenMAICClients)
+    clients._boundary = WorkerRuntimeBoundary(
+        mode="dedicated",
+        route_id="dedicated-tenant-1",
+        tenant_id="tenant-1",
+    )
+    clients._repository = Repository()
+
+    async def selection(**_kwargs):
+        return DataPlaneSelection(
+            tenant_id="tenant-1",
+            route_ref="dedicated-tenant-1",
+            provider_profile_ref="provider-tenant-1",
+            mode="dedicated",
+            worker_pool_ref="generation-tenant-1",
+            queue_ref="openmaic.tenant-1",
+        )
+
+    unavailable = DataPlaneConfigurationUnavailable()
+
+    async def client(**_kwargs):
+        raise unavailable
+
+    clients._selection = selection
+    clients._client = client
+    claim = SimpleNamespace(
+        tenant_id="tenant-1",
+        job_id="job-1",
+        phase="content",
+        attempt_count=1,
+        data_plane_mode="dedicated",
+        data_plane_route_id="dedicated-tenant-1",
+        provider_profile_id="provider-tenant-1",
+        worker_pool_ref="generation-tenant-1",
+        queue_ref="openmaic.tenant-1",
+        lease_owner="dedicated-worker-1",
+        lease_token="lease-token-1",
+    )
+
+    with pytest.raises(DataPlaneConfigurationUnavailable) as captured:
+        await clients.client_for_claim(claim)
+
+    assert captured.value is unavailable
+    assert attempts == [
+        {
+            "tenant_id": "tenant-1",
+            "job_id": "job-1",
+            "phase": "content",
+            "attempt_count": 1,
+            "mode": "dedicated",
+            "data_plane_route_id": "dedicated-tenant-1",
+            "provider_profile_id": "provider-tenant-1",
+            "worker_pool_ref": "generation-tenant-1",
+            "queue_ref": "openmaic.tenant-1",
+            "worker_id": "dedicated-worker-1",
+            "lease_token": "lease-token-1",
+            "outcome": "unavailable",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_worker_client_does_not_record_programming_value_error_as_unavailable() -> None:
+    from deeptutor.teaching.openmaic.data_planes import DataPlaneSelection
+    from deeptutor.teaching.processes import (
+        RuntimeOpenMAICClients,
+        WorkerRuntimeBoundary,
+    )
+
+    attempts: list[dict[str, object]] = []
+
+    class Repository:
+        async def record_job_route_attempt(self, **kwargs) -> None:
+            attempts.append(kwargs)
+
+    clients = RuntimeOpenMAICClients.__new__(RuntimeOpenMAICClients)
+    clients._boundary = WorkerRuntimeBoundary(
+        mode="dedicated",
+        route_id="dedicated-tenant-1",
+        tenant_id="tenant-1",
+    )
+    clients._repository = Repository()
+
+    async def selection(**_kwargs):
+        return DataPlaneSelection(
+            tenant_id="tenant-1",
+            route_ref="dedicated-tenant-1",
+            provider_profile_ref="provider-tenant-1",
+            mode="dedicated",
+            worker_pool_ref="generation-tenant-1",
+            queue_ref="openmaic.tenant-1",
+        )
+
+    programming_error = ValueError("unrelated programming defect")
+
+    async def client(**_kwargs):
+        raise programming_error
+
+    clients._selection = selection
+    clients._client = client
+    claim = SimpleNamespace(
+        tenant_id="tenant-1",
+        job_id="job-1",
+        phase="content",
+        attempt_count=1,
+        data_plane_mode="dedicated",
+        data_plane_route_id="dedicated-tenant-1",
+        provider_profile_id="provider-tenant-1",
+        worker_pool_ref="generation-tenant-1",
+        queue_ref="openmaic.tenant-1",
+        lease_owner="dedicated-worker-1",
+        lease_token="lease-token-1",
+    )
+
+    with pytest.raises(ValueError) as captured:
+        await clients.client_for_claim(claim)
+
+    assert captured.value is programming_error
+    assert attempts == []
+
+
+@pytest.mark.asyncio
+async def test_worker_client_does_not_return_client_when_route_attempt_audit_fails() -> None:
+    from deeptutor.teaching.openmaic.data_planes import DataPlaneSelection
+    from deeptutor.teaching.processes import (
+        RuntimeOpenMAICClients,
+        WorkerRuntimeBoundary,
+    )
+
+    class Repository:
+        async def record_job_route_attempt(self, **_kwargs) -> None:
+            raise RuntimeError("route attempt audit unavailable")
+
+    clients = RuntimeOpenMAICClients.__new__(RuntimeOpenMAICClients)
+    clients._boundary = WorkerRuntimeBoundary(
+        mode="dedicated",
+        route_id="dedicated-tenant-1",
+        tenant_id="tenant-1",
+    )
+    clients._repository = Repository()
+
+    async def selection(**_kwargs):
+        return DataPlaneSelection(
+            tenant_id="tenant-1",
+            route_ref="dedicated-tenant-1",
+            provider_profile_ref="provider-tenant-1",
+            mode="dedicated",
+            worker_pool_ref="generation-tenant-1",
+            queue_ref="openmaic.tenant-1",
+        )
+
+    sentinel_client = object()
+
+    async def client(**_kwargs):
+        return sentinel_client
+
+    clients._selection = selection
+    clients._client = client
+    claim = SimpleNamespace(
+        tenant_id="tenant-1",
+        job_id="job-1",
+        phase="content",
+        attempt_count=1,
+        data_plane_mode="dedicated",
+        data_plane_route_id="dedicated-tenant-1",
+        provider_profile_id="provider-tenant-1",
+        worker_pool_ref="generation-tenant-1",
+        queue_ref="openmaic.tenant-1",
+        lease_owner="dedicated-worker-1",
+        lease_token="lease-token-1",
+    )
+
+    with pytest.raises(RuntimeError, match="route attempt audit unavailable"):
+        await clients.client_for_claim(claim)
 
 
 @pytest.mark.asyncio

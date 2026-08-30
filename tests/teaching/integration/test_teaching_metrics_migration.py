@@ -452,7 +452,12 @@ def test_tenant_metrics_migration_backfills_and_removes_nonterminal_backlog(
             await engine.dispose()
 
     try:
-        upgraded = _run_tenant_migration(generation_database, schema_name, "upgrade", "head")
+        upgraded = _run_tenant_migration(
+            generation_database,
+            schema_name,
+            "upgrade",
+            METRICS_REVISION,
+        )
         assert upgraded.returncode == 0, f"{upgraded.stdout}\n{upgraded.stderr}"
         tenant_revision, ledger_revision, event_ids, received_at = asyncio.run(inspect())
         assert (tenant_revision, ledger_revision) == (METRICS_REVISION, METRICS_REVISION)
@@ -561,7 +566,9 @@ def test_metrics_migration_requires_tenant_first_platform_last_downgrade(
             PREVIOUS_REVISION,
         )
         assert running_gap.returncode != 0
-        assert "complete tenant provisioning jobs before platform metrics" in running_gap.stderr
+        assert "complete tenant provisioning jobs before platform metrics" in (
+            f"{running_gap.stdout}\n{running_gap.stderr}"
+        )
         assert {
             "teaching_metric_counter_rollups",
             "teaching_metric_histogram_rollups",
@@ -598,7 +605,9 @@ def test_metrics_migration_requires_tenant_first_platform_last_downgrade(
             PREVIOUS_REVISION,
         )
         assert platform_first.returncode != 0
-        assert "downgrade tenant schemas before platform metrics" in platform_first.stderr
+        assert "downgrade tenant schemas before platform metrics" in (
+            f"{platform_first.stdout}\n{platform_first.stderr}"
+        )
         assert {
             "teaching_metric_counter_rollups",
             "teaching_metric_histogram_rollups",

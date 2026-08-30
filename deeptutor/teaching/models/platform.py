@@ -301,6 +301,78 @@ class DataPlaneRoute(PlatformBase):
     )
 
 
+class GenerationRouteAttempt(PlatformBase):
+    """Append-only worker routing fact for one claimed job attempt."""
+
+    __tablename__ = "generation_route_attempts"
+
+    tenant_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("platform.tenants.id", ondelete="RESTRICT"),
+        primary_key=True,
+    )
+    job_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, primary_key=True)
+    phase: Mapped[str] = mapped_column(String(16))
+    decision: Mapped[str] = mapped_column(String(16))
+    data_plane_mode: Mapped[str] = mapped_column(String(16))
+    data_plane_route_id: Mapped[str] = mapped_column(String(63))
+    provider_profile_id: Mapped[str] = mapped_column(String(63))
+    worker_pool_ref: Mapped[str] = mapped_column(String(128))
+    queue_ref: Mapped[str] = mapped_column(String(128))
+    worker_id: Mapped[str] = mapped_column(String(128))
+    config_revision: Mapped[str | None] = mapped_column(String(32))
+    route_config_digest: Mapped[str | None] = mapped_column(String(64))
+    provider_config_digest: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+
+    __table_args__ = (
+        CheckConstraint("attempt_count > 0", name="attempt_count"),
+        CheckConstraint(
+            "phase IN ('outline', 'content', 'export')",
+            name="phase",
+        ),
+        CheckConstraint(
+            "decision IN ('selected', 'unavailable')",
+            name="decision",
+        ),
+        CheckConstraint(
+            "data_plane_mode IN ('shared', 'dedicated')",
+            name="data_plane_mode",
+        ),
+        CheckConstraint(
+            "length(btrim(tenant_id)) > 0 "
+            "AND length(btrim(job_id)) > 0 "
+            "AND length(btrim(data_plane_route_id)) > 0 "
+            "AND length(btrim(provider_profile_id)) > 0 "
+            "AND length(btrim(worker_pool_ref)) > 0 "
+            "AND length(btrim(queue_ref)) > 0 "
+            "AND length(btrim(worker_id)) > 0",
+            name="bindings_not_empty",
+        ),
+        CheckConstraint(
+            "(decision = 'selected' AND config_revision = 'route-binding-v1' "
+            "AND route_config_digest ~ '^[0-9a-f]{64}$' "
+            "AND route_config_digest <> "
+            "'0000000000000000000000000000000000000000000000000000000000000000' "
+            "AND provider_config_digest ~ '^[0-9a-f]{64}$' "
+            "AND provider_config_digest <> "
+            "'0000000000000000000000000000000000000000000000000000000000000000') OR "
+            "(decision = 'unavailable' AND config_revision IS NULL "
+            "AND route_config_digest IS NULL AND provider_config_digest IS NULL)",
+            name="configuration_binding",
+        ),
+        Index(
+            "ix_generation_route_attempts_tenant_created",
+            "tenant_id",
+            "created_at",
+        ),
+    )
+
+
 class TeachingMetricCounterRollup(PlatformBase):
     """Internally sharded absolute counters for the fixed public metric contract."""
 

@@ -22,7 +22,13 @@ from deeptutor.teaching.contracts import (
     canonical_teaching_brief_sha256,
 )
 from deeptutor.teaching.object_store import ObjectStoreConfigurationError
-from deeptutor.teaching.openmaic.data_planes import DataPlaneSelection, DataPlaneUnavailable
+from deeptutor.teaching.openmaic.data_planes import (
+    DataPlaneResolution,
+    DataPlaneRouteRecord,
+    DataPlaneSelection,
+    DataPlaneUnavailable,
+    ProviderProfileRecord,
+)
 from deeptutor.teaching.permissions import ResourceScope, permissions_for_roles
 from deeptutor.teaching.repositories.jobs import GenerationJobRecord
 from deeptutor.teaching.services.exports import ExportRecord
@@ -144,6 +150,8 @@ def _detail(
     progress_percent: int = 50,
     error_category: str | None = None,
     error_code: str | None = None,
+    data_plane_mode: str | None = "shared",
+    attempt_count: int = 0,
 ):
     if request_payload is None:
         request_payload = canonical_json_bytes(
@@ -168,12 +176,14 @@ def _detail(
         resource_class_id=resource_class_id,
         public_request_sha256=public_request_sha256,
         request_sha256=hashlib.sha256(request_payload.encode()).hexdigest(),
+        data_plane_mode=data_plane_mode,
         data_plane_route_id="route-trusted",
         provider_profile_id="provider-private",
         worker_pool_ref="workers-private",
         queue_ref="queue-private",
         request_payload=request_payload,
         progress_percent=progress_percent,
+        attempt_count=attempt_count,
         waiting_reason="outline_confirmation" if status == "awaiting_confirmation" else None,
         cancel_requested=False,
         error_category=error_category,
@@ -182,6 +192,74 @@ def _detail(
         result_ref=result_ref,
         retry_of_job_id=None,
         export_format=export_format,
+    )
+
+
+def _authoritative_data_plane_resolution(
+    *,
+    tenant_id: str = "tenant-1",
+    mode: str = "shared",
+    route_id: str = "shared-primary",
+    provider_profile_id: str = "platform-default",
+    worker_pool_ref: str = "shared-generation",
+    queue_ref: str = "openmaic.shared",
+    route_status: str = "active",
+    health_status: str = "healthy",
+    profile_status: str = "active",
+) -> DataPlaneResolution:
+    owner_tenant_id = None if mode == "shared" else tenant_id
+    owner_key = "shared" if mode == "shared" else tenant_id
+    return DataPlaneResolution(
+        tenant_id=tenant_id,
+        tenant_mode=mode,
+        route=DataPlaneRouteRecord(
+            route_id=route_id,
+            tenant_id=owner_tenant_id,
+            owner_key=owner_key,
+            mode=mode,
+            base_url="http://must-not-leak.internal",
+            worker_pool=worker_pool_ref,
+            queue_name=queue_ref,
+            provider_profile_id=provider_profile_id,
+            status=route_status,
+            health_status=health_status,
+        ),
+        provider_profile=ProviderProfileRecord(
+            profile_id=provider_profile_id,
+            scope=mode,
+            tenant_id=owner_tenant_id,
+            owner_key=owner_key,
+            provider_type="openai-compatible",
+            model_name="must-not-leak-model",
+            api_base_url="http://must-not-leak-provider.internal",
+            secret_ref="must-not-leak-secret-ref",
+            status=profile_status,
+        ),
+    )
+
+
+def _job_route_audit(
+    *,
+    data_plane_mode: str,
+    attempt_count: int,
+    shared_attempt_count: int,
+    dedicated_attempt_count: int,
+    selected_attempt_count: int,
+    unavailable_attempt_count: int,
+    last_attempt_phase: str = "content",
+    last_attempt_decision: str = "selected",
+    final_phase_selected: bool = True,
+):
+    return SimpleNamespace(
+        data_plane_mode=data_plane_mode,
+        attempt_count=attempt_count,
+        shared_attempt_count=shared_attempt_count,
+        dedicated_attempt_count=dedicated_attempt_count,
+        selected_attempt_count=selected_attempt_count,
+        unavailable_attempt_count=unavailable_attempt_count,
+        last_attempt_phase=last_attempt_phase,
+        last_attempt_decision=last_attempt_decision,
+        final_phase_selected=final_phase_selected,
     )
 
 
@@ -234,6 +312,10 @@ class FakeRepository:
         self.by_idempotency: dict[str, str] = {}
         self.created_requests: list[object] = []
         self.confirmed_payloads: list[tuple[str, str]] = []
+        self.data_plane_resolution: DataPlaneResolution | None = None
+        self.data_plane_resolve_calls: list[str] = []
+        self.job_route_audits: dict[str, object] = {}
+        self.job_route_audit_calls: list[dict[str, object]] = []
 
     async def create_job_and_reserve(self, request):
         self.created_requests.append(request)
@@ -261,6 +343,7 @@ class FakeRepository:
             resource_course_id=request.resource_course_id,
             resource_class_id=request.resource_class_id,
             public_request_sha256=request.public_request_sha256,
+            data_plane_mode=request.data_plane_mode,
         )
         detail.idempotency_key = request.idempotency_key
         detail.request_id = request.request_id
@@ -280,6 +363,14 @@ class FakeRepository:
     async def get_job_details(self, tenant_id: str, job_id: str):
         job = self.jobs.get(job_id)
         return job if job is not None and job.tenant_id == tenant_id else None
+
+    async def resolve(self, tenant_id: str):
+        self.data_plane_resolve_calls.append(tenant_id)
+        return self.data_plane_resolution
+
+    async def resolve_job_route_audit(self, **kwargs):
+        self.job_route_audit_calls.append(dict(kwargs))
+        return self.job_route_audits.get(str(kwargs["job_id"]))
 
     async def requeue_confirmed_content(
         self,
@@ -433,6 +524,7 @@ def api_harness():
     app.include_router(jobs_router.router, prefix="/api/v1")
     app.include_router(exports_router.router, prefix="/api/v1")
     app.dependency_overrides[jobs_router.get_job_repository] = lambda: repository
+    app.dependency_overrides[jobs_router.get_data_plane_repository] = lambda: repository
     app.dependency_overrides[jobs_router.get_data_plane_selector] = FakeSelector
     app.dependency_overrides[jobs_router.get_trusted_teaching_brief_resolver] = lambda: (
         FakeTrustedTeachingBriefResolver()
@@ -484,6 +576,7 @@ def test_duplicate_idempotency_key_returns_same_server_job(api_harness) -> None:
     assert first.status_code == second.status_code == 202
     assert first.json()["job_id"] == second.json()["job_id"]
     assert repository.created_requests[0].tenant_id == "tenant-1"
+    assert repository.created_requests[0].data_plane_mode == "shared"
     assert repository.created_requests[0].data_plane_route_id == "route-trusted"
     rendered = json.dumps(first.json(), sort_keys=True)
     assert "provider-private" not in rendered
@@ -569,6 +662,8 @@ def test_platform_admin_can_read_one_secret_free_generation_binding(api_harness)
         status="succeeded",
         phase="content",
         progress_percent=100,
+        data_plane_mode="shared",
+        attempt_count=1,
     )
     job.data_plane_route_id = "shared-primary"
     job.provider_profile_id = "platform-default"
@@ -577,6 +672,14 @@ def test_platform_admin_can_read_one_secret_free_generation_binding(api_harness)
     job.result_ref = "classroom-version-shared-smoke"
     job.request_payload = '{"providerApiKey":"must-not-leak"}'
     repository.jobs[job.job_id] = job
+    repository.job_route_audits[job.job_id] = _job_route_audit(
+        data_plane_mode="shared",
+        attempt_count=1,
+        shared_attempt_count=1,
+        dedicated_attempt_count=0,
+        selected_attempt_count=1,
+        unavailable_attempt_count=0,
+    )
 
     response = TestClient(app).get(
         "/api/v1/system/classroom-jobs/tenant-1/job-shared-smoke/binding"
@@ -596,8 +699,242 @@ def test_platform_admin_can_read_one_secret_free_generation_binding(api_harness)
         "providerProfileId": "platform-default",
         "workerPoolRef": "shared-generation",
         "queueRef": "openmaic.shared",
+        "dataPlaneMode": "shared",
+        "routeTenantId": None,
+        "routeOwnerKey": "shared",
+        "providerScope": "shared",
+        "providerTenantId": None,
+        "providerOwnerKey": "shared",
+        "attemptCount": 1,
+        "sharedRouteAttemptCount": 1,
+        "dedicatedRouteAttemptCount": 0,
+        "selectedRouteAttemptCount": 1,
+        "unavailableRouteAttemptCount": 0,
+        "routeAttemptHistoryComplete": True,
     }
     assert "must-not-leak" not in response.text
+    assert repository.data_plane_resolve_calls == []
+    assert repository.job_route_audit_calls == [
+        {
+            "tenant_id": "tenant-1",
+            "job_id": "job-shared-smoke",
+            "phase": "content",
+            "expected_attempt_count": 1,
+            "expected_data_plane_mode": "shared",
+            "expected_route_id": "shared-primary",
+            "expected_provider_profile_id": "platform-default",
+            "expected_worker_pool_ref": "shared-generation",
+            "expected_queue_ref": "openmaic.shared",
+        }
+    ]
+
+
+def test_platform_admin_can_read_authoritative_dedicated_generation_binding(
+    api_harness,
+) -> None:
+    app, repository, _cancellation, _stores, _store = api_harness
+    job = _detail(
+        job_id="job-dedicated-smoke",
+        status="succeeded",
+        phase="content",
+        progress_percent=100,
+        data_plane_mode="dedicated",
+        attempt_count=2,
+    )
+    job.data_plane_route_id = "dedicated-tenant-1"
+    job.provider_profile_id = "provider-tenant-1"
+    job.worker_pool_ref = "generation-tenant-1"
+    job.queue_ref = "openmaic.tenant-1"
+    job.result_ref = "classroom-version-dedicated-smoke"
+    repository.jobs[job.job_id] = job
+    repository.job_route_audits[job.job_id] = _job_route_audit(
+        data_plane_mode="dedicated",
+        attempt_count=2,
+        shared_attempt_count=0,
+        dedicated_attempt_count=2,
+        selected_attempt_count=2,
+        unavailable_attempt_count=0,
+    )
+
+    response = TestClient(app).get(
+        "/api/v1/system/classroom-jobs/tenant-1/job-dedicated-smoke/binding"
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "schemaVersion": 1,
+        "tenantId": "tenant-1",
+        "jobId": "job-dedicated-smoke",
+        "jobKind": "generation",
+        "phase": "content",
+        "status": "succeeded",
+        "progressPercent": 100,
+        "classroomVersionId": "classroom-version-dedicated-smoke",
+        "dataPlaneRouteId": "dedicated-tenant-1",
+        "providerProfileId": "provider-tenant-1",
+        "workerPoolRef": "generation-tenant-1",
+        "queueRef": "openmaic.tenant-1",
+        "dataPlaneMode": "dedicated",
+        "routeTenantId": "tenant-1",
+        "routeOwnerKey": "tenant-1",
+        "providerScope": "dedicated",
+        "providerTenantId": "tenant-1",
+        "providerOwnerKey": "tenant-1",
+        "attemptCount": 2,
+        "sharedRouteAttemptCount": 0,
+        "dedicatedRouteAttemptCount": 2,
+        "selectedRouteAttemptCount": 2,
+        "unavailableRouteAttemptCount": 0,
+        "routeAttemptHistoryComplete": True,
+    }
+    assert "must-not-leak" not in response.text
+    assert repository.data_plane_resolve_calls == []
+    assert repository.job_route_audit_calls == [
+        {
+            "tenant_id": "tenant-1",
+            "job_id": "job-dedicated-smoke",
+            "phase": "content",
+            "expected_attempt_count": 2,
+            "expected_data_plane_mode": "dedicated",
+            "expected_route_id": "dedicated-tenant-1",
+            "expected_provider_profile_id": "provider-tenant-1",
+            "expected_worker_pool_ref": "generation-tenant-1",
+            "expected_queue_ref": "openmaic.tenant-1",
+        }
+    ]
+
+
+def test_system_binding_remains_bound_to_job_audit_after_current_route_changes(
+    api_harness,
+) -> None:
+    app, repository, _cancellation, _stores, _store = api_harness
+    job = _detail(
+        job_id="job-binding-drift",
+        status="succeeded",
+        phase="content",
+        data_plane_mode="dedicated",
+        attempt_count=1,
+    )
+    job.data_plane_route_id = "dedicated-original"
+    job.provider_profile_id = "provider-original"
+    job.worker_pool_ref = "generation-original"
+    job.queue_ref = "openmaic.original"
+    repository.jobs[job.job_id] = job
+    repository.data_plane_resolution = _authoritative_data_plane_resolution(
+        mode="shared",
+        route_id="shared-replacement",
+        provider_profile_id="provider-replacement",
+        worker_pool_ref="shared-replacement",
+        queue_ref="openmaic.replacement",
+        route_status="disabled",
+        health_status="unhealthy",
+        profile_status="disabled",
+    )
+    repository.job_route_audits[job.job_id] = _job_route_audit(
+        data_plane_mode="dedicated",
+        attempt_count=1,
+        shared_attempt_count=0,
+        dedicated_attempt_count=1,
+        selected_attempt_count=1,
+        unavailable_attempt_count=0,
+    )
+
+    response = TestClient(app).get(
+        "/api/v1/system/classroom-jobs/tenant-1/job-binding-drift/binding"
+    )
+
+    assert response.status_code == 200
+    assert response.json()["dataPlaneRouteId"] == "dedicated-original"
+    assert response.json()["dataPlaneMode"] == "dedicated"
+    assert response.json()["routeOwnerKey"] == "tenant-1"
+    assert repository.data_plane_resolve_calls == []
+
+
+@pytest.mark.parametrize(
+    "audit",
+    [
+        None,
+        _job_route_audit(
+            data_plane_mode="unknown",
+            attempt_count=1,
+            shared_attempt_count=1,
+            dedicated_attempt_count=0,
+            selected_attempt_count=1,
+            unavailable_attempt_count=0,
+        ),
+        _job_route_audit(
+            data_plane_mode="shared",
+            attempt_count=1,
+            shared_attempt_count=-1,
+            dedicated_attempt_count=2,
+            selected_attempt_count=1,
+            unavailable_attempt_count=0,
+        ),
+        _job_route_audit(
+            data_plane_mode="shared",
+            attempt_count=1,
+            shared_attempt_count=1,
+            dedicated_attempt_count=0,
+            selected_attempt_count=0,
+            unavailable_attempt_count=0,
+        ),
+        _job_route_audit(
+            data_plane_mode="shared",
+            attempt_count=2,
+            shared_attempt_count=2,
+            dedicated_attempt_count=0,
+            selected_attempt_count=1,
+            unavailable_attempt_count=1,
+            last_attempt_phase="content",
+            last_attempt_decision="unavailable",
+            final_phase_selected=False,
+        ),
+    ],
+)
+def test_system_binding_fails_closed_without_one_valid_job_bound_audit(
+    api_harness,
+    audit,
+) -> None:
+    app, repository, _cancellation, _stores, _store = api_harness
+    job = _detail(
+        job_id="job-binding-audit",
+        status="succeeded",
+        phase="content",
+        data_plane_mode="shared",
+        attempt_count=1,
+    )
+    repository.jobs[job.job_id] = job
+    if audit is not None:
+        repository.job_route_audits[job.job_id] = audit
+
+    response = TestClient(app).get(
+        "/api/v1/system/classroom-jobs/tenant-1/job-binding-audit/binding"
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Generation data plane binding unavailable"}
+
+
+def test_system_binding_fails_closed_for_legacy_job_without_persisted_plane_mode(
+    api_harness,
+) -> None:
+    app, repository, _cancellation, _stores, _store = api_harness
+    job = _detail(
+        job_id="job-legacy-binding",
+        status="succeeded",
+        phase="content",
+        data_plane_mode=None,
+        attempt_count=1,
+    )
+    repository.jobs[job.job_id] = job
+
+    response = TestClient(app).get(
+        "/api/v1/system/classroom-jobs/tenant-1/job-legacy-binding/binding"
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Generation data plane binding unavailable"}
+    assert repository.job_route_audit_calls == []
 
 
 def test_anonymous_cannot_read_system_binding_before_repository_access(
@@ -609,7 +946,15 @@ def test_anonymous_cannot_read_system_binding_before_repository_access(
     async def unexpected_get_job_details(_tenant_id: str, _job_id: str):
         raise AssertionError("anonymous binding request must not query the repository")
 
+    async def unexpected_resolve_job_route_audit(**_kwargs):
+        raise AssertionError("anonymous binding request must not query the data-plane repository")
+
     monkeypatch.setattr(repository, "get_job_details", unexpected_get_job_details)
+    monkeypatch.setattr(
+        repository,
+        "resolve_job_route_audit",
+        unexpected_resolve_job_route_audit,
+    )
     monkeypatch.setattr(auth_router, "AUTH_ENABLED", True)
     del app.dependency_overrides[jobs_router.require_platform_admin]
     app.dependency_overrides[auth_router.require_platform_enabled] = lambda: None
@@ -636,10 +981,18 @@ def test_non_platform_admin_cannot_read_system_binding_before_repository_access(
     async def unexpected_get_job_details(_tenant_id: str, _job_id: str):
         raise AssertionError("non-admin binding request must not query the repository")
 
+    async def unexpected_resolve_job_route_audit(**_kwargs):
+        raise AssertionError("non-admin binding request must not query the data-plane repository")
+
     async def authenticated_user():
         return payload
 
     monkeypatch.setattr(repository, "get_job_details", unexpected_get_job_details)
+    monkeypatch.setattr(
+        repository,
+        "resolve_job_route_audit",
+        unexpected_resolve_job_route_audit,
+    )
     monkeypatch.setattr(auth_router, "POCKETBASE_ENABLED", False)
     monkeypatch.setattr(
         auth_router,

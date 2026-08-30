@@ -1445,6 +1445,7 @@ async def test_postgres_student_generation_migration_constraints_state_and_downg
             "mastery_levels",
             "learning_progress",
             "learning_event_quarantine",
+            "classroom_export_policy_operations",
             "pbl_grading_results",
             "pbl_grading_idempotency_keys",
         }
@@ -1501,7 +1502,7 @@ async def test_postgres_student_generation_migration_constraints_state_and_downg
             for table_name, table in expected_tables.items()
             for column in table.c
         }
-        assert (revision, state_revision) == ("20260828_0022", "20260828_0022")
+        assert (revision, state_revision) == ("20260830_0023", "20260830_0023")
 
         with pytest.raises(IntegrityError):
             async with engine.begin() as connection:
@@ -1578,7 +1579,7 @@ async def test_postgres_student_generation_migration_constraints_state_and_downg
                 ),
                 {"schema_name": schema_name},
             )
-        assert (revision, state_revision) == ("20260828_0022", "20260828_0022")
+        assert (revision, state_revision) == ("20260830_0023", "20260830_0023")
     finally:
         async with engine.begin() as connection:
             await connection.execute(

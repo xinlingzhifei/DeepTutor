@@ -139,6 +139,10 @@ class _HeartbeatGuard:
         self._error: BaseException | None = None
 
     async def __aenter__(self) -> _HeartbeatGuard:
+        await self._repository.heartbeat_claim(
+            self._claim,
+            lease_seconds=LEASE_SECONDS,
+        )
         self._task = asyncio.create_task(self._run())
         return self
 
@@ -456,7 +460,10 @@ class GenerationWorker:
             except JobLeaseLost:
                 pass
         except Exception as exc:
-            failure = classify_worker_error(exc)
+            failure = classify_worker_error(
+                exc,
+                data_plane_mode=claim.data_plane_mode,
+            )
             try:
                 if failure.retryable:
                     await self._repository.retry_claim(
@@ -481,12 +488,12 @@ class GenerationWorker:
             payload.request_payload,
             payload.request_sha256,
         )
-        client = await self._clients.client_for_claim(claim)
         async with _HeartbeatGuard(
             self._repository,
             claim,
             sleep=self._sleep,
         ) as heartbeat:
+            client = await self._clients.client_for_claim(claim)
             if payload.cancel_requested:
                 await client.cancel(claim.job_id)
                 heartbeat.assert_current()

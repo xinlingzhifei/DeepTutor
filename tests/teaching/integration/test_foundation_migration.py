@@ -24,7 +24,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 FOUNDATION_REVISION = "20260728_0001"
 SCOPED_GRANTS_REVISION = "20260730_0002"
 PROVISIONING_REVISION = "20260730_0003"
-HEAD_REVISION = "20260828_0022"
+HEAD_REVISION = "20260830_0023"
 
 
 @dataclass(frozen=True)
@@ -494,6 +494,7 @@ def test_migration_runs_from_outside_repository(
         "classroom_assets",
         "classroom_draft_media",
         "classroom_drafts",
+        "classroom_export_policy_operations",
         "classroom_export_policies",
         "classroom_exports",
         "classroom_publication_materializations",
@@ -579,6 +580,7 @@ def test_wheel_packages_migrations_and_full_app_entrypoint(
         "deeptutor/teaching/migrations/versions/20260825_0020_pbl_grading_results.py",
         "deeptutor/teaching/migrations/versions/20260827_0021_student_safety_idempotency.py",
         "deeptutor/teaching/migrations/versions/20260828_0022_classroom_export_policy_cas.py",
+        "deeptutor/teaching/migrations/versions/20260830_0023_generation_job_route_evidence.py",
     }.issubset(names)
     assert "deeptutor-migrate = deeptutor.teaching.migrations.cli:main" in entry_points
     assert "deeptutor-provisioner = deeptutor.teaching.provisioning_cli:main" in entry_points
@@ -629,6 +631,7 @@ def test_packaged_entrypoint_runs_platform_and_tenant_scopes(
         "audit_log",
         "data_plane_routes",
         "generation_queue",
+        "generation_route_attempts",
         "generation_slots",
         "outbox_messages",
         "provider_profiles",
@@ -659,6 +662,7 @@ def test_packaged_entrypoint_runs_platform_and_tenant_scopes(
         "classroom_assets",
         "classroom_draft_media",
         "classroom_drafts",
+        "classroom_export_policy_operations",
         "classroom_export_policies",
         "classroom_exports",
         "classroom_publication_materializations",
@@ -935,6 +939,7 @@ def test_foundation_migration_is_isolated_and_repeatable(migration_database):
         "audit_log",
         "data_plane_routes",
         "generation_queue",
+        "generation_route_attempts",
         "generation_slots",
         "outbox_messages",
         "provider_profiles",
@@ -965,6 +970,7 @@ def test_foundation_migration_is_isolated_and_repeatable(migration_database):
         "classroom_assets",
         "classroom_draft_media",
         "classroom_drafts",
+        "classroom_export_policy_operations",
         "classroom_export_policies",
         "classroom_exports",
         "classroom_publication_materializations",
@@ -1012,6 +1018,7 @@ def test_foundation_migration_is_isolated_and_repeatable(migration_database):
         "classroom_assets",
         "classroom_draft_media",
         "classroom_drafts",
+        "classroom_export_policy_operations",
         "classroom_export_policies",
         "classroom_exports",
         "classroom_publication_materializations",
@@ -1775,6 +1782,7 @@ def _install_source_runtime_database(
     from deeptutor.services import config as config_module
     from deeptutor.services.config import PlatformSettings
     from deeptutor.teaching import database as database_module
+    from deeptutor.teaching.migrations import runner as migration_runner
 
     settings = PlatformSettings(
         enabled=True,
@@ -1788,6 +1796,11 @@ def _install_source_runtime_database(
     )
     monkeypatch.setattr(
         config_module,
+        "load_platform_settings",
+        lambda: settings,
+    )
+    monkeypatch.setattr(
+        migration_runner,
         "load_platform_settings",
         lambda: settings,
     )
@@ -1809,9 +1822,12 @@ def test_postgres_data_plane_routing_is_fail_closed_and_owner_bound(
         Tenant,
     )
     from deeptutor.teaching.openmaic.data_planes import (
+        ROUTE_BINDING_CONFIG_REVISION,
         DataPlaneSelection,
         DataPlaneSelector,
         DataPlaneUnavailable,
+        provider_config_digest,
+        route_config_digest,
     )
     from deeptutor.teaching.repositories.data_planes import (
         SqlAlchemyDataPlaneRepository,
@@ -1959,6 +1975,10 @@ def test_postgres_data_plane_routing_is_fail_closed_and_owner_bound(
                 settings=SimpleNamespace(enabled=True),
                 repository=repository,
             )
+            standard_resolution = await repository.resolve(standard_tenant)
+            assert standard_resolution is not None
+            assert standard_resolution.route is not None
+            assert standard_resolution.provider_profile is not None
             standard_selection = await selector.resolve(standard_tenant)
             assert standard_selection == DataPlaneSelection(
                 tenant_id=standard_tenant,
@@ -1967,7 +1987,14 @@ def test_postgres_data_plane_routing_is_fail_closed_and_owner_bound(
                 mode="shared",
                 worker_pool_ref="routing-shared-pool",
                 queue_ref="routing.shared",
+                config_revision=ROUTE_BINDING_CONFIG_REVISION,
+                route_config_digest=route_config_digest(standard_resolution.route),
+                provider_config_digest=provider_config_digest(standard_resolution.provider_profile),
             )
+            private_resolution = await repository.resolve(private_tenant)
+            assert private_resolution is not None
+            assert private_resolution.route is not None
+            assert private_resolution.provider_profile is not None
             private_selection = await selector.resolve(private_tenant)
             assert private_selection == DataPlaneSelection(
                 tenant_id=private_tenant,
@@ -1976,6 +2003,9 @@ def test_postgres_data_plane_routing_is_fail_closed_and_owner_bound(
                 mode="dedicated",
                 worker_pool_ref="routing-private-pool",
                 queue_ref="routing.private",
+                config_revision=ROUTE_BINDING_CONFIG_REVISION,
+                route_config_digest=route_config_digest(private_resolution.route),
+                provider_config_digest=provider_config_digest(private_resolution.provider_profile),
             )
             assert (
                 await repository.resolve_bound_profile(private_selection)

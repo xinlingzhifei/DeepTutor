@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 from sqlalchemy import func, select, text, update
@@ -103,6 +103,7 @@ async def _insert_queued_job(
     phase: str = "outline",
     export_format: str | None = None,
     slot_pool: str = "generation",
+    data_plane_mode: Literal["shared", "dedicated"] = "shared",
     data_plane_route_id: str = "shared-primary",
     provider_profile_id: str = "platform-default",
     worker_pool_ref: str = "shared-generation",
@@ -135,6 +136,7 @@ async def _insert_queued_job(
                     classroom_draft_id="draft-1",
                     batch_id=None,
                     request_sha256="b" * 64,
+                    data_plane_mode=data_plane_mode,
                     data_plane_route_id=data_plane_route_id,
                     provider_profile_id=provider_profile_id,
                     worker_pool_ref=worker_pool_ref,
@@ -295,8 +297,16 @@ def test_concurrent_claimers_respect_twenty_global_two_tenant_and_mp4_pool(
                 worker_pool_ref="shared-generation",
             )
 
-            async def claim_with_retry(index: int):
-                for attempt in range(10):
+            claimed_jobs = []
+            capacity_filled = asyncio.Event()
+            claim_deadline = asyncio.get_running_loop().time() + 10
+
+            async def claim_until_capacity(index: int) -> None:
+                attempt = 0
+                while (
+                    not capacity_filled.is_set()
+                    and asyncio.get_running_loop().time() < claim_deadline
+                ):
                     claimed = await scheduler.claim(
                         "generation",
                         data_plane_route_id="shared-primary",
@@ -307,12 +317,15 @@ def test_concurrent_claimers_respect_twenty_global_two_tenant_and_mp4_pool(
                         lease_seconds=60,
                     )
                     if claimed is not None:
-                        return claimed
+                        claimed_jobs.append(claimed)
+                        if len(claimed_jobs) == 20:
+                            capacity_filled.set()
+                        return
+                    attempt += 1
                     await asyncio.sleep(0.01)
-                return None
 
-            results = await asyncio.gather(*(claim_with_retry(index) for index in range(30)))
-            claimed = [result for result in results if result is not None]
+            await asyncio.gather(*(claim_until_capacity(index) for index in range(30)))
+            claimed = claimed_jobs
             assert len(claimed) == 20
             tenant_counts = Counter(job.tenant_id for job in claimed)
             assert all(count <= 2 for count in tenant_counts.values())
@@ -370,6 +383,8 @@ def test_concurrent_claimers_respect_twenty_global_two_tenant_and_mp4_pool(
                 )
                 assert generation_claims == 20
                 assert mp4_claims == 1
+                claimed_job_ids = {job.job_id for job in claimed}
+                claimed_resources = {(job.tenant_id, job.job_id) for job in claimed}
                 claim_events = (
                     (
                         await session.execute(
@@ -377,6 +392,8 @@ def test_concurrent_claimers_respect_twenty_global_two_tenant_and_mp4_pool(
                             .where(
                                 AuditLog.action == "generation.job_claimed",
                                 AuditLog.resource_type == "generation_job",
+                                AuditLog.tenant_id.in_(tenant_ids),
+                                AuditLog.resource_id.in_(claimed_job_ids),
                             )
                             .order_by(AuditLog.id)
                         )
@@ -385,9 +402,9 @@ def test_concurrent_claimers_respect_twenty_global_two_tenant_and_mp4_pool(
                     .all()
                 )
                 assert len(claim_events) == 20
-                assert {event.resource_id for event in claim_events} == {
-                    job.job_id for job in claimed
-                }
+                assert {
+                    (event.tenant_id, event.resource_id) for event in claim_events
+                } == claimed_resources
                 assert {event.tenant_id for event in claim_events} == {
                     job.tenant_id for job in claimed
                 }
@@ -467,6 +484,7 @@ def test_shared_worker_cannot_claim_dedicated_job_with_the_same_job_id(
                 tenant_id=dedicated_tenant,
                 job_id="same-job",
                 priority="teacher",
+                data_plane_mode="dedicated",
                 data_plane_route_id="dedicated-route",
                 provider_profile_id="dedicated-provider",
                 worker_pool_ref="dedicated-worker-pool",
@@ -499,6 +517,7 @@ def test_shared_worker_cannot_claim_dedicated_job_with_the_same_job_id(
             )
             assert shared_claim is not None
             assert shared_claim.tenant_id == shared_tenant
+            assert shared_claim.data_plane_mode == "shared"
 
             async with session_factory() as session:
                 dedicated_queue = await session.get(
@@ -519,6 +538,7 @@ def test_shared_worker_cannot_claim_dedicated_job_with_the_same_job_id(
             )
             assert dedicated_claim is not None
             assert dedicated_claim.tenant_id == dedicated_tenant
+            assert dedicated_claim.data_plane_mode == "dedicated"
             assert dedicated_claim.job_id == shared_claim.job_id == "same-job"
         finally:
             await engine.dispose()

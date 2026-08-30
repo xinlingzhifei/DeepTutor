@@ -142,7 +142,7 @@ def test_append_command_rejects_unknown_event_type() -> None:
 def test_learning_revision_is_the_tenant_schema_head() -> None:
     from deeptutor.teaching.provisioning_worker import TENANT_SCHEMA_REVISION
 
-    assert TENANT_SCHEMA_REVISION == "20260828_0022"
+    assert TENANT_SCHEMA_REVISION == "20260830_0023"
 
 
 @pytest.mark.asyncio

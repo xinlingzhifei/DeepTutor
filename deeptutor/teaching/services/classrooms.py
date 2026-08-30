@@ -944,9 +944,7 @@ def _validate_portable_path(value: str) -> None:
 def _validate_controlled_artifact_path(value: str, relative_path: str) -> None:
     _validate_portable_path(value)
     if not value.startswith(_CONTROLLED_ARTIFACT_PREFIX):
-        raise InvalidDraftDocument(
-            "draft document media must use a controlled artifact path"
-        )
+        raise InvalidDraftDocument("draft document media must use a controlled artifact path")
     remainder = value[len(_CONTROLLED_ARTIFACT_PREFIX) :]
     encoded_job_id, separator, _encoded_path = remainder.partition("/")
     try:
@@ -957,17 +955,9 @@ def _validate_controlled_artifact_path(value: str, relative_path: str) -> None:
         ) from None
     safe = "-_.!~*'()"
     expected_path = "/".join(quote(segment, safe=safe) for segment in relative_path.split("/"))
-    expected = (
-        f"{_CONTROLLED_ARTIFACT_PREFIX}{quote(job_id, safe=safe)}/{expected_path}"
-    )
-    if (
-        not separator
-        or _CANONICAL_MEDIA_ID_PATTERN.fullmatch(job_id) is None
-        or value != expected
-    ):
-        raise InvalidDraftDocument(
-            "draft document media must use a controlled artifact path"
-        )
+    expected = f"{_CONTROLLED_ARTIFACT_PREFIX}{quote(job_id, safe=safe)}/{expected_path}"
+    if not separator or _CANONICAL_MEDIA_ID_PATTERN.fullmatch(job_id) is None or value != expected:
+        raise InvalidDraftDocument("draft document media must use a controlled artifact path")
 
 
 def _embedded_media_ids(
@@ -1577,6 +1567,7 @@ class SqlAlchemyClassroomGeneration:
                 request_id=generation.request_id,
                 idempotency_key=generation.idempotency_key,
                 request_sha256=payload_sha256,
+                data_plane_mode=selection.mode,
                 data_plane_route_id=selection.route_ref,
                 provider_profile_id=selection.provider_profile_ref,
                 worker_pool_ref=selection.worker_pool_ref,
@@ -1874,15 +1865,11 @@ class ClassroomService:
             source_ref = getattr(request, "source_ref")
             if content_mode == "open_creation":
                 if source_type is not None or source_ref is not None:
-                    raise ClassroomPreflightRejected(
-                        "open creation cannot select a source"
-                    )
+                    raise ClassroomPreflightRejected("open creation cannot select a source")
                 built = self._brief_builder.open_creation(brief_spec)
             else:
                 if source_type is None or source_ref is None:
-                    raise ClassroomPreflightRejected(
-                        "source-grounded creation requires a source"
-                    )
+                    raise ClassroomPreflightRejected("source-grounded creation requires a source")
                 if source_type == "knowledge_base":
                     built = await self._brief_builder.from_kb(source_ref, brief_spec)
                 elif source_type == "pdf":
@@ -2440,10 +2427,7 @@ class ClassroomService:
         record = await self._repository.get_workflow(asset_id)
         if record is None or not self._can_edit(context, record):
             return None
-        if (
-            _CANONICAL_MEDIA_ID_PATTERN.fullmatch(media_id) is None
-            or self._store_provider is None
-        ):
+        if _CANONICAL_MEDIA_ID_PATTERN.fullmatch(media_id) is None or self._store_provider is None:
             return None
         media: DraftMediaRecord | BoundClassroomMedia | None = None
         if _MEDIA_ID_PATTERN.fullmatch(media_id) is not None:

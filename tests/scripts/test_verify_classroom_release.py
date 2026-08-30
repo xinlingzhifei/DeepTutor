@@ -6,6 +6,8 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 from types import SimpleNamespace
 import zipfile
@@ -19,11 +21,47 @@ _RELEASE_RUN = {
 _SOURCE_REPOSITORY = "xinlingzhifei/DeepTutor"
 _OPENMAIC_HEAD = "0cf2a330411681190e89f48e20f305345ff99f87"
 _LIVE_FIXTURE_TOKEN = "classroom-verifier-fixture-token"
+_GATEWAY_DOCKER_HOST_IDENTITY_SHA256 = "7" * 64
+_OPENMAIC_OBSERVER_ID = "shared-ingress-observer-openmaic-01"
+_OPENMAIC_OBSERVER_ORIGIN = "https://observer.example.test"
+_OPENMAIC_CONTROL_ORIGIN = "https://shared-ingress.example.test"
 
 
 @pytest.fixture(autouse=True)
 def _live_fixture_token(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("YFEISTAI_LIVE_FIXTURE_TOKEN", _LIVE_FIXTURE_TOKEN)
+    for name in (
+        "YFEISTAI_GATEWAY_DOCKER_HOST_IDENTITY_SHA256",
+        "YFEISTAI_GATEWAY_TRUST_KEYRING",
+        "YFEISTAI_GATEWAY_TRUST_KEYRING_SHA256",
+        "YFEISTAI_GATEWAY_OBSERVER_CHALLENGE",
+        "YFEISTAI_GATEWAY_HOST_CHALLENGE",
+        "YFEISTAI_GATEWAY_TRUSTED_NOW",
+        "YFEISTAI_OPENMAIC_EXPECTED_OBSERVER_ATTESTATION_SHA256",
+        "YFEISTAI_OPENMAIC_EXPECTED_OBSERVER_ID",
+        "YFEISTAI_OPENMAIC_EXPECTED_OBSERVER_ORIGIN",
+        "YFEISTAI_OPENMAIC_EXPECTED_SHARED_INGRESS_CONTROL_ORIGIN",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_verifier_cli_starts_directly_from_repository_root() -> None:
+    root = Path(__file__).parents[2]
+    environment = os.environ.copy()
+    environment.pop("PYTHONPATH", None)
+
+    completed = subprocess.run(
+        [sys.executable, str(root / "scripts" / "verify_classroom_release.py"), "--help"],
+        cwd=root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert completed.returncode == 0, f"{completed.stdout}\n{completed.stderr}"
+    assert "--evidence" in completed.stdout
 
 
 def _load_verifier():
@@ -68,6 +106,164 @@ def _load_tenant_isolation_support():
         sys.modules.pop(spec.name, None)
 
 
+def _load_gateway_public_support():
+    path = Path(__file__).parent / "gateway_public_test_support.py"
+    spec = importlib.util.spec_from_file_location(
+        "gateway_public_test_support_for_release_verifier",
+        path,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        sys.modules.pop(spec.name, None)
+
+
+def _load_gateway_public_contract():
+    path = Path(__file__).parents[2] / "scripts" / "gateway_public_contract.py"
+    spec = importlib.util.spec_from_file_location(
+        "gateway_public_contract_for_release_verifier",
+        path,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        sys.modules.pop(spec.name, None)
+
+
+def _load_backup_restore_support():
+    path = Path(__file__).parent / "test_backup_restore_probe.py"
+    spec = importlib.util.spec_from_file_location(
+        "backup_restore_probe_support_for_release_verifier",
+        path,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        sys.modules.pop(spec.name, None)
+
+
+def _gateway_trusted_root(bundle_root: Path) -> Path:
+    return bundle_root.parent / f"{bundle_root.name}-trusted-gateway-controller"
+
+
+def _gateway_trust_pair_from_bundle(bundle_root: Path) -> dict[str, object]:
+    support = _load_gateway_public_support()
+    keyring_path = _gateway_trusted_root(bundle_root) / "gateway-trust-keyring.json"
+    observer_attestation_path = bundle_root / support.GATEWAY_OBSERVER_ATTESTATION_ARTIFACT
+    observer_envelope_path = bundle_root / support.GATEWAY_OBSERVER_TRUST_ENVELOPE_ARTIFACT
+    host_envelope_path = bundle_root / support.GATEWAY_HOST_TRUST_ENVELOPE_ARTIFACT
+    host_receipt_path = bundle_root / support.GATEWAY_HOST_PROVISIONING_RECEIPT_ARTIFACT
+    paths = {
+        "keyring": keyring_path,
+        "observer_attestation": observer_attestation_path,
+        "observer_envelope": observer_envelope_path,
+        "host_envelope": host_envelope_path,
+        "host_receipt": host_receipt_path,
+    }
+    bodies = {name: path.read_bytes() for name, path in paths.items()}
+    return {
+        "keyring_path": keyring_path,
+        "keyring_sha256": hashlib.sha256(bodies["keyring"]).hexdigest(),
+        "observer_challenge": support.GATEWAY_OBSERVER_CHALLENGE,
+        "host_challenge": support.GATEWAY_HOST_CHALLENGE,
+        "trusted_now": support.TRUSTED_NOW,
+        "observer_attestation_path": observer_attestation_path,
+        "observer_attestation_sha256": hashlib.sha256(bodies["observer_attestation"]).hexdigest(),
+        "observer_envelope_path": observer_envelope_path,
+        "observer_envelope_sha256": hashlib.sha256(bodies["observer_envelope"]).hexdigest(),
+        "host_envelope_path": host_envelope_path,
+        "host_envelope_sha256": hashlib.sha256(bodies["host_envelope"]).hexdigest(),
+        "host_receipt_path": host_receipt_path,
+        "host_receipt": json.loads(bodies["host_receipt"]),
+        "host_receipt_sha256": hashlib.sha256(bodies["host_receipt"]).hexdigest(),
+    }
+
+
+def _gateway_runtime_arguments(bundle_root: Path) -> dict[str, object]:
+    support = _load_gateway_public_support()
+    trust_pair = _gateway_trust_pair_from_bundle(bundle_root)
+    return {
+        "expected_gateway_docker_host_identity_sha256": trust_pair["host_receipt_sha256"],
+        **support.gateway_trust_arguments(trust_pair),
+    }
+
+
+def _openmaic_observer_runtime_arguments(bundle_root: Path) -> dict[str, str]:
+    observer_path = bundle_root / "runtime" / "openmaic-shared-ingress-observer-attestation.json"
+    return {
+        "expected_openmaic_observer_attestation_sha256": hashlib.sha256(
+            observer_path.read_bytes()
+        ).hexdigest(),
+        "expected_openmaic_observer_id": _OPENMAIC_OBSERVER_ID,
+        "expected_openmaic_observer_origin": _OPENMAIC_OBSERVER_ORIGIN,
+        "expected_openmaic_shared_ingress_control_origin": _OPENMAIC_CONTROL_ORIGIN,
+    }
+
+
+def _complete_bundle_runtime(module, manifest: Path, **kwargs):
+    return module.FileReleaseRuntime(
+        manifest,
+        expected_outage_docker_host_identity_sha256=(_GATEWAY_DOCKER_HOST_IDENTITY_SHA256),
+        **kwargs,
+        **_gateway_runtime_arguments(manifest.parent),
+        **_openmaic_observer_runtime_arguments(manifest.parent),
+    )
+
+
+def _gateway_cli_arguments(bundle_root: Path) -> list[str]:
+    arguments = _gateway_runtime_arguments(bundle_root)
+    observer_arguments = _openmaic_observer_runtime_arguments(bundle_root)
+    return [
+        "--outage-docker-host-identity-sha256",
+        _GATEWAY_DOCKER_HOST_IDENTITY_SHA256,
+        "--gateway-docker-host-identity-sha256",
+        str(arguments["expected_gateway_docker_host_identity_sha256"]),
+        "--gateway-trust-keyring",
+        str(arguments["trusted_keyring_path"]),
+        "--gateway-trust-keyring-sha256",
+        str(arguments["expected_trusted_keyring_sha256"]),
+        "--gateway-observer-challenge",
+        str(arguments["expected_observer_challenge"]),
+        "--gateway-host-challenge",
+        str(arguments["expected_host_challenge"]),
+        "--gateway-trusted-now",
+        str(arguments["trusted_now"]),
+        "--openmaic-observer-attestation-sha256",
+        observer_arguments["expected_openmaic_observer_attestation_sha256"],
+        "--openmaic-observer-id",
+        observer_arguments["expected_openmaic_observer_id"],
+        "--openmaic-observer-origin",
+        observer_arguments["expected_openmaic_observer_origin"],
+        "--openmaic-shared-ingress-control-origin",
+        observer_arguments["expected_openmaic_shared_ingress_control_origin"],
+    ]
+
+
+def _static_openmaic_cli_arguments() -> list[str]:
+    return [
+        "--openmaic-observer-attestation-sha256",
+        "9" * 64,
+        "--openmaic-observer-id",
+        _OPENMAIC_OBSERVER_ID,
+        "--openmaic-observer-origin",
+        _OPENMAIC_OBSERVER_ORIGIN,
+        "--openmaic-shared-ingress-control-origin",
+        _OPENMAIC_CONTROL_ORIGIN,
+    ]
+
+
 def _candidate(source_head: str) -> dict[str, object]:
     return {
         "sourceRepository": _SOURCE_REPOSITORY,
@@ -107,6 +303,178 @@ def test_tenant_isolation_uses_the_fixed_probe_contract() -> None:
         "tenant-isolation-probe",
         ("databaseIsolated", "objectsIsolated", "exportsIsolated", "eventsIsolated"),
     )
+
+
+def test_backup_restore_receipt_without_canonical_provenance_is_rejected(
+    tmp_path: Path,
+) -> None:
+    module = _load_verifier()
+    candidate = _candidate("a" * 40)
+    document = _artifact_document(module, candidate, "backup_restore")
+
+    error = module.probe_provenance_error(
+        document,
+        evidence="backup_restore",
+        candidate=candidate,
+        release_run=_RELEASE_RUN,
+        bundle_root=tmp_path,
+        candidate_root=tmp_path,
+    )
+
+    assert error == "backup restore execution proof is missing or invalid"
+
+
+@pytest.mark.parametrize(
+    ("artifact_name", "expected_error"),
+    (
+        ("restore-validation.json", "backup restore operator artifact digest does not match"),
+        ("target-config.snapshot.json", "backup restore target config digest does not match"),
+        (
+            "target-provisioning-receipt.json",
+            "backup restore target provisioning receipt digest does not match",
+        ),
+        ("source-provenance.json", "backup restore source provenance digest does not match"),
+    ),
+)
+def test_backup_restore_receipt_replays_every_canonical_artifact(
+    tmp_path: Path,
+    artifact_name: str,
+    expected_error: str,
+) -> None:
+    module = _load_verifier()
+    candidate = _candidate("a" * 40)
+    _write_candidate_files(tmp_path, candidate)
+    report_path = _load_backup_restore_support().write_release_probe_fixture(
+        tmp_path,
+        candidate=candidate,
+        release_run=_RELEASE_RUN,
+    )
+    provenance = {
+        "backupRestoreReport": {
+            "artifact": "runtime/backup-restore/backup-restore-report.json",
+            "sha256": hashlib.sha256(report_path.read_bytes()).hexdigest(),
+        }
+    }
+    document = _artifact_document(
+        module,
+        candidate,
+        "backup_restore",
+        provenance=provenance,
+    )
+    document["receipt"]["observedAt"] = json.loads(report_path.read_bytes())["observedAt"]
+    arguments = {
+        "evidence": "backup_restore",
+        "candidate": candidate,
+        "release_run": _RELEASE_RUN,
+        "bundle_root": tmp_path,
+        "candidate_root": tmp_path,
+    }
+    assert module.probe_provenance_error(document, **arguments) is None
+
+    artifact_path = tmp_path / "runtime" / "backup-restore" / artifact_name
+    artifact_path.write_bytes(artifact_path.read_bytes() + b" ")
+
+    assert module.probe_provenance_error(document, **arguments) == expected_error
+
+
+def test_backup_restore_verifier_uses_owned_source_archive_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_verifier()
+    candidate = _candidate("a" * 40)
+    _write_candidate_files(tmp_path, candidate)
+    report_path = _load_backup_restore_support().write_release_probe_fixture(
+        tmp_path,
+        candidate=candidate,
+        release_run=_RELEASE_RUN,
+    )
+    provenance = {
+        "backupRestoreReport": {
+            "artifact": "runtime/backup-restore/backup-restore-report.json",
+            "sha256": hashlib.sha256(report_path.read_bytes()).hexdigest(),
+        }
+    }
+    document = _artifact_document(
+        module,
+        candidate,
+        "backup_restore",
+        provenance=provenance,
+    )
+    document["receipt"]["observedAt"] = json.loads(report_path.read_bytes())["observedAt"]
+    loaded_paths: list[Path] = []
+    original_loader = module.load_verified_backup
+
+    def load_verified_backup(path: Path):
+        loaded_paths.append(Path(path))
+        return original_loader(path)
+
+    monkeypatch.setattr(module, "load_verified_backup", load_verified_backup)
+
+    assert (
+        module.probe_provenance_error(
+            document,
+            evidence="backup_restore",
+            candidate=candidate,
+            release_run=_RELEASE_RUN,
+            bundle_root=tmp_path,
+            candidate_root=tmp_path,
+        )
+        is None
+    )
+    assert loaded_paths
+    assert all(not path.is_relative_to(tmp_path) for path in loaded_paths)
+
+
+def test_backup_restore_verifier_rejects_subtree_replacement_during_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_verifier()
+    candidate = _candidate("a" * 40)
+    _write_candidate_files(tmp_path, candidate)
+    report_path = _load_backup_restore_support().write_release_probe_fixture(
+        tmp_path,
+        candidate=candidate,
+        release_run=_RELEASE_RUN,
+    )
+    provenance = {
+        "backupRestoreReport": {
+            "artifact": "runtime/backup-restore/backup-restore-report.json",
+            "sha256": hashlib.sha256(report_path.read_bytes()).hexdigest(),
+        }
+    }
+    document = _artifact_document(
+        module,
+        candidate,
+        "backup_restore",
+        provenance=provenance,
+    )
+    document["receipt"]["observedAt"] = json.loads(report_path.read_bytes())["observedAt"]
+    evidence_root = tmp_path / "runtime" / "backup-restore"
+    replacement = tmp_path / "runtime" / "backup-restore.replacement"
+    displaced = tmp_path / "runtime" / "backup-restore.displaced"
+    shutil.copytree(evidence_root, replacement)
+    original_parser = module.parse_backup_restore_report
+
+    def replace_before_return(*args: object, **kwargs: object):
+        parsed = original_parser(*args, **kwargs)
+        evidence_root.replace(displaced)
+        replacement.replace(evidence_root)
+        return parsed
+
+    monkeypatch.setattr(module, "parse_backup_restore_report", replace_before_return)
+
+    error = module.probe_provenance_error(
+        document,
+        evidence="backup_restore",
+        candidate=candidate,
+        release_run=_RELEASE_RUN,
+        bundle_root=tmp_path,
+        candidate_root=tmp_path,
+    )
+
+    assert error == "backup restore evidence boundary changed during replay"
 
 
 def _playwright_report(
@@ -219,6 +587,61 @@ def test_derive_probe_checks_from_native_playwright_json() -> None:
     )
 
     assert checks == {"teacherFlowPassed": True}
+
+
+@pytest.mark.parametrize(
+    "carrier",
+    (
+        "stdout-text",
+        "stdout-buffer",
+        "stderr",
+        "attachment-body",
+        "steps",
+        "test-annotations",
+        "result-annotations",
+        "project-metadata",
+    ),
+)
+def test_derive_probe_checks_rejects_playwright_data_bearing_result_fields(
+    carrier: str,
+) -> None:
+    module = _load_verifier()
+    report = _playwright_report("teacher_flow", count=1)
+    test = _first_probe_test(report)
+    results = test["results"]
+    assert isinstance(results, list) and results
+    result = results[0]
+    assert isinstance(result, dict)
+    if carrier == "stdout-text":
+        result["stdout"] = [{"text": "sensitive output"}]
+    elif carrier == "stdout-buffer":
+        result["stdout"] = [{"buffer": "c2Vuc2l0aXZlIG91dHB1dA=="}]
+    elif carrier == "stderr":
+        result["stderr"] = [{"text": "sensitive error"}]
+    elif carrier == "attachment-body":
+        result["attachments"] = [{"name": "trace", "body": "c2VjcmV0"}]
+    elif carrier == "steps":
+        result["steps"] = []
+    elif carrier == "test-annotations":
+        test["annotations"] = [{"type": "secret"}]
+    elif carrier == "result-annotations":
+        result["annotations"] = [{"type": "secret"}]
+    else:
+        config = report["config"]
+        assert isinstance(config, dict)
+        projects = config["projects"]
+        assert isinstance(projects, list) and projects
+        project = projects[0]
+        assert isinstance(project, dict)
+        project["metadata"] = {"secret": "value"}
+
+    with pytest.raises(ValueError, match="persistence boundary"):
+        module.derive_probe_checks(
+            "teacher_flow",
+            raw_report=json.dumps(report).encode(),
+            candidate=_candidate("a" * 40),
+            release_run=_RELEASE_RUN,
+        )
 
 
 def test_derive_probe_checks_rejects_duplicate_tailwind_matrix_titles() -> None:
@@ -437,11 +860,212 @@ def _openmaic_shared_report(
     }
 
 
+def _openmaic_dedicated_report(
+    candidate: dict[str, object],
+    *,
+    runtime_attestation_sha256: str,
+) -> dict[str, object]:
+    report = _openmaic_shared_report(
+        candidate,
+        runtime_attestation_sha256=runtime_attestation_sha256,
+    )
+    report["plane"] = "dedicated"
+    report["fixture"] = {
+        "tenantId": "tenant-openmaic-dedicated-01",
+        "teacherUserId": "teacher-openmaic-dedicated-01",
+        "courseId": "course-openmaic-dedicated-01",
+        "classId": "class-openmaic-dedicated-01",
+    }
+    report["binding"] = {
+        "routeId": "dedicated-tenant-openmaic-01",
+        "routeTenantId": "tenant-openmaic-dedicated-01",
+        "routeOwnerKey": "tenant-openmaic-dedicated-01",
+        "providerProfileId": "provider-tenant-openmaic-01",
+        "providerScope": "dedicated",
+        "providerTenantId": "tenant-openmaic-dedicated-01",
+        "providerOwnerKey": "tenant-openmaic-dedicated-01",
+        "workerPoolRef": "generation-tenant-openmaic-01",
+        "queueRef": "openmaic.tenant-openmaic-01",
+        "attemptCount": 2,
+        "sharedRouteAttemptCount": 0,
+        "dedicatedRouteAttemptCount": 2,
+        "selectedRouteAttemptCount": 1,
+        "unavailableRouteAttemptCount": 1,
+        "routeAttemptHistoryComplete": True,
+    }
+    return report
+
+
+def _openmaic_dedicated_outage_attestation(
+    candidate: dict[str, object],
+    *,
+    runtime_attestation_sha256: str,
+    observer_attestation_sha256: str,
+    attempt_marker_reference: dict[str, object],
+) -> dict[str, object]:
+    tenant_id = "tenant-openmaic-dedicated-01"
+    route_id = "dedicated-tenant-openmaic-01"
+    observer_trust_anchor = {
+        "sha256": observer_attestation_sha256,
+        "observerId": "shared-ingress-observer-openmaic-01",
+        "observerOrigin": "https://observer.example.test",
+        "sharedIngressControlOrigin": "https://shared-ingress.example.test",
+    }
+    report = {
+        "schemaVersion": 1,
+        "producer": "openmaic-dedicated-outage",
+        "candidate": candidate,
+        "releaseRun": _RELEASE_RUN,
+        "observedAt": "2026-08-24T00:00:01Z",
+        "baseUrl": "https://candidate.example.test",
+        "runtimeAttestation": {
+            "artifact": "runtime/runtime-attestation.json",
+            "sha256": runtime_attestation_sha256,
+        },
+        "observerAttestation": {
+            "artifact": "runtime/openmaic-shared-ingress-observer-attestation.json",
+            "sha256": observer_attestation_sha256,
+            "observerId": "shared-ingress-observer-openmaic-01",
+            "observerOrigin": "https://observer.example.test",
+            "sharedIngressControlOrigin": "https://shared-ingress.example.test",
+        },
+        "fixture": {
+            "tenantId": tenant_id,
+            "attemptMarker": attempt_marker_reference,
+            "cleanupBoundary": {
+                "reason": "formal-delete-api-unavailable",
+                "reversibleResourcesDeleted": [
+                    "classEnrollment",
+                    "tenantMembership",
+                    "teacherIdentity",
+                ],
+                "retainedAuditResources": [
+                    {"resourceType": "course", "resourceId": "course-outage-01"},
+                    {"resourceType": "class", "resourceId": "class-outage-01"},
+                    {"resourceType": "generationQuotaGrant", "resourceId": tenant_id},
+                    {"resourceType": "classroomAsset", "resourceId": "asset-outage-01"},
+                    {
+                        "resourceType": "generationJob",
+                        "resourceId": "job-openmaic-dedicated-outage-01",
+                    },
+                    {"resourceType": "classroomAsset", "resourceId": "asset-canary-01"},
+                    {
+                        "resourceType": "generationJob",
+                        "resourceId": "job-openmaic-dedicated-canary-01",
+                    },
+                ],
+            },
+        },
+        "provenance": {
+            "attemptMarker": attempt_marker_reference,
+            "observerTrustAnchor": observer_trust_anchor,
+            "dockerBoundary": {
+                "dockerHostIdentitySha256": _GATEWAY_DOCKER_HOST_IDENTITY_SHA256,
+                "daemonIdentityBeforeSha256": "2" * 64,
+                "daemonIdentityAfterSha256": "2" * 64,
+                "inventoryBeforeSha256": "3" * 64,
+                "inventoryAfterSha256": "3" * 64,
+            },
+        },
+        "outage": {
+            "dedicatedPlaneStopped": True,
+            "routeId": route_id,
+            "jobId": "job-openmaic-dedicated-outage-01",
+            "jobStatus": "failed",
+            "errorCode": "dedicated_data_plane_unavailable",
+            "attemptCount": 2,
+            "sharedRouteAttemptCount": 0,
+            "dedicatedRouteAttemptCount": 2,
+            "selectedRouteAttemptCount": 2,
+            "unavailableRouteAttemptCount": 0,
+            "routeAttemptHistoryComplete": True,
+        },
+        "sharedIngress": {
+            "observationId": "shared-ingress-openmaic-dedicated-outage-01",
+            "requestCountBefore": 7,
+            "requestCountAfter": 7,
+        },
+        "restoration": {
+            "dedicatedPlaneRestored": True,
+            "routeId": route_id,
+            "canaryJobId": "job-openmaic-dedicated-canary-01",
+            "canaryJobStatus": "succeeded",
+            "attemptCount": 1,
+            "sharedRouteAttemptCount": 0,
+            "dedicatedRouteAttemptCount": 1,
+            "selectedRouteAttemptCount": 1,
+            "unavailableRouteAttemptCount": 0,
+            "routeAttemptHistoryComplete": True,
+        },
+    }
+    child_stdout = (
+        json.dumps(report, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n"
+    ).encode()
+    report["execution"] = {
+        "command": {
+            "runner": "python",
+            "script": "scripts/openmaic_dedicated_outage_probe.py",
+            "arguments": ["--profile", "first-release"],
+        },
+        "nativeExit": 0,
+        "stdoutSha256": hashlib.sha256(child_stdout).hexdigest(),
+        "stderrSha256": hashlib.sha256(b"").hexdigest(),
+    }
+    return report
+
+
+def _openmaic_dedicated_outage_attempt_marker(
+    candidate: dict[str, object],
+    *,
+    observer_attestation_sha256: str,
+) -> dict[str, object]:
+    return {
+        "schemaVersion": 1,
+        "producer": "openmaic-dedicated-outage-attempt",
+        "candidate": candidate,
+        "releaseRun": _RELEASE_RUN,
+        "observerTrustAnchor": {
+            "sha256": observer_attestation_sha256,
+            "observerId": "shared-ingress-observer-openmaic-01",
+            "observerOrigin": "https://observer.example.test",
+            "sharedIngressControlOrigin": "https://shared-ingress.example.test",
+        },
+        "fixturePlan": {
+            "tenantId": "tenant-openmaic-dedicated-01",
+            "routeId": "dedicated-tenant-openmaic-01",
+            "cleanupBoundary": "identity-membership-enrollment-only",
+            "retainedResourceTypes": [
+                "course",
+                "class",
+                "generationQuotaGrant",
+                "classroomAsset",
+                "generationJob",
+            ],
+        },
+    }
+
+
+def _openmaic_shared_ingress_observer_attestation() -> dict[str, object]:
+    return {
+        "schemaVersion": 1,
+        "producer": "openmaic-shared-ingress-observer",
+        "releaseRun": _RELEASE_RUN,
+        "observedAt": "2026-08-24T00:00:00Z",
+        "observer": {
+            "observerId": "shared-ingress-observer-openmaic-01",
+            "observerUrl": "https://observer.example.test",
+            "sharedIngressControlUrl": ("https://shared-ingress.example.test/v1/control-canaries"),
+        },
+    }
+
+
 def _write_probe_proof(
     tmp_path: Path,
     module,
     candidate: dict[str, object],
     evidence: str,
+    *,
+    gateway_trust_pair: dict[str, object] | None = None,
 ) -> dict[str, object] | None:
     if evidence == "running_containers":
         attestation_path = tmp_path / "runtime" / "runtime-attestation.json"
@@ -594,10 +1218,14 @@ def _write_probe_proof(
                 "sha256": hashlib.sha256(attestation_path.read_bytes()).hexdigest(),
             }
         }
-    if evidence == "openmaic_shared_plane":
+    if evidence in {"openmaic_shared_plane", "openmaic_dedicated_plane"}:
+        plane = "shared" if evidence == "openmaic_shared_plane" else "dedicated"
         runtime_path = tmp_path / "runtime" / "runtime-attestation.json"
         runtime_sha256 = hashlib.sha256(runtime_path.read_bytes()).hexdigest()
-        report = _openmaic_shared_report(
+        report_factory = (
+            _openmaic_shared_report if plane == "shared" else _openmaic_dedicated_report
+        )
+        report = report_factory(
             candidate,
             runtime_attestation_sha256=runtime_sha256,
         )
@@ -621,7 +1249,7 @@ def _write_probe_proof(
                 "command": {
                     "runner": "python",
                     "script": "scripts/openmaic_smoke_probe.py",
-                    "arguments": ["--plane", "shared", "--profile", "first-release"],
+                    "arguments": ["--plane", plane, "--profile", "first-release"],
                 },
                 "nativeExit": 0,
                 "stdout": stdout.decode("utf-8"),
@@ -632,17 +1260,90 @@ def _write_probe_proof(
                 "fixture": report["fixture"],
                 "binding": report["binding"],
                 "generation": report["generation"],
-                "checks": {"sharedGenerationPassed": True},
+                "checks": (
+                    {"sharedGenerationPassed": True}
+                    if plane == "shared"
+                    else {
+                        "dedicatedGenerationPassed": True,
+                        "noSharedClientIssued": True,
+                    }
+                ),
             },
         }
-        proof_path = tmp_path / "runtime" / "openmaic-shared-plane-attestation.json"
+        proof_name = f"openmaic-{plane}-plane-attestation.json"
+        proof_path = tmp_path / "runtime" / proof_name
         proof_path.write_text(json.dumps(proof, sort_keys=True), encoding="utf-8")
-        return {
-            "openmaicSharedPlaneAttestation": {
-                "artifact": "runtime/openmaic-shared-plane-attestation.json",
+        provenance_key = (
+            "openmaicSharedPlaneAttestation"
+            if plane == "shared"
+            else "openmaicDedicatedPlaneAttestation"
+        )
+        provenance = {
+            provenance_key: {
+                "artifact": f"runtime/{proof_name}",
                 "sha256": hashlib.sha256(proof_path.read_bytes()).hexdigest(),
             }
         }
+        if plane == "dedicated":
+            observer_path = (
+                tmp_path / "runtime" / "openmaic-shared-ingress-observer-attestation.json"
+            )
+            observer_body = (
+                json.dumps(
+                    _openmaic_shared_ingress_observer_attestation(),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode()
+            observer_path.write_bytes(observer_body)
+            observer_sha256 = hashlib.sha256(observer_body).hexdigest()
+            marker = _openmaic_dedicated_outage_attempt_marker(
+                candidate,
+                observer_attestation_sha256=observer_sha256,
+            )
+            marker_body = (
+                json.dumps(
+                    marker,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode()
+            marker_path = tmp_path / "runtime" / "openmaic-dedicated-outage-attempt.json"
+            marker_path.write_bytes(marker_body)
+            marker_reference = {
+                "artifact": "runtime/openmaic-dedicated-outage-attempt.json",
+                "sha256": hashlib.sha256(marker_body).hexdigest(),
+            }
+            outage_path = tmp_path / "runtime" / "openmaic-dedicated-outage-attestation.json"
+            outage = _openmaic_dedicated_outage_attestation(
+                candidate,
+                runtime_attestation_sha256=runtime_sha256,
+                observer_attestation_sha256=observer_sha256,
+                attempt_marker_reference=marker_reference,
+            )
+            outage_body = (
+                json.dumps(
+                    outage,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode()
+            outage_path.write_bytes(outage_body)
+            provenance["openmaicDedicatedOutageAttestation"] = {
+                "artifact": "runtime/openmaic-dedicated-outage-attestation.json",
+                "sha256": hashlib.sha256(outage_body).hexdigest(),
+            }
+            provenance["openmaicSharedIngressObserverAttestation"] = {
+                "artifact": "runtime/openmaic-shared-ingress-observer-attestation.json",
+                "sha256": observer_sha256,
+            }
+        return provenance
     if evidence == "classroom_exports":
         support = _load_classroom_export_support()
         raw_root = tmp_path / "raw" / "classroom-exports"
@@ -697,6 +1398,34 @@ def _write_probe_proof(
                 "sha256": hashlib.sha256(proof_path.read_bytes()).hexdigest(),
             }
         }
+    if evidence == "backup_restore":
+        report_path = _load_backup_restore_support().write_release_probe_fixture(
+            tmp_path,
+            candidate=candidate,
+            release_run=_RELEASE_RUN,
+        )
+        return {
+            "backupRestoreReport": {
+                "artifact": "runtime/backup-restore/backup-restore-report.json",
+                "sha256": hashlib.sha256(report_path.read_bytes()).hexdigest(),
+            }
+        }
+    if evidence == "gateway_only_public":
+        assert gateway_trust_pair is not None
+        support = _load_gateway_public_support()
+        contract = _load_gateway_public_contract()
+        proof = support.proof_document(
+            contract,
+            root=tmp_path,
+            candidate=candidate,
+            release_run=_RELEASE_RUN,
+            attestation_sha256=str(gateway_trust_pair["observer_attestation_sha256"]),
+            docker_host_identity_sha256=str(gateway_trust_pair["host_receipt_sha256"]),
+        )
+        proof["trustPair"] = support.gateway_trust_references(gateway_trust_pair)
+        proof_path = tmp_path / "runtime" / "gateway-only-public-attestation.json"
+        proof_path.write_bytes(support.canonical_json(proof))
+        return support.receipt_provenance(proof_path)
     recipe = module.PROBE_RECIPES.get(evidence)
     if recipe is None:
         return None
@@ -986,6 +1715,10 @@ def _manifest_document(
 
 
 def _write_candidate_files(tmp_path: Path, candidate: dict[str, object]) -> None:
+    shutil.copyfile(
+        Path(__file__).resolve().parents[2] / "docker-compose.yml",
+        tmp_path / "docker-compose.yml",
+    )
     digests = candidate["imageDigests"]
     assert isinstance(digests, dict)
     release_tag = candidate["releaseTag"]
@@ -1039,7 +1772,8 @@ def _write_candidate_files(tmp_path: Path, candidate: dict[str, object]) -> None
         name: f"{repository}:{tag}@{digest}"
         for name, (repository, tag, digest) in specifications.items()
     }
-    (tmp_path / "docker-compose.platform.yml").write_text(
+    platform_compose_path = tmp_path / "docker-compose.platform.yml"
+    platform_compose_path.write_text(
         json.dumps(
             {
                 "services": {
@@ -1070,6 +1804,23 @@ def _write_candidate_files(tmp_path: Path, candidate: dict[str, object]) -> None
                 }
             }
         ),
+        encoding="utf-8",
+    )
+    platform_compose = json.loads(platform_compose_path.read_bytes())
+    platform_services = platform_compose["services"]
+    for service in platform_services.values():
+        service["networks"] = ["platform-internal"]
+    platform_services["deeptutor"]["networks"].append("platform-service-egress")
+    platform_services["gateway"]["networks"].append("platform-edge")
+    platform_services["openmaic"]["networks"].append("shared-provider-egress")
+    platform_compose["networks"] = {
+        "platform-internal": {"internal": True},
+        "platform-edge": {},
+        "platform-service-egress": {},
+        "shared-provider-egress": {},
+    }
+    platform_compose_path.write_text(
+        json.dumps(platform_compose, sort_keys=True),
         encoding="utf-8",
     )
     (tmp_path / "docker-compose.data-plane.yml").write_text(
@@ -1115,11 +1866,54 @@ def _write_runtime_attestation(
         tagged, digest = reference.rsplit("@", 1)
         return f"{tagged.rsplit(':', 1)[0]}@{digest}"
 
+    def canonical_json(document: object) -> str:
+        return json.dumps(document, separators=(",", ":"), sort_keys=True)
+
+    empty_environment_sha256 = hashlib.sha256(b"{}").hexdigest()
+    compose_hashes = {
+        service: hashlib.sha256(f"compose:{service}".encode()).hexdigest()
+        for service in service_images
+    }
+    compose_security = {
+        "services": {
+            service: {
+                "image": reference,
+                "restart": "no" if service in one_shots else "unless-stopped",
+                "profiles": [],
+                "privileged": False,
+                "capAdd": [],
+                "capDrop": [],
+                "command": None,
+                "entrypoint": None,
+                "user": None,
+                "environmentHashes": {},
+                "volumes": [],
+                "secrets": [],
+                "configs": [],
+            }
+            for service, reference in sorted(service_images.items())
+        },
+        "volumes": {},
+        "secrets": {},
+        "configs": {},
+    }
+
     containers: list[dict[str, object]] = []
     for service in sorted(service_images):
         reference = service_images[service]
         one_shot = service in one_shots
         image_id = "sha256:local-" + hashlib.sha256(reference.encode()).hexdigest()
+        security = {
+            "configHash": compose_hashes[service],
+            "privileged": False,
+            "mounts": [],
+            "capAdd": [],
+            "capDrop": [],
+            "command": None,
+            "entrypoint": None,
+            "user": "",
+            "environmentSha256": empty_environment_sha256,
+        }
         containers.append(
             {
                 "containerId": f"container-{service}",
@@ -1132,6 +1926,7 @@ def _write_runtime_attestation(
                 "restarting": False,
                 "health": "healthy" if service in healthy else "none",
                 "exitCode": 0,
+                "security": security,
                 "imageId": image_id,
                 "repoDigests": [repo_digest(reference)],
             }
@@ -1144,6 +1939,9 @@ def _write_runtime_attestation(
             "state": container["state"],
             "health": container["health"],
             "exitCode": container["exitCode"],
+            "securitySha256": hashlib.sha256(
+                canonical_json(container["security"]).encode()
+            ).hexdigest(),
         }
         for container in containers
     ]
@@ -1159,11 +1957,34 @@ def _write_runtime_attestation(
         '"configImage":{{json .Config.Image}},'
         '"project":{{json (index .Config.Labels "com.docker.compose.project")}},'
         '"service":{{json (index .Config.Labels "com.docker.compose.service")}},'
+        '"configHash":{{json (index .Config.Labels "com.docker.compose.config-hash")}},'
+        '"privileged":{{json .HostConfig.Privileged}},"mounts":{{json .Mounts}},'
+        '"capAdd":{{json .HostConfig.CapAdd}},"capDrop":{{json .HostConfig.CapDrop}},'
+        '"command":{{json .Config.Cmd}},"entrypoint":{{json .Config.Entrypoint}},'
+        '"user":{{json .Config.User}},"environment":{{json .Config.Env}},'
         '"state":{{json .State.Status}},"running":{{json .State.Running}},'
         '"restarting":{{json .State.Restarting}},"exitCode":{{json .State.ExitCode}},'
         '"health":{{if .State.Health}}{{json .State.Health.Status}}{{else}}"none"{{end}}}'
     )
-    image_format = '{"imageId":{{json .Id}},"repoDigests":{{json .RepoDigests}}}'
+    image_format = (
+        '{"imageId":{{json .Id}},"repoDigests":{{json .RepoDigests}},'
+        '"command":{{json .Config.Cmd}},"entrypoint":{{json .Config.Entrypoint}},'
+        '"user":{{json .Config.User}},"environment":{{json .Config.Env}},'
+        '"volumes":{{json .Config.Volumes}}}'
+    )
+    compose_topology = [
+        "compose",
+        "--env-file",
+        "<deployment-root>/data/user/settings/docker.env",
+        "--project-directory",
+        "<deployment-root>",
+        "--project-name",
+        "yfeistai-platform",
+        "-f",
+        "<candidate-root>/docker-compose.yml",
+        "-f",
+        "<candidate-root>/docker-compose.platform.yml",
+    ]
     ps = [
         "ps",
         "-a",
@@ -1184,29 +2005,44 @@ def _write_runtime_attestation(
             "stdoutSha256": hashlib.sha256(stdout.encode()).hexdigest(),
         }
 
-    container_records = [
-        command(
-            ["container", "inspect", "--format", container_format, str(container["containerId"])],
-            json.dumps(
-                {
-                    name: container[name]
-                    for name in (
-                        "containerId",
-                        "localImageId",
-                        "configImage",
-                        "project",
-                        "service",
-                        "state",
-                        "running",
-                        "restarting",
-                        "exitCode",
-                        "health",
-                    )
-                }
-            ),
+    container_records = []
+    for container in containers_by_id:
+        security = container["security"]
+        assert isinstance(security, dict)
+        container_records.append(
+            command(
+                [
+                    "container",
+                    "inspect",
+                    "--format",
+                    container_format,
+                    str(container["containerId"]),
+                ],
+                json.dumps(
+                    {
+                        "containerId": container["containerId"],
+                        "localImageId": container["localImageId"],
+                        "configImage": container["configImage"],
+                        "project": container["project"],
+                        "service": container["service"],
+                        "configHash": security["configHash"],
+                        "privileged": security["privileged"],
+                        "mounts": [],
+                        "capAdd": security["capAdd"],
+                        "capDrop": security["capDrop"],
+                        "command": security["command"],
+                        "entrypoint": security["entrypoint"],
+                        "user": security["user"],
+                        "environmentHashes": {},
+                        "state": container["state"],
+                        "running": container["running"],
+                        "restarting": container["restarting"],
+                        "exitCode": container["exitCode"],
+                        "health": container["health"],
+                    }
+                ),
+            )
         )
-        for container in containers_by_id
-    ]
     image_records = []
     for reference in sorted(set(service_images.values())):
         container = next(item for item in containers if item["configImage"] == reference)
@@ -1217,11 +2053,34 @@ def _write_runtime_attestation(
                     {
                         "imageId": container["imageId"],
                         "repoDigests": container["repoDigests"],
+                        "command": None,
+                        "entrypoint": None,
+                        "user": "",
+                        "environmentHashes": {},
+                        "volumes": None,
                     }
                 ),
             )
         )
     ps_record = command(ps, ps_stdout)
+    docker_context_record = command(
+        [
+            "context",
+            "inspect",
+            "default",
+            "--format",
+            "{{json .Endpoints.docker.Host}}",
+        ],
+        json.dumps("npipe:////./pipe/dockerDesktopLinuxEngine"),
+    )
+    docker_info_record = command(
+        [
+            "info",
+            "--format",
+            '{"serverId":{{json .ID}},"osType":{{json .OSType}}}',
+        ],
+        json.dumps({"serverId": "daemon-yfeistai-01", "osType": "linux"}),
+    )
     document = {
         "schemaVersion": 1,
         "candidate": candidate,
@@ -1233,12 +2092,32 @@ def _write_runtime_attestation(
         "afterSnapshot": snapshot,
         "containers": containers,
         "commands": [
+            command(
+                [*compose_topology, "config", "--format", "json"],
+                canonical_json(compose_security),
+            ),
+            command(
+                [*compose_topology, "config", "--hash", "*"],
+                "\n".join(
+                    f"{service} {compose_hashes[service]}" for service in sorted(compose_hashes)
+                ),
+            ),
+            docker_context_record,
+            docker_info_record,
             ps_record,
             *container_records,
             *image_records,
             ps_record,
             *container_records,
+            docker_context_record,
+            docker_info_record,
         ],
+        "dockerHostIdentity": {
+            "context": "default",
+            "endpoint": "npipe:////./pipe/dockerDesktopLinuxEngine",
+            "serverId": "daemon-yfeistai-01",
+            "dockerHostIdentitySha256": _GATEWAY_DOCKER_HOST_IDENTITY_SHA256,
+        },
     }
     runtime = root / "runtime"
     runtime.mkdir()
@@ -1354,12 +2233,27 @@ def _write_complete_bundle(
     candidate = _candidate(source_head)
     module.PROJECT_ROOT = tmp_path
     _write_candidate_files(tmp_path, candidate)
+    gateway_support = _load_gateway_public_support()
+    gateway_trust_pair = gateway_support.write_gateway_trust_pair(
+        tmp_path,
+        _load_gateway_public_contract(),
+        trusted_root=_gateway_trusted_root(tmp_path),
+        candidate=candidate,
+        release_run=_RELEASE_RUN,
+        runtime_path=tmp_path / "runtime" / "runtime-attestation.json",
+    )
     evidence: dict[str, object] = {}
     artifacts = tmp_path / "artifacts"
     artifacts.mkdir()
     for name in module.REQUIRED_LAYERS:
         artifact_path = artifacts / f"{name}.json"
-        provenance = _write_probe_proof(tmp_path, module, candidate, name)
+        provenance = _write_probe_proof(
+            tmp_path,
+            module,
+            candidate,
+            name,
+            gateway_trust_pair=gateway_trust_pair,
+        )
         artifact_body = json.dumps(
             _artifact_document(module, candidate, name, provenance=provenance),
             sort_keys=True,
@@ -1386,10 +2280,25 @@ def _rewrite_bundle_candidate(
     evidence: dict[str, object],
     candidate: dict[str, object],
 ) -> None:
+    gateway_support = _load_gateway_public_support()
+    gateway_trust_pair = gateway_support.write_gateway_trust_pair(
+        tmp_path,
+        _load_gateway_public_contract(),
+        trusted_root=_gateway_trusted_root(tmp_path),
+        candidate=candidate,
+        release_run=_RELEASE_RUN,
+        runtime_path=tmp_path / "runtime" / "runtime-attestation.json",
+    )
     for name, raw in evidence.items():
         assert isinstance(raw, dict)
         artifact_path = tmp_path / str(raw["artifact"])
-        provenance = _write_probe_proof(tmp_path, module, candidate, name)
+        provenance = _write_probe_proof(
+            tmp_path,
+            module,
+            candidate,
+            name,
+            gateway_trust_pair=gateway_trust_pair,
+        )
         artifact_body = json.dumps(
             _artifact_document(module, candidate, name, provenance=provenance),
             sort_keys=True,
@@ -1729,6 +2638,367 @@ def test_file_runtime_rejects_self_attested_openmaic_shared_plane_without_bound_
     )
 
 
+def test_file_runtime_rejects_self_attested_openmaic_dedicated_plane_without_bound_provenance(
+    tmp_path: Path,
+) -> None:
+    module = _load_verifier()
+    manifest, evidence_map, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    evidence_entry = evidence_map["openmaic_dedicated_plane"]
+    assert isinstance(evidence_entry, dict)
+    artifact_path = tmp_path / str(evidence_entry["artifact"])
+    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    artifact.pop("provenance")
+    artifact_body = json.dumps(artifact, sort_keys=True).encode()
+    artifact_path.write_bytes(artifact_body)
+    evidence_entry["artifactSha256"] = hashlib.sha256(artifact_body).hexdigest()
+    manifest.write_text(
+        json.dumps(_manifest_document(module, candidate, evidence_map)),
+        encoding="utf-8",
+    )
+
+    result = module.verify(
+        module.FileReleaseRuntime(
+            manifest,
+            expected_source_head="a" * 40,
+            candidate_root=tmp_path,
+        )
+    )
+
+    assert result.layers["openmaic_dedicated_plane"].status == "fail"
+    assert (
+        "OpenMAIC dedicated plane execution proof is missing or invalid"
+        in result.layers["openmaic_dedicated_plane"].detail
+    )
+
+
+def test_file_runtime_rejects_dedicated_success_without_independent_outage_provenance(
+    tmp_path: Path,
+) -> None:
+    module = _load_verifier()
+    manifest, evidence_map, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    evidence_entry = evidence_map["openmaic_dedicated_plane"]
+    assert isinstance(evidence_entry, dict)
+    artifact_path = tmp_path / str(evidence_entry["artifact"])
+    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    provenance = artifact["provenance"]
+    assert isinstance(provenance, dict)
+    provenance.pop("openmaicDedicatedOutageAttestation")
+    artifact_body = json.dumps(artifact, sort_keys=True).encode()
+    artifact_path.write_bytes(artifact_body)
+    evidence_entry["artifactSha256"] = hashlib.sha256(artifact_body).hexdigest()
+    manifest.write_text(
+        json.dumps(_manifest_document(module, candidate, evidence_map)),
+        encoding="utf-8",
+    )
+
+    result = module.verify(
+        module.FileReleaseRuntime(
+            manifest,
+            expected_source_head="a" * 40,
+            candidate_root=tmp_path,
+        )
+    )
+
+    assert result.layers["openmaic_dedicated_plane"].status == "fail"
+    assert (
+        "OpenMAIC dedicated outage execution proof is missing or invalid"
+        in result.layers["openmaic_dedicated_plane"].detail
+    )
+
+
+def test_outage_attempt_marker_replay_uses_external_observer_anchor_and_exact_candidate_run(
+    tmp_path: Path,
+) -> None:
+    module = _load_verifier()
+    candidate = _candidate("a" * 40)
+    observer_sha256 = "7" * 64
+    marker = {
+        "schemaVersion": 1,
+        "producer": "openmaic-dedicated-outage-attempt",
+        "candidate": candidate,
+        "releaseRun": _RELEASE_RUN,
+        "observerTrustAnchor": {
+            "sha256": observer_sha256,
+            "observerId": "shared-ingress-observer-openmaic-01",
+            "observerOrigin": "https://observer.example.test",
+            "sharedIngressControlOrigin": "https://shared-ingress.example.test",
+        },
+        "fixturePlan": {
+            "tenantId": "tenant-openmaic-dedicated-01",
+            "routeId": "dedicated-tenant-openmaic-01",
+            "cleanupBoundary": "identity-membership-enrollment-only",
+            "retainedResourceTypes": [
+                "course",
+                "class",
+                "generationQuotaGrant",
+                "classroomAsset",
+                "generationJob",
+            ],
+        },
+    }
+    marker_path = tmp_path / "runtime" / "openmaic-dedicated-outage-attempt.json"
+    marker_path.parent.mkdir()
+    marker_body = (
+        json.dumps(marker, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n"
+    ).encode()
+    marker_path.write_bytes(marker_body)
+    reference = {
+        "artifact": "runtime/openmaic-dedicated-outage-attempt.json",
+        "sha256": hashlib.sha256(marker_body).hexdigest(),
+    }
+
+    assert (
+        module._replay_openmaic_dedicated_outage_attempt_marker(
+            tmp_path,
+            reference,
+            candidate=candidate,
+            release_run=_RELEASE_RUN,
+            expected_observer_attestation_sha256=observer_sha256,
+            expected_observer_id="shared-ingress-observer-openmaic-01",
+            expected_observer_origin="https://observer.example.test",
+            expected_shared_ingress_control_origin="https://shared-ingress.example.test",
+            expected_tenant_id="tenant-openmaic-dedicated-01",
+            expected_route_id="dedicated-tenant-openmaic-01",
+        )
+        == marker
+    )
+
+    changed = copy.deepcopy(marker)
+    changed["observerTrustAnchor"]["sha256"] = "9" * 64
+    changed_body = (
+        json.dumps(changed, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n"
+    ).encode()
+    marker_path.write_bytes(changed_body)
+    changed_reference = {**reference, "sha256": hashlib.sha256(changed_body).hexdigest()}
+    with pytest.raises(ValueError, match="observer"):
+        module._replay_openmaic_dedicated_outage_attempt_marker(
+            tmp_path,
+            changed_reference,
+            candidate=candidate,
+            release_run=_RELEASE_RUN,
+            expected_observer_attestation_sha256=observer_sha256,
+            expected_observer_id="shared-ingress-observer-openmaic-01",
+            expected_observer_origin="https://observer.example.test",
+            expected_shared_ingress_control_origin="https://shared-ingress.example.test",
+            expected_tenant_id="tenant-openmaic-dedicated-01",
+            expected_route_id="dedicated-tenant-openmaic-01",
+        )
+
+
+def test_dedicated_outage_receipt_replays_actual_marker_with_external_docker_anchor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_verifier()
+    candidate = _candidate("a" * 40)
+    observer_sha256 = "7" * 64
+    docker_host_sha256 = "6" * 64
+    marker = {
+        "schemaVersion": 1,
+        "producer": "openmaic-dedicated-outage-attempt",
+        "candidate": candidate,
+        "releaseRun": _RELEASE_RUN,
+        "observerTrustAnchor": {
+            "sha256": observer_sha256,
+            "observerId": "shared-ingress-observer-openmaic-01",
+            "observerOrigin": "https://observer.example.test",
+            "sharedIngressControlOrigin": "https://shared-ingress.example.test",
+        },
+        "fixturePlan": {
+            "tenantId": "tenant-openmaic-dedicated-01",
+            "routeId": "dedicated-tenant-openmaic-01",
+            "cleanupBoundary": "identity-membership-enrollment-only",
+            "retainedResourceTypes": [
+                "course",
+                "class",
+                "generationQuotaGrant",
+                "classroomAsset",
+                "generationJob",
+            ],
+        },
+    }
+    marker_body = (
+        json.dumps(marker, ensure_ascii=False, separators=(",", ":"), sort_keys=True) + "\n"
+    ).encode()
+    marker_reference = {
+        "artifact": "runtime/openmaic-dedicated-outage-attempt.json",
+        "sha256": hashlib.sha256(marker_body).hexdigest(),
+    }
+    document = {
+        "baseUrl": "https://candidate.example.test",
+        "runtimeAttestation": {
+            "artifact": "runtime/runtime-attestation.json",
+            "sha256": "5" * 64,
+        },
+        "observerAttestation": {
+            "artifact": "runtime/openmaic-shared-ingress-observer-attestation.json",
+            "sha256": observer_sha256,
+            "observerId": "shared-ingress-observer-openmaic-01",
+            "observerOrigin": "https://observer.example.test",
+            "sharedIngressControlOrigin": "https://shared-ingress.example.test",
+        },
+        "fixture": {
+            "tenantId": "tenant-openmaic-dedicated-01",
+            "attemptMarker": marker_reference,
+        },
+        "provenance": {
+            "attemptMarker": marker_reference,
+            "observerTrustAnchor": marker["observerTrustAnchor"],
+            "dockerBoundary": {
+                "dockerHostIdentitySha256": docker_host_sha256,
+                "daemonIdentityBeforeSha256": "2" * 64,
+                "daemonIdentityAfterSha256": "2" * 64,
+                "inventoryBeforeSha256": "3" * 64,
+                "inventoryAfterSha256": "3" * 64,
+            },
+        },
+        "outage": {"routeId": "dedicated-tenant-openmaic-01"},
+    }
+    body = (json.dumps(document, separators=(",", ":"), sort_keys=True) + "\n").encode()
+    replayed: list[dict[str, object]] = []
+
+    monkeypatch.setattr(module, "validate_runtime_attestation", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        module,
+        "_proof_bytes",
+        lambda *_args, **_kwargs: (
+            b"observer-body",
+            SimpleNamespace(close=lambda: None),
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "parse_openmaic_shared_ingress_observer_attestation",
+        lambda *_args, **_kwargs: {
+            "observer": {
+                "observerId": "shared-ingress-observer-openmaic-01",
+                "observerUrl": "https://observer.example.test",
+                "sharedIngressControlUrl": (
+                    "https://shared-ingress.example.test/v1/control-canaries"
+                ),
+            }
+        },
+    )
+
+    def replay_marker(*_args, return_body=False, **kwargs):
+        assert return_body is True
+        assert kwargs["expected_observer_attestation_sha256"] == observer_sha256
+        replayed.append(kwargs)
+        return marker, marker_body
+
+    monkeypatch.setattr(module, "_replay_openmaic_dedicated_outage_attempt_marker", replay_marker)
+
+    def parse_outage(_body, **kwargs):
+        assert kwargs["attempt_marker_body"] == marker_body
+        assert kwargs["expected_docker_host_identity_sha256"] == docker_host_sha256
+        return {"observedAt": "2026-08-30T00:00:01Z"}
+
+    monkeypatch.setattr(module, "parse_openmaic_dedicated_outage_attestation", parse_outage)
+    monkeypatch.setattr(
+        module,
+        "derive_openmaic_dedicated_outage_checks",
+        lambda _report: {"noSharedFallback": True},
+    )
+
+    assert module.derive_openmaic_dedicated_outage_receipt_checks(
+        body,
+        bundle_root=tmp_path,
+        candidate_root=tmp_path,
+        candidate=candidate,
+        release_run=_RELEASE_RUN,
+        expected_tenant_id="tenant-openmaic-dedicated-01",
+        expected_docker_host_identity_sha256=docker_host_sha256,
+        expected_openmaic_observer_attestation_sha256=observer_sha256,
+        expected_openmaic_observer_id=_OPENMAIC_OBSERVER_ID,
+        expected_openmaic_observer_origin=_OPENMAIC_OBSERVER_ORIGIN,
+        expected_openmaic_shared_ingress_control_origin=_OPENMAIC_CONTROL_ORIGIN,
+    ) == ({"noSharedFallback": True}, "2026-08-30T00:00:01Z")
+    assert len(replayed) == 1
+
+
+def test_file_runtime_rejects_dedicated_success_without_observer_provenance(
+    tmp_path: Path,
+) -> None:
+    module = _load_verifier()
+    manifest, evidence_map, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    evidence_entry = evidence_map["openmaic_dedicated_plane"]
+    assert isinstance(evidence_entry, dict)
+    artifact_path = tmp_path / str(evidence_entry["artifact"])
+    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    provenance = artifact["provenance"]
+    assert isinstance(provenance, dict)
+    provenance.pop("openmaicSharedIngressObserverAttestation")
+    artifact_body = json.dumps(artifact, sort_keys=True).encode()
+    artifact_path.write_bytes(artifact_body)
+    evidence_entry["artifactSha256"] = hashlib.sha256(artifact_body).hexdigest()
+    manifest.write_text(
+        json.dumps(_manifest_document(module, candidate, evidence_map)),
+        encoding="utf-8",
+    )
+
+    result = module.verify(
+        module.FileReleaseRuntime(
+            manifest,
+            expected_source_head="a" * 40,
+            candidate_root=tmp_path,
+        )
+    )
+
+    assert result.layers["openmaic_dedicated_plane"].status == "fail"
+    assert (
+        "OpenMAIC shared-ingress observer execution proof is missing or invalid"
+        in result.layers["openmaic_dedicated_plane"].detail
+    )
+
+
+def test_file_runtime_rejects_self_consistent_untrusted_shared_ingress_observer_attestation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_verifier()
+    manifest, _evidence, _candidate_document = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    monkeypatch.setattr(
+        module,
+        "derive_openmaic_dedicated_plane_receipt_checks",
+        lambda *_args, **_kwargs: (
+            {
+                "dedicatedGenerationPassed": True,
+                "noSharedClientIssued": True,
+            },
+            "2026-08-24T00:00:00Z",
+        ),
+    )
+
+    result = module.verify(
+        module.FileReleaseRuntime(
+            manifest,
+            expected_source_head="a" * 40,
+            candidate_root=tmp_path,
+            expected_outage_docker_host_identity_sha256=(_GATEWAY_DOCKER_HOST_IDENTITY_SHA256),
+            **_gateway_runtime_arguments(tmp_path),
+        )
+    )
+
+    assert result.layers["openmaic_dedicated_plane"].status == "fail"
+    assert "external observer trust anchor" in result.layers["openmaic_dedicated_plane"].detail
+
+
 @pytest.mark.parametrize(
     "tamper",
     ("candidate", "release_run", "runtime", "command", "stdout_digest", "summary"),
@@ -1766,6 +3036,67 @@ def test_openmaic_shared_plane_replay_rejects_bound_proof_tampering(
             candidate=candidate,
             release_run=_RELEASE_RUN,
         )
+
+
+def test_openmaic_dedicated_plane_replay_rejects_bound_proof_tampering(
+    tmp_path: Path,
+) -> None:
+    module = _load_verifier()
+    derive = getattr(module, "derive_openmaic_dedicated_plane_receipt_checks", None)
+    assert callable(derive), "OpenMAIC dedicated-plane proof replay is missing"
+    _manifest, _evidence, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    proof_path = tmp_path / "runtime" / "openmaic-dedicated-plane-attestation.json"
+    original = json.loads(proof_path.read_text(encoding="utf-8"))
+
+    for tamper in (
+        "candidate",
+        "release_run",
+        "runtime",
+        "command",
+        "stdout_digest",
+        "binding",
+        "summary",
+    ):
+        proof = copy.deepcopy(original)
+        if tamper == "candidate":
+            proof["candidate"]["sourceHead"] = "b" * 40
+        elif tamper == "release_run":
+            proof["releaseRun"]["runId"] = "run-other"
+        elif tamper == "runtime":
+            proof["runtimeAttestation"]["sha256"] = "0" * 64
+        elif tamper == "command":
+            proof["execution"]["command"]["arguments"][1] = "shared"
+        elif tamper == "stdout_digest":
+            proof["execution"]["stdoutSha256"] = "0" * 64
+        elif tamper == "binding":
+            report = json.loads(proof["execution"]["stdout"])
+            report["binding"]["routeTenantId"] = "tenant-other"
+            stdout = (
+                json.dumps(
+                    report,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+            proof["execution"]["stdout"] = stdout
+            proof["execution"]["stdoutSha256"] = hashlib.sha256(stdout.encode()).hexdigest()
+        else:
+            proof["summary"]["generation"]["jobId"] = "job-other"
+
+        with pytest.raises(ValueError):
+            derive(
+                json.dumps(proof, sort_keys=True).encode(),
+                bundle_root=tmp_path,
+                candidate_root=tmp_path,
+                candidate=candidate,
+                release_run=_RELEASE_RUN,
+            )
 
 
 def test_openmaic_shared_plane_replay_rejects_current_live_token_in_stdout(
@@ -2889,32 +4220,86 @@ def test_file_runtime_rejects_extra_preflight_receipt_fields(
     assert "receipt" in result.layers["database_revisions"].detail
 
 
-def test_file_runtime_requires_the_same_candidate_head(tmp_path: Path) -> None:
+def test_file_runtime_requires_the_same_candidate_head(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     module = _load_verifier()
     manifest, _, _ = _write_complete_bundle(
         tmp_path,
         module,
         source_head="a" * 40,
     )
+    _bind_gateway_expected_environment(monkeypatch, tmp_path)
 
-    result = module.verify(module.FileReleaseRuntime(manifest, expected_source_head="b" * 40))
+    result = module.verify(
+        _complete_bundle_runtime(
+            module,
+            manifest,
+            expected_source_head="b" * 40,
+        )
+    )
 
     assert result.ok is False
     assert result.failed == ("source_head",)
     assert "does not match" in result.layers["source_head"].detail
 
 
-def test_probe_command_record_is_stable_across_verifier_source_roots(tmp_path: Path) -> None:
+def test_file_runtime_rejects_bundle_parent_replacement_after_receipt_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_verifier()
+    bundle_root = tmp_path / "bundle"
+    bundle_root.mkdir()
+    manifest, _, _ = _write_complete_bundle(
+        bundle_root,
+        module,
+        source_head="a" * 40,
+    )
+    retained_root = tmp_path / "retained-bundle"
+    original_provenance = module.probe_provenance_error
+    switched = False
+
+    def replay(*args, **kwargs):
+        nonlocal switched
+        result = original_provenance(*args, **kwargs)
+        bundle_root.rename(retained_root)
+        bundle_root.mkdir()
+        switched = True
+        return result
+
+    monkeypatch.setattr(module, "probe_provenance_error", replay)
+    runtime = module.FileReleaseRuntime(
+        manifest,
+        expected_source_head="a" * 40,
+        candidate_root=bundle_root,
+    )
+
+    result = runtime.result("teacher_flow")
+
+    assert switched
+    assert result is not None
+    assert result.status == "fail"
+    assert "boundary" in result.detail or "changed" in result.detail
+
+
+def test_probe_command_record_is_stable_across_verifier_source_roots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     module = _load_verifier()
     manifest, _, _ = _write_complete_bundle(
         tmp_path,
         module,
         source_head="a" * 40,
     )
+    _bind_gateway_expected_environment(monkeypatch, tmp_path)
     module.SCRIPTS_ROOT = Path("E:/different-verifier-root/scripts")
 
     result = module.verify(
-        module.FileReleaseRuntime(
+        _complete_bundle_runtime(
+            module,
             manifest,
             expected_source_head="a" * 40,
             candidate_root=tmp_path,
@@ -3166,6 +4551,7 @@ def test_file_runtime_rejects_non_service_compose_reference(
 
 def test_file_runtime_accepts_compose_tags_and_merged_custom_image_services(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = _load_verifier()
     manifest, _, _ = _write_complete_bundle(
@@ -3173,6 +4559,7 @@ def test_file_runtime_accepts_compose_tags_and_merged_custom_image_services(
         module,
         source_head="c" * 40,
     )
+    _bind_gateway_expected_environment(monkeypatch, tmp_path)
     lock = json.loads((tmp_path / "deploy" / "image-lock.json").read_text())
     references = {name: record["reference"] for name, record in lock["images"].items()}
     platform = f"""\
@@ -3186,6 +4573,8 @@ x-images:
   minio-client: &minio-client-image {json.dumps(references["minio_client"])}
 x-teaching-process: &teaching-process
   image: *deeptutor-image
+  networks:
+    - platform-internal
 services:
   pocketbase:
     ports: !reset []
@@ -3195,23 +4584,37 @@ services:
     build: !reset null
     networks: !override
       - platform-internal
+      - platform-service-egress
   gateway:
     image: *nginx-image
+    networks:
+      - platform-internal
+      - platform-edge
   postgres:
     image: *postgres-image
+    networks:
+      - platform-internal
   minio:
     image: *minio-image
+    networks:
+      - platform-internal
   minio-bootstrap:
     image: *minio-client-image
     restart: "no"
+    networks:
+      - platform-internal
   teaching-migrate:
     image: *deeptutor-image
     restart: "no"
+    networks:
+      - platform-internal
   tenant-provisioner:
     <<: *teaching-process
   shared-data-plane-bootstrap:
     image: *deeptutor-image
     restart: "no"
+    networks:
+      - platform-internal
   teaching-dispatcher:
     <<: *teaching-process
   teaching-worker:
@@ -3224,12 +4627,29 @@ services:
     <<: *teaching-process
   openmaic:
     image: *openmaic-image
+    networks:
+      - platform-internal
+      - shared-provider-egress
   openmaic-render:
     image: *openmaic-render-image
+    networks:
+      - platform-internal
+networks:
+  platform-internal:
+    internal: true
+  platform-edge: {{}}
+  platform-service-egress: {{}}
+  shared-provider-egress: {{}}
 """
     (tmp_path / "docker-compose.platform.yml").write_text(platform, encoding="utf-8")
 
-    result = module.verify(module.FileReleaseRuntime(manifest, expected_source_head="c" * 40))
+    result = module.verify(
+        _complete_bundle_runtime(
+            module,
+            manifest,
+            expected_source_head="c" * 40,
+        )
+    )
 
     assert result.ok is True
 
@@ -3512,10 +4932,18 @@ def test_main_rechecks_source_tree_after_reading_evidence_bundle(
         module,
         source_head=source_head,
     )
+    _bind_gateway_expected_environment(monkeypatch, tmp_path)
     observed_heads = iter((source_head, ""))
     monkeypatch.setattr(module, "_git_head", lambda: next(observed_heads))
 
-    exit_code = module.main(["--evidence", str(manifest), "--json"])
+    exit_code = module.main(
+        [
+            "--evidence",
+            str(manifest),
+            "--json",
+            *_gateway_cli_arguments(tmp_path),
+        ]
+    )
     payload = json.loads(capsys.readouterr().out)
 
     assert exit_code == 1
@@ -3538,6 +4966,7 @@ def test_main_verifies_candidate_artifact_outside_the_clean_source_root(
         module,
         source_head=source_head,
     )
+    _bind_gateway_expected_environment(monkeypatch, candidate_root)
     clean_source_root = tmp_path / "clean-source"
     clean_source_root.mkdir()
     module.PROJECT_ROOT = clean_source_root
@@ -3550,6 +4979,7 @@ def test_main_verifies_candidate_artifact_outside_the_clean_source_root(
             "--candidate-root",
             str(candidate_root),
             "--json",
+            *_gateway_cli_arguments(candidate_root),
         ]
     )
     payload = json.loads(capsys.readouterr().out)
@@ -3557,6 +4987,298 @@ def test_main_verifies_candidate_artifact_outside_the_clean_source_root(
     assert exit_code == 0
     assert payload["status"] == "ready"
     assert payload["candidate"]["sourceHead"] == source_head
+
+
+@pytest.mark.parametrize("source", ("cli", "environment"))
+def test_verifier_cli_resolves_trusted_gateway_docker_host_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+) -> None:
+    module = _load_verifier()
+    captured: dict[str, object] = {}
+
+    class CapturingRuntime:
+        def __init__(self, path: Path, **kwargs) -> None:
+            captured["path"] = path
+            captured.update(kwargs)
+
+    result = SimpleNamespace(ok=True)
+    monkeypatch.setattr(module, "FileReleaseRuntime", CapturingRuntime)
+    monkeypatch.setattr(module, "verify", lambda _runtime: result)
+    monkeypatch.setattr(module, "report_payload", lambda _result: {"status": "ready"})
+    monkeypatch.setattr(module, "_git_head", lambda: "a" * 40)
+    monkeypatch.delenv("YFEISTAI_GATEWAY_DOCKER_HOST_IDENTITY_SHA256", raising=False)
+    argv = [
+        "--evidence",
+        str(tmp_path / "evidence.json"),
+        "--gateway-trust-keyring",
+        str(tmp_path / "gateway-trust-keyring.json"),
+        "--gateway-trust-keyring-sha256",
+        "6" * 64,
+        "--gateway-observer-challenge",
+        "8" * 64,
+        "--gateway-host-challenge",
+        "9" * 64,
+        "--gateway-trusted-now",
+        "2026-08-30T04:05:00Z",
+        "--json",
+        *_static_openmaic_cli_arguments(),
+    ]
+    if source == "cli":
+        argv.extend(
+            [
+                "--gateway-docker-host-identity-sha256",
+                _GATEWAY_DOCKER_HOST_IDENTITY_SHA256,
+            ]
+        )
+    else:
+        monkeypatch.setenv(
+            "YFEISTAI_GATEWAY_DOCKER_HOST_IDENTITY_SHA256",
+            _GATEWAY_DOCKER_HOST_IDENTITY_SHA256,
+        )
+
+    assert module.main(argv) == 0
+    assert captured["expected_gateway_docker_host_identity_sha256"] == (
+        _GATEWAY_DOCKER_HOST_IDENTITY_SHA256
+    )
+
+
+def test_verify_cli_requires_and_forwards_gateway_external_trust_inputs_before_verify(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_verifier()
+    captured: dict[str, object] = {}
+    verify_calls = 0
+    keyring = tmp_path / "trusted" / "gateway-trust-keyring.json"
+    trust_inputs = (
+        (
+            "--gateway-trust-keyring",
+            "YFEISTAI_GATEWAY_TRUST_KEYRING",
+            "trusted_keyring_path",
+            str(keyring),
+            str(keyring.with_name("other-keyring.json")),
+        ),
+        (
+            "--gateway-trust-keyring-sha256",
+            "YFEISTAI_GATEWAY_TRUST_KEYRING_SHA256",
+            "expected_trusted_keyring_sha256",
+            "6" * 64,
+            "7" * 64,
+        ),
+        (
+            "--gateway-observer-challenge",
+            "YFEISTAI_GATEWAY_OBSERVER_CHALLENGE",
+            "expected_observer_challenge",
+            "8" * 64,
+            "a" * 64,
+        ),
+        (
+            "--gateway-host-challenge",
+            "YFEISTAI_GATEWAY_HOST_CHALLENGE",
+            "expected_host_challenge",
+            "9" * 64,
+            "b" * 64,
+        ),
+        (
+            "--gateway-trusted-now",
+            "YFEISTAI_GATEWAY_TRUSTED_NOW",
+            "trusted_now",
+            "2026-08-30T04:00:30Z",
+            "2026-08-30T04:00:31Z",
+        ),
+    )
+
+    class CapturingRuntime:
+        def __init__(self, path: Path, **kwargs) -> None:
+            captured["path"] = path
+            captured.update(kwargs)
+
+    result = SimpleNamespace(ok=True)
+
+    def verify(runtime) -> SimpleNamespace:
+        nonlocal verify_calls
+        verify_calls += 1
+        assert isinstance(runtime, CapturingRuntime)
+        return result
+
+    monkeypatch.setattr(module, "FileReleaseRuntime", CapturingRuntime)
+    monkeypatch.setattr(module, "verify", verify)
+    monkeypatch.setattr(module, "report_payload", lambda _result: {"status": "ready"})
+    monkeypatch.setattr(module, "_git_head", lambda: "a" * 40)
+    for _flag, environment_name, _keyword, _value, _mismatch in trust_inputs:
+        monkeypatch.delenv(environment_name, raising=False)
+    monkeypatch.delenv("YFEISTAI_GATEWAY_DOCKER_HOST_IDENTITY_SHA256", raising=False)
+
+    def argv(*, omitted_flag: str | None = None) -> list[str]:
+        arguments = [
+            "--evidence",
+            str(tmp_path / "release-evidence.json"),
+            "--gateway-docker-host-identity-sha256",
+            "5" * 64,
+            "--json",
+            *_static_openmaic_cli_arguments(),
+        ]
+        for flag, _environment_name, _keyword, value, _mismatch in trust_inputs:
+            if flag != omitted_flag:
+                arguments.extend((flag, value))
+        return arguments
+
+    assert module.main(argv()) == 0
+    assert verify_calls == 1
+    assert captured["expected_gateway_docker_host_identity_sha256"] == "5" * 64
+    for flag, _environment_name, keyword, value, _mismatch in trust_inputs:
+        expected = Path(value) if flag == "--gateway-trust-keyring" else value
+        assert captured[keyword] == expected
+
+    for flag, _environment_name, _keyword, _value, _mismatch in trust_inputs:
+        before = verify_calls
+        with pytest.raises(SystemExit):
+            module.main(argv(omitted_flag=flag))
+        assert verify_calls == before
+
+    for _flag, environment_name, keyword, value, mismatch in trust_inputs:
+        monkeypatch.setenv(environment_name, value)
+        captured.clear()
+        assert module.main(argv()) == 0
+        expected = Path(value) if keyword == "trusted_keyring_path" else value
+        assert captured[keyword] == expected
+
+        monkeypatch.setenv(environment_name, mismatch)
+        before = verify_calls
+        with pytest.raises(SystemExit):
+            module.main(argv())
+        assert verify_calls == before
+        monkeypatch.delenv(environment_name)
+
+
+def test_verify_cli_requires_and_forwards_openmaic_observer_trust_anchor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_verifier()
+    expected_flags = {
+        "--openmaic-observer-attestation-sha256",
+        "--openmaic-observer-id",
+        "--openmaic-observer-origin",
+        "--openmaic-shared-ingress-control-origin",
+    }
+    assert expected_flags <= set(module._parser()._option_string_actions)
+
+    captured: dict[str, object] = {}
+
+    class CapturingRuntime:
+        def __init__(self, path: Path, **kwargs) -> None:
+            captured["path"] = path
+            captured.update(kwargs)
+
+    result = SimpleNamespace(ok=True)
+    monkeypatch.setattr(module, "FileReleaseRuntime", CapturingRuntime)
+    monkeypatch.setattr(module, "verify", lambda _runtime: result)
+    monkeypatch.setattr(module, "report_payload", lambda _result: {"status": "ready"})
+    monkeypatch.setattr(module, "_git_head", lambda: "a" * 40)
+
+    observer_inputs = (
+        (
+            "--openmaic-observer-attestation-sha256",
+            "expected_openmaic_observer_attestation_sha256",
+            "9" * 64,
+        ),
+        ("--openmaic-observer-id", "expected_openmaic_observer_id", _OPENMAIC_OBSERVER_ID),
+        (
+            "--openmaic-observer-origin",
+            "expected_openmaic_observer_origin",
+            _OPENMAIC_OBSERVER_ORIGIN,
+        ),
+        (
+            "--openmaic-shared-ingress-control-origin",
+            "expected_openmaic_shared_ingress_control_origin",
+            _OPENMAIC_CONTROL_ORIGIN,
+        ),
+    )
+
+    def argv(*, omitted_flag: str | None = None) -> list[str]:
+        arguments = [
+            "--evidence",
+            str(tmp_path / "release-evidence.json"),
+            "--gateway-docker-host-identity-sha256",
+            "5" * 64,
+            "--gateway-trust-keyring",
+            str(tmp_path / "gateway-trust-keyring.json"),
+            "--gateway-trust-keyring-sha256",
+            "6" * 64,
+            "--gateway-observer-challenge",
+            "8" * 64,
+            "--gateway-host-challenge",
+            "7" * 64,
+            "--gateway-trusted-now",
+            "2026-08-30T04:05:00Z",
+            "--json",
+        ]
+        for flag, _keyword, value in observer_inputs:
+            if flag != omitted_flag:
+                arguments.extend((flag, value))
+        return arguments
+
+    assert module.main(argv()) == 0
+    for _flag, keyword, value in observer_inputs:
+        assert captured[keyword] == value
+
+    for flag, _keyword, _value in observer_inputs:
+        with pytest.raises(SystemExit):
+            module.main(argv(omitted_flag=flag))
+
+
+@pytest.mark.parametrize("case", ("missing", "zero"))
+def test_verifier_cli_rejects_absent_or_zero_gateway_docker_host_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    module = _load_verifier()
+    monkeypatch.setattr(
+        module,
+        "FileReleaseRuntime",
+        lambda *_args, **_kwargs: pytest.fail(
+            "invalid gateway Docker host identity reached evidence verification"
+        ),
+    )
+    attempts = [([], None)]
+    if case == "zero":
+        attempts = [
+            (["--gateway-docker-host-identity-sha256", "0" * 64], None),
+            ([], "0" * 64),
+        ]
+    for extra_arguments, environment_value in attempts:
+        monkeypatch.delenv(
+            "YFEISTAI_GATEWAY_DOCKER_HOST_IDENTITY_SHA256",
+            raising=False,
+        )
+        if environment_value is not None:
+            monkeypatch.setenv(
+                "YFEISTAI_GATEWAY_DOCKER_HOST_IDENTITY_SHA256",
+                environment_value,
+            )
+        with pytest.raises(SystemExit):
+            module.main(
+                [
+                    "--evidence",
+                    str(tmp_path / "evidence.json"),
+                    "--gateway-trust-keyring",
+                    str(tmp_path / "gateway-trust-keyring.json"),
+                    "--gateway-trust-keyring-sha256",
+                    "6" * 64,
+                    "--gateway-observer-challenge",
+                    "8" * 64,
+                    "--gateway-host-challenge",
+                    "9" * 64,
+                    "--gateway-trusted-now",
+                    "2026-08-30T04:05:00Z",
+                    "--json",
+                    *extra_arguments,
+                ]
+            )
 
 
 def test_git_head_rejects_a_dirty_source_candidate(monkeypatch) -> None:
@@ -3630,7 +5352,7 @@ def test_open_windows_directory_no_follow_closes_current_on_system_exit(
     monkeypatch.setattr(
         module,
         "_open_windows_directory_handle",
-        lambda _path: (current_handle, (1, 1)),
+        lambda _path, *, deletable=False: (current_handle, (1, 1)),
     )
 
     def fail_relative(handle: object, component: str) -> tuple[object, tuple[int, int]]:
@@ -3645,3 +5367,735 @@ def test_open_windows_directory_no_follow_closes_current_on_system_exit(
         module._open_windows_directory_no_follow(Path("C:/bundle/runtime"))
 
     assert closed == [current_handle]
+
+
+def _rewrite_gateway_artifact(
+    tmp_path: Path,
+    module,
+    manifest: Path,
+    evidence_map: dict[str, object],
+    document: dict[str, object],
+) -> None:
+    entry = evidence_map["gateway_only_public"]
+    assert isinstance(entry, dict)
+    artifact_path = tmp_path / str(entry["artifact"])
+    body = json.dumps(document, sort_keys=True).encode()
+    artifact_path.write_bytes(body)
+    entry["artifactSha256"] = hashlib.sha256(body).hexdigest()
+    manifest.write_text(
+        json.dumps(_manifest_document(module, document["candidate"], evidence_map)),
+        encoding="utf-8",
+    )
+
+
+def _bind_gateway_expected_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> str:
+    support = _load_gateway_public_support()
+    attestation_path = tmp_path / "runtime" / "gateway-external-observer-attestation.json"
+    monkeypatch.setenv(
+        support.EXPECTED_ATTESTATION_ENV,
+        hashlib.sha256(attestation_path.read_bytes()).hexdigest(),
+    )
+    monkeypatch.setenv(support.EXPECTED_OBSERVER_ID_ENV, support.OBSERVER_ID)
+    monkeypatch.setenv(support.EXPECTED_OBSERVER_ORIGIN_ENV, support.OBSERVER_ORIGIN)
+    monkeypatch.setenv(support.TRUSTED_NOW_ENV, support.TRUSTED_NOW)
+    monkeypatch.setenv(support.RUN_STARTED_AT_ENV, support.RUN_STARTED_AT)
+    monkeypatch.setenv(support.RUN_ENDED_AT_ENV, support.RUN_ENDED_AT)
+    monkeypatch.setenv(
+        support.EXPECTED_DOCKER_HOST_IDENTITY_ENV,
+        str(_gateway_trust_pair_from_bundle(tmp_path)["host_receipt_sha256"]),
+    )
+    sentinel = "gateway-verifier-sentinel-secret-must-not-leak"
+    monkeypatch.setenv("YFEISTAI_GATEWAY_SENTINEL_SECRET", sentinel)
+    return sentinel
+
+
+def _gateway_host_identity_proof(
+    tmp_path: Path,
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    proof_context: str | None = None,
+    proof_endpoint: str | None = None,
+    proof_server_id: str | None = None,
+    proof_identity_sha256: str | None = None,
+) -> tuple[dict[str, object], bytes, dict[str, object]]:
+    support = _load_gateway_public_support()
+    _manifest, _evidence, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    trust_pair = _gateway_trust_pair_from_bundle(tmp_path)
+    trusted_host_identity_sha256 = str(trust_pair["host_receipt_sha256"])
+    runtime_path = tmp_path / "runtime" / "runtime-attestation.json"
+    runtime_sha256 = hashlib.sha256(runtime_path.read_bytes()).hexdigest()
+
+    def validate_runtime(_path: Path, **kwargs):
+        assert kwargs["expected_sha256"] == runtime_sha256
+        return json.loads(runtime_path.read_bytes())
+
+    monkeypatch.setattr(module, "validate_runtime_attestation", validate_runtime)
+    _bind_gateway_expected_environment(monkeypatch, tmp_path)
+    proof = json.loads((tmp_path / "runtime" / "gateway-only-public-attestation.json").read_bytes())
+    proof["docker"]["daemon"]["context"] = proof_context or support.DOCKER_CONTEXT
+    proof["docker"]["daemon"]["endpoint"] = proof_endpoint or support.DOCKER_ENDPOINT
+    proof["docker"]["daemon"]["serverId"] = proof_server_id or support.DOCKER_SERVER_ID
+    proof["docker"]["daemon"]["dockerHostIdentitySha256"] = (
+        proof_identity_sha256 or trusted_host_identity_sha256
+    )
+    return candidate, support.canonical_json(proof), trust_pair
+
+
+def _gateway_external_trust_proof(
+    tmp_path: Path,
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
+    support = _load_gateway_public_support()
+    _manifest, _evidence, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    runtime_path = tmp_path / "runtime" / "runtime-attestation.json"
+    trust_pair = _gateway_trust_pair_from_bundle(tmp_path)
+    runtime_sha256 = hashlib.sha256(runtime_path.read_bytes()).hexdigest()
+
+    def validate_runtime(path: Path, **kwargs):
+        assert Path(path) == runtime_path
+        assert kwargs["expected_sha256"] == runtime_sha256
+        return json.loads(runtime_path.read_bytes())
+
+    monkeypatch.setattr(module, "validate_runtime_attestation", validate_runtime)
+    _bind_gateway_expected_environment(monkeypatch, tmp_path)
+    monkeypatch.setenv(
+        support.EXPECTED_DOCKER_HOST_IDENTITY_ENV,
+        str(trust_pair["host_receipt_sha256"]),
+    )
+    proof = json.loads((tmp_path / "runtime" / "gateway-only-public-attestation.json").read_bytes())
+    return candidate, proof, trust_pair
+
+
+@pytest.mark.parametrize(
+    "trust_case",
+    (
+        "valid",
+        "observer-envelope-tampered",
+        "host-envelope-tampered",
+        "host-receipt-tampered",
+        "keyring-tampered",
+    ),
+)
+def test_gateway_only_public_verifier_replays_external_trust_pair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    trust_case: str,
+) -> None:
+    module = _load_verifier()
+    support = _load_gateway_public_support()
+    candidate, proof, trust_pair = _gateway_external_trust_proof(
+        tmp_path,
+        module,
+        monkeypatch,
+    )
+    if trust_case != "valid":
+        input_name = trust_case.removesuffix("-tampered")
+        path_keys = {
+            "observer-envelope": "observer_envelope_path",
+            "host-envelope": "host_envelope_path",
+            "host-receipt": "host_receipt_path",
+            "keyring": "keyring_path",
+        }
+        reference_keys = {
+            "observer-envelope": "observerEnvelope",
+            "host-envelope": "hostProvisionerEnvelope",
+            "host-receipt": "hostProvisioningReceipt",
+        }
+        path = Path(trust_pair[path_keys[input_name]])
+        path.write_bytes(path.read_bytes() + b" ")
+        if input_name in reference_keys:
+            proof["trustPair"][reference_keys[input_name]]["sha256"] = hashlib.sha256(
+                path.read_bytes()
+            ).hexdigest()
+        assert proof["summary"]["checks"] == {
+            "gatewayPublic": True,
+            "internalPortsClosed": True,
+        }
+
+    arguments = {
+        "bundle_root": tmp_path,
+        "candidate_root": tmp_path,
+        "candidate": candidate,
+        "release_run": _RELEASE_RUN,
+        "expected_docker_host_identity_sha256": str(trust_pair["host_receipt_sha256"]),
+        **support.gateway_trust_arguments(trust_pair),
+    }
+    proof_body = support.canonical_json(proof)
+    if trust_case == "valid":
+        checks, observed_at = module.derive_gateway_only_public_receipt_checks(
+            proof_body,
+            **arguments,
+        )
+        assert checks == {"gatewayPublic": True, "internalPortsClosed": True}
+        assert observed_at == "2026-08-30T04:00:01Z"
+    else:
+        with pytest.raises(ValueError, match="gateway trust"):
+            module.derive_gateway_only_public_receipt_checks(
+                proof_body,
+                **arguments,
+            )
+
+
+@pytest.mark.parametrize("legacy_environment_case", ("absent", "conflicting"))
+def test_gateway_verifier_uses_signed_observer_policy_without_legacy_trust_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    legacy_environment_case: str,
+) -> None:
+    module = _load_verifier()
+    support = _load_gateway_public_support()
+    candidate, proof, trust_pair = _gateway_external_trust_proof(
+        tmp_path,
+        module,
+        monkeypatch,
+    )
+    legacy_environment = {
+        support.EXPECTED_ATTESTATION_ENV: "f" * 64,
+        support.EXPECTED_OBSERVER_ID_ENV: "conflicting-external-observer",
+        support.EXPECTED_OBSERVER_ORIGIN_ENV: "https://conflicting-observer.example.net",
+        support.TRUSTED_NOW_ENV: "2026-08-30T04:06:00Z",
+        support.RUN_STARTED_AT_ENV: "2026-08-30T04:03:00Z",
+        support.RUN_ENDED_AT_ENV: "2026-08-30T04:09:00Z",
+    }
+    for name, conflicting_value in legacy_environment.items():
+        if legacy_environment_case == "absent":
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, conflicting_value)
+
+    checks, observed_at = module.derive_gateway_only_public_receipt_checks(
+        support.canonical_json(proof),
+        bundle_root=tmp_path,
+        candidate_root=tmp_path,
+        candidate=candidate,
+        release_run=_RELEASE_RUN,
+        expected_docker_host_identity_sha256=str(trust_pair["host_receipt_sha256"]),
+        **support.gateway_trust_arguments(trust_pair),
+    )
+
+    assert checks == {"gatewayPublic": True, "internalPortsClosed": True}
+    assert observed_at == "2026-08-30T04:00:01Z"
+
+
+@pytest.mark.parametrize(
+    "trust_case",
+    (
+        "valid",
+        "observer-envelope-tampered",
+        "host-envelope-tampered",
+        "host-receipt-tampered",
+        "keyring-tampered",
+    ),
+)
+def test_file_runtime_replays_gateway_external_trust_pair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    trust_case: str,
+) -> None:
+    module = _load_verifier()
+    support = _load_gateway_public_support()
+    candidate, proof, trust_pair = _gateway_external_trust_proof(
+        tmp_path,
+        module,
+        monkeypatch,
+    )
+    if trust_case != "valid":
+        input_name = trust_case.removesuffix("-tampered")
+        path_keys = {
+            "observer-envelope": "observer_envelope_path",
+            "host-envelope": "host_envelope_path",
+            "host-receipt": "host_receipt_path",
+            "keyring": "keyring_path",
+        }
+        reference_keys = {
+            "observer-envelope": "observerEnvelope",
+            "host-envelope": "hostProvisionerEnvelope",
+            "host-receipt": "hostProvisioningReceipt",
+        }
+        path = Path(trust_pair[path_keys[input_name]])
+        path.write_bytes(path.read_bytes() + b" ")
+        if input_name in reference_keys:
+            reference = proof["trustPair"][reference_keys[input_name]]
+            assert isinstance(reference, dict)
+            reference["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+        assert proof["summary"]["checks"] == {
+            "gatewayPublic": True,
+            "internalPortsClosed": True,
+        }
+
+    proof_path = tmp_path / "runtime" / "gateway-only-public-attestation.json"
+    proof_path.write_bytes(support.canonical_json(proof))
+    manifest = tmp_path / "release-evidence.json"
+    manifest_document = json.loads(manifest.read_bytes())
+    evidence_map = manifest_document["evidence"]
+    assert isinstance(evidence_map, dict)
+    entry = evidence_map["gateway_only_public"]
+    assert isinstance(entry, dict)
+    artifact_path = tmp_path / str(entry["artifact"])
+    artifact = json.loads(artifact_path.read_bytes())
+    artifact["provenance"] = support.receipt_provenance(proof_path)
+    _rewrite_gateway_artifact(tmp_path, module, manifest, evidence_map, artifact)
+
+    runtime = module.FileReleaseRuntime(
+        manifest,
+        expected_source_head=str(candidate["sourceHead"]),
+        candidate_root=tmp_path,
+        expected_gateway_docker_host_identity_sha256=str(trust_pair["host_receipt_sha256"]),
+        **support.gateway_trust_arguments(trust_pair),
+    )
+    result = runtime.result("gateway_only_public")
+    assert result is not None
+    if trust_case == "valid":
+        assert result.status == "pass"
+    else:
+        assert result.status == "fail"
+        assert "gateway trust" in result.detail
+
+
+def _write_fixed_gateway_candidate_networks(tmp_path: Path, support) -> None:
+    runtime = json.loads((tmp_path / "runtime" / "runtime-attestation.json").read_bytes())
+    fixed_compose = Path(__file__).resolve().parents[2] / "docker-compose.platform.yml"
+    expected_networks = support.expected_service_networks(fixed_compose, runtime)
+    prefix = f"{support.DOCKER_PROJECT}_"
+    logical_networks = {
+        service: [name.removeprefix(prefix) for name in networks]
+        for service, networks in expected_networks.items()
+    }
+    assert all(
+        name.startswith(prefix) for networks in expected_networks.values() for name in networks
+    )
+
+    compose_path = tmp_path / "docker-compose.platform.yml"
+    compose = json.loads(compose_path.read_bytes())
+    services = compose["services"]
+    for service, networks in logical_networks.items():
+        services[service]["networks"] = networks
+    compose["networks"] = {
+        network: {}
+        for network in sorted(
+            {network for networks in logical_networks.values() for network in networks}
+        )
+    }
+    compose_path.write_text(json.dumps(compose, sort_keys=True), encoding="utf-8")
+
+
+def test_gateway_only_public_uses_external_probe_contract() -> None:
+    module = _load_verifier()
+
+    assert module.RECEIPT_CONTRACTS["gateway_only_public"] == (
+        "gateway-external-probe",
+        ("gatewayPublic", "internalPortsClosed"),
+    )
+
+
+def test_gateway_only_public_verifier_binds_runtime_and_proof_to_trusted_docker_host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_verifier()
+    support = _load_gateway_public_support()
+    candidate, proof_body, trust_pair = _gateway_host_identity_proof(
+        tmp_path,
+        module,
+        monkeypatch,
+    )
+
+    checks, observed_at = module.derive_gateway_only_public_receipt_checks(
+        proof_body,
+        bundle_root=tmp_path,
+        candidate_root=tmp_path,
+        candidate=candidate,
+        release_run=_RELEASE_RUN,
+        expected_docker_host_identity_sha256=str(trust_pair["host_receipt_sha256"]),
+        **support.gateway_trust_arguments(trust_pair),
+    )
+
+    assert checks == {"gatewayPublic": True, "internalPortsClosed": True}
+    assert observed_at == "2026-08-30T04:00:01Z"
+
+
+@pytest.mark.parametrize(
+    "case",
+    ("context", "endpoint", "server-id", "host-identity"),
+)
+def test_gateway_only_public_verifier_rejects_self_consistent_untrusted_docker_host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    module = _load_verifier()
+    support = _load_gateway_public_support()
+    fixture_kwargs: dict[str, str] = {}
+    if case == "context":
+        fixture_kwargs["proof_context"] = "attacker"
+    elif case == "endpoint":
+        fixture_kwargs["proof_endpoint"] = "npipe:////./pipe/attacker"
+    elif case == "server-id":
+        fixture_kwargs["proof_server_id"] = "daemon-attacker"
+    else:
+        fixture_kwargs["proof_identity_sha256"] = "8" * 64
+    candidate, proof_body, trust_pair = _gateway_host_identity_proof(
+        tmp_path,
+        module,
+        monkeypatch,
+        **fixture_kwargs,
+    )
+
+    with pytest.raises(ValueError, match="Docker host identity"):
+        module.derive_gateway_only_public_receipt_checks(
+            proof_body,
+            bundle_root=tmp_path,
+            candidate_root=tmp_path,
+            candidate=candidate,
+            release_run=_RELEASE_RUN,
+            expected_docker_host_identity_sha256=str(trust_pair["host_receipt_sha256"]),
+            **support.gateway_trust_arguments(trust_pair),
+        )
+
+
+@pytest.mark.parametrize(
+    "replacement_kind",
+    (
+        "directory",
+        pytest.param(
+            "windows-reparse",
+            marks=pytest.mark.skipif(
+                os.name != "nt",
+                reason="exercises a Windows directory reparse race",
+            ),
+        ),
+    ),
+)
+def test_gateway_only_public_verifier_rejects_byte_identical_raw_ancestor_replacement_during_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement_kind: str,
+) -> None:
+    module = _load_verifier()
+    support = _load_gateway_public_support()
+    candidate, proof_body, trust_pair = _gateway_host_identity_proof(
+        tmp_path,
+        module,
+        monkeypatch,
+    )
+    raw_root = tmp_path / "raw"
+    retained_root = tmp_path / "raw.retained"
+    alternate_root = tmp_path / "raw.alternate"
+    alternate_root.mkdir()
+    report_path = raw_root / "gateway-public-observation.json"
+    assert report_path.is_file()
+    (alternate_root / report_path.name).write_bytes(report_path.read_bytes())
+    original_parse = module.parse_gateway_public_report
+    attack_outcome: str | None = None
+
+    def parse_after_replacement(*args, **kwargs):
+        nonlocal attack_outcome
+        if attack_outcome is None:
+            raw_moved = False
+            try:
+                os.replace(raw_root, retained_root)
+                raw_moved = True
+                if replacement_kind == "directory":
+                    os.replace(alternate_root, raw_root)
+                else:
+                    try:
+                        raw_root.symlink_to(alternate_root, target_is_directory=True)
+                    except OSError:
+                        os.replace(retained_root, raw_root)
+                        pytest.skip(
+                            "directory reparse points are unavailable on this Windows test host"
+                        )
+            except OSError as exc:
+                if raw_moved and not os.path.lexists(raw_root):
+                    os.replace(retained_root, raw_root)
+                if os.name != "nt" or getattr(exc, "winerror", None) not in {5, 32}:
+                    raise
+                attack_outcome = "permission-blocked"
+                raise ValueError(
+                    "gateway external observation ancestor replacement was blocked by the held lease"
+                ) from exc
+            attack_outcome = "identity-rejected"
+        return original_parse(*args, **kwargs)
+
+    monkeypatch.setattr(module, "parse_gateway_public_report", parse_after_replacement)
+
+    with pytest.raises(
+        ValueError,
+        match="external observation|ancestor|boundary|changed|reparse|blocked|lease",
+    ):
+        module.derive_gateway_only_public_receipt_checks(
+            proof_body,
+            bundle_root=tmp_path,
+            candidate_root=tmp_path,
+            candidate=candidate,
+            release_run=_RELEASE_RUN,
+            expected_docker_host_identity_sha256=str(trust_pair["host_receipt_sha256"]),
+            **support.gateway_trust_arguments(trust_pair),
+        )
+
+    assert attack_outcome in {"permission-blocked", "identity-rejected"}
+    if attack_outcome == "permission-blocked":
+        assert raw_root.is_dir()
+        assert not raw_root.is_symlink()
+        assert not retained_root.exists()
+
+
+def test_file_runtime_accepts_replayed_gateway_only_public_proof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_verifier()
+    manifest, _evidence, _candidate_document = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    sentinel = _bind_gateway_expected_environment(monkeypatch, tmp_path)
+
+    result = module.verify(
+        _complete_bundle_runtime(
+            module,
+            manifest,
+            expected_source_head="a" * 40,
+            candidate_root=tmp_path,
+        )
+    )
+
+    assert result.layers["gateway_only_public"].status == "pass"
+    assert sentinel not in repr(result.layers["gateway_only_public"])
+
+
+def test_file_runtime_accepts_gateway_proof_with_exact_candidate_compose_network_sets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_verifier()
+    support = _load_gateway_public_support()
+    contract = _load_gateway_public_contract()
+    manifest, evidence_map, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    trust_pair = _gateway_trust_pair_from_bundle(tmp_path)
+    sentinel = _bind_gateway_expected_environment(monkeypatch, tmp_path)
+    _write_fixed_gateway_candidate_networks(tmp_path, support)
+    proof_path = tmp_path / "runtime" / "gateway-only-public-attestation.json"
+    observer_sha256 = hashlib.sha256(
+        (tmp_path / "runtime" / "gateway-external-observer-attestation.json").read_bytes()
+    ).hexdigest()
+    proof = support.proof_document(
+        contract,
+        root=tmp_path,
+        candidate=candidate,
+        release_run=_RELEASE_RUN,
+        attestation_sha256=observer_sha256,
+        compose_path=tmp_path / "docker-compose.platform.yml",
+        docker_host_identity_sha256=str(trust_pair["host_receipt_sha256"]),
+    )
+    proof["trustPair"] = support.gateway_trust_references(trust_pair)
+    proof_path.write_text(json.dumps(proof, sort_keys=True), encoding="utf-8")
+    entry = evidence_map["gateway_only_public"]
+    assert isinstance(entry, dict)
+    artifact_path = tmp_path / str(entry["artifact"])
+    artifact = json.loads(artifact_path.read_bytes())
+    artifact["provenance"] = support.receipt_provenance(proof_path)
+    _rewrite_gateway_artifact(tmp_path, module, manifest, evidence_map, artifact)
+
+    result = module.verify(
+        _complete_bundle_runtime(
+            module,
+            manifest,
+            expected_source_head="a" * 40,
+            candidate_root=tmp_path,
+        )
+    )
+
+    assert result.layers["gateway_only_public"].status == "pass"
+    assert sentinel not in repr(result.layers["gateway_only_public"])
+
+
+@pytest.mark.parametrize("network_drift", ("missing-network", "additional-network"))
+def test_file_runtime_rejects_gateway_network_set_tamper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    network_drift: str,
+) -> None:
+    module = _load_verifier()
+    support = _load_gateway_public_support()
+    contract = _load_gateway_public_contract()
+    manifest, evidence_map, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    trust_pair = _gateway_trust_pair_from_bundle(tmp_path)
+    _bind_gateway_expected_environment(monkeypatch, tmp_path)
+    _write_fixed_gateway_candidate_networks(tmp_path, support)
+    proof_path = tmp_path / "runtime" / "gateway-only-public-attestation.json"
+    observer_sha256 = hashlib.sha256(
+        (tmp_path / "runtime" / "gateway-external-observer-attestation.json").read_bytes()
+    ).hexdigest()
+    proof = support.proof_document(
+        contract,
+        root=tmp_path,
+        candidate=candidate,
+        release_run=_RELEASE_RUN,
+        attestation_sha256=observer_sha256,
+        compose_path=tmp_path / "docker-compose.platform.yml",
+        network_drift=network_drift,
+        docker_host_identity_sha256=str(trust_pair["host_receipt_sha256"]),
+    )
+    proof["trustPair"] = support.gateway_trust_references(trust_pair)
+    proof_path.write_text(json.dumps(proof, sort_keys=True), encoding="utf-8")
+    entry = evidence_map["gateway_only_public"]
+    assert isinstance(entry, dict)
+    artifact_path = tmp_path / str(entry["artifact"])
+    artifact = json.loads(artifact_path.read_bytes())
+    artifact["provenance"] = support.receipt_provenance(proof_path)
+    _rewrite_gateway_artifact(tmp_path, module, manifest, evidence_map, artifact)
+
+    result = module.verify(
+        _complete_bundle_runtime(
+            module,
+            manifest,
+            expected_source_head="a" * 40,
+            candidate_root=tmp_path,
+        )
+    )
+
+    assert result.layers["gateway_only_public"].status == "fail"
+    assert "network set" in result.layers["gateway_only_public"].detail
+
+
+def test_file_runtime_rejects_handwritten_gateway_self_attestation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_verifier()
+    manifest, evidence_map, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    _bind_gateway_expected_environment(monkeypatch, tmp_path)
+    document = _artifact_document(module, candidate, "gateway_only_public")
+    _rewrite_gateway_artifact(tmp_path, module, manifest, evidence_map, document)
+
+    result = module.verify(
+        _complete_bundle_runtime(
+            module,
+            manifest,
+            expected_source_head="a" * 40,
+            candidate_root=tmp_path,
+        )
+    )
+
+    assert result.layers["gateway_only_public"].status == "fail"
+    assert (
+        "gateway-only-public execution proof is missing or invalid"
+        in result.layers["gateway_only_public"].detail
+    )
+
+
+@pytest.mark.parametrize(
+    ("case", "expected"),
+    (
+        ("missing-proof", "does not exist"),
+        ("proof-candidate", "candidate binding"),
+        ("proof-runtime", "runtime attestation"),
+        ("observer-input", "observer attestation"),
+        ("external-observation", "external observation"),
+        ("docker-port-set", "published ports"),
+        ("daemon-endpoint", "host identity"),
+        ("daemon-server", "host identity"),
+        ("network-mode", "network mode"),
+        ("docker-command-count", "Docker observation commands"),
+    ),
+)
+def test_file_runtime_rejects_gateway_provenance_tamper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    expected: str,
+) -> None:
+    module = _load_verifier()
+    support = _load_gateway_public_support()
+    contract = _load_gateway_public_contract()
+    manifest, evidence_map, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    trust_pair = _gateway_trust_pair_from_bundle(tmp_path)
+    _bind_gateway_expected_environment(monkeypatch, tmp_path)
+    entry = evidence_map["gateway_only_public"]
+    assert isinstance(entry, dict)
+    artifact_path = tmp_path / str(entry["artifact"])
+    artifact = json.loads(artifact_path.read_bytes())
+    proof_path = tmp_path / "runtime" / "gateway-only-public-attestation.json"
+
+    if case == "missing-proof":
+        proof_path.rename(tmp_path / "runtime" / "gateway-only-public-attestation.missing")
+    elif case == "observer-input":
+        observer_path = tmp_path / "runtime" / "gateway-external-observer-attestation.json"
+        observer_path.write_bytes(observer_path.read_bytes() + b" ")
+    elif case == "external-observation":
+        report_path = tmp_path / "raw" / "gateway-public-observation.json"
+        report_path.write_bytes(report_path.read_bytes() + b" ")
+    else:
+        proof = json.loads(proof_path.read_bytes())
+        if case == "proof-candidate":
+            proof["candidate"]["sourceHead"] = "b" * 40
+        elif case == "proof-runtime":
+            proof["runtimeAttestation"]["sha256"] = "6" * 64
+        elif case == "daemon-endpoint":
+            proof["docker"]["daemon"]["endpoint"] = "npipe:////./pipe/attacker"
+        elif case == "daemon-server":
+            proof["docker"]["daemon"]["serverId"] = "daemon-attacker"
+        elif case == "network-mode":
+            proof["docker"]["beforeSnapshot"][0]["networkMode"] = "host"
+            proof["docker"]["afterSnapshot"][0]["networkMode"] = "host"
+        elif case == "docker-command-count":
+            proof["docker"]["commands"].pop()
+        else:
+            observer_sha256 = hashlib.sha256(
+                (tmp_path / "runtime" / "gateway-external-observer-attestation.json").read_bytes()
+            ).hexdigest()
+            proof["docker"] = support.proof_document(
+                contract,
+                root=tmp_path,
+                candidate=candidate,
+                release_run=_RELEASE_RUN,
+                attestation_sha256=observer_sha256,
+                drift="internal-service-port",
+                docker_host_identity_sha256=str(trust_pair["host_receipt_sha256"]),
+            )["docker"]
+        proof_path.write_text(json.dumps(proof, sort_keys=True), encoding="utf-8")
+        artifact["provenance"] = support.receipt_provenance(proof_path)
+        _rewrite_gateway_artifact(tmp_path, module, manifest, evidence_map, artifact)
+
+    result = module.verify(
+        _complete_bundle_runtime(
+            module,
+            manifest,
+            expected_source_head="a" * 40,
+            candidate_root=tmp_path,
+        )
+    )
+
+    assert result.layers["gateway_only_public"].status == "fail"
+    assert expected in result.layers["gateway_only_public"].detail

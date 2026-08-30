@@ -33,6 +33,24 @@ def canonical_sha256(value: object) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
 
+def validate_playwright_persistence_boundary(document: object) -> None:
+    """Reject reporter fields that can persist live secrets or arbitrary diagnostics."""
+    pending = [document]
+    empty_values = (None, "", [], {})
+    while pending:
+        current = pending.pop()
+        if isinstance(current, dict):
+            for name, value in current.items():
+                if name == "steps" or (
+                    name in {"stdout", "stderr", "attachments", "annotations", "metadata"}
+                    and value not in empty_values
+                ):
+                    raise ValueError("Playwright persistence boundary contains unsafe data")
+                pending.append(value)
+        elif isinstance(current, list):
+            pending.extend(current)
+
+
 def probe_command_descriptor(evidence: str) -> dict[str, object]:
     if evidence not in PROBE_RECIPES:
         raise ValueError("probe evidence is invalid")

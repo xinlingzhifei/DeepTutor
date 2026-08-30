@@ -518,9 +518,7 @@ def _job_request(
         tenant_id="tenant-a",
         job_id=exported.id,
         idempotency_key=exported.id,
-        classroom_document_sha256=(
-            document_sha256 or exported.input_document_sha256 or ""
-        ),
+        classroom_document_sha256=(document_sha256 or exported.input_document_sha256 or ""),
         media_manifest_sha256=exported.input_media_manifest_sha256 or "",
         format="pptx",
         language="zh-CN",
@@ -544,6 +542,7 @@ def _job_request(
         request_id=exported.id,
         idempotency_key=exported.id,
         request_sha256=hashlib.sha256(payload.encode()).hexdigest(),
+        data_plane_mode="shared",
         data_plane_route_id="shared-primary",
         provider_profile_id="platform-default",
         worker_pool_ref="shared-generation",

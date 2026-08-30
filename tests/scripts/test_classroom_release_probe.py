@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import importlib.util
 import json
 from pathlib import Path
@@ -362,6 +363,103 @@ def test_probe_runs_only_the_fixed_teacher_recipe_and_writes_native_stdout(
     assert report.read_bytes() == native_stdout
 
 
+@pytest.mark.parametrize("encoding", ("literal", "base64"))
+def test_probe_refuses_to_persist_playwright_output_containing_fixture_token(
+    tmp_path: Path,
+    encoding: str,
+) -> None:
+    module = _load_probe()
+    npm = _trusted_node_runtime(tmp_path)
+    report = tmp_path / "raw" / "teacher.json"
+    fixture_token = "fixture-token-must-never-be-persisted"
+    environment = _probe_environment(tmp_path, report, "teacher_flow")
+    environment["YFEISTAI_LIVE_FIXTURE_TOKEN"] = fixture_token
+    exposed = (
+        fixture_token
+        if encoding == "literal"
+        else base64.b64encode(fixture_token.encode("utf-8")).decode("ascii")
+    )
+    native_stdout = json.dumps(
+        {"suites": [], "errors": [], "stdout": exposed},
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    def run(arguments: list[str], **_options: object) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(arguments, 0, stdout=native_stdout)
+
+    with pytest.raises(ValueError) as captured:
+        module.main(
+            ["teacher_flow"],
+            environ=environment,
+            runner=run,
+            runtime_resolver=lambda: module.resolve_fixed_node_runtime(
+                platform="win32", trusted_roots=(npm.parent,)
+            ),
+        )
+
+    assert "secret" in str(captured.value).lower()
+    assert fixture_token not in str(captured.value)
+    assert not report.exists()
+
+
+@pytest.mark.parametrize(
+    "carrier",
+    (
+        "stdout",
+        "stderr",
+        "attachments",
+        "test-annotations",
+        "result-annotations",
+        "project-metadata",
+        "steps",
+    ),
+)
+def test_probe_rejects_nonempty_playwright_data_carriers(
+    tmp_path: Path,
+    carrier: str,
+) -> None:
+    module = _load_probe()
+    npm = _trusted_node_runtime(tmp_path)
+    report = tmp_path / "raw" / "teacher.json"
+    payload: dict[str, object] = {
+        "config": {},
+        "suites": [],
+        "errors": [],
+        "stats": {},
+    }
+    if carrier == "test-annotations":
+        payload["suites"] = [{"specs": [{"tests": [{"annotations": [{"type": "secret"}]}]}]}]
+    elif carrier == "result-annotations":
+        payload["suites"] = [
+            {"specs": [{"tests": [{"results": [{"annotations": [{"type": "secret"}]}]}]}]}
+        ]
+    elif carrier == "project-metadata":
+        payload["config"] = {"projects": [{"metadata": {"secret": "value"}}]}
+    elif carrier == "steps":
+        payload["suites"] = [{"specs": [{"tests": [{"results": [{"steps": []}]}]}]}]
+    else:
+        payload[carrier] = [{"text": "unexpected diagnostic payload"}]
+
+    def run(arguments: list[str], **_options: object) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            stdout=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+        )
+
+    with pytest.raises(ValueError, match="unsafe data carrier"):
+        module.main(
+            ["teacher_flow"],
+            environ=_probe_environment(tmp_path, report, "teacher_flow"),
+            runner=run,
+            runtime_resolver=lambda: module.resolve_fixed_node_runtime(
+                platform="win32", trusted_roots=(npm.parent,)
+            ),
+        )
+
+    assert not report.exists()
+
+
 def test_probe_command_is_built_from_the_canonical_descriptor(tmp_path: Path) -> None:
     module = _load_probe()
     npm = _trusted_node_runtime(tmp_path)
@@ -484,7 +582,7 @@ def test_probe_cli_rejects_command_injection_inputs(forbidden: str) -> None:
         module._parse_args(["teacher_flow", forbidden, "attacker-controlled"])
 
 
-def test_probe_preserves_non_json_stdout_and_returns_native_failure(
+def test_probe_does_not_persist_non_json_stdout_from_native_failure(
     tmp_path: Path,
 ) -> None:
     module = _load_probe()
@@ -509,7 +607,7 @@ def test_probe_preserves_non_json_stdout_and_returns_native_failure(
     )
 
     assert exit_code == 7
-    assert report.read_bytes() == native_stdout
+    assert not report.exists()
 
 
 def test_probe_filters_hostile_host_environment_before_npm(

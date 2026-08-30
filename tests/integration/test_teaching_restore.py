@@ -86,6 +86,7 @@ def _restorable_backup(
     *,
     source_object_store_namespace_id: str = _SOURCE_OBJECT_STORE_NAMESPACE_ID,
     source_object_store_bucket: str = _SOURCE_OBJECT_STORE_BUCKET,
+    source_object_store_identity_sha256: str | None = None,
 ) -> tuple[Path, tuple[RestorableObjectInventoryEntry, ...], bytes]:
     payload = b"restored classroom object"
     object_key = "tenants/tenant-a/classrooms/a/document.json"
@@ -117,6 +118,7 @@ def _restorable_backup(
         object_inventory=inventory,
         source_object_store_namespace_id=source_object_store_namespace_id,
         source_object_store_bucket=source_object_store_bucket,
+        source_object_store_identity_sha256=source_object_store_identity_sha256,
         platform_schema_revision="platform-revision",
         schema_revisions={"tenant-a": "20260810_0017"},
         classroom_versions_count=2,
@@ -144,6 +146,61 @@ def _restore_target():
     )
 
 
+_TARGET_DATABASE_IDENTITY_SHA256 = "d" * 64
+_TARGET_OBJECT_IDENTITY_SHA256 = "e" * 64
+_TARGET_OBJECT_OWNER_ID_SHA256 = "f" * 64
+
+
+def _measured_restore_arguments(
+    tmp_path: Path,
+    *,
+    run_id: str,
+    target_config: Path | None = None,
+) -> dict[str, object]:
+    config = target_config or (tmp_path / "target.json")
+    config.write_bytes(b"{}\n")
+    config_sha256 = hashlib.sha256(config.read_bytes()).hexdigest()
+    candidate_sha256 = "c" * 64
+    environment_id = "restore-environment-01"
+    receipt = tmp_path / f"{run_id}-target-provisioning-receipt.json"
+    receipt.write_bytes(
+        _BACKUP._canonical_json(
+            {
+                "schemaVersion": 1,
+                "producer": "backup-restore-target-provisioner",
+                "candidateSha256": candidate_sha256,
+                "releaseRun": {
+                    "runId": run_id,
+                    "environmentId": environment_id,
+                },
+                "resources": {
+                    "database": {
+                        "identitySha256": _TARGET_DATABASE_IDENTITY_SHA256,
+                        "ownerRunId": run_id,
+                        "disposition": "runner-owned-disposable",
+                    },
+                    "objectStore": {
+                        "identitySha256": _TARGET_OBJECT_IDENTITY_SHA256,
+                        "ownerRunId": run_id,
+                        "disposition": "runner-owned-disposable",
+                    },
+                },
+            }
+        )
+    )
+    return {
+        "target_config": config,
+        "target_config_sha256": config_sha256,
+        "provisioning_receipt": receipt,
+        "provisioning_receipt_sha256": hashlib.sha256(receipt.read_bytes()).hexdigest(),
+        "run_id": run_id,
+        "environment_id": environment_id,
+        "candidate_sha256": candidate_sha256,
+        "database_ownership": "runner-owned-disposable",
+        "object_namespace_ownership": "runner-owned-disposable",
+    }
+
+
 class _RuntimeEngine:
     def __init__(self) -> None:
         self.disposed = False
@@ -164,6 +221,13 @@ class _RuntimeObjectClient:
         put_version_id: str = "target-version-1",
     ) -> None:
         self.calls = calls
+        self.meta = SimpleNamespace(
+            service_model=SimpleNamespace(
+                operation_model=lambda _name: SimpleNamespace(
+                    input_shape=SimpleNamespace(members={"IfNoneMatch": object()})
+                )
+            )
+        )
         self.prefix_count = prefix_count
         self.version_pages = list(version_pages or [])
         self.concurrent_key = concurrent_key
@@ -222,16 +286,21 @@ class _RuntimeObjectClient:
         self.calls.append(("put", captured))
         assert captured["IfNoneMatch"] == "*"
         assert captured["Key"] not in self.objects
-        payload = body.read()
+        payload = body if isinstance(body, bytes) else body.read()
+        version_id = (
+            "control-version-1"
+            if captured["Key"] == _RESTORE._OBJECT_RESTORE_CONTROL_KEY
+            else self.put_version_id
+        )
         self.objects[captured["Key"]] = payload
         self.object_metadata[captured["Key"]] = {
-            "ContentLength": len(payload),
+            "ContentLength": captured.get("ContentLength", len(payload)),
             "ContentType": captured["ContentType"],
-            "Metadata": dict(captured["Metadata"]),
+            "Metadata": dict(captured.get("Metadata", {})),
             "ETag": "target-etag-1",
-            "VersionId": self.put_version_id,
+            "VersionId": version_id,
         }
-        return {"ETag": "target-etag-1", "VersionId": self.put_version_id}
+        return {"ETag": "target-etag-1", "VersionId": version_id}
 
     def close(self) -> None:
         self.closed = True
@@ -324,9 +393,35 @@ def _successful_operator_runtime(
     async def probe_database(_engine: _RuntimeEngine):
         calls.append(("probe_database", None))
         return _RESTORE.TargetDatabaseState(
-            identity_sha256="d" * 64,
-            user_object_count=0,
+            identity_sha256=_TARGET_DATABASE_IDENTITY_SHA256,
+            user_object_count=(1 if any(name == "pg_restore" for name, _value in calls) else 0),
+            current_role=target.database_user,
+            database_owner=target.database_user,
         )
+
+    async def probe_objects(_client, _target):
+        restored_keys = {
+            key for key in client.objects if key != _RESTORE._OBJECT_RESTORE_CONTROL_KEY
+        }
+        return _RESTORE.TargetObjectState(
+            identity_sha256=_TARGET_OBJECT_IDENTITY_SHA256,
+            versioning_enabled=True,
+            object_count=len(restored_keys),
+            version_count=len(restored_keys),
+            delete_marker_count=0,
+            owner_id_sha256=_TARGET_OBJECT_OWNER_ID_SHA256,
+        )
+
+    class Exclusion:
+        async def __aenter__(self) -> None:
+            calls.append(("target_exclusion_enter", None))
+
+        async def __aexit__(self, *_args: object) -> None:
+            calls.append(("target_exclusion_exit", None))
+
+    def exclude_target(_engine, identity_sha256: str):
+        assert identity_sha256 == _TARGET_DATABASE_IDENTITY_SHA256
+        return Exclusion()
 
     async def inspect_facts(_engine: _RuntimeEngine) -> RestoredTeachingFacts:
         calls.append(("inspect", None))
@@ -385,6 +480,9 @@ def _successful_operator_runtime(
         app_access_granter=grant_app_access,
         app_engine_factory=create_app_engine,
         app_access_probe=probe_app_access,
+        target_exclusion=exclude_target,
+        target_exclusion_mode="test-exclusive-target",
+        object_state_probe=probe_objects,
     )
 
 
@@ -793,13 +891,25 @@ def test_restore_target_loader_reuses_backup_config_and_secret_contract(tmp_path
 
 def test_default_database_probe_counts_namespaced_and_database_level_user_objects() -> None:
     statements: list[str] = []
-    values = iter(("42", 3))
+    values = iter(
+        (
+            SimpleNamespace(
+                system_identifier="7449553557289146937",
+                database_oid="42",
+                database_name="restore_target",
+            ),
+            3,
+        )
+    )
 
     class Result:
         def __init__(self, value) -> None:
             self.value = value
 
         def scalar_one(self):
+            return self.value
+
+        def one(self):
             return self.value
 
     class Connection:
@@ -942,6 +1052,52 @@ def test_restore_replays_app_role_grants_for_platform_and_active_tenants() -> No
         assert f"GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA {schema}" in sql
         assert f"GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA {schema}" in sql
         assert ("ALTER DEFAULT PRIVILEGES FOR ROLE yfeistai_migrator IN SCHEMA " + schema) in sql
+    assert (
+        "REVOKE SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON TABLE "
+        "platform.generation_route_attempts FROM yfeistai_app"
+    ) in sql
+    assert (
+        "ALTER FUNCTION platform.record_generation_route_attempt("
+        "text, text, text, integer, text, text, text, text, text, text, text, text, "
+        "text, text, text) "
+        "OWNER TO yfeistai_migrator"
+    ) in sql
+    assert (
+        "ALTER FUNCTION platform.read_generation_route_attempts("
+        "text, text, text, text, text, text, text) OWNER TO yfeistai_migrator"
+    ) in sql
+    assert (
+        "GRANT EXECUTE ON FUNCTION platform.record_generation_route_attempt("
+        "text, text, text, integer, text, text, text, text, text, text, text, text, "
+        "text, text, text) "
+        "TO yfeistai_app"
+    ) in sql
+    assert (
+        "REVOKE ALL ON FUNCTION platform.record_generation_route_attempt("
+        "text, text, text, integer, text, text, text, text, text, text, text, text, "
+        "text, text, text) "
+        "FROM PUBLIC"
+    ) in sql
+    assert (
+        "record_generation_route_attempt(text, text, text, integer, text, text, text, "
+        "text, text, text, text, text)"
+    ) not in sql
+    assert (
+        "GRANT EXECUTE ON FUNCTION platform.read_generation_route_attempts("
+        "text, text, text, text, text, text, text) TO yfeistai_app"
+    ) in sql
+    assert (
+        "REVOKE ALL ON FUNCTION platform.read_generation_route_attempts("
+        "text, text, text, text, text, text, text) FROM PUBLIC"
+    ) in sql
+    assert (
+        sql.index("GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA")
+        < sql.index("ALTER FUNCTION platform.record_generation_route_attempt")
+        < sql.index("ALTER FUNCTION platform.read_generation_route_attempts")
+        < sql.index("REVOKE SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON TABLE")
+        < sql.index("REVOKE ALL ON FUNCTION platform.record_generation_route_attempt")
+        < sql.index("GRANT EXECUTE ON FUNCTION platform.record_generation_route_attempt")
+    )
 
 
 def test_restore_app_role_probe_checks_privileges_and_reads_each_schema() -> None:
@@ -962,6 +1118,7 @@ def test_restore_app_role_probe_checks_privileges_and_reads_each_schema() -> Non
         (
             Result(scalar=True),
             Result(rows=[("tenant_a",)]),
+            Result(scalar=True),
             Result(scalar=True),
             Result(scalar=1),
             Result(scalar=True),
@@ -989,9 +1146,21 @@ def test_restore_app_role_probe_checks_privileges_and_reads_each_schema() -> Non
     sql = "\n".join(statements)
     assert "current_user = 'yfeistai_app'" in sql
     assert "has_schema_privilege" in sql
-    assert sql.count("has_table_privilege") == 8
+    assert "platform.generation_route_attempts" in sql
+    assert "has_function_privilege" in sql
+    assert "record_generation_route_attempt" in sql
+    assert (
+        "record_generation_route_attempt(text, text, text, integer, text, text, text, "
+        "text, text, text, text, text, text, text, text)"
+    ) in sql
+    assert (
+        "record_generation_route_attempt(text, text, text, integer, text, text, text, "
+        "text, text, text, text, text)"
+    ) not in sql
+    assert "read_generation_route_attempts" in sql
+    assert "NOT has_table_privilege" in sql
     assert sql.count("has_sequence_privilege") == 4
-    for privilege in ("SELECT", "INSERT", "UPDATE", "DELETE"):
+    for privilege in ("SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "EXECUTE"):
         assert f"'{privilege}'" in sql
     for privilege in ("USAGE", "SELECT"):
         assert f"'{privilege}'" in sql
@@ -1338,12 +1507,15 @@ def test_restore_operator_uses_safe_database_and_object_restore_boundaries(
     report = asyncio.run(
         _RESTORE.run_restore_operator(
             backup_dir=backup_dir,
-            target_config=target_config,
             target_secret_dir=target_secret_dir,
-            run_id="run-20260821",
             report_path=report_path,
             pg_restore=Path("pg_restore-safe"),
             runtime=runtime,
+            **_measured_restore_arguments(
+                tmp_path,
+                run_id="run-20260821",
+                target_config=target_config,
+            ),
         )
     )
 
@@ -1362,15 +1534,20 @@ def test_restore_operator_uses_safe_database_and_object_restore_boundaries(
     assert "--clean" not in pg_argv
     event_names = [name for name, _value in calls]
     reverify_indices = [index for index, name in enumerate(event_names) if name == "reverify"]
+    restored_key = inventory[0].key
+    restored_put_index = next(
+        index
+        for index, (name, value) in enumerate(calls)
+        if name == "put" and value["Key"] == restored_key
+    )
     assert len(reverify_indices) == 2
     assert reverify_indices[0] < event_names.index("pg_restore")
     assert event_names.index("pg_restore") < reverify_indices[1]
-    assert reverify_indices[1] < event_names.index("put")
-    assert event_names.index("put") < event_names.index("rebind")
+    assert reverify_indices[1] < restored_put_index
+    assert restored_put_index < event_names.index("rebind")
     assert event_names.index("rebind") < event_names.index("grant_app")
     assert event_names.index("grant_app") < event_names.index("probe_app")
     assert event_names.index("probe_app") < event_names.index("inspect")
-    restored_key = inventory[0].key
     assert client.objects[restored_key] == payload
     assert (
         "put",
@@ -1429,11 +1606,10 @@ def test_restore_operator_does_not_publish_when_app_role_probe_fails(tmp_path: P
         asyncio.run(
             _RESTORE.run_restore_operator(
                 backup_dir=backup_dir,
-                target_config=tmp_path / "target.json",
                 target_secret_dir=tmp_path / "secrets",
-                run_id="app-role-denied",
                 report_path=report_path,
                 runtime=replace(runtime, app_access_probe=deny_app_access),
+                **_measured_restore_arguments(tmp_path, run_id="app-role-denied"),
             )
         )
 
@@ -1457,11 +1633,10 @@ def test_restore_operator_rejects_null_target_version_before_database_rebind(
         asyncio.run(
             _RESTORE.run_restore_operator(
                 backup_dir=backup_dir,
-                target_config=tmp_path / "target.json",
                 target_secret_dir=tmp_path / "secrets",
-                run_id="null-target-version",
                 report_path=report_path,
                 runtime=_successful_operator_runtime(calls, engine, client),
+                **_measured_restore_arguments(tmp_path, run_id="null-target-version"),
             )
         )
 
@@ -1514,11 +1689,13 @@ def test_restore_operator_does_not_publish_when_resource_cleanup_fails(
         asyncio.run(
             _RESTORE.run_restore_operator(
                 backup_dir=backup_dir,
-                target_config=tmp_path / "target.json",
                 target_secret_dir=tmp_path / "secrets",
-                run_id=f"cleanup-{failing_resource}",
                 report_path=report_path,
                 runtime=replace(runtime, app_engine_factory=create_app_engine),
+                **_measured_restore_arguments(
+                    tmp_path,
+                    run_id=f"cleanup-{failing_resource}",
+                ),
             )
         )
 
@@ -1567,15 +1744,14 @@ def test_restore_operator_preserves_primary_failure_when_cleanup_also_fails(
         asyncio.run(
             _RESTORE.run_restore_operator(
                 backup_dir=backup_dir,
-                target_config=tmp_path / "target.json",
                 target_secret_dir=tmp_path / "secrets",
-                run_id="primary-plus-cleanup",
                 report_path=report_path,
                 runtime=replace(
                     runtime,
                     facts_inspector=fail_facts,
                     app_engine_factory=lambda _database_url: app_engine,
                 ),
+                **_measured_restore_arguments(tmp_path, run_id="primary-plus-cleanup"),
             )
         )
 
@@ -1611,11 +1787,10 @@ def test_restore_operator_rejects_concurrent_object_injection_before_report(
         asyncio.run(
             _RESTORE.run_restore_operator(
                 backup_dir=backup_dir,
-                target_config=tmp_path / "target.json",
                 target_secret_dir=tmp_path / "secrets",
-                run_id="concurrent-run",
                 report_path=report_path,
                 runtime=_successful_operator_runtime(calls, engine, client),
+                **_measured_restore_arguments(tmp_path, run_id="concurrent-run"),
             )
         )
 
@@ -1781,9 +1956,9 @@ def test_restore_report_does_not_fail_after_link_commit_when_staging_cleanup_fai
 @pytest.mark.parametrize(
     ("object_count", "bucket_count", "versioning_status", "message"),
     [
-        (1, 0, "Enabled", "database must be empty"),
-        (0, 1, "Enabled", "object bucket must be empty"),
-        (0, 0, "Suspended", "object bucket versioning must be enabled"),
+        (1, 0, "Enabled", "restore target database pre-observation is invalid"),
+        (0, 1, "Enabled", "restore target object pre-observation is invalid"),
+        (0, 0, "Suspended", "restore target object pre-observation is invalid"),
     ],
     ids=("nonempty-database", "nonempty-object-bucket", "versioning-suspended"),
 )
@@ -1828,10 +2003,30 @@ def test_restore_operator_finishes_all_target_preflight_before_writing(
         return client
 
     async def probe(_engine):
+        target = _restore_target()
         return _RESTORE.TargetDatabaseState(
-            identity_sha256="d" * 64,
+            identity_sha256=_TARGET_DATABASE_IDENTITY_SHA256,
             user_object_count=object_count,
+            current_role=target.database_user,
+            database_owner=target.database_user,
         )
+
+    async def probe_objects(_client, _target):
+        return _RESTORE.TargetObjectState(
+            identity_sha256=_TARGET_OBJECT_IDENTITY_SHA256,
+            versioning_enabled=versioning_status == "Enabled",
+            object_count=bucket_count,
+            version_count=bucket_count,
+            delete_marker_count=0,
+            owner_id_sha256=_TARGET_OBJECT_OWNER_ID_SHA256,
+        )
+
+    class Exclusion:
+        async def __aenter__(self) -> None:
+            return None
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
 
     async def process(_argv, _environment):
         writes.append("database")
@@ -1848,17 +2043,19 @@ def test_restore_operator_finishes_all_target_preflight_before_writing(
         app_access_granter=lambda _engine: None,
         app_engine_factory=lambda _url: None,
         app_access_probe=lambda _engine: None,
+        target_exclusion=lambda _engine, _identity: Exclusion(),
+        target_exclusion_mode="test-exclusive-target",
+        object_state_probe=probe_objects,
     )
 
     with pytest.raises(ValueError, match=message):
         asyncio.run(
             _RESTORE.run_restore_operator(
                 backup_dir=backup_dir,
-                target_config=tmp_path / "target.json",
                 target_secret_dir=tmp_path / "secrets",
-                run_id="preflight-run",
                 report_path=tmp_path / "report.json",
                 runtime=runtime,
+                **_measured_restore_arguments(tmp_path, run_id="preflight-run"),
             )
         )
 
@@ -1867,52 +2064,152 @@ def test_restore_operator_finishes_all_target_preflight_before_writing(
     assert all(client.closed for client in clients)
 
 
-def test_restore_operator_rejects_source_object_store_as_target_before_resources(
+def test_restore_operator_rejects_source_object_store_as_target_before_mutation(
     tmp_path: Path,
 ) -> None:
+    target = _restore_target()
+    owner_id_sha256 = hashlib.sha256(b"restore-owner-01").hexdigest()
+    source_object_store_identity_sha256 = _BACKUP.physical_object_store_identity_sha256(
+        target.object_endpoint,
+        target.object_region,
+        target.object_bucket,
+        owner_id_sha256,
+    )
     backup_dir, _inventory_entries, _payload = _restorable_backup(
         tmp_path,
-        source_object_store_namespace_id="restore-objects-primary",
-        source_object_store_bucket="restore-bucket",
+        source_object_store_identity_sha256=source_object_store_identity_sha256,
     )
-    engine_creations: list[str] = []
-    object_client_creations: list[_RESTORE.RestoreTarget] = []
+    database_identity_sha256 = "d" * 64
+    candidate_sha256 = "c" * 64
+    run_id = "same-object-store"
+    environment_id = "restore-environment-01"
+    target_config = tmp_path / "target.json"
+    target_config.write_bytes(b"{}\n")
+    target_config_sha256 = hashlib.sha256(target_config.read_bytes()).hexdigest()
+    provisioning_receipt = tmp_path / "target-provisioning-receipt.json"
+    provisioning_receipt.write_bytes(
+        _BACKUP._canonical_json(
+            {
+                "schemaVersion": 1,
+                "producer": "backup-restore-target-provisioner",
+                "candidateSha256": candidate_sha256,
+                "releaseRun": {
+                    "runId": run_id,
+                    "environmentId": environment_id,
+                },
+                "resources": {
+                    "database": {
+                        "identitySha256": database_identity_sha256,
+                        "ownerRunId": run_id,
+                        "disposition": "runner-owned-disposable",
+                    },
+                    "objectStore": {
+                        "identitySha256": source_object_store_identity_sha256,
+                        "ownerRunId": run_id,
+                        "disposition": "runner-owned-disposable",
+                    },
+                },
+            }
+        )
+    )
+    provisioning_receipt_sha256 = hashlib.sha256(provisioning_receipt.read_bytes()).hexdigest()
+    engines: list[_RuntimeEngine] = []
+    clients: list[_RuntimeObjectClient] = []
+    events: list[str] = []
 
-    def create_engine(database_url: str):
-        engine_creations.append(database_url)
-        raise AssertionError("target resources must not be created")
+    def create_engine(_database_url: str) -> _RuntimeEngine:
+        engine = _RuntimeEngine()
+        engines.append(engine)
+        return engine
 
-    def create_object_client(target: _RESTORE.RestoreTarget):
-        object_client_creations.append(target)
-        raise AssertionError("target resources must not be created")
+    def create_object_client(_target: _RESTORE.RestoreTarget) -> _RuntimeObjectClient:
+        client = _RuntimeObjectClient([])
+        clients.append(client)
+        return client
+
+    async def probe_database(_engine: object) -> _RESTORE.TargetDatabaseState:
+        events.append("observe-database")
+        return _RESTORE.TargetDatabaseState(
+            identity_sha256=database_identity_sha256,
+            user_object_count=0,
+            current_role=target.database_user,
+            database_owner=target.database_user,
+        )
+
+    async def probe_objects(
+        _client: object,
+        _target: _RESTORE.RestoreTarget,
+    ) -> _RESTORE.TargetObjectState:
+        events.append("observe-objects")
+        return _RESTORE.TargetObjectState(
+            identity_sha256=source_object_store_identity_sha256,
+            versioning_enabled=True,
+            object_count=0,
+            version_count=0,
+            delete_marker_count=0,
+            owner_id_sha256=owner_id_sha256,
+        )
+
+    class Exclusion:
+        async def __aenter__(self) -> None:
+            events.append("lock-enter")
+
+        async def __aexit__(self, *_args: object) -> None:
+            events.append("lock-exit")
+
+    def exclude_target(_engine: object, identity_sha256: str) -> Exclusion:
+        assert identity_sha256 == database_identity_sha256
+        return Exclusion()
+
+    async def unexpected_mutation(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("target mutation must not run")
 
     runtime = _RESTORE.RestoreOperatorRuntime(
-        target_loader=lambda _config, _secrets: _restore_target(),
+        target_loader=lambda _config, _secrets: target,
         engine_factory=create_engine,
         object_client_factory=create_object_client,
-        database_probe=lambda _engine: None,
-        facts_inspector=lambda _engine: None,
-        process_runner=lambda _argv, _environment: None,
-        receipt_rebinder=lambda _engine, _receipts: None,
-        app_access_granter=lambda _engine: None,
-        app_engine_factory=lambda _url: None,
-        app_access_probe=lambda _engine: None,
+        database_probe=probe_database,
+        facts_inspector=unexpected_mutation,
+        process_runner=unexpected_mutation,
+        receipt_rebinder=unexpected_mutation,
+        app_access_granter=unexpected_mutation,
+        app_engine_factory=lambda _url: pytest.fail("target mutation must not run"),
+        app_access_probe=unexpected_mutation,
+        target_exclusion=exclude_target,
+        target_exclusion_mode="postgresql-session-advisory-lock",
+        object_state_probe=probe_objects,
     )
 
-    with pytest.raises(ValueError, match="distinct from the backup source"):
+    with pytest.raises(ValueError, match="object pre-observation"):
         asyncio.run(
             _RESTORE.run_restore_operator(
                 backup_dir=backup_dir,
-                target_config=tmp_path / "target.json",
+                target_config=target_config,
+                target_config_sha256=target_config_sha256,
+                provisioning_receipt=provisioning_receipt,
+                provisioning_receipt_sha256=provisioning_receipt_sha256,
                 target_secret_dir=tmp_path / "secrets",
-                run_id="same-object-store",
+                run_id=run_id,
+                environment_id=environment_id,
+                candidate_sha256=candidate_sha256,
+                database_ownership="runner-owned-disposable",
+                object_namespace_ownership="runner-owned-disposable",
                 report_path=tmp_path / "report.json",
                 runtime=runtime,
             )
         )
 
-    assert engine_creations == []
-    assert object_client_creations == []
+    assert events == [
+        "observe-database",
+        "lock-enter",
+        "observe-database",
+        "observe-objects",
+        "lock-exit",
+    ]
+    assert len(engines) == len(clients) == 1
+    assert engines[0].disposed is True
+    assert clients[0].closed is True
+    assert not (tmp_path / "report.json").exists()
 
 
 def test_restore_prefix_inspection_paginates_and_rejects_delete_markers() -> None:

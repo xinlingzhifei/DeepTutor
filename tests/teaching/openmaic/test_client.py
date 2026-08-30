@@ -342,6 +342,37 @@ def test_factory_fails_closed_for_stale_or_cross_boundary_routes(
     assert secret_resolver.calls == []
 
 
+def test_factory_classifies_invalid_bound_route_url_as_configuration_unavailable() -> None:
+    from deeptutor.teaching.openmaic.data_planes import (
+        DataPlaneConfigurationUnavailable,
+    )
+
+    selection = _selection()
+    repository = RouteBindingRepository(
+        replace(_route(), base_url="https://user:password@openmaic-shared:3000")
+    )
+    secret_resolver = RecordingServiceSecretResolver()
+    http = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda _request: (_ for _ in ()).throw(
+                AssertionError("invalid route configuration must not reach HTTP")
+            )
+        )
+    )
+    factory = OpenMAICClientFactory(
+        settings=SimpleNamespace(enabled=True),
+        binding_repository=repository,
+        service_secret_resolver=secret_resolver,
+    )
+
+    with pytest.raises(DataPlaneConfigurationUnavailable):
+        asyncio.run(factory.create(selection=selection, http_client=http))
+    asyncio.run(http.aclose())
+
+    assert repository.calls == [selection]
+    assert secret_resolver.calls == []
+
+
 def test_factory_preserves_disabled_legacy_mode_without_any_boundary_access() -> None:
     selection = _selection()
     repository = RouteBindingRepository(_route())
@@ -535,9 +566,7 @@ def test_submit_methods_sign_exact_canonical_json(
     assert job.status == "created"
 
 
-def test_export_input_staging_uses_signed_logical_declarations_and_streams_bytes() -> (
-    None
-):
+def test_export_input_staging_uses_signed_logical_declarations_and_streams_bytes() -> None:
     declaration = _export_input_declaration()
     requests: list[str] = []
     consumed: list[bytes] = []
@@ -1180,9 +1209,7 @@ def test_logs_are_limited_to_tenant_job_and_route_context(
     asyncio.run(http.aclose())
 
     client_records = [
-        record
-        for record in caplog.records
-        if record.name == "deeptutor.teaching.openmaic.client"
+        record for record in caplog.records if record.name == "deeptutor.teaching.openmaic.client"
     ]
     record = client_records[-1]
     assert record.getMessage() == "OpenMAIC request"

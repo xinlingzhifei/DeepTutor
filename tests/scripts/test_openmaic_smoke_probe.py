@@ -77,10 +77,13 @@ def test_shared_probe_loads_only_the_fixed_candidate_bound_environment(tmp_path:
 
     config = module._load_config(
         environment,
+        plane="shared",
         cwd=root,
         candidate_loader=lambda _root: _candidate(),
     )
 
+    assert config.plane == "shared"
+    assert config.dedicated_tenant_id is None
     assert config.candidate_root == root.resolve()
     assert config.candidate == _candidate()
     assert config.release_run == {
@@ -90,6 +93,53 @@ def test_shared_probe_loads_only_the_fixed_candidate_bound_environment(tmp_path:
     assert config.runtime_attestation_sha256 == RUNTIME_ATTESTATION_SHA256
     assert config.timeout_seconds == 570
     assert ADMIN_TOKEN not in repr(config)
+
+
+def test_dedicated_probe_loads_only_a_strict_pre_registered_tenant(
+    tmp_path: Path,
+) -> None:
+    module = _probe_module()
+    root = tmp_path / "candidate"
+    root.mkdir()
+    environment = {
+        "YFEISTAI_LIVE_FIXTURE_TOKEN": ADMIN_TOKEN,
+        "YFEISTAI_CANDIDATE_ROOT": str(root),
+        "YFEISTAI_RELEASE_RUN_ID": "run-openmaic-dedicated-smoke",
+        "YFEISTAI_ENVIRONMENT_ID": "environment-openmaic-dedicated-smoke",
+        "YFEISTAI_RUNTIME_ATTESTATION_SHA256": RUNTIME_ATTESTATION_SHA256,
+        "YFEISTAI_OPENMAIC_SMOKE_TIMEOUT_SECONDS": "570",
+        "YFEISTAI_DEDICATED_TENANT_ID": "tenant-dedicated-smoke",
+        "WEB_BASE_URL": BASE_URL,
+    }
+
+    arguments = module._parse_args(["--plane", "dedicated", "--profile", "first-release"])
+    config = module._load_config(
+        environment,
+        plane=arguments.plane,
+        cwd=root,
+        candidate_loader=lambda _root: _candidate(),
+    )
+
+    assert config.plane == "dedicated"
+    assert config.dedicated_tenant_id == "tenant-dedicated-smoke"
+    assert ADMIN_TOKEN not in repr(config)
+
+    for invalid in (None, "", "../tenant", "tenant dedicated"):
+        changed = dict(environment)
+        if invalid is None:
+            changed.pop("YFEISTAI_DEDICATED_TENANT_ID")
+        else:
+            changed["YFEISTAI_DEDICATED_TENANT_ID"] = invalid
+        with pytest.raises(
+            module.OpenMAICSmokeProbeError,
+            match="dedicated_tenant_invalid",
+        ):
+            module._load_config(
+                changed,
+                plane="dedicated",
+                cwd=root,
+                candidate_loader=lambda _root: _candidate(),
+            )
 
 
 def _classroom(
@@ -244,6 +294,8 @@ def test_shared_probe_uses_one_admin_token_and_formal_two_stage_generation(
         base_url=BASE_URL,
         candidate=_candidate(),
         candidate_root=tmp_path,
+        dedicated_tenant_id=None,
+        plane="shared",
         release_run=release_run,
         runtime_attestation_sha256=RUNTIME_ATTESTATION_SHA256,
         timeout_seconds=30,
@@ -576,10 +628,22 @@ def test_shared_probe_uses_one_admin_token_and_formal_two_stage_generation(
                     "status": "succeeded",
                     "progressPercent": 100,
                     "classroomVersionId": "version-shared-smoke",
+                    "dataPlaneMode": "shared",
                     "dataPlaneRouteId": "shared-primary",
+                    "routeTenantId": None,
+                    "routeOwnerKey": "shared",
                     "providerProfileId": "platform-default",
+                    "providerScope": "shared",
+                    "providerTenantId": None,
+                    "providerOwnerKey": "shared",
                     "workerPoolRef": "shared-generation",
                     "queueRef": "openmaic.shared",
+                    "attemptCount": 1,
+                    "sharedRouteAttemptCount": 1,
+                    "dedicatedRouteAttemptCount": 0,
+                    "selectedRouteAttemptCount": 1,
+                    "unavailableRouteAttemptCount": 0,
+                    "routeAttemptHistoryComplete": True,
                 },
             )
         if (method, path) == (
@@ -714,6 +778,361 @@ def test_shared_probe_uses_one_admin_token_and_formal_two_stage_generation(
     ]
 
 
+def test_dedicated_probe_uses_pre_registered_tenant_without_provisioning_or_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _probe_module()
+    contract = _contract_module()
+    tenant_id = "tenant-dedicated-smoke"
+    teacher_user_id = "teacher-user-dedicated-smoke"
+    asset_id = "asset-dedicated-smoke"
+    job_id = "job-dedicated-smoke"
+    version_id = "version-dedicated-smoke"
+    release_run = {
+        "runId": "run-openmaic-dedicated-smoke",
+        "environmentId": "environment-openmaic-dedicated-smoke",
+    }
+    config = module.ProbeConfig(
+        admin_token=module.SecretStr(ADMIN_TOKEN),
+        base_url=BASE_URL,
+        candidate=_candidate(),
+        candidate_root=tmp_path,
+        dedicated_tenant_id=tenant_id,
+        plane="dedicated",
+        release_run=release_run,
+        runtime_attestation_sha256=RUNTIME_ATTESTATION_SHA256,
+        timeout_seconds=30,
+    )
+    monkeypatch.setattr(module.secrets, "token_bytes", lambda _size: b"\x02" * 16)
+    material = module._fixture_material(config)
+    course_id = f"course-{material.resource_suffix}"
+    class_id = f"class-{material.resource_suffix}"
+    document = (
+        b'{"classroomId":"asset-dedicated-smoke","classroomVersionId":'
+        b'"version-dedicated-smoke","openmaic":{"dslVersion":"0.1.0"},'
+        b'"schemaVersion":"1.0"}\n'
+    )
+    seen: list[httpx.Request] = []
+    job_reads = 0
+    classroom_reads = 0
+    teacher_username = ""
+    teacher_password = ""
+
+    def classroom(
+        *,
+        status: str,
+        lifecycle_state: str,
+        classroom_version_id: str | None = None,
+    ) -> dict[str, object]:
+        return {
+            "assetId": asset_id,
+            "draftId": "draft-dedicated-smoke",
+            "jobId": job_id,
+            "lifecycleState": lifecycle_state,
+            "status": status,
+            "title": "OpenMAIC dedicated-plane acceptance",
+            "courseId": course_id,
+            "classId": class_id,
+            "ownerId": teacher_user_id,
+            "revision": 1,
+            "outline": (
+                None
+                if lifecycle_state == "generating_outline"
+                else {"title": "Dedicated-plane acceptance outline"}
+            ),
+            "document": (
+                {
+                    "dslVersion": "0.1.0",
+                    "classroomId": asset_id,
+                    "classroomVersionId": classroom_version_id,
+                }
+                if classroom_version_id is not None
+                else None
+            ),
+            "classroomVersionId": classroom_version_id,
+            "confirmedOutlineSha256": "b" * 64,
+            "validationReport": None,
+            "idempotencyKey": material.classroom_idempotency_key,
+        }
+
+    def job(status: str, progress: int, *, phase: str = "content") -> dict[str, object]:
+        return {
+            "job_id": job_id,
+            "job_kind": "generation",
+            "phase": phase,
+            "status": status,
+            "progress_percent": progress,
+            "waiting_reason": None,
+            "cancellable": status != "succeeded",
+            "retryable": False,
+            "outline": (
+                {"title": "Dedicated-plane acceptance outline"}
+                if phase == "outline" and status == "awaiting_confirmation"
+                else None
+            ),
+            "error_category": None,
+            "error_code": None,
+            "retry_of_job_id": None,
+            "export_format": None,
+            "download_ready": False,
+        }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal classroom_reads, job_reads, teacher_password, teacher_username
+        seen.append(request)
+        method = request.method
+        path = request.url.path
+        if (method, path) == ("PUT", "/api/v1/tenants/active"):
+            cookie = (
+                f"dt_tenant={tenant_id}; Path=/; HttpOnly; SameSite=Lax"
+                if "Authorization" in request.headers
+                else f"dt_tenant={tenant_id}; Path=/; HttpOnly; SameSite=Lax"
+            )
+            assert _request_json(request) == {"tenant_id": tenant_id}
+            return httpx.Response(
+                200,
+                headers={"Set-Cookie": cookie},
+                json={"active_tenant_id": tenant_id},
+            )
+        if (method, path) == ("GET", "/api/v1/auth/users"):
+            return httpx.Response(200, json=[])
+        if (method, path) == ("POST", "/api/v1/auth/users"):
+            payload = _request_json(request)
+            teacher_username = str(payload["username"])
+            teacher_password = str(payload["password"])
+            return httpx.Response(
+                201,
+                json={
+                    "ok": True,
+                    "user_id": teacher_user_id,
+                    "username": teacher_username,
+                    "role": "user",
+                    "is_admin": False,
+                },
+            )
+        if (method, path) == ("POST", f"/api/v1/tenants/{tenant_id}/members"):
+            return httpx.Response(
+                200,
+                json={
+                    "tenant_id": tenant_id,
+                    "user_id": teacher_user_id,
+                    "roles": ["teacher"],
+                    "grants": [
+                        {
+                            "role": "teacher",
+                            "scope_type": "tenant",
+                            "scope_id": tenant_id,
+                        }
+                    ],
+                },
+            )
+        if (method, path) == ("POST", "/api/v1/auth/login"):
+            assert _request_json(request) == {
+                "username": teacher_username,
+                "password": teacher_password,
+            }
+            return httpx.Response(
+                200,
+                headers={
+                    "Set-Cookie": (f"dt_token={TEACHER_SESSION}; Path=/; HttpOnly; SameSite=Lax")
+                },
+                json={
+                    "ok": True,
+                    "user_id": teacher_user_id,
+                    "username": teacher_username,
+                    "role": "user",
+                    "is_admin": False,
+                },
+            )
+        if (method, path) == ("POST", "/api/v1/teaching/courses"):
+            payload = _request_json(request)
+            return httpx.Response(201, json={**payload, "status": "active"})
+        if (method, path) == (
+            "POST",
+            f"/api/v1/teaching/courses/{course_id}/classes",
+        ):
+            payload = _request_json(request)
+            return httpx.Response(
+                201,
+                json={**payload, "courseId": course_id, "status": "active"},
+            )
+        if (method, path) == (
+            "POST",
+            f"/api/v1/teaching/classes/{class_id}/enrollments",
+        ):
+            return httpx.Response(
+                201,
+                json={
+                    "classId": class_id,
+                    "userId": teacher_user_id,
+                    "status": "active",
+                },
+            )
+        if (method, path) == ("POST", "/api/v1/teaching/generation-quota-grants"):
+            return httpx.Response(
+                200,
+                json={"tenantId": tenant_id, "units": 20, "balance": 20},
+            )
+        if (method, path) == ("POST", "/api/v1/classrooms"):
+            return httpx.Response(
+                202,
+                json=classroom(status="quota_reserved", lifecycle_state="generating_outline"),
+            )
+        if (method, path) == ("GET", f"/api/v1/classroom-jobs/{job_id}"):
+            job_reads += 1
+            responses = (
+                job("generating_outline", 30, phase="outline"),
+                job("awaiting_confirmation", 50, phase="outline"),
+                job("generating_content", 70),
+                job("succeeded", 100),
+            )
+            return httpx.Response(200, json=responses[min(job_reads - 1, 3)])
+        if (method, path) == ("GET", f"/api/v1/classrooms/{asset_id}"):
+            classroom_reads += 1
+            responses = (
+                classroom(status="generating_outline", lifecycle_state="generating_outline"),
+                classroom(status="awaiting_confirmation", lifecycle_state="awaiting_outline"),
+                classroom(status="generating_content", lifecycle_state="generating_content"),
+                classroom(
+                    status="succeeded",
+                    lifecycle_state="editing",
+                    classroom_version_id=version_id,
+                ),
+            )
+            return httpx.Response(200, json=responses[min(classroom_reads - 1, 3)])
+        if (method, path) == (
+            "POST",
+            f"/api/v1/classrooms/{asset_id}/confirm-outline",
+        ):
+            return httpx.Response(
+                202,
+                json=classroom(status="queued", lifecycle_state="generating_content"),
+            )
+        if (method, path) == (
+            "GET",
+            f"/api/v1/system/classroom-jobs/{tenant_id}/{job_id}/binding",
+        ):
+            return httpx.Response(
+                200,
+                json={
+                    "schemaVersion": 1,
+                    "tenantId": tenant_id,
+                    "jobId": job_id,
+                    "jobKind": "generation",
+                    "phase": "content",
+                    "status": "succeeded",
+                    "progressPercent": 100,
+                    "classroomVersionId": version_id,
+                    "dataPlaneMode": "dedicated",
+                    "dataPlaneRouteId": "dedicated-tenant-smoke",
+                    "routeTenantId": tenant_id,
+                    "routeOwnerKey": tenant_id,
+                    "providerProfileId": "provider-tenant-smoke",
+                    "providerScope": "dedicated",
+                    "providerTenantId": tenant_id,
+                    "providerOwnerKey": tenant_id,
+                    "workerPoolRef": "generation-tenant-smoke",
+                    "queueRef": "openmaic.tenant-smoke",
+                    "attemptCount": 2,
+                    "sharedRouteAttemptCount": 0,
+                    "dedicatedRouteAttemptCount": 2,
+                    "selectedRouteAttemptCount": 1,
+                    "unavailableRouteAttemptCount": 1,
+                    "routeAttemptHistoryComplete": True,
+                },
+            )
+        if (method, path) == (
+            "GET",
+            f"/api/v1/classroom-versions/{version_id}/document",
+        ):
+            digest = hashlib.sha256(document).hexdigest()
+            return httpx.Response(
+                200,
+                content=document,
+                headers={
+                    "Content-Type": "application/json",
+                    "Content-Length": str(len(document)),
+                    "ETag": f'"sha256-{digest}"',
+                },
+            )
+        if (method, path) == (
+            "DELETE",
+            f"/api/v1/teaching/classes/{class_id}/enrollments/{teacher_user_id}",
+        ):
+            return httpx.Response(204)
+        if (method, path) == (
+            "DELETE",
+            f"/api/v1/tenants/{tenant_id}/members/{teacher_user_id}",
+        ):
+            return httpx.Response(204)
+        if (method, path) == ("DELETE", f"/api/v1/auth/users/{teacher_username}"):
+            return httpx.Response(200, json={"ok": True})
+        raise AssertionError(f"unexpected request: {method} {path}")
+
+    async def no_wait(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(module.asyncio, "sleep", no_wait)
+    body = asyncio.run(
+        module._run_openmaic_smoke_probe(
+            config,
+            transport=httpx.MockTransport(handler),
+        )
+    )
+
+    for secret in (ADMIN_TOKEN, teacher_password, TEACHER_SESSION, "PROVIDER_SECRET_SENTINEL"):
+        assert secret.encode() not in body
+    parsed = contract.parse_openmaic_smoke_report(
+        body,
+        candidate=_candidate(),
+        release_run=release_run,
+        expected_base_url=BASE_URL,
+        expected_runtime_attestation_sha256=RUNTIME_ATTESTATION_SHA256,
+        forbidden_secret_values=tuple(
+            secret.encode() for secret in (ADMIN_TOKEN, teacher_password, TEACHER_SESSION)
+        ),
+        expected_plane="dedicated",
+    )
+    assert parsed["fixture"]["tenantId"] == tenant_id
+    assert parsed["binding"] == {
+        "routeId": "dedicated-tenant-smoke",
+        "routeTenantId": tenant_id,
+        "routeOwnerKey": tenant_id,
+        "providerProfileId": "provider-tenant-smoke",
+        "providerScope": "dedicated",
+        "providerTenantId": tenant_id,
+        "providerOwnerKey": tenant_id,
+        "workerPoolRef": "generation-tenant-smoke",
+        "queueRef": "openmaic.tenant-smoke",
+        "attemptCount": 2,
+        "sharedRouteAttemptCount": 0,
+        "dedicatedRouteAttemptCount": 2,
+        "selectedRouteAttemptCount": 1,
+        "unavailableRouteAttemptCount": 1,
+        "routeAttemptHistoryComplete": True,
+    }
+    assert contract.derive_openmaic_dedicated_plane_checks(parsed) == {
+        "dedicatedGenerationPassed": True,
+        "noSharedClientIssued": True,
+    }
+    request_pairs = [(request.method, request.url.path) for request in seen]
+    assert ("POST", "/api/v1/tenants") not in request_pairs
+    assert not any(
+        fragment in request.url.path
+        for request in seen
+        for fragment in ("data-plane-routes", "provider-profiles", "provider-secrets")
+    )
+    assert [pair for pair in request_pairs if pair[0] == "DELETE"] == [
+        (
+            "DELETE",
+            f"/api/v1/teaching/classes/{class_id}/enrollments/{teacher_user_id}",
+        ),
+        ("DELETE", f"/api/v1/tenants/{tenant_id}/members/{teacher_user_id}"),
+        ("DELETE", f"/api/v1/auth/users/{teacher_username}"),
+    ]
+
+
 def test_shared_probe_compensates_created_identity_after_mid_probe_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -724,6 +1143,8 @@ def test_shared_probe_compensates_created_identity_after_mid_probe_failure(
         base_url=BASE_URL,
         candidate=_candidate(),
         candidate_root=tmp_path,
+        dedicated_tenant_id=None,
+        plane="shared",
         release_run={
             "runId": "run-openmaic-shared-smoke",
             "environmentId": "environment-openmaic-shared-smoke",
@@ -825,6 +1246,8 @@ def test_shared_probe_recovers_commit_after_transport_error(
         base_url=BASE_URL,
         candidate=_candidate(),
         candidate_root=tmp_path,
+        dedicated_tenant_id=None,
+        plane="shared",
         release_run={
             "runId": "run-openmaic-shared-smoke",
             "environmentId": "environment-openmaic-shared-smoke",

@@ -212,6 +212,7 @@ class SqlAlchemyStudentClassroomGeneration:
             and details.resource_class_id == request.resource_class_id
             and details.public_request_sha256 == request.public_request_sha256
             and details.request_sha256 == request.request_sha256
+            and details.data_plane_mode == request.data_plane_mode
             and details.data_plane_route_id == request.data_plane_route_id
             and details.provider_profile_id == request.provider_profile_id
             and details.worker_pool_ref == request.worker_pool_ref
@@ -303,6 +304,7 @@ class SqlAlchemyStudentClassroomGeneration:
             request_id=generation.request_id,
             idempotency_key=generation.idempotency_key,
             request_sha256=request_sha256,
+            data_plane_mode=selection.mode,
             data_plane_route_id=selection.route_ref,
             provider_profile_id=selection.provider_profile_ref,
             worker_pool_ref=selection.worker_pool_ref,
@@ -352,9 +354,7 @@ class SqlAlchemyStudentClassroomGeneration:
         try:
             details = await self._repository.get_job_details(context.tenant_id, job_id)
             if details is None:
-                raise StudentClassroomConflict(
-                    "student generation job is unavailable"
-                )
+                raise StudentClassroomConflict("student generation job is unavailable")
         except Exception as primary_error:
             compensation_errors: list[Exception] = []
             try:
@@ -445,9 +445,7 @@ class SqlAlchemyStudentClassroomWorkflow:
                 getattr(request, "duration_minutes", 0) or (15 if mode == "micro" else 45)
             ),
             classroom_mode=mode,
-            web_policy=(
-                "enabled" if getattr(request, "web_search_requested") else "disabled"
-            ),
+            web_policy=("enabled" if getattr(request, "web_search_requested") else "disabled"),
             template_id=str(getattr(request, "template_id", "") or "student-default"),
             template_version=str(getattr(request, "template_version", "") or "1"),
             knowledge_points=(
@@ -458,9 +456,7 @@ class SqlAlchemyStudentClassroomWorkflow:
                 ),
             ),
             content_mode=getattr(request, "content_mode"),
-            open_creation_acknowledged=(
-                getattr(request, "content_mode") == "open_creation"
-            ),
+            open_creation_acknowledged=(getattr(request, "content_mode") == "open_creation"),
         )
 
     async def _build_brief(self, request: object):
@@ -804,14 +800,10 @@ class SqlAlchemyStudentClassroomWorkflow:
         ):
             raise StudentClassroomConflict("student approval reservation is unavailable")
         asset_id = record.asset_id
-        target_state = (
-            "generating_content" if details.mode == "micro" else "generating_outline"
-        )
+        target_state = "generating_content" if details.mode == "micro" else "generating_outline"
         if record.job_id is not None:
             if record.lifecycle_state in {"canceled", "failed", "draft"}:
-                raise StudentClassroomConflict(
-                    "student approval job binding is unavailable"
-                )
+                raise StudentClassroomConflict("student approval job binding is unavailable")
             return StudentGenerationApprovalView(
                 approval_id=approval.approval_id,
                 request_id=approval.request_id,
@@ -1038,9 +1030,7 @@ class StudentClassroomService:
 
     async def list_approvals(self, context: TenantContext):
         approvals = await self._approval_service.list(context)
-        return tuple(
-            [await self._workflow.approval_response(approval) for approval in approvals]
-        )
+        return tuple([await self._workflow.approval_response(approval) for approval in approvals])
 
     async def approve(
         self,

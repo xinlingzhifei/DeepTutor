@@ -237,9 +237,7 @@ class SqlAlchemySourceRepository:
             .with_for_update(read=True)
         )
         if tenant is None:
-            raise SourceEntitlementDeniedError(
-                "knowledge resource is not entitled to this tenant"
-            )
+            raise SourceEntitlementDeniedError("knowledge resource is not entitled to this tenant")
         entitlement = await session.scalar(
             select(TenantKnowledgeEntitlement.knowledge_resource_id)
             .where(
@@ -251,9 +249,7 @@ class SqlAlchemySourceRepository:
             .with_for_update(read=True)
         )
         if entitlement is None:
-            raise SourceEntitlementDeniedError(
-                "knowledge resource is not entitled to this tenant"
-            )
+            raise SourceEntitlementDeniedError("knowledge resource is not entitled to this tenant")
 
     async def _ensure_binding(
         self,
@@ -443,15 +439,11 @@ class SqlAlchemySourceRepository:
                     TenantSourceBinding.class_id == class_id,
                     TenantSourceBinding.class_id.is_(None),
                 )
-            ).order_by(
-                case((TenantSourceBinding.class_id == class_id, 0), else_=1)
-            )
+            ).order_by(case((TenantSourceBinding.class_id == class_id, 0), else_=1))
         if source_id is not None:
             statement = statement.where(SourceSnapshot.source_id == source_id)
         if resource_owner_id is not None:
-            statement = statement.where(
-                SourceSnapshot.resource_owner_id == resource_owner_id
-            )
+            statement = statement.where(SourceSnapshot.resource_owner_id == resource_owner_id)
         if binding_id is not None:
             statement = statement.where(TenantSourceBinding.id == binding_id)
         return statement.order_by(TenantSourceBinding.created_at, TenantSourceBinding.id)
@@ -554,7 +546,9 @@ class SqlAlchemySourceRepository:
         if not isinstance(manifest, dict) or not manifest.get("fragments"):
             raise SourceConflictError("source citation manifest is empty")
         for digest in (snapshot.content_sha256, snapshot.permission_sha256):
-            if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+            if len(digest) != 64 or any(
+                character not in "0123456789abcdef" for character in digest
+            ):
                 raise SourceConflictError("source snapshot digest is invalid")
         try:
             async with self._session_factory() as session:
@@ -587,7 +581,7 @@ class SqlAlchemySourceRepository:
                             citation_manifest=snapshot.citation_manifest,
                             created_by=actor_id,
                         )
-                        .on_conflict_do_nothing(index_elements=[SourceSnapshot.id])
+                        .on_conflict_do_nothing()
                     )
                     existing = await session.get(SourceSnapshot, snapshot.snapshot_id)
                     if existing is None or (
@@ -610,7 +604,9 @@ class SqlAlchemySourceRepository:
                         raise SourceConflictError("source snapshot timestamp is missing")
                     saved = SavedSourceSnapshot(existing.id, existing.created_at)
         except IntegrityError as exc:
-            raise SourceConflictError("authorized source snapshot conflicts with existing state") from exc
+            raise SourceConflictError(
+                "authorized source snapshot conflicts with existing state"
+            ) from exc
         return saved
 
     @staticmethod
@@ -684,7 +680,9 @@ class SqlAlchemySourceRepository:
                         raise SourceConflictError("source upload identity conflict")
                     record = self._upload_record(existing)
         except IntegrityError as exc:
-            raise SourceConflictError("source upload receipt conflicts with existing state") from exc
+            raise SourceConflictError(
+                "source upload receipt conflicts with existing state"
+            ) from exc
         return record
 
     async def complete_upload(
@@ -732,7 +730,9 @@ class SqlAlchemySourceRepository:
         if (
             not error_code
             or len(error_code) > 64
-            or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789_" for character in error_code)
+            or any(
+                character not in "abcdefghijklmnopqrstuvwxyz0123456789_" for character in error_code
+            )
         ):
             raise ValueError("upload error code is invalid")
         async with self._session_factory() as session:
@@ -843,7 +843,7 @@ class SqlAlchemySourceRepository:
                             citation_manifest="[]",
                             created_by=actor_id,
                         )
-                        .on_conflict_do_nothing(index_elements=[SourceSnapshot.id])
+                        .on_conflict_do_nothing()
                     )
                     existing = await session.get(SourceSnapshot, snapshot.snapshot_id)
                     if existing is None or (
@@ -912,7 +912,7 @@ class SqlAlchemySourceRepository:
                             citation_manifest="[]",
                             created_by=actor_id,
                         )
-                        .on_conflict_do_nothing(index_elements=[SourceSnapshot.id])
+                        .on_conflict_do_nothing()
                     )
                     existing = await session.get(SourceSnapshot, snapshot.snapshot_id)
                     if existing is None or (

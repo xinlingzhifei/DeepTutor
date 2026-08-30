@@ -198,6 +198,18 @@ class GenerationBindingSnapshotResponse(_ApiModel):
     provider_profile_id: str
     worker_pool_ref: str
     queue_ref: str
+    data_plane_mode: Literal["shared", "dedicated"]
+    route_tenant_id: str | None
+    route_owner_key: str
+    provider_scope: Literal["shared", "dedicated"]
+    provider_tenant_id: str | None
+    provider_owner_key: str
+    attempt_count: int
+    shared_route_attempt_count: int
+    dedicated_route_attempt_count: int
+    selected_route_attempt_count: int
+    unavailable_route_attempt_count: int
+    route_attempt_history_complete: Literal[True] = True
 
 
 class JobCancellationGateway(Protocol):
@@ -208,10 +220,14 @@ def get_job_repository() -> SqlAlchemyGenerationJobRepository:
     return SqlAlchemyGenerationJobRepository()
 
 
+def get_data_plane_repository() -> SqlAlchemyDataPlaneRepository:
+    return SqlAlchemyDataPlaneRepository()
+
+
 def get_data_plane_selector() -> DataPlaneSelector:
     return DataPlaneSelector(
         settings=load_platform_settings(),
-        repository=SqlAlchemyDataPlaneRepository(),
+        repository=get_data_plane_repository(),
     )
 
 
@@ -450,12 +466,55 @@ async def generation_binding_snapshot(
         Path(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$"),
     ],
     repository: SqlAlchemyGenerationJobRepository = Depends(get_job_repository),
+    data_plane_repository: SqlAlchemyDataPlaneRepository = Depends(get_data_plane_repository),
 ) -> GenerationBindingSnapshotResponse:
     """Return the secret-free immutable route binding for one generation job."""
 
     details = await repository.get_job_details(tenant_id, job_id)
     if details is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    mode = details.data_plane_mode
+    expected_tenant_id = None if mode == "shared" else details.tenant_id
+    expected_owner_key = "shared" if mode == "shared" else details.tenant_id
+    route_audit = (
+        await data_plane_repository.resolve_job_route_audit(
+            tenant_id=details.tenant_id,
+            job_id=details.job_id,
+            phase=details.phase,
+            expected_attempt_count=details.attempt_count,
+            expected_data_plane_mode=mode,
+            expected_route_id=details.data_plane_route_id,
+            expected_provider_profile_id=details.provider_profile_id,
+            expected_worker_pool_ref=details.worker_pool_ref,
+            expected_queue_ref=details.queue_ref,
+        )
+        if mode in {"shared", "dedicated"} and details.attempt_count > 0
+        else None
+    )
+    if (
+        route_audit is None
+        or route_audit.data_plane_mode != mode
+        or route_audit.attempt_count != details.attempt_count
+        or route_audit.shared_attempt_count + route_audit.dedicated_attempt_count
+        != details.attempt_count
+        or route_audit.selected_attempt_count + route_audit.unavailable_attempt_count
+        != details.attempt_count
+        or (mode == "shared" and route_audit.shared_attempt_count != details.attempt_count)
+        or (mode == "shared" and route_audit.dedicated_attempt_count != 0)
+        or (mode == "dedicated" and route_audit.dedicated_attempt_count != details.attempt_count)
+        or (mode == "dedicated" and route_audit.shared_attempt_count != 0)
+        or (
+            details.status == "succeeded"
+            and (
+                route_audit.selected_attempt_count < 1
+                or route_audit.final_phase_selected is not True
+            )
+        )
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Generation data plane binding unavailable",
+        )
     classroom_version_id = (
         details.result_ref
         if details.job_kind == "generation"
@@ -475,6 +534,17 @@ async def generation_binding_snapshot(
         provider_profile_id=details.provider_profile_id,
         worker_pool_ref=details.worker_pool_ref,
         queue_ref=details.queue_ref,
+        data_plane_mode=mode,
+        route_tenant_id=expected_tenant_id,
+        route_owner_key=expected_owner_key,
+        provider_scope=mode,
+        provider_tenant_id=expected_tenant_id,
+        provider_owner_key=expected_owner_key,
+        attempt_count=route_audit.attempt_count,
+        shared_route_attempt_count=route_audit.shared_attempt_count,
+        dedicated_route_attempt_count=route_audit.dedicated_attempt_count,
+        selected_route_attempt_count=route_audit.selected_attempt_count,
+        unavailable_route_attempt_count=route_audit.unavailable_attempt_count,
     )
 
 
@@ -501,6 +571,7 @@ def _generation_job_request(
         request_id=details.request_id,
         idempotency_key=details.idempotency_key,
         request_sha256=details.request_sha256,
+        data_plane_mode=details.data_plane_mode,
         data_plane_route_id=details.data_plane_route_id,
         provider_profile_id=details.provider_profile_id,
         worker_pool_ref=details.worker_pool_ref,
@@ -582,6 +653,7 @@ async def create_classroom_job(
                 request_id=generation.request_id,
                 idempotency_key=generation.idempotency_key,
                 request_sha256=hashlib.sha256(payload.encode()).hexdigest(),
+                data_plane_mode=selection.mode,
                 data_plane_route_id=selection.route_ref,
                 provider_profile_id=selection.provider_profile_ref,
                 worker_pool_ref=selection.worker_pool_ref,

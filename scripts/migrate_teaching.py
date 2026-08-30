@@ -23,6 +23,15 @@ from deeptutor.services.config import PlatformSettings, load_platform_settings
 from deeptutor.teaching.migrations.facade import migration_lock_scope
 from deeptutor.teaching.schema_names import tenant_schema_name
 
+_ROUTE_ATTEMPT_FUNCTION_SIGNATURE = (
+    "platform.record_generation_route_attempt("
+    "text, text, text, integer, text, text, text, text, text, text, text, text, "
+    "text, text, text)"
+)
+_ROUTE_ATTEMPT_READ_FUNCTION_SIGNATURE = (
+    "platform.read_generation_route_attempts(text, text, text, text, text, text, text)"
+)
+
 
 @dataclass(frozen=True, slots=True)
 class DatabaseRoleStatement:
@@ -207,6 +216,23 @@ async def _grant_app_access_on_connection(
                 f"{quoted} GRANT USAGE, SELECT ON SEQUENCES TO yfeistai_app"
             )
         )
+    for signature in (
+        _ROUTE_ATTEMPT_FUNCTION_SIGNATURE,
+        _ROUTE_ATTEMPT_READ_FUNCTION_SIGNATURE,
+    ):
+        await connection.execute(text(f"ALTER FUNCTION {signature} OWNER TO yfeistai_migrator"))
+    await connection.execute(
+        text(
+            "REVOKE SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON TABLE "
+            "platform.generation_route_attempts FROM yfeistai_app"
+        )
+    )
+    for signature in (
+        _ROUTE_ATTEMPT_FUNCTION_SIGNATURE,
+        _ROUTE_ATTEMPT_READ_FUNCTION_SIGNATURE,
+    ):
+        await connection.execute(text(f"REVOKE ALL ON FUNCTION {signature} FROM PUBLIC"))
+        await connection.execute(text(f"GRANT EXECUTE ON FUNCTION {signature} TO yfeistai_app"))
 
 
 async def _grant_app_access(engine: AsyncEngine, schemas: Sequence[str]) -> None:

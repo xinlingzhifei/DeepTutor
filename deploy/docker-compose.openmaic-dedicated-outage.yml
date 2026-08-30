@@ -1,0 +1,12 @@
+name: "${YFEISTAI_DEDICATED_OUTAGE_PROJECT:?set the run-scoped outage project}"
+
+services:
+  openmaic:
+    restart: "no"
+    labels:
+      com.yfeistai.acceptance.disposable: "true"
+      com.yfeistai.acceptance.environment-id: "${YFEISTAI_ENVIRONMENT_ID:?set environment id}"
+      com.yfeistai.acceptance.purpose: "openmaic-dedicated-outage"
+      com.yfeistai.acceptance.route-id: "${YFEISTAI_DEDICATED_ROUTE_ID:?set dedicated route id}"
+      com.yfeistai.acceptance.run-id: "${YFEISTAI_RELEASE_RUN_ID:?set release run id}"
+      com.yfeistai.acceptance.tenant-id: "${YFEISTAI_DEDICATED_TENANT_ID:?set dedicated tenant id}"

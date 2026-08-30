@@ -205,6 +205,8 @@ def test_platform_compose_command_pins_attested_project_name(monkeypatch) -> Non
         "compose",
         "--env-file",
         str(module.DOCKER_ENV_PATH),
+        "--project-directory",
+        str(module.PROJECT_ROOT),
         "--project-name",
         "yfeistai-platform",
         "-f",

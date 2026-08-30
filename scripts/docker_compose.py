@@ -59,6 +59,30 @@ def _candidate_paths(candidate_root: Path) -> Any:
     return renderer.candidate_artifact_paths(candidate_root)
 
 
+def platform_compose_topology_arguments(
+    *,
+    deployment_root: Path,
+    candidate_root: Path,
+    env_file: Path,
+) -> list[str]:
+    """Return the one fixed platform topology shared by launch and attestation."""
+    deployment = Path(os.path.abspath(deployment_root))
+    candidate = Path(os.path.abspath(candidate_root))
+    artifacts = _candidate_paths(candidate)
+    return [
+        "--env-file",
+        str(Path(os.path.abspath(env_file))),
+        "--project-directory",
+        str(deployment),
+        "--project-name",
+        "yfeistai-platform",
+        "-f",
+        str(candidate / "docker-compose.yml"),
+        "-f",
+        str(artifacts.platform_compose),
+    ]
+
+
 def _validate_production_image_lock(candidate_root: Path) -> None:
     renderer = _load_platform_renderer()
     paths = renderer.candidate_artifact_paths(candidate_root)
@@ -346,20 +370,17 @@ def _compose_command(args: list[str]) -> list[str]:
     if not docker:
         raise SystemExit("docker was not found on PATH")
     platform, data_plane, candidate_root, compose_args = _parse_topology_args(args)
-    command = [docker, "compose", "--env-file", str(DOCKER_ENV_PATH)]
+    command = [docker, "compose"]
     if platform:
-        artifact_paths = _candidate_paths(candidate_root or PROJECT_ROOT)
         command.extend(
-            (
-                "--project-name",
-                "yfeistai-platform",
-                "-f",
-                str(PROJECT_ROOT / "docker-compose.yml"),
-                "-f",
-                str(artifact_paths.platform_compose),
+            platform_compose_topology_arguments(
+                deployment_root=PROJECT_ROOT,
+                candidate_root=candidate_root or PROJECT_ROOT,
+                env_file=DOCKER_ENV_PATH,
             )
         )
     elif data_plane is not None:
+        command.extend(("--env-file", str(DOCKER_ENV_PATH)))
         artifact_paths = _candidate_paths(candidate_root or PROJECT_ROOT)
         command.extend(
             (
@@ -371,6 +392,8 @@ def _compose_command(args: list[str]) -> list[str]:
                 str(artifact_paths.data_plane_compose),
             )
         )
+    else:
+        command.extend(("--env-file", str(DOCKER_ENV_PATH)))
     command.extend(compose_args)
     return command
 

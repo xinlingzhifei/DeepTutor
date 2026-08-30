@@ -16,7 +16,7 @@ def test_pbl_grading_migration_precedes_current_tenant_head() -> None:
     )
     source = migration.read_text(encoding="utf-8")
 
-    assert TEACHING_MIGRATION_HEAD_REVISION == "20260828_0022"
+    assert TEACHING_MIGRATION_HEAD_REVISION == "20260830_0023"
     assert 'revision: str = "20260825_0020"' in source
     assert 'down_revision: str | None = "20260825_0019"' in source
     assert '"pbl_grading_results"' in source

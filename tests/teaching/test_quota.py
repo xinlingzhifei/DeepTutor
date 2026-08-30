@@ -42,6 +42,7 @@ def test_generation_request_sha_must_bind_the_canonical_payload_bytes() -> None:
         request_id="request-a",
         idempotency_key="idempotency-a",
         request_sha256=hashlib.sha256(payload.encode()).hexdigest(),
+        data_plane_mode="shared",
         data_plane_route_id="shared-primary",
         provider_profile_id="platform-default",
         worker_pool_ref="shared-generation",

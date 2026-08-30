@@ -153,6 +153,7 @@ def _request(
         request_id=f"request-{job_id}",
         idempotency_key=f"idem-{job_id}",
         request_sha256=hashlib.sha256(payload.encode()).hexdigest(),
+        data_plane_mode="shared",
         data_plane_route_id="shared-primary",
         provider_profile_id="platform-default",
         worker_pool_ref="shared-generation",
@@ -177,6 +178,7 @@ def _claim(*, phase: str = "content", attempt_count: int = 2) -> ClaimedGenerati
             else "exporting"
         ),
         slot_pool="generation",
+        data_plane_mode="shared",
         data_plane_route_id="shared-primary",
         provider_profile_id="platform-default",
         worker_pool_ref="shared-generation",
@@ -432,8 +434,14 @@ async def test_new_reservation_records_quota_only_after_unique_ledger_flush(
     assert _metric_events(idempotent_session) == []
 
 
-async def _true_binding(*_args, **_kwargs) -> bool:
-    return True
+async def _true_binding(*_args, **kwargs):
+    return SimpleNamespace(
+        data_plane_mode=kwargs.get("data_plane_mode") or "shared",
+        data_plane_route_id=kwargs["data_plane_route_id"],
+        provider_profile_id=kwargs["provider_profile_id"],
+        worker_pool_ref=kwargs["worker_pool_ref"],
+        queue_ref=kwargs["queue_ref"],
+    )
 
 
 async def _fixed_now(_session) -> datetime:
@@ -505,6 +513,7 @@ async def test_content_requeue_records_one_queued_transition_after_outbox_flush(
         status="awaiting_confirmation",
         request_id="request-job-a",
         idempotency_key="idem-job-a",
+        data_plane_mode="shared",
         data_plane_route_id="shared-primary",
         provider_profile_id="platform-default",
         worker_pool_ref="shared-generation",

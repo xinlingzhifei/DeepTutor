@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 import re
 import secrets
+from typing import Literal
 
 from sqlalchemy import Select, func, select, text
 from sqlalchemy.dialects.postgresql import insert
@@ -66,6 +67,7 @@ class ClaimedGenerationJob:
     phase: str
     status: str
     slot_pool: str
+    data_plane_mode: Literal["shared", "dedicated"]
     data_plane_route_id: str
     provider_profile_id: str
     worker_pool_ref: str
@@ -390,14 +392,15 @@ class FairScheduler:
                 )
                 if tenant_state is None:
                     return None
-                if not await lock_active_job_binding(
+                locked_binding = await lock_active_job_binding(
                     session,
                     tenant_id=tenant_state.tenant_id,
                     data_plane_route_id=data_plane_route_id,
                     provider_profile_id=provider_profile_id,
                     worker_pool_ref=worker_pool_ref,
                     queue_ref=queue_ref,
-                ):
+                )
+                if locked_binding is None:
                     return None
                 tenant_slot = await session.scalar(
                     select(GenerationSlot)
@@ -423,10 +426,12 @@ class FairScheduler:
                         select(GenerationQueue)
                         .where(
                             GenerationQueue.tenant_id == tenant_state.tenant_id,
-                            GenerationQueue.data_plane_route_id == data_plane_route_id,
-                            GenerationQueue.provider_profile_id == provider_profile_id,
-                            GenerationQueue.worker_pool_ref == worker_pool_ref,
-                            GenerationQueue.queue_ref == queue_ref,
+                            GenerationQueue.data_plane_route_id
+                            == locked_binding.data_plane_route_id,
+                            GenerationQueue.provider_profile_id
+                            == locked_binding.provider_profile_id,
+                            GenerationQueue.worker_pool_ref == locked_binding.worker_pool_ref,
+                            GenerationQueue.queue_ref == locked_binding.queue_ref,
                             GenerationQueue.slot_pool == slot_pool,
                             GenerationQueue.status == "queued",
                             GenerationQueue.available_at <= now,
@@ -477,6 +482,7 @@ class FairScheduler:
                               AND tenant_id = :tenant_id
                               AND job_kind = :job_kind
                               AND phase = :phase
+                              AND data_plane_mode = :data_plane_mode
                               AND data_plane_route_id = :data_plane_route_id
                               AND provider_profile_id = :provider_profile_id
                               AND worker_pool_ref = :worker_pool_ref
@@ -502,10 +508,11 @@ class FairScheduler:
                             "tenant_id": queue_job.tenant_id,
                             "job_kind": queue_job.job_kind,
                             "phase": queue_job.phase,
-                            "data_plane_route_id": data_plane_route_id,
-                            "provider_profile_id": provider_profile_id,
-                            "worker_pool_ref": worker_pool_ref,
-                            "queue_ref": queue_ref,
+                            "data_plane_mode": locked_binding.data_plane_mode,
+                            "data_plane_route_id": locked_binding.data_plane_route_id,
+                            "provider_profile_id": locked_binding.provider_profile_id,
+                            "worker_pool_ref": locked_binding.worker_pool_ref,
+                            "queue_ref": locked_binding.queue_ref,
                         },
                     )
                     claimed_shape = claimed_job.mappings().one_or_none()
@@ -558,10 +565,11 @@ class FairScheduler:
                     phase=queue_job.phase,
                     status=target_status,
                     slot_pool=slot_pool,
-                    data_plane_route_id=data_plane_route_id,
-                    provider_profile_id=provider_profile_id,
-                    worker_pool_ref=worker_pool_ref,
-                    queue_ref=queue_ref,
+                    data_plane_mode=locked_binding.data_plane_mode,
+                    data_plane_route_id=locked_binding.data_plane_route_id,
+                    provider_profile_id=locked_binding.provider_profile_id,
+                    worker_pool_ref=locked_binding.worker_pool_ref,
+                    queue_ref=locked_binding.queue_ref,
                     attempt_count=attempt_count,
                     lease_owner=worker_id,
                     lease_token=lease_token,

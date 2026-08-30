@@ -19,6 +19,11 @@ SOURCE_REPOSITORY = "xinlingzhifei/DeepTutor"
 SOURCE_HEAD = "a" * 40
 RELEASE_TAG = f"yfeistai-first-release-20260825-{SOURCE_HEAD[:8]}"
 OPENMAIC_HEAD = "0cf2a330411681190e89f48e20f305345ff99f87"
+CHECKOUT_ACTION = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
+UPLOAD_ARTIFACT_ACTION = "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"
+SETUP_BUILDX_ACTION = "docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f"
+LOGIN_ACTION = "docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9"
+BUILD_PUSH_ACTION = "docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8"
 CANDIDATE_ARGUMENTS = {
     "source_repository": SOURCE_REPOSITORY,
     "source_head": SOURCE_HEAD,
@@ -453,7 +458,7 @@ def test_private_platform_workflow_builds_all_images_and_exports_digest_lock() -
     steps = job["steps"]
 
     checkout = next(step for step in steps if step.get("name") == "Checkout OpenMAIC")
-    assert checkout["uses"] == "actions/checkout@v4"
+    assert checkout["uses"] == CHECKOUT_ACTION
     assert checkout["with"] == {
         "repository": "xinlingzhifei/OpenMAIC",
         "ref": "0cf2a330411681190e89f48e20f305345ff99f87",
@@ -462,9 +467,7 @@ def test_private_platform_workflow_builds_all_images_and_exports_digest_lock() -
     }
 
     build_steps = [
-        (index, step)
-        for index, step in enumerate(steps)
-        if step.get("uses") == "docker/build-push-action@v6"
+        (index, step) for index, step in enumerate(steps) if step.get("uses") == BUILD_PUSH_ACTION
     ]
     assert len(build_steps) == 3
     builds_by_tag: dict[str, tuple[int, dict[str, Any]]] = {}
@@ -526,7 +529,7 @@ def test_private_platform_workflow_builds_all_images_and_exports_digest_lock() -
     upload_index, upload_step = next(
         (index, step)
         for index, step in enumerate(steps)
-        if step.get("uses") == "actions/upload-artifact@v4"
+        if step.get("uses") == UPLOAD_ARTIFACT_ACTION
     )
     assert upload_index > verify_index
     artifact_paths = {
@@ -534,6 +537,7 @@ def test_private_platform_workflow_builds_all_images_and_exports_digest_lock() -
     }
     assert artifact_paths == {
         "release-candidate/deploy/image-lock.json",
+        "release-candidate/docker-compose.yml",
         "release-candidate/docker-compose.platform.yml",
         "release-candidate/docker-compose.data-plane.yml",
         "release-candidate/artifacts/source_head.json",
@@ -555,17 +559,13 @@ def test_private_platform_workflow_rejects_non_release_refs_before_registry_logi
     assert len(validation_steps) == 1, "candidate validation step is missing"
     validate_index, validate_step = validation_steps[0]
     login_index = next(
-        index for index, step in enumerate(steps) if step.get("uses") == "docker/login-action@v3"
+        index for index, step in enumerate(steps) if step.get("uses") == LOGIN_ACTION
     )
     first_build_index = next(
-        index
-        for index, step in enumerate(steps)
-        if step.get("uses") == "docker/build-push-action@v6"
+        index for index, step in enumerate(steps) if step.get("uses") == BUILD_PUSH_ACTION
     )
     setup_buildx_index = next(
-        index
-        for index, step in enumerate(steps)
-        if step.get("uses") == "docker/setup-buildx-action@v3"
+        index for index, step in enumerate(steps) if step.get("uses") == SETUP_BUILDX_ACTION
     )
 
     assert validate_index < setup_buildx_index < login_index < first_build_index
@@ -577,50 +577,49 @@ def test_private_platform_workflow_rejects_non_release_refs_before_registry_logi
     assert "GITHUB_REF_NAME" in command
 
 
-def test_private_platform_workflow_publishes_candidate_and_compatibility_tags() -> None:
+def test_private_platform_workflow_publishes_only_immutable_candidate_tags() -> None:
     workflow_path = ROOT / ".github" / "workflows" / "private-platform-images.yml"
     workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
     job = next(iter(workflow["jobs"].values()))
     steps = job["steps"]
     build_steps = [
-        (index, step)
-        for index, step in enumerate(steps)
-        if step.get("uses") == "docker/build-push-action@v6"
+        (index, step) for index, step in enumerate(steps) if step.get("uses") == BUILD_PUSH_ACTION
     ]
     expected = {
-        "build_deeptutor": (
-            "ghcr.io/xinlingzhifei/deeptutor:${{ github.ref_name }}",
-            "ghcr.io/xinlingzhifei/deeptutor:first-release",
-        ),
-        "build_openmaic": (
-            "ghcr.io/xinlingzhifei/openmaic:${{ github.ref_name }}",
-            "ghcr.io/xinlingzhifei/openmaic:0.3.1-0cf2a330",
-        ),
-        "build_openmaic_render": (
-            "ghcr.io/xinlingzhifei/openmaic-render:${{ github.ref_name }}",
-            "ghcr.io/xinlingzhifei/openmaic-render:0.3.1-0cf2a330",
-        ),
+        "build_deeptutor": "ghcr.io/xinlingzhifei/deeptutor:${{ github.ref_name }}",
+        "build_openmaic": "ghcr.io/xinlingzhifei/openmaic:${{ github.ref_name }}",
+        "build_openmaic_render": ("ghcr.io/xinlingzhifei/openmaic-render:${{ github.ref_name }}"),
     }
     assert len(build_steps) == 3
     for _index, step in build_steps:
         tags = {line.strip() for line in str(step["with"]["tags"]).splitlines() if line.strip()}
-        assert tags == {expected[step["id"]][0]}
+        assert tags == {expected[step["id"]]}
 
     promotion_steps = [
-        (index, step)
-        for index, step in enumerate(steps)
-        if step.get("name") == "Promote verified compatibility image tags"
+        step for step in steps if step.get("name") == "Promote verified compatibility image tags"
     ]
-    assert len(promotion_steps) == 1, "verified alias promotion step is missing"
-    promotion_index, promotion_step = promotion_steps[0]
-    verify_index = next(
-        index for index, step in enumerate(steps) if step.get("name") == "Verify image lock"
-    )
-    assert verify_index < promotion_index
-    command = str(promotion_step["run"])
-    for _candidate, alias in expected.values():
-        assert alias in command
-    assert command.count("docker buildx imagetools create") == 3
+    assert not promotion_steps, "candidate build must not move mutable compatibility tags"
+    source = workflow_path.read_text(encoding="utf-8")
+    assert "docker buildx imagetools create" not in source
+    assert "ghcr.io/xinlingzhifei/deeptutor:first-release" not in source
+    assert "ghcr.io/xinlingzhifei/openmaic:0.3.1-0cf2a330" not in source
+    assert "ghcr.io/xinlingzhifei/openmaic-render:0.3.1-0cf2a330" not in source
+
+
+def test_private_platform_workflow_pins_third_party_actions_to_commits() -> None:
+    workflow_path = ROOT / ".github" / "workflows" / "private-platform-images.yml"
+    workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+    job = next(iter(workflow["jobs"].values()))
+    action_refs = [str(step["uses"]) for step in job["steps"] if "uses" in step]
+
+    assert action_refs
+    assert set(action_refs) == {
+        CHECKOUT_ACTION,
+        UPLOAD_ARTIFACT_ACTION,
+        SETUP_BUILDX_ACTION,
+        LOGIN_ACTION,
+        BUILD_PUSH_ACTION,
+    }
 
 
 def test_private_platform_workflow_binds_remote_digests_to_build_outputs() -> None:
@@ -628,9 +627,7 @@ def test_private_platform_workflow_binds_remote_digests_to_build_outputs() -> No
     workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
     job = next(iter(workflow["jobs"].values()))
     steps = job["steps"]
-    build_ids = {
-        step.get("id") for step in steps if step.get("uses") == "docker/build-push-action@v6"
-    }
+    build_ids = {step.get("id") for step in steps if step.get("uses") == BUILD_PUSH_ACTION}
     assert build_ids == {"build_deeptutor", "build_openmaic", "build_openmaic_render"}
     verify_step = next(step for step in steps if step.get("name") == "Verify image lock")
     assert verify_step["env"] == {
@@ -650,7 +647,7 @@ def test_private_platform_workflow_refuses_to_overwrite_candidate_image_tags() -
     job = next(iter(workflow["jobs"].values()))
     steps = job["steps"]
     login_index = next(
-        index for index, step in enumerate(steps) if step.get("uses") == "docker/login-action@v3"
+        index for index, step in enumerate(steps) if step.get("uses") == LOGIN_ACTION
     )
     guard_steps = [
         (index, step)
@@ -660,9 +657,7 @@ def test_private_platform_workflow_refuses_to_overwrite_candidate_image_tags() -
     assert len(guard_steps) == 1, "candidate image overwrite guard is missing"
     guard_index, guard_step = guard_steps[0]
     first_build_index = next(
-        index
-        for index, step in enumerate(steps)
-        if step.get("uses") == "docker/build-push-action@v6"
+        index for index, step in enumerate(steps) if step.get("uses") == BUILD_PUSH_ACTION
     )
 
     assert login_index < guard_index < first_build_index
@@ -697,6 +692,7 @@ def test_private_platform_workflow_emits_task1_receipts_from_clean_source() -> N
     assert ".git/info/exclude" in prepare_command
     assert "/openmaic-upstream/" in prepare_command
     assert "/release-candidate/" in prepare_command
+    assert "release-candidate/docker-compose.yml" in prepare_command
     assert "release-candidate/docker-compose.platform.yml" in prepare_command
     assert "release-candidate/docker-compose.data-plane.yml" in prepare_command
 
@@ -731,7 +727,7 @@ def test_private_platform_workflow_emits_task1_receipts_from_clean_source() -> N
     upload_index, upload_step = next(
         (index, step)
         for index, step in enumerate(steps)
-        if step.get("uses") == "actions/upload-artifact@v4"
+        if step.get("uses") == UPLOAD_ARTIFACT_ACTION
     )
     assert receipt_index < upload_index
     artifact_paths = {
@@ -739,6 +735,7 @@ def test_private_platform_workflow_emits_task1_receipts_from_clean_source() -> N
     }
     assert artifact_paths == {
         "release-candidate/deploy/image-lock.json",
+        "release-candidate/docker-compose.yml",
         "release-candidate/docker-compose.platform.yml",
         "release-candidate/docker-compose.data-plane.yml",
         "release-candidate/artifacts/source_head.json",

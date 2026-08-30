@@ -18,7 +18,7 @@ def test_student_safety_idempotency_migration_is_current_tenant_head() -> None:
     upgrade = source.split("def _upgrade_tenant()", 1)[1].split("def upgrade()", 1)[0]
     downgrade = source.split("def _downgrade_tenant()", 1)[1].split("def downgrade()", 1)[0]
 
-    assert TEACHING_MIGRATION_HEAD_REVISION == "20260828_0022"
+    assert TEACHING_MIGRATION_HEAD_REVISION == "20260830_0023"
     assert 'revision: str = "20260827_0021"' in source
     assert 'down_revision: str | None = "20260825_0020"' in source
     assert (

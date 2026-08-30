@@ -52,6 +52,7 @@ def _request(tenant_id: str, job_id: str, *, max_attempts: int = 5) -> Generatio
         request_id=f"request-{job_id}",
         idempotency_key=f"idempotency-{job_id}",
         request_sha256=hashlib.sha256(b"{}").hexdigest(),
+        data_plane_mode="shared",
         data_plane_route_id="shared-primary",
         provider_profile_id="platform-default",
         worker_pool_ref="shared-generation",

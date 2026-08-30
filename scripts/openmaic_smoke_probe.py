@@ -1,4 +1,4 @@
-"""Run one candidate-bound OpenMAIC shared-plane generation smoke probe."""
+"""Run one candidate-bound OpenMAIC generation smoke probe."""
 
 from __future__ import annotations
 
@@ -40,12 +40,37 @@ _LOCAL_USER_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _MAX_JSON_RESPONSE_BYTES = 1024 * 1024
 _MAX_DOCUMENT_BYTES = 128 * 1024 * 1024
-_TITLE = "OpenMAIC shared-plane acceptance"
 _SHARED_BINDING = {
     "routeId": "shared-primary",
     "providerProfileId": "platform-default",
     "workerPoolRef": "shared-generation",
     "queueRef": "openmaic.shared",
+}
+_BINDING_RESPONSE_FIELDS = {
+    "schemaVersion",
+    "tenantId",
+    "jobId",
+    "jobKind",
+    "phase",
+    "status",
+    "progressPercent",
+    "classroomVersionId",
+    "dataPlaneMode",
+    "dataPlaneRouteId",
+    "routeTenantId",
+    "routeOwnerKey",
+    "providerProfileId",
+    "providerScope",
+    "providerTenantId",
+    "providerOwnerKey",
+    "workerPoolRef",
+    "queueRef",
+    "attemptCount",
+    "sharedRouteAttemptCount",
+    "dedicatedRouteAttemptCount",
+    "selectedRouteAttemptCount",
+    "unavailableRouteAttemptCount",
+    "routeAttemptHistoryComplete",
 }
 
 
@@ -64,6 +89,8 @@ class ProbeConfig:
         "base_url",
         "candidate",
         "candidate_root",
+        "dedicated_tenant_id",
+        "plane",
         "release_run",
         "runtime_attestation_sha256",
         "timeout_seconds",
@@ -76,14 +103,29 @@ class ProbeConfig:
         base_url: str,
         candidate: Mapping[str, object],
         candidate_root: Path,
+        dedicated_tenant_id: str | None,
+        plane: str,
         release_run: Mapping[str, str],
         runtime_attestation_sha256: str,
         timeout_seconds: int,
     ) -> None:
+        if plane not in {"shared", "dedicated"}:
+            raise OpenMAICSmokeProbeError("plane_invalid")
+        if plane == "dedicated":
+            if (
+                not isinstance(dedicated_tenant_id, str)
+                or _PUBLIC_ID.fullmatch(dedicated_tenant_id) is None
+            ):
+                raise OpenMAICSmokeProbeError("dedicated_tenant_invalid")
+        elif dedicated_tenant_id is not None:
+            raise OpenMAICSmokeProbeError("dedicated_tenant_invalid")
+
         self.admin_token = admin_token
         self.base_url = base_url
         self.candidate = dict(candidate)
         self.candidate_root = candidate_root
+        self.dedicated_tenant_id = dedicated_tenant_id
+        self.plane = plane
         self.release_run = dict(release_run)
         self.runtime_attestation_sha256 = runtime_attestation_sha256
         self.timeout_seconds = timeout_seconds
@@ -92,6 +134,7 @@ class ProbeConfig:
         return (
             "ProbeConfig(admin_token=SecretStr('**********'), "
             f"base_url={self.base_url!r}, candidate_root={self.candidate_root!r}, "
+            f"dedicated_tenant_id={self.dedicated_tenant_id!r}, plane={self.plane!r}, "
             f"release_run={self.release_run!r}, "
             f"runtime_attestation_sha256={self.runtime_attestation_sha256!r}, "
             f"timeout_seconds={self.timeout_seconds!r})"
@@ -213,6 +256,10 @@ def _resource_suffix(run_id: str) -> str:
     return hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:20]
 
 
+def _plane_title(plane: str) -> str:
+    return f"OpenMAIC {plane}-plane acceptance"
+
+
 def _fixture_material(config: ProbeConfig) -> _FixtureMaterial:
     source_head = config.candidate.get("sourceHead")
     run_id = config.release_run.get("runId")
@@ -224,8 +271,9 @@ def _fixture_material(config: ProbeConfig) -> _FixtureMaterial:
     ):
         raise OpenMAICSmokeProbeError("release_identity_invalid")
 
+    prefix = f"openmaic-{config.plane}"
     tenant_binding = f"{source_head}\0{run_id}\0tenant".encode("utf-8")
-    tenant_key = f"openmaic-shared-{hashlib.sha256(tenant_binding).hexdigest()[:24]}"
+    tenant_key = f"{prefix}-{hashlib.sha256(tenant_binding).hexdigest()[:24]}"
     nonce = secrets.token_bytes(16)
     credential_binding = _json_bytes(
         {
@@ -241,13 +289,13 @@ def _fixture_material(config: ProbeConfig) -> _FixtureMaterial:
     ).hexdigest()
     suffix = f"{_resource_suffix(run_id)}-{credential_digest[:8]}"
     return _FixtureMaterial(
-        teacher_username=f"openmaic-shared-{credential_digest[:24]}",
+        teacher_username=f"{prefix}-{credential_digest[:24]}",
         teacher_password=SecretStr(f"Oms-{credential_digest[24:56]}-Aa7!"),
         tenant_idempotency_key=tenant_key,
-        tenant_name=f"{_TITLE} {tenant_key.removeprefix('openmaic-shared-')}",
+        tenant_name=f"{_plane_title(config.plane)} {tenant_key.removeprefix(f'{prefix}-')}",
         resource_suffix=suffix,
-        classroom_idempotency_key=f"openmaic-shared-{credential_digest[:24]}-classroom",
-        quota_idempotency_key=f"openmaic-shared-{credential_digest[:24]}-quota",
+        classroom_idempotency_key=f"{prefix}-{credential_digest[:24]}-classroom",
+        quota_idempotency_key=f"{prefix}-{credential_digest[:24]}-quota",
     )
 
 
@@ -845,12 +893,132 @@ async def _wait_for_generated_classroom(
         await asyncio.sleep(min(0.25, _remaining(deadline)))
 
 
+def _report_binding(
+    binding: Mapping[str, object],
+    *,
+    plane: str,
+    tenant_id: str,
+    job_id: str,
+    classroom_version_id: str,
+) -> dict[str, object]:
+    error = f"{plane}_binding_invalid"
+    if set(binding) != _BINDING_RESPONSE_FIELDS:
+        raise OpenMAICSmokeProbeError(error)
+    expected_common = {
+        "schemaVersion": 1,
+        "tenantId": tenant_id,
+        "jobId": job_id,
+        "jobKind": "generation",
+        "phase": "content",
+        "status": "succeeded",
+        "progressPercent": 100,
+        "classroomVersionId": classroom_version_id,
+        "dataPlaneMode": plane,
+    }
+    if any(binding.get(field) != value for field, value in expected_common.items()):
+        raise OpenMAICSmokeProbeError(error)
+
+    attempt_count = binding.get("attemptCount")
+    shared_attempt_count = binding.get("sharedRouteAttemptCount")
+    dedicated_attempt_count = binding.get("dedicatedRouteAttemptCount")
+    selected_attempt_count = binding.get("selectedRouteAttemptCount")
+    unavailable_attempt_count = binding.get("unavailableRouteAttemptCount")
+    if (
+        any(
+            type(value) is not int
+            for value in (
+                attempt_count,
+                shared_attempt_count,
+                dedicated_attempt_count,
+                selected_attempt_count,
+                unavailable_attempt_count,
+            )
+        )
+        or attempt_count <= 0
+        or shared_attempt_count < 0
+        or dedicated_attempt_count < 0
+        or shared_attempt_count + dedicated_attempt_count != attempt_count
+        or selected_attempt_count <= 0
+        or unavailable_attempt_count < 0
+        or selected_attempt_count + unavailable_attempt_count != attempt_count
+        or binding.get("routeAttemptHistoryComplete") is not True
+    ):
+        raise OpenMAICSmokeProbeError(error)
+
+    if plane == "shared":
+        expected_shared = {
+            "dataPlaneRouteId": _SHARED_BINDING["routeId"],
+            "routeTenantId": None,
+            "routeOwnerKey": "shared",
+            "providerProfileId": _SHARED_BINDING["providerProfileId"],
+            "providerScope": "shared",
+            "providerTenantId": None,
+            "providerOwnerKey": "shared",
+            "workerPoolRef": _SHARED_BINDING["workerPoolRef"],
+            "queueRef": _SHARED_BINDING["queueRef"],
+        }
+        if (
+            any(binding.get(field) != value for field, value in expected_shared.items())
+            or shared_attempt_count != attempt_count
+            or dedicated_attempt_count != 0
+        ):
+            raise OpenMAICSmokeProbeError(error)
+        return dict(_SHARED_BINDING)
+
+    dedicated = {
+        "routeId": binding.get("dataPlaneRouteId"),
+        "routeTenantId": binding.get("routeTenantId"),
+        "routeOwnerKey": binding.get("routeOwnerKey"),
+        "providerProfileId": binding.get("providerProfileId"),
+        "providerScope": binding.get("providerScope"),
+        "providerTenantId": binding.get("providerTenantId"),
+        "providerOwnerKey": binding.get("providerOwnerKey"),
+        "workerPoolRef": binding.get("workerPoolRef"),
+        "queueRef": binding.get("queueRef"),
+        "attemptCount": attempt_count,
+        "sharedRouteAttemptCount": shared_attempt_count,
+        "dedicatedRouteAttemptCount": dedicated_attempt_count,
+        "selectedRouteAttemptCount": selected_attempt_count,
+        "unavailableRouteAttemptCount": unavailable_attempt_count,
+        "routeAttemptHistoryComplete": binding.get("routeAttemptHistoryComplete"),
+    }
+    if (
+        plane != "dedicated"
+        or any(
+            not isinstance(dedicated.get(field), str)
+            or _PUBLIC_ID.fullmatch(dedicated[field]) is None
+            for field in (
+                "routeId",
+                "routeTenantId",
+                "routeOwnerKey",
+                "providerProfileId",
+                "providerTenantId",
+                "providerOwnerKey",
+                "workerPoolRef",
+                "queueRef",
+            )
+        )
+        or dedicated["routeTenantId"] != tenant_id
+        or dedicated["routeOwnerKey"] != tenant_id
+        or dedicated["providerScope"] != "dedicated"
+        or dedicated["providerTenantId"] != tenant_id
+        or dedicated["providerOwnerKey"] != tenant_id
+        or dedicated["sharedRouteAttemptCount"] != 0
+        or dedicated["dedicatedRouteAttemptCount"] != dedicated["attemptCount"]
+        or any(
+            dedicated.get(field) == shared_value for field, shared_value in _SHARED_BINDING.items()
+        )
+    ):
+        raise OpenMAICSmokeProbeError(error)
+    return dedicated
+
+
 async def _run_openmaic_smoke_probe(
     config: ProbeConfig,
     *,
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> bytes:
-    """Create an isolated fixture and prove one materialized shared-plane generation."""
+    """Create an isolated fixture and prove one materialized generation."""
 
     material = _fixture_material(config)
     deadline = time.monotonic() + config.timeout_seconds
@@ -867,23 +1035,35 @@ async def _run_openmaic_smoke_probe(
         ) as api,
         AsyncExitStack() as fixture_cleanup,
     ):
-        created_tenant = await api.admin_json(
-            "POST",
-            "/api/v1/tenants",
-            expected_status=202,
-            headers={"Idempotency-Key": material.tenant_idempotency_key},
-            json_body={"name": material.tenant_name},
-        )
-        tenant_id = _public_id(created_tenant.get("tenant_id"), "tenant_create_invalid")
-        provisioning_job_id = _public_id(created_tenant.get("job_id"), "tenant_create_invalid")
-        if created_tenant.get("status") not in {"provisioning", "active"}:
-            raise OpenMAICSmokeProbeError("tenant_create_invalid")
-        await _wait_for_tenant(
-            api,
-            tenant_id=tenant_id,
-            job_id=provisioning_job_id,
-            deadline=deadline,
-        )
+        if config.plane == "shared":
+            created_tenant = await api.admin_json(
+                "POST",
+                "/api/v1/tenants",
+                expected_status=202,
+                headers={"Idempotency-Key": material.tenant_idempotency_key},
+                json_body={"name": material.tenant_name},
+            )
+            tenant_id = _public_id(
+                created_tenant.get("tenant_id"),
+                "tenant_create_invalid",
+            )
+            provisioning_job_id = _public_id(
+                created_tenant.get("job_id"),
+                "tenant_create_invalid",
+            )
+            if created_tenant.get("status") not in {"provisioning", "active"}:
+                raise OpenMAICSmokeProbeError("tenant_create_invalid")
+            await _wait_for_tenant(
+                api,
+                tenant_id=tenant_id,
+                job_id=provisioning_job_id,
+                deadline=deadline,
+            )
+        else:
+            tenant_id = _public_id(
+                config.dedicated_tenant_id,
+                "dedicated_tenant_invalid",
+            )
         await api.select_admin_tenant(tenant_id)
 
         await api.require_identity_absent(material.teacher_username)
@@ -948,7 +1128,7 @@ async def _run_openmaic_smoke_probe(
             "/api/v1/teaching/courses",
             expected_status=201,
             tenant_id=tenant_id,
-            json_body={"id": course_id, "title": _TITLE},
+            json_body={"id": course_id, "title": _plane_title(config.plane)},
         )
         if course.get("id") != course_id or course.get("status") != "active":
             raise OpenMAICSmokeProbeError("course_create_invalid")
@@ -958,7 +1138,7 @@ async def _run_openmaic_smoke_probe(
             f"/api/v1/teaching/courses/{course_id}/classes",
             expected_status=201,
             tenant_id=tenant_id,
-            json_body={"id": class_id, "name": _TITLE},
+            json_body={"id": class_id, "name": _plane_title(config.plane)},
         )
         if (
             classroom.get("id") != class_id
@@ -1006,10 +1186,10 @@ async def _run_openmaic_smoke_probe(
             tenant_id=tenant_id,
             headers={"Idempotency-Key": material.classroom_idempotency_key},
             json_body={
-                "title": _TITLE,
+                "title": _plane_title(config.plane),
                 "courseId": course_id,
                 "classId": class_id,
-                "objective": "Prove one real OpenMAIC shared-plane classroom generation",
+                "objective": f"Prove one real OpenMAIC {config.plane}-plane classroom generation",
                 "gradeBand": "grade-8",
                 "audience": "intermediate",
                 "durationMinutes": 15,
@@ -1020,9 +1200,9 @@ async def _run_openmaic_smoke_probe(
                 "templateVersion": "1",
                 "knowledgePoints": [
                     {
-                        "knowledgePointId": "kp-openmaic-shared-plane",
-                        "title": "OpenMAIC shared-plane generation",
-                        "description": "Verify canonical shared-plane materialization",
+                        "knowledgePointId": f"kp-openmaic-{config.plane}-plane",
+                        "title": f"OpenMAIC {config.plane}-plane generation",
+                        "description": (f"Verify canonical {config.plane}-plane materialization"),
                     }
                 ],
                 "contentMode": "open_creation",
@@ -1097,22 +1277,13 @@ async def _run_openmaic_smoke_probe(
             f"/api/v1/system/classroom-jobs/{tenant_id}/{job_id}/binding",
             expected_status=200,
         )
-        expected_binding_response = {
-            "schemaVersion": 1,
-            "tenantId": tenant_id,
-            "jobId": job_id,
-            "jobKind": "generation",
-            "phase": "content",
-            "status": "succeeded",
-            "progressPercent": 100,
-            "classroomVersionId": classroom_version_id,
-            "dataPlaneRouteId": _SHARED_BINDING["routeId"],
-            "providerProfileId": _SHARED_BINDING["providerProfileId"],
-            "workerPoolRef": _SHARED_BINDING["workerPoolRef"],
-            "queueRef": _SHARED_BINDING["queueRef"],
-        }
-        if binding != expected_binding_response:
-            raise OpenMAICSmokeProbeError("shared_binding_invalid")
+        report_binding = _report_binding(
+            binding,
+            plane=config.plane,
+            tenant_id=tenant_id,
+            job_id=job_id,
+            classroom_version_id=classroom_version_id,
+        )
 
         document = await api.teacher_document(
             f"/api/v1/classroom-versions/{classroom_version_id}/document",
@@ -1125,7 +1296,7 @@ async def _run_openmaic_smoke_probe(
     report = {
         "schemaVersion": OPENMAIC_SMOKE_SCHEMA_VERSION,
         "producer": OPENMAIC_SMOKE_PRODUCER,
-        "plane": "shared",
+        "plane": config.plane,
         "candidate": config.candidate,
         "releaseRun": config.release_run,
         "observedAt": observed_at,
@@ -1140,7 +1311,7 @@ async def _run_openmaic_smoke_probe(
             "courseId": course_id,
             "classId": class_id,
         },
-        "binding": dict(_SHARED_BINDING),
+        "binding": report_binding,
         "generation": {
             "jobId": job_id,
             "jobStatus": "succeeded",
@@ -1164,13 +1335,14 @@ async def _run_openmaic_smoke_probe(
             material.teacher_password.get_secret_value().encode("utf-8"),
             teacher_session.get_secret_value().encode("utf-8"),
         ),
+        expected_plane=config.plane,
     )
     return body
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = _StableArgumentParser(description=__doc__)
-    parser.add_argument("--plane", required=True, choices=("shared",))
+    parser.add_argument("--plane", required=True, choices=("shared", "dedicated"))
     parser.add_argument("--profile", required=True, choices=("first-release",))
     return parser.parse_args(argv)
 
@@ -1178,9 +1350,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def _load_config(
     environment: Mapping[str, str],
     *,
+    plane: str,
     cwd: Path,
     candidate_loader: CandidateLoader = _default_candidate_loader,
 ) -> ProbeConfig:
+    if plane not in {"shared", "dedicated"}:
+        raise OpenMAICSmokeProbeError("plane_invalid")
     raw_root = environment.get("YFEISTAI_CANDIDATE_ROOT")
     if not isinstance(raw_root, str) or not raw_root:
         raise OpenMAICSmokeProbeError("candidate_root_invalid")
@@ -1196,6 +1371,16 @@ def _load_config(
     if not isinstance(token, str) or not token.strip():
         raise OpenMAICSmokeProbeError("fixture_token_unavailable")
     token = token.strip()
+
+    dedicated_tenant_id: str | None = None
+    if plane == "dedicated":
+        raw_dedicated_tenant_id = environment.get("YFEISTAI_DEDICATED_TENANT_ID")
+        if (
+            not isinstance(raw_dedicated_tenant_id, str)
+            or _PUBLIC_ID.fullmatch(raw_dedicated_tenant_id) is None
+        ):
+            raise OpenMAICSmokeProbeError("dedicated_tenant_invalid")
+        dedicated_tenant_id = raw_dedicated_tenant_id
 
     release_run: dict[str, str] = {}
     for field, name in (
@@ -1242,6 +1427,8 @@ def _load_config(
         base_url=base_url,
         candidate=candidate,
         candidate_root=candidate_root,
+        dedicated_tenant_id=dedicated_tenant_id,
+        plane=plane,
         release_run=release_run,
         runtime_attestation_sha256=runtime_sha256,
         timeout_seconds=timeout_seconds,
@@ -1259,8 +1446,8 @@ async def _run_main(config: ProbeConfig) -> bytes:
 
 def main(argv: Sequence[str] | None = None) -> int:
     try:
-        _parse_args(argv)
-        config = _load_config(os.environ, cwd=Path.cwd())
+        arguments = _parse_args(argv)
+        config = _load_config(os.environ, plane=arguments.plane, cwd=Path.cwd())
         body = asyncio.run(_run_main(config))
         sys.stdout.buffer.write(body)
         sys.stdout.buffer.flush()

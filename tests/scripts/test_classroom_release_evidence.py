@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 import zipfile
 
 import pytest
@@ -55,6 +56,27 @@ def _load_verifier():
     )
 
 
+def _load_runtime_attestation_producer():
+    return _load_path(
+        "classroom_runtime_attestation_for_release_evidence",
+        ROOT / "scripts" / "classroom_runtime_attestation.py",
+    )
+
+
+def _load_runtime_attestation_support():
+    return _load_path(
+        "classroom_runtime_attestation_support_for_release_evidence",
+        ROOT / "tests" / "scripts" / "test_classroom_runtime_attestation.py",
+    )
+
+
+def _load_verify_release_support():
+    return _load_path(
+        "verify_classroom_release_support_for_evidence_test",
+        ROOT / "tests" / "scripts" / "test_verify_classroom_release.py",
+    )
+
+
 def _load_classroom_export_support():
     return _load_path(
         "classroom_export_contract_support_for_release_evidence",
@@ -74,6 +96,211 @@ def _load_openmaic_smoke_support():
         "openmaic_smoke_contract_support_for_release_evidence",
         ROOT / "tests" / "scripts" / "test_openmaic_smoke_contract.py",
     )
+
+
+def _load_gateway_public_support():
+    return _load_path(
+        "gateway_public_test_support_for_release_evidence",
+        ROOT / "tests" / "scripts" / "gateway_public_test_support.py",
+    )
+
+
+def _load_gateway_public_contract():
+    return _load_path(
+        "gateway_public_contract_for_release_evidence",
+        ROOT / "scripts" / "gateway_public_contract.py",
+    )
+
+
+def _load_backup_restore_support():
+    return _load_path(
+        "backup_restore_probe_support_for_release_evidence",
+        ROOT / "tests" / "scripts" / "test_backup_restore_probe.py",
+    )
+
+
+def test_backup_restore_writer_requires_canonical_probe_output(tmp_path: Path) -> None:
+    module = _load_evidence_module()
+    candidate_root, _candidate_document = _write_candidate_root(tmp_path)
+    bundle_root = tmp_path / "bundle"
+    (bundle_root / "runtime" / "backup-restore").mkdir(parents=True)
+
+    with pytest.raises(ValueError, match="backup restore report"):
+        module.write_backup_restore_receipt(
+            candidate_root=candidate_root,
+            bundle_root=bundle_root,
+            release_run=RELEASE_RUN,
+            database_ownership="runner-owned-disposable",
+            object_namespace_ownership="runner-owned-disposable",
+        )
+
+    assert not (bundle_root / "artifacts" / "backup_restore.json").exists()
+
+
+def test_backup_restore_writer_and_assembler_bind_canonical_report(tmp_path: Path) -> None:
+    module = _load_evidence_module()
+    support = _load_backup_restore_support()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    bundle_root = tmp_path / "bundle"
+    report_path = support.write_release_probe_fixture(
+        bundle_root,
+        candidate=candidate,
+        release_run=RELEASE_RUN,
+    )
+
+    receipt = module.write_backup_restore_receipt(
+        candidate_root=candidate_root,
+        bundle_root=bundle_root,
+        release_run=RELEASE_RUN,
+        database_ownership="runner-owned-disposable",
+        object_namespace_ownership="runner-owned-disposable",
+    )
+
+    assert receipt["provenance"] == {
+        "backupRestoreReport": {
+            "artifact": "runtime/backup-restore/backup-restore-report.json",
+            "sha256": hashlib.sha256(report_path.read_bytes()).hexdigest(),
+        }
+    }
+    assert receipt["receipt"]["result"]["checks"] == {
+        "newDatabaseRestored": True,
+        "distinctVersionedBucketRestored": True,
+        "receiptsVerified": True,
+    }
+    manifest = module.assemble_manifest(
+        bundle_root / "release-evidence.json",
+        candidate_root=candidate_root,
+        release_run=RELEASE_RUN,
+        receipt_paths={"backup_restore": bundle_root / "artifacts" / "backup_restore.json"},
+    )
+    assert manifest["evidence"]["backup_restore"]["status"] == "pass"
+
+
+def test_backup_restore_writer_preserves_existing_receipt_without_replace(
+    tmp_path: Path,
+) -> None:
+    module = _load_evidence_module()
+    support = _load_backup_restore_support()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    bundle_root = tmp_path / "bundle"
+    support.write_release_probe_fixture(
+        bundle_root,
+        candidate=candidate,
+        release_run=RELEASE_RUN,
+    )
+    receipt_path = bundle_root / "artifacts" / "backup_restore.json"
+    receipt_path.parent.mkdir()
+    receipt_path.write_bytes(b"competing-receipt\n")
+
+    with pytest.raises(FileExistsError, match="already exists"):
+        module.write_backup_restore_receipt(
+            candidate_root=candidate_root,
+            bundle_root=bundle_root,
+            release_run=RELEASE_RUN,
+            database_ownership="runner-owned-disposable",
+            object_namespace_ownership="runner-owned-disposable",
+        )
+
+    assert receipt_path.read_bytes() == b"competing-receipt\n"
+
+
+def test_backup_restore_writer_rejects_artifacts_parent_replacement_before_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_evidence_module()
+    support = _load_backup_restore_support()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    bundle_root = tmp_path / "bundle"
+    support.write_release_probe_fixture(
+        bundle_root,
+        candidate=candidate,
+        release_run=RELEASE_RUN,
+    )
+    artifacts_root = bundle_root / "artifacts"
+    artifacts_root.mkdir()
+    retained_root = bundle_root / "artifacts.retained"
+    alternate_root = bundle_root / "artifacts.alternate"
+    alternate_root.mkdir()
+    original_publish = module._publish_classroom_no_replace
+    attack_outcome: str | None = None
+
+    def replace_parent(boundary, source, target, *, source_handle) -> None:
+        nonlocal attack_outcome
+        try:
+            os.replace(artifacts_root, retained_root)
+            os.replace(alternate_root, artifacts_root)
+        except OSError as exc:
+            if os.name != "nt" or getattr(exc, "winerror", None) not in {5, 32}:
+                raise
+            attack_outcome = "permission-blocked"
+            raise ValueError(
+                "backup restore publication ancestor replacement was blocked by the held lease"
+            ) from exc
+        attack_outcome = "identity-rejected"
+        original_publish(
+            boundary,
+            source,
+            target,
+            source_handle=source_handle,
+        )
+
+    monkeypatch.setattr(module, "_publish_classroom_no_replace", replace_parent)
+
+    with pytest.raises(
+        ValueError,
+        match="ancestor|boundary|publication|changed|blocked|lease",
+    ):
+        module.write_backup_restore_receipt(
+            candidate_root=candidate_root,
+            bundle_root=bundle_root,
+            release_run=RELEASE_RUN,
+            database_ownership="runner-owned-disposable",
+            object_namespace_ownership="runner-owned-disposable",
+        )
+
+    assert attack_outcome in {"permission-blocked", "identity-rejected"}
+    assert not (artifacts_root / "backup_restore.json").exists()
+    assert not (retained_root / "backup_restore.json").exists()
+
+
+def test_backup_restore_writer_postcommit_cleanup_failure_preserves_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_evidence_module()
+    support = _load_backup_restore_support()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    bundle_root = tmp_path / "bundle"
+    support.write_release_probe_fixture(
+        bundle_root,
+        candidate=candidate,
+        release_run=RELEASE_RUN,
+    )
+    original_remove = module._remove_classroom_entries
+    injected = False
+
+    def fail_cleanup(boundary, entries, *, label: str) -> None:
+        nonlocal injected
+        original_remove(boundary, entries, label=label)
+        if label == "backup restore staging evidence":
+            injected = True
+            raise OSError("injected backup restore staging cleanup failure")
+
+    monkeypatch.setattr(module, "_remove_classroom_entries", fail_cleanup)
+
+    receipt = module.write_backup_restore_receipt(
+        candidate_root=candidate_root,
+        bundle_root=bundle_root,
+        release_run=RELEASE_RUN,
+        database_ownership="runner-owned-disposable",
+        object_namespace_ownership="runner-owned-disposable",
+    )
+
+    receipt_path = bundle_root / "artifacts" / "backup_restore.json"
+    assert injected is True
+    assert json.loads(receipt_path.read_bytes()) == receipt
+    assert not list(receipt_path.parent.glob(".backup-restore-*.tmp"))
 
 
 def _teacher_playwright_report() -> dict[str, object]:
@@ -149,8 +376,10 @@ def _write_candidate_root(tmp_path: Path) -> tuple[Path, dict[str, object]]:
     candidate_root = tmp_path / "candidate"
     deploy = candidate_root / "deploy"
     deploy.mkdir(parents=True)
+    base_compose = candidate_root / "docker-compose.yml"
     platform_compose = candidate_root / "docker-compose.platform.yml"
     data_plane_compose = candidate_root / "docker-compose.data-plane.yml"
+    base_compose.write_bytes((ROOT / "docker-compose.yml").read_bytes())
     platform_compose.write_bytes((ROOT / "docker-compose.platform.yml").read_bytes())
     data_plane_compose.write_bytes((ROOT / "docker-compose.data-plane.yml").read_bytes())
     calls = 0
@@ -174,168 +403,49 @@ def _write_candidate_root(tmp_path: Path) -> tuple[Path, dict[str, object]]:
 
 
 def _write_runtime_attestation(candidate_root: Path, lock: dict[str, object]) -> Path:
-    images = lock["images"]
-    assert isinstance(images, dict)
-    references = {
-        name: record["reference"] for name, record in images.items() if isinstance(record, dict)
-    }
-    service_images = {
-        "deeptutor": references["deeptutor"],
-        "gateway": references["nginx"],
-        "postgres": references["postgres"],
-        "minio": references["minio"],
-        "minio-bootstrap": references["minio_client"],
-        "teaching-migrate": references["deeptutor"],
-        "tenant-provisioner": references["deeptutor"],
-        "openmaic": references["openmaic"],
-        "shared-data-plane-bootstrap": references["deeptutor"],
-        "openmaic-render": references["openmaic_render"],
-        "teaching-dispatcher": references["deeptutor"],
-        "teaching-worker": references["deeptutor"],
-        "teaching-export-worker": references["deeptutor"],
-        "teaching-reaper": references["deeptutor"],
-        "learning-projector": references["deeptutor"],
-    }
-    one_shots = {
-        "minio-bootstrap",
-        "teaching-migrate",
-        "shared-data-plane-bootstrap",
-    }
-    healthy = {"deeptutor", "postgres", "minio", "openmaic", "openmaic-render"}
-
-    def repo_digest(reference: str) -> str:
-        tagged, digest = reference.rsplit("@", 1)
-        return f"{tagged.rsplit(':', 1)[0]}@{digest}"
-
-    containers: list[dict[str, object]] = []
-    for service in sorted(service_images):
-        one_shot = service in one_shots
-        reference = service_images[service]
-        image_id = "sha256:local-" + hashlib.sha256(reference.encode()).hexdigest()
-        containers.append(
-            {
-                "containerId": f"container-{service}",
-                "service": service,
-                "project": "yfeistai-platform",
-                "configImage": reference,
-                "localImageId": image_id,
-                "state": "exited" if one_shot else "running",
-                "running": not one_shot,
-                "restarting": False,
-                "health": "healthy" if service in healthy else "none",
-                "exitCode": 0,
-                "imageId": image_id,
-                "repoDigests": [repo_digest(reference)],
-            }
-        )
-    snapshot = [
-        {
-            "containerId": container["containerId"],
-            "service": container["service"],
-            "image": container["configImage"],
-            "state": container["state"],
-            "health": container["health"],
-            "exitCode": container["exitCode"],
-        }
-        for container in containers
-    ]
-    docker_prefix = [
-        "docker",
-        "--config",
-        "<isolated-docker-config>",
-        "--context",
-        "default",
-    ]
-    container_format = (
-        '{"containerId":{{json .Id}},"localImageId":{{json .Image}},'
-        '"configImage":{{json .Config.Image}},'
-        '"project":{{json (index .Config.Labels "com.docker.compose.project")}},'
-        '"service":{{json (index .Config.Labels "com.docker.compose.service")}},'
-        '"state":{{json .State.Status}},"running":{{json .State.Running}},'
-        '"restarting":{{json .State.Restarting}},"exitCode":{{json .State.ExitCode}},'
-        '"health":{{if .State.Health}}{{json .State.Health.Status}}{{else}}"none"{{end}}}'
+    producer = _load_runtime_attestation_producer()
+    support = _load_runtime_attestation_support()
+    candidate, expected_services = producer._load_candidate(candidate_root)
+    assert candidate == lock["candidate"]
+    base_compose = producer.yaml.load(
+        (candidate_root / "docker-compose.yml").read_text(encoding="utf-8"),
+        Loader=producer._ComposeLoader,
     )
-    image_format = '{"imageId":{{json .Id}},"repoDigests":{{json .RepoDigests}}}'
-    ps = [
-        "ps",
-        "-a",
-        "--no-trunc",
-        "--filter",
-        "label=com.docker.compose.project=yfeistai-platform",
-        "--format",
-        "{{json .ID}}",
-    ]
-    containers_by_id = sorted(containers, key=lambda item: str(item["containerId"]))
-    ps_stdout = "\n".join(json.dumps(container["containerId"]) for container in containers_by_id)
+    base_services = base_compose.get("services") if isinstance(base_compose, dict) else None
+    assert isinstance(base_services, dict)
 
-    def command(arguments: list[str], stdout: str) -> dict[str, object]:
-        return {
-            "argv": [*docker_prefix, *arguments],
-            "nativeExit": 0,
-            "stdout": stdout,
-            "stdoutSha256": hashlib.sha256(stdout.encode()).hexdigest(),
+    def merged_restart(service: str, settings: dict[str, object]) -> str:
+        restart = settings["restart"]
+        if isinstance(restart, str) and restart:
+            return restart
+        base_service = base_services.get(service)
+        assert isinstance(base_service, dict)
+        inherited = base_service.get("restart", "no")
+        assert isinstance(inherited, str) and inherited
+        return inherited
+
+    support.SERVICES = {
+        service: {
+            "restart": merged_restart(service, settings),
+            "health": ("healthy" if service in producer._REQUIRED_HEALTHY_SERVICES else "none"),
         }
-
-    container_records = [
-        command(
-            ["container", "inspect", "--format", container_format, str(container["containerId"])],
-            json.dumps(
-                {
-                    name: container[name]
-                    for name in (
-                        "containerId",
-                        "localImageId",
-                        "configImage",
-                        "project",
-                        "service",
-                        "state",
-                        "running",
-                        "restarting",
-                        "exitCode",
-                        "health",
-                    )
-                }
-            ),
-        )
-        for container in containers_by_id
-    ]
-    image_records = []
-    for reference in sorted(set(service_images.values())):
-        container = next(item for item in containers if item["configImage"] == reference)
-        image_records.append(
-            command(
-                ["image", "inspect", "--format", image_format, reference],
-                json.dumps(
-                    {
-                        "imageId": container["imageId"],
-                        "repoDigests": container["repoDigests"],
-                    }
-                ),
-            )
-        )
-    ps_record = command(ps, ps_stdout)
-    report = {
-        "schemaVersion": 1,
-        "candidate": lock["candidate"],
-        "releaseRun": RELEASE_RUN,
-        "observedAt": "2026-08-25T00:00:00Z",
-        "baseUrl": BASE_URL,
-        "project": "yfeistai-platform",
-        "beforeSnapshot": snapshot,
-        "afterSnapshot": snapshot,
-        "containers": containers,
-        "commands": [
-            ps_record,
-            *container_records,
-            *image_records,
-            ps_record,
-            *container_records,
-        ],
+        for service, settings in expected_services.items()
     }
-    path = candidate_root / "runtime" / "runtime-attestation.json"
-    path.parent.mkdir()
-    path.write_text(json.dumps(report), encoding="utf-8")
-    return path
+    references = {
+        service: str(settings["image"]) for service, settings in expected_services.items()
+    }
+    producer.produce_runtime_attestation(
+        candidate_root=candidate_root,
+        deployment_root=ROOT,
+        bundle_root=candidate_root,
+        release_run=RELEASE_RUN,
+        observed_at="2026-08-25T00:00:00Z",
+        base_url=BASE_URL,
+        runner=support.FakeDocker(references),
+        docker_resolver=lambda: Path("C:/fixed/docker.exe"),
+        environ={"SystemRoot": "C:/Windows"},
+    )
+    return candidate_root / "runtime" / "runtime-attestation.json"
 
 
 def _write_teacher_probe_receipt(
@@ -716,7 +826,9 @@ def test_probe_rejects_runtime_attestation_drift_after_execution(tmp_path: Path,
     assert not output.exists()
     assert not raw_report.exists()
     assert not execution.exists()
-    assert list((candidate_root / "failures" / "teacher_flow").glob("*/raw.json"))
+    failure_directories = list((candidate_root / "failures" / "teacher_flow").glob("*"))
+    assert len(failure_directories) == 1
+    assert {path.name for path in failure_directories[0].iterdir()} == {"failure.json"}
 
 
 @pytest.mark.parametrize("consumer", ("assembler", "file-runtime"))
@@ -795,7 +907,7 @@ def test_probe_receipt_preserves_existing_output_when_command_fails(
     assert not raw_report.exists()
 
 
-def test_failed_probe_preserves_diagnostics_and_canonical_paths_are_retryable(
+def test_failed_probe_preserves_secret_free_diagnostics_and_canonical_paths_are_retryable(
     tmp_path: Path,
 ) -> None:
     module = _load_evidence_module()
@@ -834,10 +946,12 @@ def test_failed_probe_preserves_diagnostics_and_canonical_paths_are_retryable(
     assert not output.exists()
     assert not raw_report.exists()
     assert not execution.exists()
-    failure_raw = list((candidate_root / "failures" / "teacher_flow").glob("*/raw.json"))
-    assert len(failure_raw) == 1
-    assert failure_raw[0].read_bytes() == b"native failure diagnostics"
-    assert list((candidate_root / "failures" / "teacher_flow").glob("*/failure.json"))
+    failure_directories = list((candidate_root / "failures" / "teacher_flow").glob("*"))
+    assert len(failure_directories) == 1
+    assert {path.name for path in failure_directories[0].iterdir()} == {"failure.json"}
+    failure = json.loads((failure_directories[0] / "failure.json").read_bytes())
+    assert failure["nativeExit"] == 7
+    assert failure["artifacts"] == {}
 
     def pass_probe(arguments, *, cwd, env, timeout):
         del cwd, timeout
@@ -867,7 +981,7 @@ def test_failed_probe_preserves_diagnostics_and_canonical_paths_are_retryable(
     assert receipt == json.loads(output.read_text(encoding="utf-8"))
     assert raw_report.exists()
     assert execution.exists()
-    assert failure_raw[0].exists()
+    assert (failure_directories[0] / "failure.json").exists()
 
 
 @pytest.mark.parametrize("case", ("invalid-raw", "outer-timeout"))
@@ -910,7 +1024,9 @@ def test_invalid_or_timed_out_probe_leaves_only_failure_diagnostics(
     assert not output.exists()
     assert not raw_report.exists()
     assert not execution.exists()
-    assert list((candidate_root / "failures" / "teacher_flow").glob("*/raw.json"))
+    failure_directories = list((candidate_root / "failures" / "teacher_flow").glob("*"))
+    assert len(failure_directories) == 1
+    assert {path.name for path in failure_directories[0].iterdir()} == {"failure.json"}
 
 
 def test_receipt_publication_failure_rolls_back_proof_and_allows_retry(
@@ -965,8 +1081,12 @@ def test_receipt_publication_failure_rolls_back_proof_and_allows_retry(
     assert not raw_report.exists()
     assert not execution.exists()
     failure_root = candidate_root / "failures" / "teacher_flow"
-    assert list(failure_root.glob("*/raw.json"))
-    assert list(failure_root.glob("*/execution.json"))
+    failure_directories = list(failure_root.glob("*"))
+    assert len(failure_directories) == 1
+    assert {path.name for path in failure_directories[0].iterdir()} == {
+        "execution.json",
+        "failure.json",
+    }
 
     receipt = module.run_probe_receipt(
         output,
@@ -1231,6 +1351,176 @@ def test_manifest_assembler_hashes_candidate_bound_receipts(tmp_path: Path) -> N
     assert set(result.missing) == set(verifier.REQUIRED_LAYERS) - {"teacher_flow"}
 
 
+def test_manifest_assembler_rejects_bundle_parent_replacement_after_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_evidence_module()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    receipt_path, _raw_report, _execution = _write_teacher_probe_receipt(
+        module,
+        candidate_root=candidate_root,
+        candidate=candidate,
+        working_directory=tmp_path,
+    )
+    receipt_body = receipt_path.read_bytes()
+    output = candidate_root / "release-evidence.json"
+    retained_root = tmp_path / "retained-candidate"
+    original_validate = module._validated_receipt
+    switched = False
+
+    def validate(*args, **kwargs):
+        nonlocal switched
+        result = original_validate(*args, **kwargs)
+        candidate_root.rename(retained_root)
+        candidate_root.mkdir()
+        (candidate_root / "artifacts").mkdir()
+        switched = True
+        return result
+
+    monkeypatch.setattr(module, "_validated_receipt", validate)
+
+    with pytest.raises(ValueError, match="boundary|changed"):
+        module.assemble_manifest(
+            output,
+            candidate_root=candidate_root,
+            release_run=RELEASE_RUN,
+            receipt_paths={"teacher_flow": receipt_path},
+        )
+
+    assert switched
+    assert not output.exists()
+    assert not (retained_root / "release-evidence.json").exists()
+    assert (retained_root / "artifacts" / "teacher_flow.json").read_bytes() == receipt_body
+
+
+def test_manifest_assembler_publishes_canonical_proof_last_without_replace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_evidence_module()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    receipt_path, _raw_report, _execution = _write_teacher_probe_receipt(
+        module,
+        candidate_root=candidate_root,
+        candidate=candidate,
+        working_directory=tmp_path,
+    )
+    output = candidate_root / "release-evidence.json"
+    events: list[str] = []
+    original_validate = module._validated_receipt
+    original_publish = module._publish_no_replace
+
+    def validate(*args, **kwargs):
+        result = original_validate(*args, **kwargs)
+        events.append("validated")
+        return result
+
+    def publish(source: Path, target: Path) -> None:
+        assert target == output
+        if not target.exists():
+            staged_document = json.loads(source.read_bytes())
+            assert staged_document["evidence"]["teacher_flow"]["status"] == "pass"
+            events.append("commit")
+        original_publish(source, target)
+
+    def fsync_directory(path: Path) -> None:
+        assert path == output.parent
+        events.append(
+            "directory-fsync-after-commit" if output.exists() else "directory-fsync-before-commit"
+        )
+
+    def forbid_replace(*_args, **_kwargs):
+        pytest.fail("manifest publication must not replace its target")
+
+    monkeypatch.setattr(module, "_validated_receipt", validate)
+    monkeypatch.setattr(module, "_publish_no_replace", publish)
+    monkeypatch.setattr(module, "_fsync_directory", fsync_directory, raising=False)
+    monkeypatch.setattr(module.os, "replace", forbid_replace)
+
+    manifest = module.assemble_manifest(
+        output,
+        candidate_root=candidate_root,
+        release_run=RELEASE_RUN,
+        receipt_paths={"teacher_flow": receipt_path},
+    )
+
+    assert events[0] == "validated"
+    assert events[-1] == "directory-fsync-after-commit"
+    assert events.index("commit") < len(events) - 1
+    canonical_body = module._json_bytes(manifest)
+    assert output.read_bytes() == canonical_body
+    with pytest.raises(FileExistsError):
+        module.assemble_manifest(
+            output,
+            candidate_root=candidate_root,
+            release_run=RELEASE_RUN,
+            receipt_paths={"teacher_flow": receipt_path},
+        )
+    assert output.read_bytes() == canonical_body
+
+
+def test_manifest_assembler_cleanup_failure_does_not_mask_primary_publication_abort(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_evidence_module()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    receipt_path, _raw_report, _execution = _write_teacher_probe_receipt(
+        module,
+        candidate_root=candidate_root,
+        candidate=candidate,
+        working_directory=tmp_path,
+    )
+    output = candidate_root / "release-evidence.json"
+
+    class PublicationAbort(BaseException):
+        pass
+
+    primary = PublicationAbort("injected manifest publication abort")
+    original_unlink = Path.unlink
+
+    def abort_publication(*_args, **_kwargs):
+        raise primary
+
+    def fail_staging_cleanup(*_args, **_kwargs):
+        raise OSError("injected manifest staging cleanup failure")
+
+    def fail_owned_staging_cleanup(path: Path, *, missing_ok: bool = False) -> None:
+        if (
+            path.parent == output.parent
+            and path.name.startswith(f".{output.name}.")
+            and path.name.endswith(".tmp")
+        ):
+            raise OSError("injected manifest staging cleanup failure")
+        original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(module, "_publish_no_replace", abort_publication)
+    monkeypatch.setattr(
+        module,
+        "_remove_manifest_staging",
+        fail_staging_cleanup,
+        raising=False,
+    )
+    monkeypatch.setattr(module.os, "replace", abort_publication)
+    monkeypatch.setattr(Path, "unlink", fail_owned_staging_cleanup)
+
+    with pytest.raises(PublicationAbort) as caught:
+        module.assemble_manifest(
+            output,
+            candidate_root=candidate_root,
+            release_run=RELEASE_RUN,
+            receipt_paths={"teacher_flow": receipt_path},
+        )
+
+    assert caught.value is primary
+    assert any(
+        "cleanup" in note and "injected manifest staging cleanup failure" in note
+        for note in getattr(primary, "__notes__", ())
+    )
+    assert not output.exists()
+
+
 @pytest.mark.parametrize("case", ("candidate", "release-run", "body"))
 def test_manifest_assembler_rejects_mismatched_or_tampered_receipts(
     tmp_path: Path,
@@ -1278,12 +1568,12 @@ def test_manifest_publish_preserves_existing_file_when_replace_fails(
     manifest_path = candidate_root / "release-evidence.json"
     manifest_path.write_bytes(b"sentinel")
 
-    def fail_replace(_source: Path, _target: Path) -> None:
-        raise OSError("simulated manifest publish failure")
+    def fail_publish(_source: Path, _target: Path) -> None:
+        pytest.fail("manifest publisher must not run for an existing target")
 
-    monkeypatch.setattr(module.os, "replace", fail_replace)
+    monkeypatch.setattr(module, "_publish_no_replace", fail_publish)
 
-    with pytest.raises(OSError, match="simulated manifest publish failure"):
+    with pytest.raises(FileExistsError, match="release manifest already exists"):
         module.assemble_manifest(
             manifest_path,
             candidate_root=candidate_root,
@@ -3425,6 +3715,344 @@ def test_openmaic_shared_plane_receipt_is_derived_from_fixed_live_smoke(
     assert result.layers["openmaic_shared_plane"].status == "pass"
 
 
+def test_dedicated_outage_binding_replays_actual_marker_and_external_docker_anchor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_evidence_module()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    marker_body = b'{"producer":"openmaic-dedicated-outage-attempt"}\n'
+    marker_reference = {
+        "artifact": "runtime/openmaic-dedicated-outage-attempt.json",
+        "sha256": hashlib.sha256(marker_body).hexdigest(),
+    }
+    outage_body = (
+        json.dumps(
+            {
+                "fixture": {
+                    "tenantId": "tenant-openmaic-dedicated-01",
+                    "attemptMarker": marker_reference,
+                },
+                "provenance": {"attemptMarker": marker_reference},
+                "outage": {"routeId": "dedicated-tenant-openmaic-01"},
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode()
+    replay_calls: list[dict[str, object]] = []
+
+    def replay_marker(*_args, return_body=False, **kwargs):
+        assert return_body is True
+        replay_calls.append(kwargs)
+        return {"producer": "openmaic-dedicated-outage-attempt"}, marker_body
+
+    def parse_outage(body: bytes, **kwargs):
+        assert body == outage_body
+        assert kwargs["attempt_marker_body"] == marker_body
+        assert kwargs["expected_docker_host_identity_sha256"] == "6" * 64
+        return {"producer": "openmaic-dedicated-outage"}
+
+    monkeypatch.setattr(
+        module,
+        "_replay_openmaic_dedicated_outage_attempt_marker",
+        replay_marker,
+        raising=False,
+    )
+    monkeypatch.setattr(module, "parse_openmaic_dedicated_outage_attestation", parse_outage)
+
+    assert module._parse_bound_openmaic_dedicated_outage_attestation(
+        outage_body,
+        bundle_root=candidate_root,
+        candidate=candidate,
+        release_run=RELEASE_RUN,
+        expected_base_url="https://candidate.example.test",
+        expected_runtime_attestation_sha256="5" * 64,
+        expected_observer_attestation_sha256="7" * 64,
+        expected_observer_id="shared-ingress-observer-openmaic-01",
+        expected_observer_origin="https://observer.example.test",
+        expected_shared_ingress_control_origin="https://shared-ingress.example.test",
+        expected_tenant_id="tenant-openmaic-dedicated-01",
+        expected_docker_host_identity_sha256="6" * 64,
+    ) == {"producer": "openmaic-dedicated-outage"}
+    assert len(replay_calls) == 1
+
+
+def test_dedicated_outage_rejects_self_consistent_observer_without_external_trust_anchor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_evidence_module()
+    verifier = _load_verifier()
+    support = _load_verify_release_support()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    support._RELEASE_RUN = RELEASE_RUN
+    provenance = support._write_probe_proof(
+        candidate_root,
+        verifier,
+        candidate,
+        "openmaic_dedicated_plane",
+    )
+    receipt = candidate_root / "artifacts" / "openmaic_dedicated_plane.json"
+    receipt.parent.mkdir(exist_ok=True)
+    receipt.write_text(
+        json.dumps(
+            support._artifact_document(
+                verifier,
+                candidate,
+                "openmaic_dedicated_plane",
+                release_run=RELEASE_RUN,
+                provenance=provenance,
+            ),
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    verifier_globals = module.probe_provenance_error.__globals__
+    monkeypatch.setitem(
+        verifier_globals,
+        "derive_openmaic_dedicated_plane_receipt_checks",
+        lambda *_args, **_kwargs: (
+            {
+                "dedicatedGenerationPassed": True,
+                "noSharedClientIssued": True,
+            },
+            "2026-08-24T00:00:00Z",
+        ),
+    )
+    monkeypatch.setitem(
+        verifier_globals,
+        "validate_runtime_attestation",
+        lambda *_args, **_kwargs: {},
+    )
+    output = candidate_root / "externally-anchored-release-evidence.json"
+
+    with pytest.raises(ValueError, match="external observer trust anchor"):
+        module.assemble_manifest(
+            output,
+            candidate_root=candidate_root,
+            release_run=RELEASE_RUN,
+            receipt_paths={"openmaic_dedicated_plane": receipt},
+            expected_outage_docker_host_identity_sha256="7" * 64,
+        )
+
+    observer_path = candidate_root / "runtime" / "openmaic-shared-ingress-observer-attestation.json"
+    with pytest.raises(ValueError, match="OpenMAIC dedicated outage execution proof"):
+        module.assemble_manifest(
+            output,
+            candidate_root=candidate_root,
+            release_run=RELEASE_RUN,
+            receipt_paths={"openmaic_dedicated_plane": receipt},
+            expected_outage_docker_host_identity_sha256="7" * 64,
+            expected_openmaic_observer_attestation_sha256="8" * 64,
+            expected_openmaic_observer_id="foreign-observer-01",
+            expected_openmaic_observer_origin="https://foreign-observer.example.test",
+            expected_openmaic_shared_ingress_control_origin=(
+                "https://foreign-control.example.test"
+            ),
+        )
+
+    manifest = module.assemble_manifest(
+        output,
+        candidate_root=candidate_root,
+        release_run=RELEASE_RUN,
+        receipt_paths={"openmaic_dedicated_plane": receipt},
+        expected_outage_docker_host_identity_sha256="7" * 64,
+        expected_openmaic_observer_attestation_sha256=hashlib.sha256(
+            observer_path.read_bytes()
+        ).hexdigest(),
+        expected_openmaic_observer_id="shared-ingress-observer-openmaic-01",
+        expected_openmaic_observer_origin="https://observer.example.test",
+        expected_openmaic_shared_ingress_control_origin=("https://shared-ingress.example.test"),
+    )
+
+    assert manifest["evidence"]["openmaic_dedicated_plane"]["status"] == "pass"
+
+
+def test_openmaic_dedicated_plane_receipt_is_derived_from_fixed_live_smoke(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_evidence_module()
+    writer = getattr(module, "write_openmaic_dedicated_plane_receipt", None)
+    assert callable(writer), "fixed OpenMAIC dedicated-plane receipt producer is missing"
+    support = _load_openmaic_smoke_support()
+    expected_host_identity_sha256 = support.DOCKER_HOST_IDENTITY_SHA256
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    runtime_path = candidate_root / "runtime" / "runtime-attestation.json"
+    runtime_sha256 = hashlib.sha256(runtime_path.read_bytes()).hexdigest()
+    token = "openmaic-dedicated-plane-token-must-not-be-serialized"
+    monkeypatch.setenv("YFEISTAI_LIVE_FIXTURE_TOKEN", token)
+    monkeypatch.delenv("YFEISTAI_DEDICATED_TENANT_ID", raising=False)
+
+    def forbidden_runner(*_args, **_kwargs):
+        pytest.fail("dedicated-plane writer must reject an invalid tenant ID before running")
+
+    for invalid_tenant_id in (None, " tenant-openmaic-dedicated-01"):
+        if invalid_tenant_id is None:
+            monkeypatch.delenv("YFEISTAI_DEDICATED_TENANT_ID", raising=False)
+        else:
+            monkeypatch.setenv("YFEISTAI_DEDICATED_TENANT_ID", invalid_tenant_id)
+        with pytest.raises(
+            ValueError,
+            match="dedicated-plane tenant ID is unavailable or invalid",
+        ):
+            writer(
+                candidate_root=candidate_root,
+                bundle_root=candidate_root,
+                release_run=RELEASE_RUN,
+                timeout_seconds=600,
+                expected_outage_docker_host_identity_sha256=expected_host_identity_sha256,
+                runner=forbidden_runner,
+            )
+
+    dedicated_tenant_id = "tenant-openmaic-dedicated-01"
+    monkeypatch.setenv("YFEISTAI_DEDICATED_TENANT_ID", dedicated_tenant_id)
+    monkeypatch.setenv("COMPOSE_FILE", "attacker-compose.yml")
+    with pytest.raises(ValueError, match="shared-ingress observer attestation is invalid"):
+        writer(
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            timeout_seconds=600,
+            expected_outage_docker_host_identity_sha256=expected_host_identity_sha256,
+            runner=forbidden_runner,
+        )
+
+    outage_path = candidate_root / "runtime" / "openmaic-dedicated-outage-attestation.json"
+    observer_path = candidate_root / "runtime" / "openmaic-shared-ingress-observer-attestation.json"
+    observer = support._observer_attestation()
+    observer["releaseRun"] = RELEASE_RUN
+    observer_body = support._module().canonical_openmaic_shared_ingress_observer_attestation(
+        observer
+    )
+    observer_path.write_bytes(observer_body)
+    observer_sha256 = hashlib.sha256(observer_body).hexdigest()
+    marker_path = candidate_root / "runtime" / "openmaic-dedicated-outage-attempt.json"
+    marker = support._dedicated_outage_attempt_marker(
+        candidate=candidate,
+        release_run=RELEASE_RUN,
+        observer_sha256=observer_sha256,
+    )
+    marker_body = support._body(marker)
+    marker_path.write_bytes(marker_body)
+    marker_reference = {
+        "artifact": "runtime/openmaic-dedicated-outage-attempt.json",
+        "sha256": hashlib.sha256(marker_body).hexdigest(),
+    }
+    outage_report = support._dedicated_outage_attestation(
+        candidate=candidate,
+        release_run=RELEASE_RUN,
+        runtime_attestation_sha256=runtime_sha256,
+    )
+    outage_report["observerAttestation"]["sha256"] = observer_sha256
+    outage_report["fixture"]["attemptMarker"] = marker_reference
+    outage_report["provenance"]["attemptMarker"] = marker_reference
+    outage_report["provenance"]["observerTrustAnchor"] = marker["observerTrustAnchor"]
+    execution = outage_report.pop("execution")
+    execution["stdoutSha256"] = hashlib.sha256(support._body(outage_report)).hexdigest()
+    outage_report["execution"] = execution
+    outage_path.write_bytes(
+        support._module().canonical_openmaic_dedicated_outage_attestation(outage_report)
+    )
+    calls: list[dict[str, object]] = []
+    publications: list[str] = []
+    real_publish = module._publish_classroom_no_replace
+
+    def runner(arguments, *, cwd, env, timeout):
+        report = support._dedicated_report()
+        report["candidate"] = candidate
+        report["releaseRun"] = RELEASE_RUN
+        report["runtimeAttestation"] = {
+            "artifact": "runtime/runtime-attestation.json",
+            "sha256": runtime_sha256,
+        }
+        calls.append(
+            {
+                "arguments": arguments,
+                "cwd": cwd,
+                "env": env,
+                "timeout": timeout,
+            }
+        )
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            support._body(report).decode("utf-8"),
+            "",
+        )
+
+    def record_publication(boundary, source: Path, target: Path, *, source_handle) -> None:
+        real_publish(boundary, source, target, source_handle=source_handle)
+        publications.append(target.relative_to(candidate_root).as_posix())
+
+    monkeypatch.setattr(module, "_publish_classroom_no_replace", record_publication)
+    receipt = writer(
+        candidate_root=candidate_root,
+        bundle_root=candidate_root,
+        release_run=RELEASE_RUN,
+        timeout_seconds=600,
+        expected_outage_docker_host_identity_sha256=expected_host_identity_sha256,
+        runner=runner,
+    )
+
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["arguments"][-4:] == [
+        "--plane",
+        "dedicated",
+        "--profile",
+        "first-release",
+    ]
+    assert call["cwd"] == candidate_root.resolve()
+    assert call["timeout"] == 600
+    assert call["env"]["YFEISTAI_LIVE_FIXTURE_TOKEN"] == token
+    assert call["env"]["YFEISTAI_DEDICATED_TENANT_ID"] == dedicated_tenant_id
+    assert dedicated_tenant_id not in call["arguments"]
+    assert "COMPOSE_FILE" not in call["env"]
+
+    receipt_path = candidate_root / "artifacts" / "openmaic_dedicated_plane.json"
+    proof_path = candidate_root / "runtime" / "openmaic-dedicated-plane-attestation.json"
+    assert publications == [
+        "artifacts/openmaic_dedicated_plane.json",
+        "runtime/openmaic-dedicated-plane-attestation.json",
+    ]
+    assert receipt == json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["evidence"] == "openmaic_dedicated_plane"
+    assert receipt["receipt"]["result"]["checks"] == {
+        "dedicatedGenerationPassed": True,
+        "noSharedClientIssued": True,
+        "noSharedFallback": True,
+    }
+    proof_sha256 = hashlib.sha256(proof_path.read_bytes()).hexdigest()
+    assert receipt["provenance"] == {
+        "openmaicDedicatedPlaneAttestation": {
+            "artifact": "runtime/openmaic-dedicated-plane-attestation.json",
+            "sha256": proof_sha256,
+        },
+        "openmaicDedicatedOutageAttestation": {
+            "artifact": "runtime/openmaic-dedicated-outage-attestation.json",
+            "sha256": hashlib.sha256(outage_path.read_bytes()).hexdigest(),
+        },
+        "openmaicSharedIngressObserverAttestation": {
+            "artifact": "runtime/openmaic-shared-ingress-observer-attestation.json",
+            "sha256": hashlib.sha256(observer_body).hexdigest(),
+        },
+    }
+    proof = json.loads(proof_path.read_text(encoding="utf-8"))
+    assert proof["execution"]["command"] == module.openmaic_dedicated_plane_command_record()
+    assert proof["summary"]["binding"]["routeTenantId"] == proof["summary"]["fixture"]["tenantId"]
+    assert proof["summary"]["checks"] == {
+        "dedicatedGenerationPassed": True,
+        "noSharedClientIssued": True,
+    }
+    assert token not in receipt_path.read_text(encoding="utf-8")
+    assert token not in proof_path.read_text(encoding="utf-8")
+    assert "YFEISTAI_DEDICATED_TENANT_ID" not in receipt_path.read_text(encoding="utf-8")
+    assert "YFEISTAI_DEDICATED_TENANT_ID" not in proof_path.read_text(encoding="utf-8")
+
+
 def test_openmaic_shared_plane_publication_failure_leaves_no_formal_receipt_or_proof(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3603,6 +4231,59 @@ def test_release_evidence_cli_runs_fixed_openmaic_shared_plane_producer(
     }
     assert capsys.readouterr().out == (
         f"{bundle_root / 'runtime' / 'openmaic-shared-plane-attestation.json'}\n"
+    )
+
+
+def test_release_evidence_cli_runs_fixed_openmaic_dedicated_plane_producer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = _load_evidence_module()
+    support = _load_openmaic_smoke_support()
+    candidate_root = tmp_path / "candidate"
+    bundle_root = tmp_path / "bundle"
+    captured: dict[str, object] = {}
+
+    def write_receipt(**arguments: object) -> dict[str, object]:
+        captured.update(arguments)
+        return {}
+
+    monkeypatch.setattr(
+        module,
+        "write_openmaic_dedicated_plane_receipt",
+        write_receipt,
+        raising=False,
+    )
+    assert (
+        module.main(
+            [
+                "openmaic-dedicated-plane",
+                "--candidate-root",
+                str(candidate_root),
+                "--bundle-root",
+                str(bundle_root),
+                "--run-id",
+                RELEASE_RUN["runId"],
+                "--environment-id",
+                RELEASE_RUN["environmentId"],
+                "--timeout-seconds",
+                "600",
+                "--outage-docker-host-identity-sha256",
+                support.DOCKER_HOST_IDENTITY_SHA256,
+            ]
+        )
+        == 0
+    )
+    assert captured == {
+        "candidate_root": candidate_root,
+        "bundle_root": bundle_root,
+        "release_run": RELEASE_RUN,
+        "timeout_seconds": 600,
+        "expected_outage_docker_host_identity_sha256": support.DOCKER_HOST_IDENTITY_SHA256,
+    }
+    assert capsys.readouterr().out == (
+        f"{bundle_root / 'runtime' / 'openmaic-dedicated-plane-attestation.json'}\n"
     )
 
 
@@ -4439,6 +5120,52 @@ def test_release_evidence_cli_writes_candidate_receipts(
     assert capsys.readouterr().out == f"{output}\n"
 
 
+def test_release_evidence_cli_writes_backup_restore_receipt(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    module = _load_evidence_module()
+    candidate_root = tmp_path / "candidate"
+    bundle_root = tmp_path / "bundle"
+    captured: dict[str, object] = {}
+
+    def write_receipt(**arguments: object) -> dict[str, object]:
+        captured.update(arguments)
+        return {}
+
+    monkeypatch.setattr(module, "write_backup_restore_receipt", write_receipt)
+
+    assert (
+        module.main(
+            [
+                "backup-restore",
+                "--candidate-root",
+                str(candidate_root),
+                "--bundle-root",
+                str(bundle_root),
+                "--run-id",
+                RELEASE_RUN["runId"],
+                "--environment-id",
+                RELEASE_RUN["environmentId"],
+                "--database-ownership",
+                "runner-owned-disposable",
+                "--object-namespace-ownership",
+                "runner-owned-disposable",
+            ]
+        )
+        == 0
+    )
+    assert captured == {
+        "candidate_root": candidate_root,
+        "bundle_root": bundle_root,
+        "release_run": RELEASE_RUN,
+        "database_ownership": "runner-owned-disposable",
+        "object_namespace_ownership": "runner-owned-disposable",
+    }
+    assert capsys.readouterr().out == f"{bundle_root / 'artifacts' / 'backup_restore.json'}\n"
+
+
 def test_release_evidence_cli_assembles_named_receipts(
     tmp_path: Path,
     monkeypatch,
@@ -4587,3 +5314,1833 @@ def test_release_evidence_cli_rejects_self_attestation_inputs(
                 "attacker-controlled",
             ]
         )
+
+
+def _gateway_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module = _load_evidence_module()
+    contract = _load_gateway_public_contract()
+    support = _load_gateway_public_support()
+    candidate_root, candidate = _write_candidate_root(tmp_path)
+    runtime_path = candidate_root / "runtime" / "runtime-attestation.json"
+    runtime = json.loads(runtime_path.read_bytes())
+    context_stdout = json.dumps(support.DOCKER_ENDPOINT)
+    info_stdout = json.dumps(
+        {
+            "osType": support.DOCKER_OS_TYPE,
+            "serverId": support.DOCKER_SERVER_ID,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+    def host_command(arguments: list[str], stdout: str) -> dict[str, object]:
+        return {
+            "argv": [*support.DOCKER_LOGICAL_PREFIX, *arguments],
+            "nativeExit": 0,
+            "stdout": stdout,
+            "stdoutSha256": hashlib.sha256(stdout.encode()).hexdigest(),
+        }
+
+    host_commands = [
+        host_command(support.DOCKER_CONTEXT_ARGUMENTS, context_stdout),
+        host_command(support.DOCKER_INFO_ARGUMENTS, info_stdout),
+    ]
+    runtime_commands = runtime["commands"]
+    runtime["commands"] = [
+        *runtime_commands[:2],
+        *host_commands,
+        *runtime_commands[2:],
+        *host_commands,
+    ]
+    runtime_path.write_text(json.dumps(runtime, sort_keys=True), encoding="utf-8")
+    trust_pair = support.write_gateway_trust_pair(
+        candidate_root,
+        contract,
+        trusted_root=tmp_path / "trusted-gateway-controller",
+        candidate=candidate,
+        release_run=RELEASE_RUN,
+        runtime_path=runtime_path,
+    )
+
+    def validate_runtime(path: Path, **_kwargs):
+        assert Path(path) == runtime_path
+        return json.loads(runtime_path.read_bytes())
+
+    monkeypatch.setattr(module, "validate_runtime_attestation", validate_runtime)
+    report_path = Path(trust_pair["report_path"])
+    attestation_path = Path(trust_pair["observer_attestation_path"])
+    monkeypatch.setenv(
+        support.EXPECTED_ATTESTATION_ENV,
+        str(trust_pair["observer_attestation_sha256"]),
+    )
+    monkeypatch.setenv(support.EXPECTED_OBSERVER_ID_ENV, support.OBSERVER_ID)
+    monkeypatch.setenv(support.EXPECTED_OBSERVER_ORIGIN_ENV, support.OBSERVER_ORIGIN)
+    monkeypatch.setenv(support.TRUSTED_NOW_ENV, support.TRUSTED_NOW)
+    monkeypatch.setenv(support.RUN_STARTED_AT_ENV, support.RUN_STARTED_AT)
+    monkeypatch.setenv(support.RUN_ENDED_AT_ENV, support.RUN_ENDED_AT)
+    return (
+        module,
+        contract,
+        support,
+        candidate_root,
+        runtime_path,
+        report_path,
+        attestation_path,
+        trust_pair,
+    )
+
+
+def _gateway_external_trust_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    return _gateway_fixture(tmp_path, monkeypatch)
+
+
+def _invalidate_gateway_trust_input(
+    trust_pair: dict[str, object],
+    invalid_input: str,
+) -> None:
+    input_name, mutation = invalid_input.rsplit("-", 1)
+    path_keys = {
+        "observer-envelope": "observer_envelope_path",
+        "host-envelope": "host_envelope_path",
+        "host-receipt": "host_receipt_path",
+        "keyring": "keyring_path",
+    }
+    path = Path(trust_pair[path_keys[input_name]])
+    if mutation == "missing":
+        path.rename(path.with_name(f"{path.name}.missing"))
+    else:
+        path.write_bytes(path.read_bytes() + b" ")
+
+
+@pytest.mark.parametrize(
+    "invalid_input",
+    (
+        "observer-envelope-missing",
+        "observer-envelope-tampered",
+        "host-envelope-missing",
+        "host-envelope-tampered",
+        "host-receipt-missing",
+        "host-receipt-tampered",
+        "keyring-missing",
+        "keyring-tampered",
+    ),
+)
+def test_gateway_only_public_requires_external_trust_pair_before_docker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_input: str,
+) -> None:
+    (
+        module,
+        _contract,
+        support,
+        candidate_root,
+        runtime_path,
+        _report_path,
+        _attestation_path,
+        trust_pair,
+    ) = _gateway_external_trust_fixture(tmp_path, monkeypatch)
+    _invalidate_gateway_trust_input(trust_pair, invalid_input)
+    calls: list[list[str]] = []
+
+    try:
+        with pytest.raises(ValueError, match="gateway trust"):
+            module.write_gateway_only_public_receipt(
+                candidate_root=candidate_root,
+                bundle_root=candidate_root,
+                release_run=RELEASE_RUN,
+                timeout_seconds=30,
+                expected_docker_host_identity_sha256=str(trust_pair["host_receipt_sha256"]),
+                **support.gateway_trust_arguments(trust_pair),
+                runner=support.docker_runner(runtime_path, calls=calls),
+                docker_resolver=lambda: Path("C:/fixed/docker.exe"),
+            )
+    finally:
+        assert calls == []
+
+
+def test_gateway_only_public_binds_external_trust_pair_into_execution_proof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        module,
+        _contract,
+        support,
+        candidate_root,
+        runtime_path,
+        _report_path,
+        _attestation_path,
+        trust_pair,
+    ) = _gateway_external_trust_fixture(tmp_path, monkeypatch)
+
+    module.write_gateway_only_public_receipt(
+        candidate_root=candidate_root,
+        bundle_root=candidate_root,
+        release_run=RELEASE_RUN,
+        timeout_seconds=30,
+        expected_docker_host_identity_sha256=str(trust_pair["host_receipt_sha256"]),
+        **support.gateway_trust_arguments(trust_pair),
+        runner=support.docker_runner(runtime_path),
+        docker_resolver=lambda: Path("C:/fixed/docker.exe"),
+    )
+
+    runtime = json.loads(runtime_path.read_bytes())
+    proof = json.loads(
+        (candidate_root / "runtime" / "gateway-only-public-attestation.json").read_bytes()
+    )
+    host_receipt = trust_pair["host_receipt"]
+    assert isinstance(host_receipt, dict)
+    host = host_receipt["host"]
+    assert isinstance(host, dict)
+    expected_runtime_identity = {
+        "context": host["dockerContext"],
+        "endpoint": host["dockerEndpoint"],
+        "serverId": host["dockerServerId"],
+        "dockerHostIdentitySha256": trust_pair["host_receipt_sha256"],
+    }
+    assert proof["trustPair"] == support.gateway_trust_references(trust_pair)
+    assert runtime["dockerHostIdentity"] == expected_runtime_identity
+    assert proof["docker"]["daemon"] == {
+        **expected_runtime_identity,
+        "osType": host["osType"],
+    }
+
+
+@pytest.mark.parametrize("legacy_environment", ("absent", "conflicting"))
+def test_gateway_only_public_uses_signed_observer_policy_without_legacy_trust_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    legacy_environment: str,
+) -> None:
+    (
+        module,
+        _contract,
+        support,
+        candidate_root,
+        runtime_path,
+        _report_path,
+        _attestation_path,
+        trust_pair,
+    ) = _gateway_external_trust_fixture(tmp_path, monkeypatch)
+    legacy_values = {
+        support.EXPECTED_ATTESTATION_ENV: "f" * 64,
+        support.EXPECTED_OBSERVER_ID_ENV: "conflicting-observer-01",
+        support.EXPECTED_OBSERVER_ORIGIN_ENV: "https://conflicting-observer.example.net",
+        support.TRUSTED_NOW_ENV: "2026-08-30T04:06:00Z",
+        support.RUN_STARTED_AT_ENV: "2026-08-30T03:59:00Z",
+        support.RUN_ENDED_AT_ENV: "2026-08-30T04:11:00Z",
+    }
+    for name, value in legacy_values.items():
+        if legacy_environment == "absent":
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+
+    receipt = module.write_gateway_only_public_receipt(
+        candidate_root=candidate_root,
+        bundle_root=candidate_root,
+        release_run=RELEASE_RUN,
+        timeout_seconds=30,
+        expected_docker_host_identity_sha256=str(trust_pair["host_receipt_sha256"]),
+        **support.gateway_trust_arguments(trust_pair),
+        runner=support.docker_runner(runtime_path),
+        docker_resolver=lambda: Path("C:/fixed/docker.exe"),
+    )
+
+    expected_checks = {"gatewayPublic": True, "internalPortsClosed": True}
+    proof = json.loads(
+        (candidate_root / "runtime" / "gateway-only-public-attestation.json").read_bytes()
+    )
+    assert proof["trustPair"] == support.gateway_trust_references(trust_pair)
+    assert proof["summary"]["checks"] == expected_checks
+    assert receipt["receipt"]["result"]["checks"] == expected_checks
+
+
+def _expected_gateway_service_networks(support) -> dict[str, list[str]]:
+    internal = f"{support.DOCKER_PROJECT}_platform-internal"
+    expected = {
+        service: [internal]
+        for service in (
+            "postgres",
+            "minio",
+            "minio-bootstrap",
+            "teaching-migrate",
+            "tenant-provisioner",
+            "shared-data-plane-bootstrap",
+            "openmaic-render",
+            "teaching-dispatcher",
+            "teaching-worker",
+            "teaching-export-worker",
+            "teaching-reaper",
+            "learning-projector",
+        )
+    }
+    expected.update(
+        {
+            "deeptutor": [
+                internal,
+                f"{support.DOCKER_PROJECT}_platform-service-egress",
+            ],
+            "gateway": [
+                internal,
+                f"{support.DOCKER_PROJECT}_platform-edge",
+            ],
+            "openmaic": [
+                internal,
+                f"{support.DOCKER_PROJECT}_shared-provider-egress",
+            ],
+        }
+    )
+    return expected
+
+
+def test_gateway_only_public_candidate_compose_locks_each_runtime_service_network_set(
+    tmp_path: Path,
+) -> None:
+    support = _load_gateway_public_support()
+    candidate_root, _candidate = _write_candidate_root(tmp_path)
+    runtime = json.loads((candidate_root / "runtime" / "runtime-attestation.json").read_bytes())
+
+    assert support.expected_service_networks(
+        candidate_root / "docker-compose.platform.yml",
+        runtime,
+    ) == _expected_gateway_service_networks(support)
+
+
+def test_gateway_only_public_binds_trusted_docker_host_identity_to_runtime_and_observed_daemon(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        module,
+        _contract,
+        support,
+        candidate_root,
+        runtime_path,
+        _report_path,
+        _attestation_path,
+        trust_pair,
+    ) = _gateway_fixture(
+        tmp_path,
+        monkeypatch,
+    )
+
+    with pytest.raises(ValueError, match="Docker host identity"):
+        module.write_gateway_only_public_receipt(
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            timeout_seconds=30,
+            expected_docker_host_identity_sha256="8" * 64,
+            **support.gateway_trust_arguments(trust_pair),
+            runner=support.docker_runner(runtime_path),
+            docker_resolver=lambda: Path("C:/fixed/docker.exe"),
+        )
+    assert not (candidate_root / "artifacts" / "gateway_only_public.json").exists()
+    assert not (candidate_root / "runtime" / "gateway-only-public-attestation.json").exists()
+
+    module.write_gateway_only_public_receipt(
+        candidate_root=candidate_root,
+        bundle_root=candidate_root,
+        release_run=RELEASE_RUN,
+        timeout_seconds=30,
+        expected_docker_host_identity_sha256=str(trust_pair["host_receipt_sha256"]),
+        **support.gateway_trust_arguments(trust_pair),
+        runner=support.docker_runner(runtime_path),
+        docker_resolver=lambda: Path("C:/fixed/docker.exe"),
+    )
+
+    runtime = json.loads(runtime_path.read_bytes())
+    proof = json.loads(
+        (candidate_root / "runtime" / "gateway-only-public-attestation.json").read_bytes()
+    )
+    expected_identity = support.docker_host_identity(
+        identity_sha256=str(trust_pair["host_receipt_sha256"])
+    )
+    assert runtime["dockerHostIdentity"] == expected_identity
+    assert proof["docker"]["daemon"] == {
+        **expected_identity,
+        "osType": support.DOCKER_OS_TYPE,
+    }
+
+
+@pytest.mark.parametrize(
+    ("case", "attacker_value"),
+    (
+        ("endpoint", "npipe:////./pipe/attacker"),
+        ("serverId", "daemon-attacker"),
+    ),
+    ids=("endpoint", "server-id"),
+)
+def test_gateway_only_public_rejects_self_consistent_untrusted_docker_daemon(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    attacker_value: str,
+) -> None:
+    (
+        module,
+        _contract,
+        support,
+        candidate_root,
+        runtime_path,
+        _report_path,
+        _attestation_path,
+        trust_pair,
+    ) = _gateway_fixture(
+        tmp_path,
+        monkeypatch,
+    )
+    original_runner = support.docker_runner(runtime_path)
+
+    def runner(arguments, *, cwd, env, timeout):
+        logical = arguments[5:]
+        if case == "endpoint" and logical == support.DOCKER_CONTEXT_ARGUMENTS:
+            return subprocess.CompletedProcess(arguments, 0, json.dumps(attacker_value), "")
+        if case == "serverId" and logical == support.DOCKER_INFO_ARGUMENTS:
+            return subprocess.CompletedProcess(
+                arguments,
+                0,
+                json.dumps(
+                    {"osType": support.DOCKER_OS_TYPE, "serverId": attacker_value},
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+                "",
+            )
+        return original_runner(arguments, cwd=cwd, env=env, timeout=timeout)
+
+    with pytest.raises(ValueError, match="Docker host identity"):
+        module.write_gateway_only_public_receipt(
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            timeout_seconds=30,
+            expected_docker_host_identity_sha256=str(trust_pair["host_receipt_sha256"]),
+            **support.gateway_trust_arguments(trust_pair),
+            runner=runner,
+            docker_resolver=lambda: Path("C:/fixed/docker.exe"),
+        )
+
+    assert not (candidate_root / "artifacts" / "gateway_only_public.json").exists()
+    assert not (candidate_root / "runtime" / "gateway-only-public-attestation.json").exists()
+
+
+def test_gateway_only_public_receipt_records_exact_candidate_compose_network_sets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        module,
+        _contract,
+        support,
+        candidate_root,
+        runtime_path,
+        _report_path,
+        _attestation_path,
+        trust_pair,
+    ) = _gateway_fixture(tmp_path, monkeypatch)
+    compose_path = candidate_root / "docker-compose.platform.yml"
+    calls: list[list[str]] = []
+
+    module.write_gateway_only_public_receipt(
+        candidate_root=candidate_root,
+        bundle_root=candidate_root,
+        release_run=RELEASE_RUN,
+        timeout_seconds=30,
+        expected_docker_host_identity_sha256=str(trust_pair["host_receipt_sha256"]),
+        **support.gateway_trust_arguments(trust_pair),
+        runner=support.docker_runner(
+            runtime_path,
+            compose_path=compose_path,
+            calls=calls,
+        ),
+        docker_resolver=lambda: Path("C:/fixed/docker.exe"),
+    )
+
+    proof = json.loads(
+        (candidate_root / "runtime" / "gateway-only-public-attestation.json").read_bytes()
+    )
+    expected_networks = _expected_gateway_service_networks(support)
+    for snapshot_name in ("beforeSnapshot", "afterSnapshot"):
+        snapshot = proof["docker"][snapshot_name]
+        assert {
+            row["service"]: {
+                "networkMode": row["networkMode"],
+                "networks": row["networks"],
+            }
+            for row in snapshot
+        } == {
+            service: {
+                "networkMode": networks[-1],
+                "networks": sorted(networks),
+            }
+            for service, networks in expected_networks.items()
+        }
+    inspect_calls = [
+        arguments for arguments in calls if arguments[5:8] == ["container", "inspect", "--format"]
+    ]
+    assert inspect_calls
+    assert all(arguments[8] == support.DOCKER_NETWORK_INSPECT_FORMAT for arguments in inspect_calls)
+
+
+@pytest.mark.parametrize("network_drift", ("missing-network", "additional-network"))
+def test_gateway_only_public_rejects_missing_or_additional_compose_network_attachment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    network_drift: str,
+) -> None:
+    (
+        module,
+        _contract,
+        support,
+        candidate_root,
+        runtime_path,
+        _report_path,
+        _attestation_path,
+        trust_pair,
+    ) = _gateway_fixture(tmp_path, monkeypatch)
+
+    with pytest.raises(ValueError, match="network set"):
+        module.write_gateway_only_public_receipt(
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            timeout_seconds=30,
+            expected_docker_host_identity_sha256=str(trust_pair["host_receipt_sha256"]),
+            **support.gateway_trust_arguments(trust_pair),
+            runner=support.docker_runner(
+                runtime_path,
+                compose_path=candidate_root / "docker-compose.platform.yml",
+                network_drift=network_drift,
+            ),
+            docker_resolver=lambda: Path("C:/fixed/docker.exe"),
+        )
+
+    assert not (candidate_root / "artifacts" / "gateway_only_public.json").exists()
+    assert not (candidate_root / "runtime" / "gateway-only-public-attestation.json").exists()
+
+
+def test_gateway_only_public_receipt_replays_external_and_docker_proof_last(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        module,
+        _contract,
+        support,
+        candidate_root,
+        runtime_path,
+        report_path,
+        attestation_path,
+        trust_pair,
+    ) = _gateway_fixture(tmp_path, monkeypatch)
+    immutable_inputs = {
+        report_path: report_path.read_bytes(),
+        attestation_path: attestation_path.read_bytes(),
+    }
+    sentinel_secret = "gateway-sentinel-secret-must-not-leak"
+    monkeypatch.setenv("YFEISTAI_GATEWAY_SENTINEL_SECRET", sentinel_secret)
+    docker_calls: list[list[str]] = []
+    docker_environments: list[dict[str, str]] = []
+    publications: list[str] = []
+    original_publish = module._publish_no_replace
+
+    def publish(source: Path, target: Path) -> None:
+        publications.append(target.relative_to(candidate_root).as_posix())
+        original_publish(source, target)
+
+    monkeypatch.setattr(module, "_publish_no_replace", publish)
+    receipt = module.write_gateway_only_public_receipt(
+        candidate_root=candidate_root,
+        bundle_root=candidate_root,
+        release_run=RELEASE_RUN,
+        timeout_seconds=30,
+        expected_docker_host_identity_sha256=str(trust_pair["host_receipt_sha256"]),
+        **support.gateway_trust_arguments(trust_pair),
+        runner=support.docker_runner(
+            runtime_path,
+            calls=docker_calls,
+            environments=docker_environments,
+        ),
+        docker_resolver=lambda: Path("C:/fixed/docker.exe"),
+    )
+
+    proof_path = candidate_root / "runtime" / "gateway-only-public-attestation.json"
+    receipt_path = candidate_root / "artifacts" / "gateway_only_public.json"
+    proof = json.loads(proof_path.read_bytes())
+    assert publications == [
+        "artifacts/gateway_only_public.json",
+        "runtime/gateway-only-public-attestation.json",
+    ]
+    assert proof["docker"]["beforeSnapshot"] == proof["docker"]["afterSnapshot"]
+    assert proof["docker"]["daemon"] == {
+        "context": support.DOCKER_CONTEXT,
+        "endpoint": support.DOCKER_ENDPOINT,
+        "serverId": support.DOCKER_SERVER_ID,
+        "osType": support.DOCKER_OS_TYPE,
+        "dockerHostIdentitySha256": trust_pair["host_receipt_sha256"],
+    }
+    runtime = json.loads(runtime_path.read_bytes())
+    ordered_ids = sorted(str(row["containerId"]) for row in runtime["containers"])
+    expected_round = [
+        support.DOCKER_CONTEXT_ARGUMENTS,
+        support.DOCKER_INFO_ARGUMENTS,
+        support.DOCKER_PS_ARGUMENTS,
+        *[
+            [
+                "container",
+                "inspect",
+                "--format",
+                support.DOCKER_NETWORK_INSPECT_FORMAT,
+                container_id,
+            ]
+            for container_id in ordered_ids
+        ],
+        support.DOCKER_CONTEXT_ARGUMENTS,
+        support.DOCKER_INFO_ARGUMENTS,
+    ]
+    assert [arguments[5:] for arguments in docker_calls] == [
+        *expected_round,
+        *expected_round,
+    ]
+    assert all(Path(arguments[0]) == Path("C:/fixed/docker.exe") for arguments in docker_calls)
+    assert all(arguments[1] == "--config" for arguments in docker_calls)
+    assert all(arguments[3:5] == ["--context", "default"] for arguments in docker_calls)
+    expected_networks = _expected_gateway_service_networks(support)
+    assert all(
+        row["networkMode"] == expected_networks[row["service"]][-1]
+        for row in proof["docker"]["beforeSnapshot"]
+    )
+    assert [row for row in proof["docker"]["beforeSnapshot"] if row["publishedPorts"]] == [
+        {
+            "containerId": "container-gateway",
+            "project": "yfeistai-platform",
+            "service": "gateway",
+            "networkMode": f"{support.DOCKER_PROJECT}_platform-edge",
+            "networks": [
+                f"{support.DOCKER_PROJECT}_platform-edge",
+                f"{support.DOCKER_PROJECT}_platform-internal",
+            ],
+            "publishedPorts": [
+                {
+                    "containerPort": 80,
+                    "hostIp": "0.0.0.0",
+                    "hostPort": 80,
+                    "protocol": "tcp",
+                },
+                {
+                    "containerPort": 443,
+                    "hostIp": "0.0.0.0",
+                    "hostPort": 443,
+                    "protocol": "tcp",
+                },
+            ],
+        }
+    ]
+    assert proof["summary"]["checks"] == {
+        "gatewayPublic": True,
+        "internalPortsClosed": True,
+    }
+    assert receipt["provenance"] == support.receipt_provenance(proof_path)
+    assert json.loads(receipt_path.read_bytes()) == receipt
+    assert {path: path.read_bytes() for path in immutable_inputs} == immutable_inputs
+    assert all(sentinel_secret not in environment.values() for environment in docker_environments)
+    assert sentinel_secret not in proof_path.read_text(encoding="utf-8")
+    assert sentinel_secret not in receipt_path.read_text(encoding="utf-8")
+
+
+def test_gateway_only_public_proves_before_and_after_daemon_identity_for_each_round(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        module,
+        _contract,
+        support,
+        candidate_root,
+        runtime_path,
+        _report_path,
+        _attestation_path,
+        trust_pair,
+    ) = _gateway_fixture(tmp_path, monkeypatch)
+    calls: list[list[str]] = []
+
+    module.write_gateway_only_public_receipt(
+        candidate_root=candidate_root,
+        bundle_root=candidate_root,
+        release_run=RELEASE_RUN,
+        timeout_seconds=30,
+        expected_docker_host_identity_sha256=str(trust_pair["host_receipt_sha256"]),
+        **support.gateway_trust_arguments(trust_pair),
+        runner=support.docker_runner(runtime_path, calls=calls),
+        docker_resolver=lambda: Path("C:/fixed/docker.exe"),
+    )
+
+    logical_calls = [arguments[5:] for arguments in calls]
+    assert logical_calls.count(support.DOCKER_CONTEXT_ARGUMENTS) == 4
+    assert logical_calls.count(support.DOCKER_INFO_ARGUMENTS) == 4
+    runtime = json.loads(runtime_path.read_bytes())
+    ordered_ids = sorted(str(row["containerId"]) for row in runtime["containers"])
+    snapshot_commands = [
+        support.DOCKER_PS_ARGUMENTS,
+        *[
+            [
+                "container",
+                "inspect",
+                "--format",
+                support.DOCKER_NETWORK_INSPECT_FORMAT,
+                container_id,
+            ]
+            for container_id in ordered_ids
+        ],
+    ]
+    bracketed_round = [
+        support.DOCKER_CONTEXT_ARGUMENTS,
+        support.DOCKER_INFO_ARGUMENTS,
+        *snapshot_commands,
+        support.DOCKER_CONTEXT_ARGUMENTS,
+        support.DOCKER_INFO_ARGUMENTS,
+    ]
+    assert logical_calls == [*bracketed_round, *bracketed_round]
+    proof = json.loads(
+        (candidate_root / "runtime" / "gateway-only-public-attestation.json").read_bytes()
+    )
+    command_records = proof["docker"]["commands"]
+    assert [record["argv"][5:] for record in command_records] == logical_calls
+    context_observations = [
+        json.loads(record["stdout"])
+        for record in command_records
+        if record["argv"][5:] == support.DOCKER_CONTEXT_ARGUMENTS
+    ]
+    info_observations = [
+        json.loads(record["stdout"])
+        for record in command_records
+        if record["argv"][5:] == support.DOCKER_INFO_ARGUMENTS
+    ]
+    assert context_observations == [support.DOCKER_ENDPOINT] * 4
+    assert (
+        info_observations
+        == [{"osType": support.DOCKER_OS_TYPE, "serverId": support.DOCKER_SERVER_ID}] * 4
+    )
+
+
+def test_gateway_only_public_rejects_second_round_post_snapshot_daemon_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        module,
+        _contract,
+        support,
+        candidate_root,
+        runtime_path,
+        _report_path,
+        _attestation_path,
+        trust_pair,
+    ) = _gateway_fixture(tmp_path, monkeypatch)
+    original_runner = support.docker_runner(runtime_path)
+    context_observations = 0
+    info_observations = 0
+
+    def runner(arguments, *, cwd, env, timeout):
+        nonlocal context_observations, info_observations
+        logical = arguments[5:]
+        if logical == support.DOCKER_CONTEXT_ARGUMENTS:
+            context_observations += 1
+            if context_observations == 4:
+                return subprocess.CompletedProcess(
+                    arguments,
+                    0,
+                    json.dumps("npipe:////./pipe/attacker"),
+                    "",
+                )
+        elif logical == support.DOCKER_INFO_ARGUMENTS:
+            info_observations += 1
+            if info_observations == 4:
+                return subprocess.CompletedProcess(
+                    arguments,
+                    0,
+                    json.dumps(
+                        {"osType": support.DOCKER_OS_TYPE, "serverId": "daemon-attacker"},
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                    "",
+                )
+        return original_runner(arguments, cwd=cwd, env=env, timeout=timeout)
+
+    with pytest.raises(ValueError, match="Docker.*(?:daemon|host identity)"):
+        module.write_gateway_only_public_receipt(
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            timeout_seconds=30,
+            expected_docker_host_identity_sha256=str(trust_pair["host_receipt_sha256"]),
+            **support.gateway_trust_arguments(trust_pair),
+            runner=runner,
+            docker_resolver=lambda: Path("C:/fixed/docker.exe"),
+        )
+
+    assert context_observations == 4
+    assert not (candidate_root / "artifacts" / "gateway_only_public.json").exists()
+    assert not (candidate_root / "runtime" / "gateway-only-public-attestation.json").exists()
+
+
+def test_gateway_only_public_uses_single_decreasing_deadline_across_both_docker_rounds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        module,
+        _contract,
+        support,
+        candidate_root,
+        runtime_path,
+        _report_path,
+        _attestation_path,
+        trust_pair,
+    ) = _gateway_fixture(tmp_path, monkeypatch)
+    now = [100.0]
+    timeouts: list[int] = []
+    original_runner = support.docker_runner(runtime_path)
+
+    def monotonic() -> float:
+        return now[0]
+
+    def runner(arguments, *, cwd, env, timeout):
+        timeouts.append(timeout)
+        completed = original_runner(
+            arguments,
+            cwd=cwd,
+            env=env,
+            timeout=timeout,
+        )
+        now[0] += 1.0
+        return completed
+
+    monkeypatch.setattr(
+        module,
+        "time",
+        SimpleNamespace(monotonic=monotonic),
+        raising=False,
+    )
+
+    module.write_gateway_only_public_receipt(
+        candidate_root=candidate_root,
+        bundle_root=candidate_root,
+        release_run=RELEASE_RUN,
+        timeout_seconds=60,
+        expected_docker_host_identity_sha256=str(trust_pair["host_receipt_sha256"]),
+        **support.gateway_trust_arguments(trust_pair),
+        runner=runner,
+        docker_resolver=lambda: Path("C:/fixed/docker.exe"),
+    )
+
+    runtime = json.loads(runtime_path.read_bytes())
+    command_count = 2 * (len(runtime["containers"]) + 5)
+    assert timeouts == [60 - index for index in range(command_count)]
+
+
+def test_gateway_only_public_rejects_exhausted_total_deadline_before_next_docker_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        module,
+        _contract,
+        support,
+        candidate_root,
+        runtime_path,
+        report_path,
+        attestation_path,
+        trust_pair,
+    ) = _gateway_fixture(tmp_path, monkeypatch)
+    immutable_inputs = (report_path.read_bytes(), attestation_path.read_bytes())
+    now = [200.0]
+    calls: list[list[str]] = []
+    original_runner = support.docker_runner(runtime_path)
+
+    def monotonic() -> float:
+        return now[0]
+
+    def runner(arguments, *, cwd, env, timeout):
+        calls.append([*arguments])
+        completed = original_runner(
+            arguments,
+            cwd=cwd,
+            env=env,
+            timeout=timeout,
+        )
+        now[0] = 203.0
+        return completed
+
+    monkeypatch.setattr(
+        module,
+        "time",
+        SimpleNamespace(monotonic=monotonic),
+        raising=False,
+    )
+
+    with pytest.raises(ValueError, match="deadline|budget|timeout"):
+        module.write_gateway_only_public_receipt(
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            timeout_seconds=3,
+            expected_docker_host_identity_sha256=str(trust_pair["host_receipt_sha256"]),
+            **support.gateway_trust_arguments(trust_pair),
+            runner=runner,
+            docker_resolver=lambda: Path("C:/fixed/docker.exe"),
+        )
+
+    assert len(calls) == 1
+    assert not (candidate_root / "artifacts" / "gateway_only_public.json").exists()
+    assert not (candidate_root / "runtime" / "gateway-only-public-attestation.json").exists()
+    assert not list((candidate_root / "artifacts").glob(".gateway-only-public-*.tmp"))
+    assert not list((candidate_root / "runtime").glob(".gateway-only-public-*.tmp"))
+    assert (report_path.read_bytes(), attestation_path.read_bytes()) == immutable_inputs
+
+
+@pytest.mark.parametrize(
+    ("drift", "message"),
+    (
+        ("internal-service-port", "published ports"),
+        ("daemon-endpoint", "daemon"),
+        ("server-id", "daemon"),
+        ("network-mode", "network mode"),
+    ),
+)
+def test_gateway_only_public_rejects_docker_drift_without_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    drift: str,
+    message: str,
+) -> None:
+    (
+        module,
+        _contract,
+        support,
+        candidate_root,
+        runtime_path,
+        report_path,
+        attestation_path,
+        trust_pair,
+    ) = _gateway_fixture(tmp_path, monkeypatch)
+    immutable_inputs = (report_path.read_bytes(), attestation_path.read_bytes())
+
+    with pytest.raises(ValueError, match=message):
+        module.write_gateway_only_public_receipt(
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            timeout_seconds=30,
+            expected_docker_host_identity_sha256=str(trust_pair["host_receipt_sha256"]),
+            **support.gateway_trust_arguments(trust_pair),
+            runner=support.docker_runner(runtime_path, drift=drift),
+            docker_resolver=lambda: Path("C:/fixed/docker.exe"),
+        )
+
+    assert not (candidate_root / "artifacts" / "gateway_only_public.json").exists()
+    assert not (candidate_root / "runtime" / "gateway-only-public-attestation.json").exists()
+    assert (report_path.read_bytes(), attestation_path.read_bytes()) == immutable_inputs
+
+
+@pytest.mark.parametrize("input_name", ("report", "attestation"))
+def test_gateway_only_public_rejects_symlinked_external_input_before_docker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    input_name: str,
+) -> None:
+    (
+        module,
+        _contract,
+        support,
+        candidate_root,
+        _runtime_path,
+        report_path,
+        attestation_path,
+        trust_pair,
+    ) = _gateway_fixture(tmp_path, monkeypatch)
+    path = report_path if input_name == "report" else attestation_path
+    real_path = path.with_name(f"{path.name}.real")
+    path.replace(real_path)
+    try:
+        path.symlink_to(real_path)
+    except OSError:
+        pytest.skip("symlinks are unavailable on this Windows test host")
+
+    def forbidden_runner(*_args, **_kwargs):
+        pytest.fail("gateway writer must reject symlinked input before Docker")
+
+    with pytest.raises(ValueError, match="symlink|reparse|no-follow"):
+        module.write_gateway_only_public_receipt(
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            timeout_seconds=30,
+            expected_docker_host_identity_sha256=str(trust_pair["host_receipt_sha256"]),
+            **support.gateway_trust_arguments(trust_pair),
+            runner=forbidden_runner,
+            docker_resolver=lambda: Path("C:/fixed/docker.exe"),
+        )
+
+    assert not (candidate_root / "artifacts" / "gateway_only_public.json").exists()
+    assert not (candidate_root / "runtime" / "gateway-only-public-attestation.json").exists()
+
+
+def test_gateway_only_public_rejects_symlinked_input_ancestor_before_docker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        module,
+        _contract,
+        support,
+        candidate_root,
+        _runtime_path,
+        _report_path,
+        _attestation_path,
+        trust_pair,
+    ) = _gateway_fixture(tmp_path, monkeypatch)
+    raw_root = candidate_root / "raw"
+    real_root = candidate_root / "raw.real"
+    raw_root.replace(real_root)
+    try:
+        raw_root.symlink_to(real_root, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks are unavailable on this Windows test host")
+
+    def forbidden_runner(*_args, **_kwargs):
+        pytest.fail("gateway writer must reject a symlinked ancestor before Docker")
+
+    with pytest.raises(ValueError, match="symlink|reparse|no-follow"):
+        module.write_gateway_only_public_receipt(
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            timeout_seconds=30,
+            expected_docker_host_identity_sha256=str(trust_pair["host_receipt_sha256"]),
+            **support.gateway_trust_arguments(trust_pair),
+            runner=forbidden_runner,
+            docker_resolver=lambda: Path("C:/fixed/docker.exe"),
+        )
+
+
+@pytest.mark.parametrize(
+    "drifted_input",
+    ("external-observation", "observer-attestation", "candidate", "runtime"),
+)
+def test_gateway_only_public_rejects_input_or_candidate_runtime_mid_run_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    drifted_input: str,
+) -> None:
+    (
+        module,
+        _contract,
+        support,
+        candidate_root,
+        runtime_path,
+        report_path,
+        attestation_path,
+        trust_pair,
+    ) = _gateway_fixture(tmp_path, monkeypatch)
+    paths = {
+        "external-observation": report_path,
+        "observer-attestation": attestation_path,
+        "candidate": candidate_root / "deploy" / "image-lock.json",
+        "runtime": runtime_path,
+    }
+    drift_path = paths[drifted_input]
+    original_runner = support.docker_runner(runtime_path)
+    drifted = False
+
+    def runner(arguments, *, cwd, env, timeout):
+        nonlocal drifted
+        if not drifted:
+            drifted = True
+            replacement = drift_path.with_name(f".{drift_path.name}.swap")
+            replacement.write_bytes(drift_path.read_bytes() + b" ")
+            replacement.replace(drift_path)
+        return original_runner(arguments, cwd=cwd, env=env, timeout=timeout)
+
+    with pytest.raises(ValueError, match="changed|identity|digest"):
+        module.write_gateway_only_public_receipt(
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            timeout_seconds=30,
+            expected_docker_host_identity_sha256=str(trust_pair["host_receipt_sha256"]),
+            **support.gateway_trust_arguments(trust_pair),
+            runner=runner,
+            docker_resolver=lambda: Path("C:/fixed/docker.exe"),
+        )
+
+    assert not (candidate_root / "artifacts" / "gateway_only_public.json").exists()
+    assert not (candidate_root / "runtime" / "gateway-only-public-attestation.json").exists()
+
+
+def test_gateway_only_public_rejects_byte_identical_input_ancestor_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        module,
+        _contract,
+        support,
+        candidate_root,
+        runtime_path,
+        report_path,
+        _attestation_path,
+        trust_pair,
+    ) = _gateway_fixture(tmp_path, monkeypatch)
+    raw_root = candidate_root / "raw"
+    retained_root = candidate_root / "raw.retained"
+    alternate_root = candidate_root / "raw.alternate"
+    alternate_root.mkdir()
+    os.link(report_path, alternate_root / report_path.name)
+    original_runner = support.docker_runner(runtime_path)
+    replaced = False
+
+    def runner(arguments, *, cwd, env, timeout):
+        nonlocal replaced
+        if not replaced:
+            os.replace(raw_root, retained_root)
+            os.replace(alternate_root, raw_root)
+            replaced = True
+        return original_runner(arguments, cwd=cwd, env=env, timeout=timeout)
+
+    with pytest.raises(ValueError, match="ancestor|boundary|changed"):
+        module.write_gateway_only_public_receipt(
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            timeout_seconds=30,
+            expected_docker_host_identity_sha256=str(trust_pair["host_receipt_sha256"]),
+            **support.gateway_trust_arguments(trust_pair),
+            runner=runner,
+            docker_resolver=lambda: Path("C:/fixed/docker.exe"),
+        )
+
+    assert replaced is True
+    assert not (candidate_root / "artifacts" / "gateway_only_public.json").exists()
+    assert not (candidate_root / "runtime" / "gateway-only-public-attestation.json").exists()
+
+
+def test_gateway_only_public_rejects_publication_ancestor_replacement_after_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        module,
+        _contract,
+        support,
+        candidate_root,
+        runtime_path,
+        _report_path,
+        _attestation_path,
+        trust_pair,
+    ) = _gateway_fixture(tmp_path, monkeypatch)
+    artifacts_root = candidate_root / "artifacts"
+    artifacts_root.mkdir(exist_ok=True)
+    retained_root = candidate_root / "artifacts.retained"
+    alternate_root = candidate_root / "artifacts.alternate"
+    alternate_root.mkdir()
+    original_stage = module._stage_gateway_json
+    replaced = False
+
+    def stage(parent: Path, document):
+        nonlocal replaced
+        if Path(parent) == artifacts_root and not replaced:
+            os.replace(artifacts_root, retained_root)
+            os.replace(alternate_root, artifacts_root)
+            replaced = True
+        return original_stage(parent, document)
+
+    monkeypatch.setattr(module, "_stage_gateway_json", stage)
+
+    with pytest.raises(ValueError, match="ancestor|boundary|publication|changed"):
+        module.write_gateway_only_public_receipt(
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            timeout_seconds=30,
+            expected_docker_host_identity_sha256=str(trust_pair["host_receipt_sha256"]),
+            **support.gateway_trust_arguments(trust_pair),
+            runner=support.docker_runner(runtime_path),
+            docker_resolver=lambda: Path("C:/fixed/docker.exe"),
+        )
+
+    assert replaced is True
+    assert not (artifacts_root / "gateway_only_public.json").exists()
+    assert not (retained_root / "gateway_only_public.json").exists()
+    assert not (candidate_root / "runtime" / "gateway-only-public-attestation.json").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="exercises a Windows directory reparse race")
+def test_gateway_only_public_rejects_published_parent_reparse_before_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        module,
+        _contract,
+        support,
+        candidate_root,
+        runtime_path,
+        _report_path,
+        _attestation_path,
+        trust_pair,
+    ) = _gateway_fixture(tmp_path, monkeypatch)
+    artifacts_root = candidate_root / "artifacts"
+    artifacts_root.mkdir(exist_ok=True)
+    retained_root = candidate_root / "artifacts.retained"
+    redirected_root = candidate_root / "artifacts.redirected"
+    original_assert_published = module._assert_gateway_published
+    attack_outcome: str | None = None
+
+    def assert_published(path: Path, *, body: bytes, identity: tuple[int, int]) -> None:
+        nonlocal attack_outcome
+        original_assert_published(path, body=body, identity=identity)
+        if Path(path).parent != artifacts_root or attack_outcome is not None:
+            return
+        redirected_root.mkdir()
+        os.link(path, redirected_root / Path(path).name)
+        try:
+            os.replace(artifacts_root, retained_root)
+        except OSError as exc:
+            if getattr(exc, "winerror", None) not in {5, 32}:
+                raise
+            attack_outcome = "permission-blocked"
+            raise ValueError(
+                "gateway publication ancestor replacement was blocked by the held lease"
+            ) from exc
+        try:
+            artifacts_root.symlink_to(redirected_root, target_is_directory=True)
+        except OSError:
+            os.replace(retained_root, artifacts_root)
+            pytest.skip("directory reparse points are unavailable on this Windows test host")
+        attack_outcome = "identity-rejected"
+
+    monkeypatch.setattr(module, "_assert_gateway_published", assert_published)
+
+    with pytest.raises(
+        ValueError,
+        match="reparse|ancestor|boundary|publication|changed|blocked|lease",
+    ):
+        module.write_gateway_only_public_receipt(
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            timeout_seconds=30,
+            expected_docker_host_identity_sha256=str(trust_pair["host_receipt_sha256"]),
+            **support.gateway_trust_arguments(trust_pair),
+            runner=support.docker_runner(runtime_path),
+            docker_resolver=lambda: Path("C:/fixed/docker.exe"),
+        )
+
+    assert attack_outcome in {"permission-blocked", "identity-rejected"}
+    if attack_outcome == "permission-blocked":
+        assert artifacts_root.is_dir()
+        assert not artifacts_root.is_symlink()
+        assert not retained_root.exists()
+
+
+def test_gateway_only_public_baseexception_cleans_owned_staging_and_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        module,
+        _contract,
+        support,
+        candidate_root,
+        runtime_path,
+        _report_path,
+        _attestation_path,
+        trust_pair,
+    ) = _gateway_fixture(tmp_path, monkeypatch)
+    staged_paths: list[Path] = []
+    decoy = candidate_root / "runtime" / ".gateway-only-public-decoy.tmp"
+    decoy.write_bytes(b"unowned-sentinel")
+
+    class InjectedAbort(BaseException):
+        pass
+
+    def abort_publish(source: Path, _target: Path) -> None:
+        staged_paths.append(source)
+        raise InjectedAbort("injected gateway publication abort")
+
+    monkeypatch.setattr(module, "_publish_no_replace", abort_publish)
+
+    with pytest.raises(InjectedAbort, match="injected gateway publication abort"):
+        module.write_gateway_only_public_receipt(
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            timeout_seconds=30,
+            expected_docker_host_identity_sha256=str(trust_pair["host_receipt_sha256"]),
+            **support.gateway_trust_arguments(trust_pair),
+            runner=support.docker_runner(runtime_path),
+            docker_resolver=lambda: Path("C:/fixed/docker.exe"),
+        )
+
+    assert staged_paths
+    assert all(not path.exists() for path in staged_paths)
+    assert decoy.read_bytes() == b"unowned-sentinel"
+    assert not (candidate_root / "artifacts" / "gateway_only_public.json").exists()
+    assert not (candidate_root / "runtime" / "gateway-only-public-attestation.json").exists()
+
+
+def test_gateway_only_public_proof_failure_retracts_partial_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        module,
+        _contract,
+        support,
+        candidate_root,
+        runtime_path,
+        report_path,
+        attestation_path,
+        trust_pair,
+    ) = _gateway_fixture(tmp_path, monkeypatch)
+    immutable_inputs = (report_path.read_bytes(), attestation_path.read_bytes())
+    original_publish = module._publish_no_replace
+    calls = 0
+
+    def publish(source: Path, target: Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("injected proof publication failure")
+        original_publish(source, target)
+
+    monkeypatch.setattr(module, "_publish_no_replace", publish)
+
+    with pytest.raises(OSError, match="injected proof publication failure"):
+        module.write_gateway_only_public_receipt(
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            timeout_seconds=30,
+            expected_docker_host_identity_sha256=str(trust_pair["host_receipt_sha256"]),
+            **support.gateway_trust_arguments(trust_pair),
+            runner=support.docker_runner(runtime_path),
+            docker_resolver=lambda: Path("C:/fixed/docker.exe"),
+        )
+
+    assert not (candidate_root / "artifacts" / "gateway_only_public.json").exists()
+    assert not (candidate_root / "runtime" / "gateway-only-public-attestation.json").exists()
+    assert (report_path.read_bytes(), attestation_path.read_bytes()) == immutable_inputs
+
+
+@pytest.mark.parametrize(
+    "cleanup_failure",
+    ("staging-unlink", "staging-handle-close", "directory-lease-close"),
+)
+def test_gateway_only_public_postcommit_cleanup_failure_preserves_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup_failure: str,
+) -> None:
+    (
+        module,
+        _contract,
+        support,
+        candidate_root,
+        runtime_path,
+        _report_path,
+        _attestation_path,
+        trust_pair,
+    ) = _gateway_fixture(tmp_path, monkeypatch)
+    receipt_path = candidate_root / "artifacts" / "gateway_only_public.json"
+    proof_path = candidate_root / "runtime" / "gateway-only-public-attestation.json"
+    injected = False
+
+    def assert_formal_commit() -> None:
+        assert receipt_path.is_file()
+        assert proof_path.is_file()
+
+    if cleanup_failure == "staging-unlink":
+        original_remove = module._remove_classroom_entries
+
+        def remove(boundary, entries, *, label: str) -> None:
+            nonlocal injected
+            original_remove(boundary, entries, label=label)
+            if label == "gateway staging evidence":
+                assert_formal_commit()
+                injected = True
+                raise OSError("injected postcommit staging unlink failure")
+
+        monkeypatch.setattr(module, "_remove_classroom_entries", remove)
+    elif cleanup_failure == "staging-handle-close":
+        original_open = module._open_gateway_staged_input
+
+        class CloseFailureHandle:
+            def __init__(self, handle) -> None:
+                self._handle = handle
+
+            def fileno(self) -> int:
+                return self._handle.fileno()
+
+            def close(self) -> None:
+                nonlocal injected
+                self._handle.close()
+                if not injected:
+                    assert_formal_commit()
+                    injected = True
+                    raise OSError("injected postcommit staging handle close failure")
+
+        def open_staged(boundary, path: Path, *, body: bytes, identity: tuple[int, int]):
+            return CloseFailureHandle(
+                original_open(
+                    boundary,
+                    path,
+                    body=body,
+                    identity=identity,
+                )
+            )
+
+        monkeypatch.setattr(module, "_open_gateway_staged_input", open_staged)
+    else:
+        original_close = module._GatewayPublicationBoundary.close
+
+        def close(boundary, *, suppress_errors: bool = False) -> None:
+            nonlocal injected
+            original_close(boundary, suppress_errors=suppress_errors)
+            if not suppress_errors:
+                assert_formal_commit()
+                injected = True
+                raise OSError("injected postcommit directory lease close failure")
+
+        monkeypatch.setattr(module._GatewayPublicationBoundary, "close", close)
+
+    receipt = module.write_gateway_only_public_receipt(
+        candidate_root=candidate_root,
+        bundle_root=candidate_root,
+        release_run=RELEASE_RUN,
+        timeout_seconds=30,
+        expected_docker_host_identity_sha256=str(trust_pair["host_receipt_sha256"]),
+        **support.gateway_trust_arguments(trust_pair),
+        runner=support.docker_runner(runtime_path),
+        docker_resolver=lambda: Path("C:/fixed/docker.exe"),
+    )
+
+    assert injected
+    assert json.loads(receipt_path.read_bytes()) == receipt
+    assert (
+        json.loads(proof_path.read_bytes())["summary"]["checks"]
+        == receipt["receipt"]["result"]["checks"]
+    )
+    assert not list((candidate_root / "artifacts").glob(".gateway-only-public-*.tmp"))
+    assert not list((candidate_root / "runtime").glob(".gateway-only-public-*.tmp"))
+
+
+def test_gateway_only_public_precommit_failure_remains_primary_when_cleanup_also_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        module,
+        _contract,
+        support,
+        candidate_root,
+        runtime_path,
+        _report_path,
+        _attestation_path,
+        trust_pair,
+    ) = _gateway_fixture(tmp_path, monkeypatch)
+    receipt_path = candidate_root / "artifacts" / "gateway_only_public.json"
+    proof_path = candidate_root / "runtime" / "gateway-only-public-attestation.json"
+    original_publish = module._publish_no_replace
+    original_remove = module._remove_classroom_entries
+    publish_calls = 0
+    cleanup_injected = False
+
+    class InjectedAbort(BaseException):
+        pass
+
+    def publish(source: Path, target: Path) -> None:
+        nonlocal publish_calls
+        publish_calls += 1
+        if publish_calls == 2:
+            raise InjectedAbort("injected precommit proof publication abort")
+        original_publish(source, target)
+
+    def remove(boundary, entries, *, label: str) -> None:
+        nonlocal cleanup_injected
+        original_remove(boundary, entries, label=label)
+        if label == "gateway formal evidence":
+            cleanup_injected = True
+            raise OSError("injected precommit formal cleanup failure")
+
+    monkeypatch.setattr(module, "_publish_no_replace", publish)
+    monkeypatch.setattr(module, "_remove_classroom_entries", remove)
+
+    with pytest.raises(
+        InjectedAbort,
+        match="injected precommit proof publication abort",
+    ) as caught:
+        module.write_gateway_only_public_receipt(
+            candidate_root=candidate_root,
+            bundle_root=candidate_root,
+            release_run=RELEASE_RUN,
+            timeout_seconds=30,
+            expected_docker_host_identity_sha256=str(trust_pair["host_receipt_sha256"]),
+            **support.gateway_trust_arguments(trust_pair),
+            runner=support.docker_runner(runtime_path),
+            docker_resolver=lambda: Path("C:/fixed/docker.exe"),
+        )
+
+    assert cleanup_injected
+    assert any(
+        "gateway formal evidence cleanup failed" in note
+        and "injected precommit formal cleanup failure" in note
+        for note in getattr(caught.value, "__notes__", ())
+    )
+    assert not receipt_path.exists()
+    assert not proof_path.exists()
+    assert not list((candidate_root / "artifacts").glob(".gateway-only-public-*.tmp"))
+    assert not list((candidate_root / "runtime").glob(".gateway-only-public-*.tmp"))
+
+
+def test_release_evidence_cli_forwards_trusted_gateway_docker_host_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    (
+        module,
+        _contract,
+        support,
+        candidate_root,
+        _runtime_path,
+        _report_path,
+        _attestation_path,
+        trust_pair,
+    ) = _gateway_fixture(tmp_path, monkeypatch)
+    captured: dict[str, object] = {}
+
+    def write_receipt(**kwargs):
+        captured.update(kwargs)
+        return {}
+
+    monkeypatch.setattr(
+        module,
+        "write_gateway_only_public_receipt",
+        write_receipt,
+        raising=False,
+    )
+    bundle_root = candidate_root
+
+    assert (
+        module.main(
+            [
+                "gateway-only-public",
+                "--candidate-root",
+                str(candidate_root),
+                "--bundle-root",
+                str(bundle_root),
+                "--run-id",
+                RELEASE_RUN["runId"],
+                "--environment-id",
+                RELEASE_RUN["environmentId"],
+                "--timeout-seconds",
+                "30",
+                "--docker-host-identity-sha256",
+                str(trust_pair["host_receipt_sha256"]),
+                "--gateway-trust-keyring",
+                str(trust_pair["keyring_path"]),
+                "--gateway-trust-keyring-sha256",
+                str(trust_pair["keyring_sha256"]),
+                "--gateway-observer-challenge",
+                str(trust_pair["observer_challenge"]),
+                "--gateway-host-challenge",
+                str(trust_pair["host_challenge"]),
+                "--gateway-trusted-now",
+                str(trust_pair["trusted_now"]),
+            ]
+        )
+        == 0
+    )
+    assert captured == {
+        "candidate_root": candidate_root,
+        "bundle_root": bundle_root,
+        "release_run": RELEASE_RUN,
+        "timeout_seconds": 30,
+        "expected_docker_host_identity_sha256": trust_pair["host_receipt_sha256"],
+        **support.gateway_trust_arguments(trust_pair),
+    }
+    assert capsys.readouterr().out == (
+        f"{bundle_root / 'runtime' / 'gateway-only-public-attestation.json'}\n"
+    )
+
+
+def test_gateway_only_public_cli_forwards_external_trust_pair_inputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    (
+        module,
+        _contract,
+        support,
+        candidate_root,
+        _runtime_path,
+        _report_path,
+        _attestation_path,
+        trust_pair,
+    ) = _gateway_fixture(tmp_path, monkeypatch)
+    captured: dict[str, object] = {}
+
+    def write_receipt(**kwargs):
+        captured.update(kwargs)
+        return {}
+
+    monkeypatch.setattr(module, "write_gateway_only_public_receipt", write_receipt)
+    bundle_root = candidate_root
+
+    assert (
+        module.main(
+            [
+                "gateway-only-public",
+                "--candidate-root",
+                str(candidate_root),
+                "--bundle-root",
+                str(bundle_root),
+                "--run-id",
+                RELEASE_RUN["runId"],
+                "--environment-id",
+                RELEASE_RUN["environmentId"],
+                "--timeout-seconds",
+                "30",
+                "--docker-host-identity-sha256",
+                str(trust_pair["host_receipt_sha256"]),
+                "--gateway-trust-keyring",
+                str(trust_pair["keyring_path"]),
+                "--gateway-trust-keyring-sha256",
+                str(trust_pair["keyring_sha256"]),
+                "--gateway-observer-challenge",
+                str(trust_pair["observer_challenge"]),
+                "--gateway-host-challenge",
+                str(trust_pair["host_challenge"]),
+                "--gateway-trusted-now",
+                str(trust_pair["trusted_now"]),
+            ]
+        )
+        == 0
+    )
+    assert captured == {
+        "candidate_root": candidate_root,
+        "bundle_root": bundle_root,
+        "release_run": RELEASE_RUN,
+        "timeout_seconds": 30,
+        "expected_docker_host_identity_sha256": trust_pair["host_receipt_sha256"],
+        **support.gateway_trust_arguments(trust_pair),
+    }
+    assert capsys.readouterr().out == (
+        f"{bundle_root / 'runtime' / 'gateway-only-public-attestation.json'}\n"
+    )
+
+
+def test_release_evidence_cli_assembles_gateway_receipt_with_trusted_docker_host_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    (
+        module,
+        _contract,
+        support,
+        candidate_root,
+        runtime_path,
+        _report_path,
+        _attestation_path,
+        trust_pair,
+    ) = _gateway_fixture(tmp_path, monkeypatch)
+    receipt_path = candidate_root / "artifacts" / "gateway_only_public.json"
+    output = candidate_root / "release-evidence.json"
+    module.write_gateway_only_public_receipt(
+        candidate_root=candidate_root,
+        bundle_root=candidate_root,
+        release_run=RELEASE_RUN,
+        timeout_seconds=30,
+        expected_docker_host_identity_sha256=str(trust_pair["host_receipt_sha256"]),
+        **support.gateway_trust_arguments(trust_pair),
+        runner=support.docker_runner(runtime_path),
+        docker_resolver=lambda: Path("C:/fixed/docker.exe"),
+    )
+
+    assert (
+        module.main(
+            [
+                "assemble",
+                "--output",
+                str(output),
+                "--candidate-root",
+                str(candidate_root),
+                "--run-id",
+                RELEASE_RUN["runId"],
+                "--environment-id",
+                RELEASE_RUN["environmentId"],
+                "--receipt",
+                f"gateway_only_public={receipt_path}",
+                "--gateway-docker-host-identity-sha256",
+                str(trust_pair["host_receipt_sha256"]),
+                "--gateway-trust-keyring",
+                str(trust_pair["keyring_path"]),
+                "--gateway-trust-keyring-sha256",
+                str(trust_pair["keyring_sha256"]),
+                "--gateway-observer-challenge",
+                str(trust_pair["observer_challenge"]),
+                "--gateway-host-challenge",
+                str(trust_pair["host_challenge"]),
+                "--gateway-trusted-now",
+                str(trust_pair["trusted_now"]),
+            ]
+        )
+        == 0
+    )
+    manifest = json.loads(output.read_bytes())
+    assert manifest["evidence"]["gateway_only_public"] == {
+        "status": "pass",
+        "detail": "gateway_only_public verified by gateway-external-probe",
+        "artifact": "artifacts/gateway_only_public.json",
+        "artifactSha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+    }
+    assert capsys.readouterr().out == f"{output}\n"
+
+
+def _tamper_published_gateway_trust_input(
+    support,
+    candidate_root: Path,
+    receipt_path: Path,
+    trust_pair: dict[str, object],
+    trust_case: str,
+) -> None:
+    path_keys = {
+        "observer-envelope": "observer_envelope_path",
+        "host-envelope": "host_envelope_path",
+        "host-receipt": "host_receipt_path",
+        "keyring": "keyring_path",
+    }
+    reference_keys = {
+        "observer-envelope": "observerEnvelope",
+        "host-envelope": "hostProvisionerEnvelope",
+        "host-receipt": "hostProvisioningReceipt",
+    }
+    path = Path(trust_pair[path_keys[trust_case]])
+    path.write_bytes(path.read_bytes() + b" ")
+    if trust_case == "keyring":
+        return
+
+    proof_path = candidate_root / "runtime" / "gateway-only-public-attestation.json"
+    proof = json.loads(proof_path.read_bytes())
+    proof["trustPair"][reference_keys[trust_case]]["sha256"] = hashlib.sha256(
+        path.read_bytes()
+    ).hexdigest()
+    proof_body = support.canonical_json(proof)
+    proof_path.write_bytes(proof_body)
+    receipt = json.loads(receipt_path.read_bytes())
+    receipt["provenance"]["gatewayOnlyPublicAttestation"]["sha256"] = hashlib.sha256(
+        proof_body
+    ).hexdigest()
+    receipt_path.write_bytes(support.canonical_json(receipt))
+
+
+@pytest.mark.parametrize(
+    "trust_case",
+    (
+        "valid",
+        "observer-envelope",
+        "host-envelope",
+        "host-receipt",
+        "keyring",
+    ),
+)
+def test_manifest_assembler_replays_gateway_external_trust_pair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    trust_case: str,
+) -> None:
+    (
+        module,
+        _contract,
+        support,
+        candidate_root,
+        runtime_path,
+        _report_path,
+        _attestation_path,
+        trust_pair,
+    ) = _gateway_external_trust_fixture(tmp_path, monkeypatch)
+    receipt_path = candidate_root / "artifacts" / "gateway_only_public.json"
+    output = candidate_root / "release-evidence.json"
+    module.write_gateway_only_public_receipt(
+        candidate_root=candidate_root,
+        bundle_root=candidate_root,
+        release_run=RELEASE_RUN,
+        timeout_seconds=30,
+        expected_docker_host_identity_sha256=str(trust_pair["host_receipt_sha256"]),
+        **support.gateway_trust_arguments(trust_pair),
+        runner=support.docker_runner(runtime_path),
+        docker_resolver=lambda: Path("C:/fixed/docker.exe"),
+    )
+    if trust_case != "valid":
+        _tamper_published_gateway_trust_input(
+            support,
+            candidate_root,
+            receipt_path,
+            trust_pair,
+            trust_case,
+        )
+
+    arguments = [
+        "assemble",
+        "--output",
+        str(output),
+        "--candidate-root",
+        str(candidate_root),
+        "--run-id",
+        RELEASE_RUN["runId"],
+        "--environment-id",
+        RELEASE_RUN["environmentId"],
+        "--receipt",
+        f"gateway_only_public={receipt_path}",
+        "--gateway-docker-host-identity-sha256",
+        str(trust_pair["host_receipt_sha256"]),
+        "--gateway-trust-keyring",
+        str(trust_pair["keyring_path"]),
+        "--gateway-trust-keyring-sha256",
+        str(trust_pair["keyring_sha256"]),
+        "--gateway-observer-challenge",
+        str(trust_pair["observer_challenge"]),
+        "--gateway-host-challenge",
+        str(trust_pair["host_challenge"]),
+        "--gateway-trusted-now",
+        str(trust_pair["trusted_now"]),
+    ]
+    if trust_case == "valid":
+        assert module.main(arguments) == 0
+        manifest = json.loads(output.read_bytes())
+        assert manifest["evidence"]["gateway_only_public"] == {
+            "status": "pass",
+            "detail": "gateway_only_public verified by gateway-external-probe",
+            "artifact": "artifacts/gateway_only_public.json",
+            "artifactSha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+        }
+    else:
+        try:
+            with pytest.raises(ValueError, match="gateway trust"):
+                module.main(arguments)
+        finally:
+            assert not output.exists()

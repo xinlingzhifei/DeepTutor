@@ -4,11 +4,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from deeptutor.teaching.openmaic.auth import ServiceSecretUnavailable
 from deeptutor.teaching.openmaic.client import (
     OpenMAICPollingExhausted,
     OpenMAICRequestFailed,
     OpenMAICTimeout,
     OpenMAICUnavailable,
+)
+from deeptutor.teaching.openmaic.data_planes import (
+    DataPlaneConfigurationUnavailable,
+    DataPlaneMode,
+    DataPlaneUnavailable,
 )
 
 RETRYABLE_ERROR_CATEGORIES = {
@@ -25,6 +31,7 @@ NON_RETRYABLE_ERROR_CATEGORIES = {
     "source_snapshot_invalid",
     "contract_invalid",
     "confirmed_outline_hash_mismatch",
+    "data_plane_unavailable",
 }
 MAX_RETRY_DELAY_SECONDS = 5 * 60
 MAX_DSL_REPAIR_ATTEMPTS = 2
@@ -53,9 +60,30 @@ def can_repair_dsl(repair_attempts: int) -> bool:
     return 0 <= repair_attempts < MAX_DSL_REPAIR_ATTEMPTS
 
 
-def classify_worker_error(error: BaseException) -> JobFailure:
+def classify_worker_error(
+    error: BaseException,
+    *,
+    data_plane_mode: DataPlaneMode | None = None,
+) -> JobFailure:
     """Map transport and provider failures without leaking their messages."""
 
+    if isinstance(
+        error,
+        (
+            DataPlaneConfigurationUnavailable,
+            DataPlaneUnavailable,
+            ServiceSecretUnavailable,
+        ),
+    ):
+        return JobFailure(
+            "data_plane_unavailable",
+            (
+                "dedicated_data_plane_unavailable"
+                if data_plane_mode == "dedicated"
+                else "data_plane_unavailable"
+            ),
+            False,
+        )
     if isinstance(error, OpenMAICRequestFailed):
         if error.status_code == 429:
             return JobFailure("provider_429", "openmaic_429", True)
@@ -69,7 +97,15 @@ def classify_worker_error(error: BaseException) -> JobFailure:
     if isinstance(error, OpenMAICPollingExhausted):
         return JobFailure("read_timeout", "openmaic_polling_exhausted", True)
     if isinstance(error, OpenMAICUnavailable):
-        return JobFailure("engine_unavailable", "openmaic_unavailable", True)
+        return JobFailure(
+            "engine_unavailable",
+            (
+                "dedicated_data_plane_unavailable"
+                if data_plane_mode == "dedicated"
+                else "openmaic_unavailable"
+            ),
+            True,
+        )
     return JobFailure("contract_invalid", "worker_contract_invalid", False)
 
 

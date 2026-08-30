@@ -322,6 +322,7 @@ async def test_job_gateway_uses_hash_only_request_and_atomic_export_binding() ->
             return SimpleNamespace(
                 route_ref="shared-primary",
                 provider_profile_ref="platform-default",
+                mode="shared",
                 worker_pool_ref="shared-generation",
                 queue_ref="openmaic.shared",
             )
@@ -445,7 +446,9 @@ async def test_input_materializer_commits_an_immutable_recoverable_snapshot(tmp_
     replay = await materializer.materialize(command)
 
     assert replay == first
-    manifest_bytes = b"".join([chunk async for chunk in await store.open(first.manifest_object_key)])
+    manifest_bytes = b"".join(
+        [chunk async for chunk in await store.open(first.manifest_object_key)]
+    )
     assert hashlib.sha256(manifest_bytes).hexdigest() == first.manifest_sha256
     assert b"temporary/draft-media" not in manifest_bytes
     assert b"export-inputs/export-fixed/classroom.json" in manifest_bytes

@@ -4,17 +4,21 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import asdict, dataclass, field
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from contextlib import asynccontextmanager
+from dataclasses import asdict, dataclass, field, replace
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
 import tempfile
-from typing import TYPE_CHECKING, Any
+import time
+from typing import TYPE_CHECKING, Any, TypeVar
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
@@ -32,10 +36,16 @@ if TYPE_CHECKING:
 
 
 _RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
+_ENVIRONMENT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _TENANT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _SAFE_SCHEMA = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
 _RESTORE_DATABASE_USER = "yfeistai_migrator"
+_OWNERSHIP_VALUES = {"runner-owned-disposable", "retained-audit"}
+_OBJECT_RESTORE_CONTROL_KEY = ".yfeistai-backup-restore-control/claim.json"
+_PROCESS_CLEANUP_GRACE_SECONDS = 10.0
+_OBJECT_CLIENT_CLEANUP_GRACE_SECONDS = _PROCESS_CLEANUP_GRACE_SECONDS
+_OwnedResult = TypeVar("_OwnedResult")
 
 
 def _canonical_json(payload: object) -> bytes:
@@ -138,6 +148,13 @@ class RestoredObjectReceipt:
 
 
 @dataclass(frozen=True, slots=True)
+class _ObjectRestoreControlClaim:
+    version_id: str
+    body: bytes = field(repr=False)
+    body_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
 class RestoredTeachingFacts:
     platform_schema_revision: str
     schema_revisions: dict[str, str]
@@ -161,12 +178,31 @@ class RestoreValidationReport:
     object_prefix: str
     validated: tuple[str, ...]
     failures: tuple[str, ...]
+    target_evidence: dict[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class TargetDatabaseState:
     identity_sha256: str
     user_object_count: int
+    current_role: str | None = None
+    database_owner: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TargetObjectState:
+    identity_sha256: str
+    versioning_enabled: bool
+    object_count: int
+    version_count: int
+    delete_marker_count: int
+    owner_id_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class TargetObservation:
+    database: TargetDatabaseState
+    objects: TargetObjectState
 
 
 @dataclass(frozen=True, slots=True)
@@ -201,6 +237,23 @@ class RestoreOperatorRuntime:
     app_access_granter: Callable[[Any], Awaitable[None]]
     app_engine_factory: Callable[[str], Any]
     app_access_probe: Callable[[Any], Awaitable[bool]]
+    target_exclusion: Callable[[Any, str], Any] | None = None
+    target_exclusion_mode: str | None = None
+    object_state_probe: Callable[[Any, RestoreTarget], Awaitable[TargetObjectState]] | None = None
+
+
+async def _execute_measured_target_operation(
+    *,
+    exclusion: Callable[[], Any],
+    observe: Callable[[], Awaitable[Any]],
+    mutate: Callable[[], Awaitable[Any]],
+    validate: Callable[[object, object, object], Any],
+) -> Any:
+    async with exclusion():
+        before = await observe()
+        mutation_result = await mutate()
+        after = await observe()
+        return validate(before, after, mutation_result)
 
 
 def _validate_restore_inputs(
@@ -418,11 +471,17 @@ async def _default_database_probe(engine: Any) -> TargetDatabaseState:
     from sqlalchemy import text
 
     async with engine.connect() as connection:
-        database_oid = (
+        identity_row = (
             await connection.execute(
-                text("SELECT oid::text FROM pg_database WHERE datname = current_database()")
+                text(
+                    "SELECT controls.system_identifier::text AS system_identifier, "
+                    "databases.oid::text AS database_oid, "
+                    "databases.datname::text AS database_name "
+                    "FROM pg_control_system() AS controls CROSS JOIN pg_database AS databases "
+                    "WHERE databases.datname = current_database()"
+                )
             )
-        ).scalar_one()
+        ).one()
         object_count = (
             await connection.execute(
                 text(
@@ -502,17 +561,48 @@ async def _default_database_probe(engine: Any) -> TargetDatabaseState:
                 )
             )
         ).scalar_one()
-    engine_url = engine.url
+    system_identifier = identity_row.system_identifier
+    database_oid = identity_row.database_oid
+    database_name = identity_row.database_name
+    if any(
+        not isinstance(value, str) or not value
+        for value in (system_identifier, database_oid, database_name)
+    ):
+        raise RuntimeError("restore target physical database identity is unavailable")
     identity_payload = {
-        "databaseHost": str(engine_url.host),
-        "databasePort": int(engine_url.port or 5432),
-        "databaseName": str(engine_url.database),
-        "databaseOid": str(database_oid),
+        "systemIdentifier": system_identifier,
+        "databaseOid": database_oid,
+        "databaseName": database_name,
     }
     identity = hashlib.sha256(_canonical_json(identity_payload)).hexdigest()
     return TargetDatabaseState(
         identity_sha256=identity,
         user_object_count=int(object_count),
+    )
+
+
+async def _default_measured_database_probe(engine: Any) -> TargetDatabaseState:
+    from sqlalchemy import text
+
+    state = await _default_database_probe(engine)
+    async with engine.connect() as connection:
+        row = (
+            await connection.execute(
+                text(
+                    "SELECT current_user::text AS current_role, roles.rolname::text AS owner "
+                    "FROM pg_database AS databases JOIN pg_roles AS roles "
+                    "ON roles.oid = databases.datdba WHERE databases.datname = current_database()"
+                )
+            )
+        ).one()
+    current_role = str(row[0])
+    database_owner = str(row[1])
+    if not current_role or not database_owner:
+        raise RuntimeError("restore target database ownership could not be inspected")
+    return replace(
+        state,
+        current_role=current_role,
+        database_owner=database_owner,
     )
 
 
@@ -618,6 +708,32 @@ async def _default_app_access_probe(engine: Any) -> bool:
             schema != "platform" and _SAFE_SCHEMA.fullmatch(schema) is None for schema in schemas
         ):
             raise ValueError("restored tenant schema metadata is invalid")
+        route_attempt_access_valid = (
+            await connection.execute(
+                text(
+                    "SELECT NOT has_table_privilege(current_user, "
+                    "'platform.generation_route_attempts', 'INSERT') "
+                    "AND NOT has_table_privilege(current_user, "
+                    "'platform.generation_route_attempts', 'SELECT') "
+                    "AND NOT has_table_privilege(current_user, "
+                    "'platform.generation_route_attempts', 'UPDATE') "
+                    "AND NOT has_table_privilege(current_user, "
+                    "'platform.generation_route_attempts', 'DELETE') "
+                    "AND NOT has_table_privilege(current_user, "
+                    "'platform.generation_route_attempts', 'TRUNCATE') "
+                    "AND has_function_privilege(current_user, "
+                    "'platform.record_generation_route_attempt(text, text, text, "
+                    "integer, text, text, text, text, text, text, text, text, "
+                    "text, text, text)', "
+                    "'EXECUTE') "
+                    "AND has_function_privilege(current_user, "
+                    "'platform.read_generation_route_attempts(text, text, text, "
+                    "text, text, text, text)', 'EXECUTE')"
+                )
+            )
+        ).scalar_one()
+        if route_attempt_access_valid is not True:
+            return False
         for schema in schemas:
             privileges_valid = (
                 await connection.execute(
@@ -631,7 +747,9 @@ async def _default_app_access_probe(engine: Any) -> bool:
                         "schemaname, tablename), 'UPDATE') AND has_table_privilege("
                         "current_user, format('%I.%I', schemaname, tablename), "
                         "'DELETE')) FROM pg_tables "
-                        "WHERE schemaname = :schema), TRUE) "
+                        "WHERE schemaname = :schema "
+                        "AND NOT (schemaname = 'platform' "
+                        "AND tablename = 'generation_route_attempts')), TRUE) "
                         "AND COALESCE((SELECT bool_and(has_sequence_privilege("
                         "current_user, format('%I.%I', schemaname, sequencename), "
                         "'USAGE') AND has_sequence_privilege(current_user, "
@@ -1083,36 +1201,223 @@ async def _default_facts_inspector(engine: Any) -> RestoredTeachingFacts:
 async def _default_process_runner(
     argv: tuple[str, ...],
     environment: dict[str, str],
+    *,
+    deadline_monotonic: float,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> int:
     try:
-        result = await asyncio.to_thread(
-            subprocess.run,
-            argv,
-            check=False,
-            env=environment,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            shell=False,
-            timeout=60 * 60,
+        return await _await_owned_operation(
+            asyncio.to_thread(
+                _run_process_with_deadline,
+                argv,
+                environment,
+                deadline_monotonic=deadline_monotonic,
+                monotonic=monotonic,
+            )
         )
     except (OSError, subprocess.SubprocessError):
         raise RuntimeError("pg_restore could not be executed") from None
-    return int(result.returncode)
 
 
-def _default_runtime() -> RestoreOperatorRuntime:
+def _run_process_with_deadline(
+    argv: tuple[str, ...],
+    environment: dict[str, str],
+    *,
+    deadline_monotonic: float,
+    monotonic: Callable[[], float],
+    cleanup_grace_seconds: float = _PROCESS_CLEANUP_GRACE_SECONDS,
+) -> int:
+    remaining = deadline_monotonic - monotonic()
+    if not math.isfinite(remaining) or remaining <= 0:
+        raise subprocess.TimeoutExpired(argv, max(0.0, remaining))
+    if (
+        isinstance(cleanup_grace_seconds, bool)
+        or not isinstance(cleanup_grace_seconds, (int, float))
+        or not math.isfinite(cleanup_grace_seconds)
+        or cleanup_grace_seconds <= 0
+    ):
+        raise ValueError("pg_restore process cleanup grace is invalid")
+    cleanup_grace_seconds = float(cleanup_grace_seconds)
+    options: dict[str, object] = {
+        "env": environment,
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "shell": False,
+    }
+    if os.name == "nt":
+        options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | getattr(
+            subprocess,
+            "CREATE_NO_WINDOW",
+            0,
+        )
+    else:
+        options["start_new_session"] = True
+    process = subprocess.Popen(argv, **options)
+    try:
+        return int(process.wait(timeout=remaining))
+    except BaseException as primary_failure:
+        cleanup_failures: list[str] = []
+        try:
+            cleanup_deadline = monotonic() + cleanup_grace_seconds
+        except BaseException:
+            cleanup_deadline = None
+            cleanup_failures.append("cleanup clock")
+        try:
+            _terminate_process_tree(process)
+        except BaseException:
+            cleanup_failures.append("process tree termination")
+            try:
+                process.kill()
+            except BaseException:
+                cleanup_failures.append("process fallback termination")
+        try:
+            cleanup_remaining = (
+                max(0.0, cleanup_deadline - monotonic()) if cleanup_deadline is not None else 0.0
+            )
+        except BaseException:
+            cleanup_remaining = 0.0
+            cleanup_failures.append("cleanup clock")
+        if cleanup_remaining > 0:
+            try:
+                process.wait(timeout=cleanup_remaining)
+            except BaseException:
+                cleanup_failures.append("process reap")
+        else:
+            cleanup_failures.append("process reap deadline")
+        if cleanup_failures:
+            primary_failure.add_note(
+                "pg_restore cleanup incomplete: " + ", ".join(cleanup_failures)
+            )
+        raise
+
+
+def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
+    if os.name != "nt":
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        return
+    system_root = os.environ.get("SystemRoot") or os.environ.get("WINDIR")
+    if not system_root:
+        raise OSError("Windows system root is unavailable")
+    taskkill = Path(system_root) / "System32" / "taskkill.exe"
+    result = subprocess.run(
+        [str(taskkill), "/PID", str(process.pid), "/T", "/F"],
+        check=False,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        shell=False,
+        timeout=10,
+        env={"SystemRoot": system_root, "WINDIR": system_root},
+    )
+    if result.returncode != 0 and process.poll() is None:
+        raise subprocess.SubprocessError("taskkill did not terminate the process tree")
+
+
+@asynccontextmanager
+async def _default_target_exclusion(engine: Any, identity_sha256: str):
+    from sqlalchemy import text
+
+    if not isinstance(identity_sha256, str) or _SHA256.fullmatch(identity_sha256) is None:
+        raise ValueError("restore target concurrency exclusion identity is invalid")
+    lock_key = int.from_bytes(bytes.fromhex(identity_sha256)[:8], "big", signed=True)
+    connection_context = engine.connect()
+    connection = await connection_context.__aenter__()
+    try:
+        acquired = (
+            await connection.execute(
+                text("SELECT pg_try_advisory_lock(:lock_key)"),
+                {"lock_key": lock_key},
+            )
+        ).scalar_one()
+        if acquired is not True:
+            raise RuntimeError("restore target concurrency exclusion is already held")
+        try:
+            yield
+        finally:
+            primary_failure = sys.exception()
+
+            async def release_exclusion() -> None:
+                released = (
+                    await connection.execute(
+                        text("SELECT pg_advisory_unlock(:lock_key)"),
+                        {"lock_key": lock_key},
+                    )
+                ).scalar_one()
+                if released is not True:
+                    raise RuntimeError("restore target concurrency exclusion release failed")
+
+            try:
+                await _await_owned_cleanup(release_exclusion())
+            except asyncio.CancelledError:
+                if primary_failure is None:
+                    raise
+                primary_failure.add_note(
+                    "restore target concurrency exclusion release was repeatedly cancelled"
+                )
+            except BaseException as error:
+                if primary_failure is not None:
+                    primary_failure.add_note("restore target concurrency exclusion release failed")
+                else:
+                    raise RuntimeError(
+                        "restore target concurrency exclusion release failed"
+                    ) from error
+    finally:
+        primary_failure = sys.exception()
+        error_info = (
+            (type(primary_failure), primary_failure, primary_failure.__traceback__)
+            if primary_failure is not None
+            else (None, None, None)
+        )
+        try:
+            await _await_owned_operation(connection_context.__aexit__(*error_info))
+        except asyncio.CancelledError:
+            if primary_failure is None:
+                raise
+            primary_failure.add_note(
+                "restore target concurrency exclusion connection exit was repeatedly cancelled"
+            )
+        except BaseException as error:
+            if primary_failure is not None:
+                primary_failure.add_note(
+                    "restore target concurrency exclusion connection exit failed"
+                )
+            else:
+                raise RuntimeError(
+                    "restore target concurrency exclusion connection exit failed"
+                ) from error
+
+
+def _default_runtime(
+    *,
+    deadline_monotonic: float,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> RestoreOperatorRuntime:
+    async def process_runner(argv: tuple[str, ...], environment: dict[str, str]) -> int:
+        return await _default_process_runner(
+            argv,
+            environment,
+            deadline_monotonic=deadline_monotonic,
+            monotonic=monotonic,
+        )
+
     return RestoreOperatorRuntime(
         target_loader=load_restore_target,
         engine_factory=_default_engine_factory,
         object_client_factory=_default_object_client_factory,
-        database_probe=_default_database_probe,
+        database_probe=_default_measured_database_probe,
         facts_inspector=_default_facts_inspector,
-        process_runner=_default_process_runner,
+        process_runner=process_runner,
         receipt_rebinder=_default_rebind_database_object_receipts,
         app_access_granter=_default_grant_app_access,
         app_engine_factory=_default_engine_factory,
         app_access_probe=_default_app_access_probe,
+        target_exclusion=_default_target_exclusion,
+        target_exclusion_mode="postgresql-session-advisory-lock",
+        object_state_probe=_default_object_state_probe,
     )
 
 
@@ -1135,6 +1440,61 @@ def _report_target(path: Path) -> Path:
     if requested.parent.is_symlink() or not parent.is_dir():
         raise ValueError("restore report parent is unsafe")
     return parent / requested.name
+
+
+def _validate_target_config_snapshot(path: Path, expected_sha256: str | None) -> None:
+    if expected_sha256 is None:
+        return
+    if _SHA256.fullmatch(expected_sha256) is None:
+        raise ValueError("restore target config digest is invalid")
+    source = Path(path)
+    if source.is_symlink() or not source.is_file():
+        raise ValueError("restore target config snapshot is unavailable")
+    try:
+        body = source.read_bytes()
+        payload = json.loads(body)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise ValueError("restore target config snapshot is invalid") from None
+    if (
+        not isinstance(payload, dict)
+        or _canonical_json(payload) != body
+        or hashlib.sha256(body).hexdigest() != expected_sha256
+    ):
+        raise ValueError("restore target config snapshot is invalid")
+
+
+def _load_target_provisioning_receipt(
+    path: Path,
+    expected_sha256: str,
+    *,
+    candidate_sha256: str,
+    run_id: str,
+    environment_id: str,
+    database_disposition: str,
+    object_store_disposition: str,
+) -> bytes:
+    if _SHA256.fullmatch(expected_sha256) is None:
+        raise ValueError("restore target provisioning receipt digest is invalid")
+    source = Path(path)
+    if source.is_symlink() or not source.is_file():
+        raise ValueError("restore target provisioning receipt is unavailable")
+    try:
+        body = source.read_bytes()
+    except OSError:
+        raise ValueError("restore target provisioning receipt is unavailable") from None
+    if hashlib.sha256(body).hexdigest() != expected_sha256:
+        raise ValueError("restore target provisioning receipt digest is invalid")
+    from backup_restore_contract import parse_target_provisioning_receipt
+
+    parse_target_provisioning_receipt(
+        body,
+        provisioning_receipt_sha256=expected_sha256,
+        candidate_sha256=candidate_sha256,
+        release_run={"runId": run_id, "environmentId": environment_id},
+        database_disposition=database_disposition,
+        object_store_disposition=object_store_disposition,
+    )
+    return body
 
 
 def _pg_restore_argv(
@@ -1184,7 +1544,83 @@ def _pg_environment(password: str) -> dict[str, str]:
 
 async def _client_call(client: Any, method: str, **arguments: object) -> Any:
     operation = getattr(client, method)
-    return await asyncio.to_thread(operation, **arguments)
+    return await _await_owned_operation(
+        asyncio.to_thread(operation, **arguments),
+        cleanup_grace_seconds=_OBJECT_CLIENT_CLEANUP_GRACE_SECONDS,
+        incomplete_cleanup_note="object client operation cleanup incomplete",
+    )
+
+
+async def _await_owned_operation(
+    operation: Awaitable[_OwnedResult],
+    *,
+    cleanup_grace_seconds: float | None = None,
+    incomplete_cleanup_note: str | None = None,
+) -> _OwnedResult:
+    if cleanup_grace_seconds is not None:
+        if (
+            isinstance(cleanup_grace_seconds, bool)
+            or not isinstance(cleanup_grace_seconds, (int, float))
+            or not math.isfinite(cleanup_grace_seconds)
+            or cleanup_grace_seconds <= 0
+            or not isinstance(incomplete_cleanup_note, str)
+            or not incomplete_cleanup_note
+        ):
+            raise ValueError("owned operation cleanup grace is invalid")
+        cleanup_grace_seconds = float(cleanup_grace_seconds)
+    elif incomplete_cleanup_note is not None:
+        raise ValueError("owned operation cleanup grace is invalid")
+
+    async def run_operation() -> _OwnedResult:
+        return await operation
+
+    operation_task = asyncio.create_task(run_operation())
+    first_cancellation: asyncio.CancelledError | None = None
+    cleanup_deadline: float | None = None
+    cleanup_incomplete_noted = False
+    loop = asyncio.get_running_loop()
+    while not operation_task.done():
+        try:
+            if cleanup_deadline is not None and not cleanup_incomplete_noted:
+                remaining = cleanup_deadline - loop.time()
+                if remaining <= 0:
+                    if first_cancellation is None or incomplete_cleanup_note is None:
+                        raise RuntimeError("owned operation cleanup state is invalid")
+                    first_cancellation.add_note(incomplete_cleanup_note)
+                    cleanup_incomplete_noted = True
+                    continue
+                await asyncio.wait((operation_task,), timeout=remaining)
+                if not operation_task.done():
+                    if first_cancellation is None or incomplete_cleanup_note is None:
+                        raise RuntimeError("owned operation cleanup state is invalid")
+                    first_cancellation.add_note(incomplete_cleanup_note)
+                    cleanup_incomplete_noted = True
+            else:
+                await asyncio.shield(operation_task)
+        except asyncio.CancelledError as cancellation:
+            if first_cancellation is None:
+                first_cancellation = cancellation
+                if cleanup_grace_seconds is not None:
+                    cleanup_deadline = loop.time() + cleanup_grace_seconds
+            current_task = asyncio.current_task()
+            if current_task is not None:
+                current_task.uncancel()
+    try:
+        result = operation_task.result()
+    except BaseException as operation_failure:
+        if first_cancellation is not None:
+            first_cancellation.add_note(
+                f"owned operation failed: {type(operation_failure).__name__}"
+            )
+            raise first_cancellation
+        raise
+    if first_cancellation is not None:
+        raise first_cancellation
+    return result
+
+
+async def _await_owned_cleanup(cleanup: Awaitable[None]) -> None:
+    await _await_owned_operation(cleanup)
 
 
 def _digest_body(body: Any) -> tuple[str, int]:
@@ -1198,10 +1634,23 @@ def _digest_body(body: Any) -> tuple[str, int]:
     return digest.hexdigest(), size
 
 
+def _read_bounded_body(body: Any, maximum_size: int) -> bytes:
+    payload = bytearray()
+    while len(payload) <= maximum_size:
+        remaining = maximum_size + 1 - len(payload)
+        chunk = body.read(min(1024 * 1024, remaining))
+        if not isinstance(chunk, bytes):
+            raise ValueError("object body is invalid")
+        if not chunk:
+            break
+        payload.extend(chunk)
+    return bytes(payload)
+
+
 async def _close_resource(resource: object) -> None:
     close = getattr(resource, "close", None)
     if close is not None:
-        await asyncio.to_thread(close)
+        await _await_owned_cleanup(asyncio.to_thread(close))
 
 
 async def _list_object_versions(
@@ -1258,6 +1707,31 @@ async def _list_object_versions(
             raise RuntimeError("restore target object prefix could not be inspected") from None
 
 
+def _separate_object_restore_control(
+    versions: tuple[object, ...],
+    delete_markers: tuple[object, ...],
+) -> tuple[tuple[object, ...], tuple[object, ...], tuple[dict[str, object], ...]]:
+    business_versions: list[object] = []
+    control_versions: list[dict[str, object]] = []
+    for version in versions:
+        if isinstance(version, dict) and version.get("Key") == _OBJECT_RESTORE_CONTROL_KEY:
+            if not isinstance(version.get("VersionId"), str) or not version["VersionId"]:
+                raise RuntimeError("restore target object control claim is invalid")
+            control_versions.append(version)
+        else:
+            business_versions.append(version)
+    business_delete_markers: list[object] = []
+    for marker in delete_markers:
+        if isinstance(marker, dict) and marker.get("Key") == _OBJECT_RESTORE_CONTROL_KEY:
+            raise RuntimeError("restore target object control claim was deleted")
+        business_delete_markers.append(marker)
+    return (
+        tuple(business_versions),
+        tuple(business_delete_markers),
+        tuple(control_versions),
+    )
+
+
 async def _object_prefix_is_empty(
     client: Any,
     *,
@@ -1268,6 +1742,10 @@ async def _object_prefix_is_empty(
         client,
         bucket=bucket,
         prefix=prefix,
+    )
+    versions, delete_markers, _control_versions = _separate_object_restore_control(
+        versions,
+        delete_markers,
     )
     return not versions and not delete_markers
 
@@ -1286,18 +1764,260 @@ async def _object_bucket_versioning_is_enabled(client: Any, *, bucket: str) -> b
     return isinstance(response, dict) and response.get("Status") == "Enabled"
 
 
+async def _claim_object_restore_control(
+    client: Any,
+    *,
+    bucket: str,
+    candidate_sha256: str,
+    provisioning_receipt_sha256: str,
+    run_id: str,
+    environment_id: str,
+    database_identity_sha256: str,
+    object_store_identity_sha256: str,
+) -> _ObjectRestoreControlClaim:
+    if (
+        _SHA256.fullmatch(candidate_sha256) is None
+        or _SHA256.fullmatch(provisioning_receipt_sha256) is None
+        or _RUN_ID.fullmatch(run_id) is None
+        or _ENVIRONMENT_ID.fullmatch(environment_id) is None
+        or _SHA256.fullmatch(database_identity_sha256) is None
+        or _SHA256.fullmatch(object_store_identity_sha256) is None
+    ):
+        raise ValueError("restore target object control claim identity is invalid")
+    marker = {
+        "schemaVersion": 1,
+        "candidateSha256": candidate_sha256,
+        "provisioningReceiptSha256": provisioning_receipt_sha256,
+        "releaseRun": {
+            "runId": run_id,
+            "environmentId": environment_id,
+        },
+        "target": {
+            "databaseIdentitySha256": database_identity_sha256,
+            "objectStoreIdentitySha256": object_store_identity_sha256,
+        },
+    }
+    marker_body = _canonical_json(marker)
+    try:
+        service_model = client.meta.service_model
+        operation_model = service_model.operation_model("PutObject")
+        input_members = operation_model.input_shape.members
+    except Exception:
+        raise RuntimeError(
+            "restore target object storage does not support atomic conditional create"
+        ) from None
+    if not isinstance(input_members, Mapping) or "IfNoneMatch" not in input_members:
+        raise RuntimeError(
+            "restore target object storage does not support atomic conditional create"
+        )
+    try:
+        response = await _client_call(
+            client,
+            "put_object",
+            Bucket=bucket,
+            Key=_OBJECT_RESTORE_CONTROL_KEY,
+            Body=marker_body,
+            ContentType="application/json",
+            IfNoneMatch="*",
+        )
+    except Exception as error:
+        response = getattr(error, "response", None)
+        error_details = response.get("Error") if isinstance(response, Mapping) else None
+        response_metadata = (
+            response.get("ResponseMetadata") if isinstance(response, Mapping) else None
+        )
+        if (
+            isinstance(error_details, Mapping) and error_details.get("Code") == "PreconditionFailed"
+        ) or (
+            isinstance(response_metadata, Mapping)
+            and response_metadata.get("HTTPStatusCode") == 412
+        ):
+            raise RuntimeError("restore target object control key is already claimed") from None
+        raise RuntimeError("restore target object control claim failed") from None
+    if not isinstance(response, dict):
+        raise RuntimeError("restore target object control claim returned no receipt")
+    etag = response.get("ETag")
+    version_id = response.get("VersionId")
+    if (
+        not isinstance(etag, str)
+        or not etag
+        or not etag.strip()
+        or etag != etag.strip()
+        or len(etag) > 1024
+        or not isinstance(version_id, str)
+        or not version_id
+        or not version_id.strip()
+        or version_id != version_id.strip()
+        or version_id == "null"
+        or len(version_id) > 1024
+    ):
+        raise RuntimeError("restore target object control claim returned no receipt")
+    return _ObjectRestoreControlClaim(
+        version_id=version_id,
+        body=marker_body,
+        body_sha256=hashlib.sha256(marker_body).hexdigest(),
+    )
+
+
+async def _default_object_state_probe(
+    client: Any,
+    target: RestoreTarget,
+) -> TargetObjectState:
+    from backup_restore_contract import physical_object_store_identity_sha256
+
+    versioning_enabled = await _object_bucket_versioning_is_enabled(
+        client,
+        bucket=target.object_bucket,
+    )
+    versions, delete_markers = await _list_object_versions(
+        client,
+        bucket=target.object_bucket,
+        prefix="",
+    )
+    versions, delete_markers, _control_versions = _separate_object_restore_control(
+        versions,
+        delete_markers,
+    )
+    try:
+        owner_response = await _client_call(
+            client,
+            "get_bucket_acl",
+            Bucket=target.object_bucket,
+        )
+        owner = owner_response["Owner"]
+        owner_id = owner["ID"]
+    except Exception:
+        raise RuntimeError("restore target object ownership could not be inspected") from None
+    if not isinstance(owner_id, str) or not owner_id or len(owner_id) > 1024:
+        raise RuntimeError("restore target object ownership could not be inspected")
+    keys: set[str] = set()
+    for version in versions:
+        if (
+            not isinstance(version, dict)
+            or not isinstance(version.get("Key"), str)
+            or not isinstance(version.get("VersionId"), str)
+            or not version["VersionId"]
+        ):
+            raise RuntimeError("restore target object versions could not be inspected")
+        keys.add(version["Key"])
+    if any(
+        not isinstance(marker, dict)
+        or not isinstance(marker.get("Key"), str)
+        or not isinstance(marker.get("VersionId"), str)
+        or not marker["VersionId"]
+        for marker in delete_markers
+    ):
+        raise RuntimeError("restore target object versions could not be inspected")
+    owner_id_sha256 = hashlib.sha256(owner_id.encode("utf-8")).hexdigest()
+    return TargetObjectState(
+        identity_sha256=physical_object_store_identity_sha256(
+            target.object_endpoint,
+            target.object_region,
+            target.object_bucket,
+            owner_id_sha256,
+        ),
+        versioning_enabled=versioning_enabled,
+        object_count=len(keys),
+        version_count=len(versions),
+        delete_marker_count=len(delete_markers),
+        owner_id_sha256=owner_id_sha256,
+    )
+
+
 async def _restored_object_prefix_is_exact(
     client: Any,
     *,
     bucket: str,
     prefix: str,
     expected_receipts: tuple[RestoredObjectReceipt, ...],
+    required_control_claim: _ObjectRestoreControlClaim | None = None,
+    required_control_version_id: str | None = None,
 ) -> bool:
     versions, delete_markers = await _list_object_versions(
         client,
         bucket=bucket,
         prefix=prefix,
     )
+    versions, delete_markers, control_versions = _separate_object_restore_control(
+        versions,
+        delete_markers,
+    )
+    if required_control_claim is not None and required_control_version_id is not None:
+        return False
+    if required_control_version_id is not None:
+        return False
+    if required_control_claim is not None:
+        if (
+            not isinstance(required_control_claim, _ObjectRestoreControlClaim)
+            or not isinstance(required_control_claim.body, bytes)
+            or not required_control_claim.body
+            or _SHA256.fullmatch(required_control_claim.body_sha256) is None
+            or hashlib.sha256(required_control_claim.body).hexdigest()
+            != required_control_claim.body_sha256
+        ):
+            return False
+        try:
+            marker = json.loads(required_control_claim.body)
+        except (TypeError, UnicodeDecodeError, json.JSONDecodeError):
+            return False
+        if not isinstance(marker, dict) or _canonical_json(marker) != required_control_claim.body:
+            return False
+        if len(control_versions) != 1:
+            return False
+        control_version = control_versions[0]
+        if (
+            control_version.get("VersionId") != required_control_claim.version_id
+            or control_version.get("IsLatest") is not True
+        ):
+            return False
+        control_body: object | None = None
+        try:
+            try:
+                response = await _client_call(
+                    client,
+                    "get_object",
+                    Bucket=bucket,
+                    Key=_OBJECT_RESTORE_CONTROL_KEY,
+                    VersionId=required_control_claim.version_id,
+                )
+            except Exception:
+                raise RuntimeError("restore target object control readback failed") from None
+            if not isinstance(response, Mapping):
+                return False
+            control_body = response.get("Body")
+            if control_body is None:
+                return False
+            try:
+                stored_body = await _await_owned_operation(
+                    asyncio.to_thread(
+                        _read_bounded_body,
+                        control_body,
+                        len(required_control_claim.body),
+                    ),
+                    cleanup_grace_seconds=_OBJECT_CLIENT_CLEANUP_GRACE_SECONDS,
+                    incomplete_cleanup_note="object client operation cleanup incomplete",
+                )
+            except Exception:
+                raise RuntimeError("restore target object control readback failed") from None
+            if (
+                stored_body != required_control_claim.body
+                or hashlib.sha256(stored_body).hexdigest() != required_control_claim.body_sha256
+            ):
+                return False
+        finally:
+            if control_body is not None:
+                primary_failure = sys.exception()
+                try:
+                    await _close_resource(control_body)
+                except BaseException as close_failure:
+                    if primary_failure is not None:
+                        primary_failure.add_note(
+                            "restore target object control readback cleanup failed"
+                        )
+                    else:
+                        raise RuntimeError(
+                            "restore target object control readback cleanup failed"
+                        ) from close_failure
     expected = {receipt.key: receipt.version_id for receipt in expected_receipts}
     if delete_markers or len(expected) != len(expected_receipts) or len(versions) != len(expected):
         return False
@@ -1401,9 +2121,13 @@ async def _restore_inventory_objects(
                 VersionId=receipt.version_id,
             )
             restored_body = restored_response["Body"]
-            restored_sha256, restored_size = await asyncio.to_thread(
-                _digest_body,
-                restored_body,
+            restored_sha256, restored_size = await _await_owned_operation(
+                asyncio.to_thread(
+                    _digest_body,
+                    restored_body,
+                ),
+                cleanup_grace_seconds=_OBJECT_CLIENT_CLEANUP_GRACE_SECONDS,
+                incomplete_cleanup_note="object client operation cleanup incomplete",
             )
         except Exception:
             raise RuntimeError("restored object could not be verified") from None
@@ -1436,6 +2160,143 @@ async def _restore_database_dump(
         raise RuntimeError("pg_restore failed")
 
 
+def _validate_measured_target_transition(
+    before: TargetObservation,
+    after: TargetObservation,
+    restored_count: object,
+    *,
+    target: RestoreTarget,
+    target_config_sha256: str,
+    provisioning_receipt_sha256: str,
+    database_ownership: str,
+    object_namespace_ownership: str,
+    exclusion_mode: str,
+    exclusion_identity_sha256: str,
+) -> dict[str, object]:
+    if isinstance(restored_count, bool) or not isinstance(restored_count, int):
+        raise RuntimeError("restore target mutation result is invalid")
+    if restored_count < 0:
+        raise RuntimeError("restore target mutation result is invalid")
+    database_before = before.database
+    database_after = after.database
+    objects_before = before.objects
+    objects_after = after.objects
+    if (
+        database_before.identity_sha256 != database_after.identity_sha256
+        or database_before.user_object_count != 0
+        or database_after.user_object_count <= 0
+        or database_before.current_role != target.database_user
+        or database_after.current_role != target.database_user
+        or database_before.database_owner != target.database_user
+        or database_after.database_owner != target.database_user
+    ):
+        raise RuntimeError("restore target database observations are invalid")
+    if (
+        objects_before.identity_sha256 != objects_after.identity_sha256
+        or objects_before.versioning_enabled is not True
+        or objects_after.versioning_enabled is not True
+        or objects_before.object_count != 0
+        or objects_before.version_count != 0
+        or objects_before.delete_marker_count != 0
+        or objects_after.object_count != restored_count
+        or objects_after.version_count != restored_count
+        or objects_after.delete_marker_count != 0
+        or not isinstance(objects_before.owner_id_sha256, str)
+        or _SHA256.fullmatch(objects_before.owner_id_sha256) is None
+        or objects_before.owner_id_sha256 != objects_after.owner_id_sha256
+    ):
+        raise RuntimeError("restore target object observations are invalid")
+    if (
+        database_ownership not in _OWNERSHIP_VALUES
+        or object_namespace_ownership not in _OWNERSHIP_VALUES
+        or not isinstance(exclusion_mode, str)
+        or not exclusion_mode
+        or _SHA256.fullmatch(exclusion_identity_sha256) is None
+    ):
+        raise RuntimeError("restore target ownership or exclusion evidence is invalid")
+    return {
+        "targetConfigSha256": target_config_sha256,
+        "provisioningReceiptSha256": provisioning_receipt_sha256,
+        "database": {
+            "host": target.database_host,
+            "port": target.database_port,
+            "name": target.database_name,
+            "identitySha256": database_before.identity_sha256,
+            "ownership": database_ownership,
+            "pre": {
+                "identitySha256": database_before.identity_sha256,
+                "userObjectCount": database_before.user_object_count,
+                "currentRole": database_before.current_role,
+                "owner": database_before.database_owner,
+            },
+            "post": {
+                "identitySha256": database_after.identity_sha256,
+                "userObjectCount": database_after.user_object_count,
+                "currentRole": database_after.current_role,
+                "owner": database_after.database_owner,
+            },
+        },
+        "objects": {
+            "endpoint": target.object_endpoint,
+            "region": target.object_region,
+            "namespaceId": target.object_namespace_id,
+            "bucket": target.object_bucket,
+            "identitySha256": objects_before.identity_sha256,
+            "ownership": object_namespace_ownership,
+            "pre": {
+                "identitySha256": objects_before.identity_sha256,
+                "versioningEnabled": objects_before.versioning_enabled,
+                "objectCount": objects_before.object_count,
+                "versionCount": objects_before.version_count,
+                "deleteMarkerCount": objects_before.delete_marker_count,
+                "ownerIdSha256": objects_before.owner_id_sha256,
+            },
+            "post": {
+                "identitySha256": objects_after.identity_sha256,
+                "versioningEnabled": objects_after.versioning_enabled,
+                "objectCount": objects_after.object_count,
+                "versionCount": objects_after.version_count,
+                "deleteMarkerCount": objects_after.delete_marker_count,
+                "ownerIdSha256": objects_after.owner_id_sha256,
+            },
+        },
+        "concurrencyExclusion": {
+            "mode": exclusion_mode,
+            "identitySha256": exclusion_identity_sha256,
+            "heldThroughPostValidation": True,
+        },
+    }
+
+
+def _validate_measured_target_precondition(
+    observation: TargetObservation,
+    *,
+    target: RestoreTarget,
+    source_database_identity_sha256: str,
+    source_object_identity_sha256: str,
+) -> None:
+    database = observation.database
+    objects = observation.objects
+    if (
+        _SHA256.fullmatch(str(database.identity_sha256)) is None
+        or database.identity_sha256 == source_database_identity_sha256
+        or database.user_object_count != 0
+        or database.current_role != target.database_user
+        or database.database_owner != target.database_user
+    ):
+        raise ValueError("restore target database pre-observation is invalid")
+    if (
+        _SHA256.fullmatch(str(objects.identity_sha256)) is None
+        or objects.identity_sha256 == source_object_identity_sha256
+        or objects.versioning_enabled is not True
+        or objects.object_count != 0
+        or objects.version_count != 0
+        or objects.delete_marker_count != 0
+        or _SHA256.fullmatch(str(objects.owner_id_sha256)) is None
+    ):
+        raise ValueError("restore target object pre-observation is invalid")
+
+
 def restore_report_payload(
     report: RestoreValidationReport,
     *,
@@ -1451,8 +2312,8 @@ def restore_report_payload(
         raise ValueError("manifest digest is invalid")
     if not isinstance(target_object_bucket, str) or not target_object_bucket:
         raise ValueError("target object bucket is invalid")
-    return {
-        "schemaVersion": 2,
+    payload = {
+        "schemaVersion": 3 if report.target_evidence is not None else 2,
         "runId": run_id,
         "ok": report.ok,
         "targetDatabaseIdentitySha256": report.target_database_identity_sha256,
@@ -1463,7 +2324,10 @@ def restore_report_payload(
             "archiveFingerprintSha256": archive_fingerprint_sha256,
             "manifestSha256": manifest_sha256,
         },
-        "database": {"singleTransaction": True},
+        "database": {
+            "dumpRestoreSingleTransaction": True,
+            "postRestoreMutationsAtomic": False,
+        },
         "objects": {
             "createOnly": True,
             "isolation": "empty_target_bucket",
@@ -1473,6 +2337,9 @@ def restore_report_payload(
         },
         "crossSystemAtomic": False,
     }
+    if report.target_evidence is not None:
+        payload["target"] = report.target_evidence
+    return payload
 
 
 def _fsync_directory(path: Path) -> None:
@@ -1516,53 +2383,88 @@ def _write_restore_report(
     except OSError:
         raise RuntimeError("restore report staging could not be created") from None
     staging = Path(staging_name)
-    failure: Exception | None = None
+    descriptor_open = True
     committed = False
     try:
-        with os.fdopen(descriptor, "wb") as handle:
+        handle = os.fdopen(descriptor, "wb")
+        descriptor_open = False
+        with handle:
             restrict_secret_file(staging)
             handle.write(report_bytes)
             handle.flush()
             os.fsync(handle.fileno())
-        os.link(staging, path)
+        try:
+            os.link(staging, path)
+        except FileExistsError:
+            raise FileExistsError("restore report already exists") from None
         committed = True
         # The no-replace hard link is the publication commit point. Once the
         # formal report exists, later durability/cleanup attempts cannot turn
         # the operator result into a contradictory failure.
         try:
             _fsync_directory(path.parent)
-        except Exception:
+        except BaseException:
             pass
     except FileExistsError:
-        failure = FileExistsError("restore report already exists")
-    except Exception:
-        failure = RuntimeError("restore report could not be published")
+        raise
+    except OSError:
+        raise RuntimeError("restore report could not be published") from None
     finally:
+        primary_failure = sys.exception()
+        if descriptor_open:
+            try:
+                os.close(descriptor)
+            except BaseException:
+                if primary_failure is not None and not committed:
+                    primary_failure.add_note("restore report staging descriptor cleanup failed")
+                elif not committed:
+                    raise
         try:
             staging.unlink(missing_ok=True)
-        except OSError:
-            if not committed and failure is None:
-                failure = RuntimeError("restore report staging cleanup failed")
-    if not committed and failure is not None:
-        raise failure from None
+        except BaseException:
+            if primary_failure is not None and not committed:
+                primary_failure.add_note("restore report staging cleanup failed")
+            elif not committed:
+                raise
 
 
 async def run_restore_operator(
     *,
     backup_dir: Path,
     target_config: Path,
+    provisioning_receipt: Path | None = None,
+    provisioning_receipt_sha256: str | None = None,
     target_secret_dir: Path,
     run_id: str,
     report_path: Path,
     pg_restore: Path = Path("pg_restore"),
+    target_config_sha256: str | None = None,
+    database_ownership: str | None = None,
+    object_namespace_ownership: str | None = None,
+    candidate_sha256: str | None = None,
+    environment_id: str | None = None,
+    deadline_monotonic: float | None = None,
     runtime: RestoreOperatorRuntime | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
 ) -> RestoreValidationReport:
     """Restore into one empty target DB and one empty versioned target bucket.
 
-    PostgreSQL is restored in one transaction. Object writes are independently
-    create-only; this function deliberately makes no cross-system atomicity claim.
+    The pg_restore dump phase uses one transaction. Receipt rebinding, grants,
+    and object writes are post-restore mutations and are not atomic with that
+    dump transaction or with one another across systems.
     """
 
+    current_monotonic = monotonic()
+    if deadline_monotonic is None:
+        deadline_monotonic = current_monotonic + 60 * 60
+    if (
+        isinstance(deadline_monotonic, bool)
+        or not isinstance(deadline_monotonic, (int, float))
+        or not math.isfinite(deadline_monotonic)
+        or deadline_monotonic <= current_monotonic
+    ):
+        raise ValueError("restore deadline is invalid or expired")
+    deadline_monotonic = float(deadline_monotonic)
     prefix = _object_prefix(run_id)
     backup = _load_verified_backup(Path(backup_dir))
     if len(backup.object_payloads) != len(backup.object_inventory) or any(
@@ -1571,7 +2473,26 @@ async def run_restore_operator(
     ):
         raise ValueError("verified backup does not contain every object payload")
     report_target = _report_target(Path(report_path))
-    selected_runtime = runtime or _default_runtime()
+    _validate_target_config_snapshot(Path(target_config), target_config_sha256)
+    selected_runtime = runtime or _default_runtime(
+        deadline_monotonic=deadline_monotonic,
+        monotonic=monotonic,
+    )
+    measured_values = (
+        target_config_sha256,
+        provisioning_receipt,
+        provisioning_receipt_sha256,
+        database_ownership,
+        object_namespace_ownership,
+        candidate_sha256,
+        environment_id,
+        selected_runtime.target_exclusion,
+        selected_runtime.target_exclusion_mode,
+        selected_runtime.object_state_probe,
+    )
+    measured_execution = all(value is not None for value in measured_values)
+    if not measured_execution:
+        raise ValueError("restore measured target evidence is required")
     try:
         target = selected_runtime.target_loader(
             Path(target_config),
@@ -1581,17 +2502,26 @@ async def run_restore_operator(
         raise ValueError("restore target configuration is invalid") from None
     if target.database_user != _RESTORE_DATABASE_USER:
         raise ValueError("restore target database role must be yfeistai_migrator")
-    from backup_teaching import object_store_identity_sha256
-
-    try:
-        target_object_store_identity = object_store_identity_sha256(
-            target.object_namespace_id,
-            target.object_bucket,
+    provisioning_receipt_body: bytes | None = None
+    if measured_execution:
+        if (
+            provisioning_receipt is None
+            or provisioning_receipt_sha256 is None
+            or candidate_sha256 is None
+            or environment_id is None
+            or database_ownership is None
+            or object_namespace_ownership is None
+        ):
+            raise RuntimeError("restore target provisioning receipt is unavailable")
+        provisioning_receipt_body = _load_target_provisioning_receipt(
+            provisioning_receipt,
+            provisioning_receipt_sha256,
+            candidate_sha256=candidate_sha256,
+            run_id=run_id,
+            environment_id=environment_id,
+            database_disposition=database_ownership,
+            object_store_disposition=object_namespace_ownership,
         )
-    except ValueError:
-        raise ValueError("restore target object store identity is invalid") from None
-    if target_object_store_identity == backup.manifest.source_object_store_identity_sha256:
-        raise ValueError("restore target object store must be distinct from the backup source")
 
     try:
         engine = selected_runtime.engine_factory(target.database_url)
@@ -1600,36 +2530,13 @@ async def run_restore_operator(
     object_client: Any | None = None
     app_engine: Any | None = None
     restored_receipts: tuple[RestoredObjectReceipt, ...] | None = None
+    object_control_claim: _ObjectRestoreControlClaim | None = None
     report: RestoreValidationReport | None = None
     try:
-        try:
-            database_state = await selected_runtime.database_probe(engine)
-        except Exception:
-            raise RuntimeError("restore target database could not be inspected") from None
-        _validate_restore_inputs(
-            backup.manifest,
-            target_database_identity_sha256=database_state.identity_sha256,
-            object_prefix=prefix,
-            object_inventory=backup.object_inventory,
-        )
-        if database_state.user_object_count != 0:
-            raise ValueError("restore target database must be empty")
-
         try:
             object_client = selected_runtime.object_client_factory(target)
         except Exception:
             raise RuntimeError("restore target object storage is unavailable") from None
-        if not await _object_bucket_versioning_is_enabled(
-            object_client,
-            bucket=target.object_bucket,
-        ):
-            raise ValueError("restore target object bucket versioning must be enabled")
-        if not await _object_prefix_is_empty(
-            object_client,
-            bucket=target.object_bucket,
-            prefix=prefix,
-        ):
-            raise ValueError("restore target object bucket must be empty")
 
         async def restore_database() -> None:
             current_backup = _reverify_verified_backup(backup)
@@ -1686,49 +2593,200 @@ async def run_restore_operator(
             except Exception:
                 raise RuntimeError("restored database validation failed") from None
 
-        report = await validate_teaching_restore(
-            backup.manifest,
-            target_database_identity_sha256=database_state.identity_sha256,
-            object_prefix=prefix,
-            object_inventory=backup.object_inventory,
-            restore_database=restore_database,
-            restore_objects=restore_objects,
-            inspect_restored_facts=inspect_restored_facts,
-        )
-        try:
-            exact_prefix = await _restored_object_prefix_is_exact(
-                object_client,
-                bucket=target.object_bucket,
-                prefix=prefix,
-                expected_receipts=restored_receipts or (),
+        async def perform_mutations(database_identity_sha256: str) -> RestoreValidationReport:
+            return await validate_teaching_restore(
+                backup.manifest,
+                target_database_identity_sha256=database_identity_sha256,
+                object_prefix=prefix,
+                object_inventory=backup.object_inventory,
+                restore_database=restore_database,
+                restore_objects=restore_objects,
+                inspect_restored_facts=inspect_restored_facts,
             )
-        except Exception:
-            raise RuntimeError("restored object bucket verification failed") from None
-        if not exact_prefix:
-            raise RuntimeError("restored object bucket verification failed")
+
+        async def verify_restored_object_prefix() -> None:
+            if object_client is None or restored_receipts is None or object_control_claim is None:
+                raise RuntimeError("restored object bucket verification failed")
+            try:
+                exact_prefix = await _restored_object_prefix_is_exact(
+                    object_client,
+                    bucket=target.object_bucket,
+                    prefix=prefix,
+                    expected_receipts=restored_receipts,
+                    required_control_claim=object_control_claim,
+                )
+            except Exception:
+                raise RuntimeError("restored object bucket verification failed") from None
+            if not exact_prefix:
+                raise RuntimeError("restored object bucket verification failed")
+
+        if measured_execution:
+            target_exclusion = selected_runtime.target_exclusion
+            object_state_probe = selected_runtime.object_state_probe
+            exclusion_mode = selected_runtime.target_exclusion_mode
+            if (
+                target_exclusion is None
+                or object_state_probe is None
+                or exclusion_mode is None
+                or target_config_sha256 is None
+                or database_ownership is None
+                or object_namespace_ownership is None
+                or candidate_sha256 is None
+                or environment_id is None
+                or provisioning_receipt_body is None
+                or provisioning_receipt_sha256 is None
+            ):
+                raise RuntimeError("restore measured target evidence is unavailable")
+            try:
+                lock_database_state = await selected_runtime.database_probe(engine)
+            except Exception:
+                raise RuntimeError(
+                    "restore target physical database identity could not be inspected"
+                ) from None
+            exclusion_identity_sha256 = getattr(
+                lock_database_state,
+                "identity_sha256",
+                None,
+            )
+            if (
+                not isinstance(exclusion_identity_sha256, str)
+                or _SHA256.fullmatch(exclusion_identity_sha256) is None
+                or exclusion_identity_sha256 == backup.manifest.database.identity_sha256
+            ):
+                raise ValueError("restore target physical database identity is invalid")
+            observations: list[TargetObservation] = []
+
+            async def observe_target() -> TargetObservation:
+                try:
+                    database_state = await selected_runtime.database_probe(engine)
+                    object_state = await object_state_probe(object_client, target)
+                except Exception:
+                    raise RuntimeError("restore target state could not be inspected") from None
+                if database_state.identity_sha256 != exclusion_identity_sha256:
+                    raise RuntimeError("restore target physical database identity changed")
+                observation = TargetObservation(
+                    database=database_state,
+                    objects=object_state,
+                )
+                observations.append(observation)
+                if len(observations) == 2:
+                    await verify_restored_object_prefix()
+                return observation
+
+            async def mutate_target() -> RestoreValidationReport:
+                nonlocal object_control_claim
+                if len(observations) != 1:
+                    raise RuntimeError("restore target pre-observation is unavailable")
+                before = observations[0]
+                _validate_measured_target_precondition(
+                    before,
+                    target=target,
+                    source_database_identity_sha256=backup.manifest.database.identity_sha256,
+                    source_object_identity_sha256=(
+                        backup.manifest.source_object_store_identity_sha256
+                    ),
+                )
+                _validate_restore_inputs(
+                    backup.manifest,
+                    target_database_identity_sha256=before.database.identity_sha256,
+                    object_prefix=prefix,
+                    object_inventory=backup.object_inventory,
+                )
+                from backup_restore_contract import parse_target_provisioning_receipt
+
+                parse_target_provisioning_receipt(
+                    provisioning_receipt_body,
+                    provisioning_receipt_sha256=provisioning_receipt_sha256,
+                    candidate_sha256=candidate_sha256,
+                    release_run={"runId": run_id, "environmentId": environment_id},
+                    database_disposition=database_ownership,
+                    object_store_disposition=object_namespace_ownership,
+                    database_identity_sha256=before.database.identity_sha256,
+                    object_store_identity_sha256=before.objects.identity_sha256,
+                )
+                object_control_claim = await _claim_object_restore_control(
+                    object_client,
+                    bucket=target.object_bucket,
+                    candidate_sha256=candidate_sha256,
+                    provisioning_receipt_sha256=provisioning_receipt_sha256,
+                    run_id=run_id,
+                    environment_id=environment_id,
+                    database_identity_sha256=before.database.identity_sha256,
+                    object_store_identity_sha256=before.objects.identity_sha256,
+                )
+                return await perform_mutations(before.database.identity_sha256)
+
+            def validate_target_transition(
+                before: object,
+                after: object,
+                current_report: object,
+            ) -> RestoreValidationReport:
+                if (
+                    not isinstance(before, TargetObservation)
+                    or not isinstance(after, TargetObservation)
+                    or not isinstance(current_report, RestoreValidationReport)
+                ):
+                    raise RuntimeError("restore target observations are invalid")
+                target_evidence = _validate_measured_target_transition(
+                    before,
+                    after,
+                    len(backup.object_inventory),
+                    target=target,
+                    target_config_sha256=target_config_sha256,
+                    provisioning_receipt_sha256=provisioning_receipt_sha256,
+                    database_ownership=database_ownership,
+                    object_namespace_ownership=object_namespace_ownership,
+                    exclusion_mode=exclusion_mode,
+                    exclusion_identity_sha256=exclusion_identity_sha256,
+                )
+                return replace(current_report, target_evidence=target_evidence)
+
+            report = await _execute_measured_target_operation(
+                exclusion=lambda: target_exclusion(engine, exclusion_identity_sha256),
+                observe=observe_target,
+                mutate=mutate_target,
+                validate=validate_target_transition,
+            )
     finally:
         primary_failure = sys.exception()
         cleanup_failures: list[str] = []
+        cleanup_cancellation: asyncio.CancelledError | None = None
+
+        async def reconcile_cleanup(label: str, cleanup: Awaitable[None]) -> None:
+            nonlocal cleanup_cancellation
+            try:
+                await cleanup
+            except asyncio.CancelledError as cancellation:
+                if primary_failure is not None:
+                    primary_failure.add_note(
+                        f"restore {label} cleanup was repeatedly cancelled after reconciliation"
+                    )
+                elif cleanup_cancellation is None:
+                    cleanup_cancellation = cancellation
+            except BaseException:
+                cleanup_failures.append(label)
+
         if app_engine is not None:
-            try:
-                await app_engine.dispose()
-            except BaseException:
-                cleanup_failures.append("app role database")
+            await reconcile_cleanup(
+                "app role database",
+                _await_owned_cleanup(app_engine.dispose()),
+            )
         if object_client is not None:
-            try:
-                await _close_resource(object_client)
-            except BaseException:
-                cleanup_failures.append("object client")
-        try:
-            await engine.dispose()
-        except BaseException:
-            cleanup_failures.append("target database")
+            await reconcile_cleanup("object client", _close_resource(object_client))
+        await reconcile_cleanup(
+            "target database",
+            _await_owned_cleanup(engine.dispose()),
+        )
         if cleanup_failures:
             summary = "restore resource cleanup failed: " + ", ".join(cleanup_failures)
             if primary_failure is not None:
                 primary_failure.add_note(summary)
+            elif cleanup_cancellation is not None:
+                cleanup_cancellation.add_note(summary)
             else:
                 raise RuntimeError(summary) from None
+        if primary_failure is None and cleanup_cancellation is not None:
+            raise cleanup_cancellation
 
     if report is None:
         raise RuntimeError("restore validation did not produce a report")
@@ -1748,10 +2806,26 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backup-dir", required=True, type=Path)
     parser.add_argument("--target-config", required=True, type=Path)
+    parser.add_argument("--target-config-sha256", required=True)
+    parser.add_argument("--provisioning-receipt", required=True, type=Path)
+    parser.add_argument("--provisioning-receipt-sha256", required=True)
     parser.add_argument("--target-secret-dir", required=True, type=Path)
     parser.add_argument("--run-id", required=True)
+    parser.add_argument("--environment-id", required=True)
+    parser.add_argument("--candidate-sha256", required=True)
     parser.add_argument("--report", required=True, type=Path)
     parser.add_argument("--pg-restore", default=Path("pg_restore"), type=Path)
+    parser.add_argument(
+        "--database-ownership",
+        required=True,
+        choices=tuple(sorted(_OWNERSHIP_VALUES)),
+    )
+    parser.add_argument(
+        "--object-namespace-ownership",
+        required=True,
+        choices=tuple(sorted(_OWNERSHIP_VALUES)),
+    )
+    parser.add_argument("--deadline-monotonic", required=True, type=float)
     return parser
 
 
@@ -1762,10 +2836,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             run_restore_operator(
                 backup_dir=arguments.backup_dir,
                 target_config=arguments.target_config,
+                provisioning_receipt=arguments.provisioning_receipt,
+                provisioning_receipt_sha256=arguments.provisioning_receipt_sha256,
                 target_secret_dir=arguments.target_secret_dir,
                 run_id=arguments.run_id,
                 report_path=arguments.report,
                 pg_restore=arguments.pg_restore,
+                target_config_sha256=arguments.target_config_sha256,
+                database_ownership=arguments.database_ownership,
+                object_namespace_ownership=arguments.object_namespace_ownership,
+                candidate_sha256=arguments.candidate_sha256,
+                environment_id=arguments.environment_id,
+                deadline_monotonic=arguments.deadline_monotonic,
             )
         )
     except Exception:
