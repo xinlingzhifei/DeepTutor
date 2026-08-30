@@ -165,6 +165,17 @@ jobs:
           )
           PY
 
+      - name: Install release receipt dependencies
+        shell: bash
+        run: |
+          python -m pip install \
+            --disable-pip-version-check \
+            --no-input \
+            --only-binary=:all: \
+            "PyYAML==6.0.3" \
+            "pydantic==2.13.3" \
+            "python-pptx==1.0.2"
+
       - name: Record Task1 release evidence
         shell: bash
         run: |

@@ -743,6 +743,36 @@ def test_private_platform_workflow_emits_task1_receipts_from_clean_source() -> N
     }
 
 
+def test_private_platform_workflow_installs_receipt_dependencies_before_recording() -> None:
+    workflow_path = ROOT / ".github" / "workflows" / "private-platform-images.yml"
+    workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+    job = next(iter(workflow["jobs"].values()))
+    steps = job["steps"]
+
+    install_steps = [
+        (index, step)
+        for index, step in enumerate(steps)
+        if step.get("name") == "Install release receipt dependencies"
+    ]
+    assert len(install_steps) == 1, "release receipt dependencies must be installed exactly once"
+    install_index, install_step = install_steps[0]
+    receipt_index = next(
+        index
+        for index, step in enumerate(steps)
+        if step.get("name") == "Record Task1 release evidence"
+    )
+    assert install_index < receipt_index
+
+    command = str(install_step["run"])
+    assert "python -m pip install" in command
+    assert "--disable-pip-version-check" in command
+    assert "--no-input" in command
+    assert "--only-binary=:all:" in command
+    assert "python-pptx==1.0.2" in command
+    assert "pydantic==2.13.3" in command
+    assert "PyYAML==6.0.3" in command
+
+
 def test_image_lock_writer_binds_source_head_release_tag_and_custom_digests(
     tmp_path: Path,
 ) -> None:
