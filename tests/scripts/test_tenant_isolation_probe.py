@@ -12,6 +12,12 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
+from tests.scripts.platform_candidate_test_support import (
+    POCKETBASE_BASE_COMPOSE_DRIFTS,
+    drift_pocketbase_base_compose,
+    write_schema3_candidate_root,
+)
+
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -52,6 +58,68 @@ def _targets() -> dict[str, object]:
             "classroomVersionId": "version-tenant-owner",
         },
     }
+
+
+@pytest.mark.parametrize("drift", POCKETBASE_BASE_COMPOSE_DRIFTS)
+def test_default_candidate_loader_rejects_schema3_pocketbase_base_compose_drift_before_probe(
+    tmp_path: Path,
+    drift: str,
+) -> None:
+    module = _module()
+    candidate_root, lock = write_schema3_candidate_root(tmp_path)
+    drift_pocketbase_base_compose(candidate_root, lock, drift)
+
+    with pytest.raises(ValueError, match="production Compose image references"):
+        module._default_candidate_loader(candidate_root)
+
+
+def test_tenant_isolation_command_revalidates_schema3_candidate_after_probe_before_stdout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _module()
+    candidate_root, _lock = write_schema3_candidate_root(tmp_path)
+    shadow_root, shadow_lock = write_schema3_candidate_root(tmp_path / "shadow")
+    drift_pocketbase_base_compose(shadow_root, shadow_lock, "different-digest")
+    candidate_base = candidate_root / "docker-compose.yml"
+    shadow_base = shadow_root / "docker-compose.yml"
+    capacity_path, capacity_sha256 = _write_capacity_attestation(candidate_root)
+    real_stat = Path.stat
+    real_lstat = Path.lstat
+    swapped = False
+    published: list[bytes] = []
+
+    def stat_with_candidate_swap(path: Path, *args, **kwargs):
+        if swapped and Path(path) == candidate_base:
+            return real_stat(shadow_base, *args, **kwargs)
+        return real_stat(path, *args, **kwargs)
+
+    def lstat_with_candidate_swap(path: Path):
+        if swapped and Path(path) == candidate_base:
+            return real_lstat(shadow_base)
+        return real_lstat(path)
+
+    async def successful_probe(_config) -> bytes:
+        nonlocal swapped
+        swapped = True
+        return b'{"probe":"succeeded"}\n'
+
+    monkeypatch.setattr(Path, "stat", stat_with_candidate_swap)
+    monkeypatch.setattr(Path, "lstat", lstat_with_candidate_swap)
+    monkeypatch.setattr(module, "_run_tenant_isolation_probe", successful_probe)
+    monkeypatch.setattr(module, "_write_stdout_report", published.append)
+    monkeypatch.chdir(candidate_root)
+    for name, value in _live_environment(
+        candidate_root,
+        capacity_path,
+        capacity_sha256,
+    ).items():
+        monkeypatch.setenv(name, value)
+
+    exit_code = module.main(["--profile", "first-release"])
+
+    assert swapped is True
+    assert (exit_code, published) == (1, [])
 
 
 def _tenant_cookie(request: httpx.Request) -> str | None:
@@ -1378,26 +1446,28 @@ def test_reversible_fixture_cleanup_completes_session_then_removes_binding_and_e
 def test_cli_never_writes_token_password_cookie_or_ticket_fields(
     monkeypatch: pytest.MonkeyPatch,
     capsysbinary: pytest.CaptureFixture[bytes],
+    tmp_path: Path,
 ) -> None:
     module = _module()
-    config = SimpleNamespace(
-        candidate={"sourceHead": "a" * 40},
-        release_run={"runId": "run-a", "environmentId": "acceptance-a"},
-        base_url="https://classroom.example.test",
-    )
+    candidate_root, _lock = write_schema3_candidate_root(tmp_path)
+    capacity_path, capacity_sha256 = _write_capacity_attestation(candidate_root)
+    probe_roots: list[Path] = []
     forbidden_body = (
         b'{"token":"admin-secret","password":"role-secret",'
         b'"cookie":"session-secret","ticket":"content-secret"}\n'
     )
-    monkeypatch.setattr(module, "_parse_args", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(module, "_load_config", lambda *_args, **_kwargs: config)
-    monkeypatch.setattr(
-        module,
-        "_run_tenant_isolation_probe",
-        lambda _config: _async_value(forbidden_body),
-    )
 
-    assert module.main([]) == 1
+    async def sensitive_probe(config):
+        probe_roots.append(config.candidate_root)
+        return forbidden_body
+
+    monkeypatch.setattr(module, "_run_tenant_isolation_probe", sensitive_probe)
+    monkeypatch.chdir(candidate_root)
+    for name, value in _live_environment(candidate_root, capacity_path, capacity_sha256).items():
+        monkeypatch.setenv(name, value)
+
+    assert module.main(["--profile", "first-release"]) == 1
+    assert probe_roots == [candidate_root]
     captured = capsysbinary.readouterr()
     assert captured.out == b""
     assert captured.err == b"tenant_isolation_report_invalid\n"

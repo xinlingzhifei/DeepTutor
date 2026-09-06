@@ -32,10 +32,12 @@ export type LiveApiRequestOptions = {
   headers?: Record<string, string>;
   data?: unknown;
   multipart?: Record<string, string | number | boolean | LiveApiFile>;
+  maxRedirects?: number;
 };
 
 export interface LiveApiResponse {
   status(): number;
+  url(): string;
   json(): Promise<unknown>;
 }
 
@@ -45,13 +47,26 @@ export interface LiveApiRequestContext {
   put(url: string, options?: LiveApiRequestOptions): Promise<LiveApiResponse>;
 }
 
+interface LiveObservedRequest {
+  url(): string;
+  method(): string;
+  isNavigationRequest(): boolean;
+}
+
 export interface LivePage {
+  url(): string;
   goto(url: string): Promise<unknown>;
   locator(selector: string): {
+    waitFor(options: { state: "visible"; timeout: number }): Promise<void>;
+    count(): Promise<number>;
+    getAttribute(name: string): Promise<string | null>;
     fill(value: string): Promise<unknown>;
     click(): Promise<unknown>;
   };
   waitForURL(url: string): Promise<unknown>;
+  waitForRequest(
+    predicate: (request: LiveObservedRequest) => boolean | Promise<boolean>,
+  ): Promise<LiveObservedRequest>;
 }
 
 export type LiveStudentClassroomMode = "micro" | "full";
@@ -338,12 +353,18 @@ export interface LiveFixtureRecords {
   enrollments: LiveEnrollmentRecord[];
 }
 
+export type LiveCandidateIdentity = {
+  candidateSha256: string;
+};
+
 export type LiveFixtureContextOptions = {
   request: LiveApiRequestContext;
   adminToken: string;
+  apiOrigin: string;
   releaseRun: string;
   environment: string;
   evidence: LiveEvidence;
+  candidate: LiveCandidateIdentity;
   provisioningPollAttempts?: number;
   provisioningPollIntervalMs?: number;
   pause?: (milliseconds: number) => Promise<void>;
@@ -396,11 +417,97 @@ function requiredPublicValue(value: string, label: string): string {
   return normalized;
 }
 
+const AMBIGUOUS_URL_CHARACTERS = /[\\\u0000-\u001f\u007f]/;
+
+function canonicalHttpsOrigin(value: string): string {
+  if (
+    typeof value !== "string" ||
+    value !== value.trim() ||
+    AMBIGUOUS_URL_CHARACTERS.test(value)
+  ) {
+    throw new Error("live fixture API origin is invalid");
+  }
+  try {
+    const parsed = new URL(value);
+    if (
+      parsed.protocol !== "https:" ||
+      parsed.username ||
+      parsed.password ||
+      parsed.pathname !== "/" ||
+      parsed.search ||
+      parsed.hash ||
+      (value !== parsed.origin && value !== `${parsed.origin}/`)
+    ) {
+      throw new Error("invalid");
+    }
+    return parsed.origin;
+  } catch {
+    throw new Error("live fixture API origin is invalid");
+  }
+}
+
+function canonicalRelativeUrl(
+  path: string,
+  origin: string,
+  label: string,
+): URL {
+  if (
+    !path.startsWith("/") ||
+    path.startsWith("//") ||
+    path.includes("#") ||
+    AMBIGUOUS_URL_CHARACTERS.test(path)
+  ) {
+    throw new Error(`live fixture ${label} is invalid`);
+  }
+  const parsed = new URL(path, `${origin}/`);
+  if (parsed.protocol !== "https:" || parsed.origin !== origin) {
+    throw new Error(`live fixture ${label} is invalid`);
+  }
+  return parsed;
+}
+
+export function sameOriginHttpsUrl(
+  value: string,
+  origin: string,
+  label: string,
+): URL {
+  try {
+    if (AMBIGUOUS_URL_CHARACTERS.test(value)) throw new Error("invalid");
+    const parsed = new URL(value);
+    if (
+      parsed.protocol !== "https:" ||
+      parsed.username ||
+      parsed.password ||
+      parsed.origin !== origin
+    ) {
+      throw new Error("invalid");
+    }
+    return parsed;
+  } catch {
+    throw new Error(`live fixture ${label} origin is invalid`);
+  }
+}
+
+function validatedCandidateIdentity(
+  raw: LiveCandidateIdentity,
+): Readonly<LiveCandidateIdentity> {
+  if (!raw || typeof raw.candidateSha256 !== "string") {
+    throw new Error("live fixture candidate identity is invalid");
+  }
+  const candidateSha256 = raw.candidateSha256;
+  if (!/^(?!0{64}$)[0-9a-f]{64}$/.test(candidateSha256)) {
+    throw new Error("live fixture candidate identity is invalid");
+  }
+  return Object.freeze({ candidateSha256 });
+}
+
 export class LiveFixtureContext {
   readonly policyVersion = LIVE_FIXTURE_POLICY_VERSION;
   readonly releaseRun: string;
   readonly environment: string;
   readonly evidence: LiveEvidence;
+  readonly apiOrigin: string;
+  readonly candidate: Readonly<LiveCandidateIdentity>;
   readonly provisioningPollAttempts: number;
   readonly provisioningPollIntervalMs: number;
   readonly records: LiveFixtureRecords = {
@@ -414,8 +521,10 @@ export class LiveFixtureContext {
   };
 
   constructor(options: LiveFixtureContextOptions) {
-    const adminToken = options.adminToken.trim();
-    if (!adminToken) throw new Error("live fixture admin token is required");
+    const adminToken = options.adminToken;
+    if (!adminToken || adminToken !== adminToken.trim()) {
+      throw new Error("live fixture admin token is required");
+    }
     if (!LIVE_EVIDENCE.has(options.evidence)) {
       throw new Error("live fixture evidence is unsupported");
     }
@@ -430,6 +539,8 @@ export class LiveFixtureContext {
     this.releaseRun = requiredPublicValue(options.releaseRun, "release run");
     this.environment = requiredPublicValue(options.environment, "environment");
     this.evidence = options.evidence;
+    this.apiOrigin = canonicalHttpsOrigin(options.apiOrigin);
+    this.candidate = validatedCandidateIdentity(options.candidate);
     this.provisioningPollAttempts = pollAttempts;
     this.provisioningPollIntervalMs = pollInterval;
     contextPrivate.set(this, {
@@ -475,6 +586,7 @@ function hmacDigest(context: LiveFixtureContext, role: LiveRole | "fixture"): Bu
     `releaseRun=${context.releaseRun}`,
     `environment=${context.environment}`,
     `evidence=${context.evidence}`,
+    `candidateSha256=${context.candidate.candidateSha256}`,
     `role=${role}`,
   ].join("\0");
   return createHmac("sha256", secret.adminToken).update(material).digest();
@@ -557,6 +669,31 @@ async function guardedRequest(
   }
 }
 
+export async function guardedLiveApiRequest(
+  request: LiveApiRequestContext,
+  label: string,
+  method: "get" | "post" | "put",
+  path: string,
+  canonicalOrigin: string,
+  options: LiveApiRequestOptions = {},
+): Promise<LiveApiResponse> {
+  const origin = canonicalHttpsOrigin(canonicalOrigin);
+  let target: URL;
+  try {
+    target = canonicalRelativeUrl(path, origin, "relative API path");
+  } catch {
+    throw new Error("live fixture requires a relative API path");
+  }
+  const response = await guardedRequest(label, () =>
+    request[method](target.href, { ...options, maxRedirects: 0 }),
+  );
+  sameOriginHttpsUrl(response.url(), origin, `${label} response`);
+  if (response.status() >= 300 && response.status() < 400) {
+    throw new Error(`live fixture ${label} redirect was rejected`);
+  }
+  return response;
+}
+
 async function responseRecord(
   response: LiveApiResponse,
   label: string,
@@ -633,20 +770,30 @@ export async function ensureLiveUser(
   const identity = deriveLiveIdentity(context, role);
   const secret = privateContext(context);
   const password = identityPassword(identity);
-  const created = await guardedRequest("user creation", () =>
-    secret.request.post("/api/v1/auth/users", {
+  const created = await guardedLiveApiRequest(
+    secret.request,
+    "user creation",
+    "post",
+    "/api/v1/auth/users",
+    context.apiOrigin,
+    {
       headers: adminHeaders(context),
       data: { username: identity.username, password },
-    }),
+    },
   );
   let payload: Record<string, unknown>;
   if (created.status() === 201) {
     payload = await responseRecord(created, "user creation");
   } else if (created.status() === 409) {
-    const login = await guardedRequest("user ownership", () =>
-      secret.request.post("/api/v1/auth/login", {
+    const login = await guardedLiveApiRequest(
+      secret.request,
+      "user ownership",
+      "post",
+      "/api/v1/auth/login",
+      context.apiOrigin,
+      {
         data: { username: identity.username, password },
-      }),
+      },
     );
     if (login.status() !== 200) {
       throw new Error("live fixture user ownership could not be proven");
@@ -699,14 +846,19 @@ export async function ensureLiveTenant(
 ): Promise<LiveTenantRecord> {
   const secret = privateContext(context);
   const name = tenantName(context);
-  const created = await guardedRequest("tenant creation", () =>
-    secret.request.post("/api/v1/tenants", {
+  const created = await guardedLiveApiRequest(
+    secret.request,
+    "tenant creation",
+    "post",
+    "/api/v1/tenants",
+    context.apiOrigin,
+    {
       headers: {
         ...adminHeaders(context),
         "Idempotency-Key": tenantIdempotencyKey(context),
       },
       data: { name },
-    }),
+    },
   );
   if (created.status() !== 202) {
     throw new Error("live fixture tenant creation failed");
@@ -717,11 +869,13 @@ export async function ensureLiveTenant(
   );
   let active = state.status === "active";
   for (let attempt = 0; !active && attempt < context.provisioningPollAttempts; attempt += 1) {
-    const polled = await guardedRequest("tenant provisioning", () =>
-      secret.request.get(
-        `/api/v1/tenants/${encodeURIComponent(state.tenantId)}/provisioning`,
-        { headers: adminHeaders(context) },
-      ),
+    const polled = await guardedLiveApiRequest(
+      secret.request,
+      "tenant provisioning",
+      "get",
+      `/api/v1/tenants/${encodeURIComponent(state.tenantId)}/provisioning`,
+      context.apiOrigin,
+      { headers: adminHeaders(context) },
     );
     if (polled.status() !== 200) {
       throw new Error("live fixture tenant provisioning failed");
@@ -748,11 +902,16 @@ export async function ensureLiveTenant(
   }
   if (!active) throw new Error("live fixture tenant did not become active");
 
-  const switched = await guardedRequest("tenant switch", () =>
-    secret.request.put("/api/v1/tenants/active", {
+  const switched = await guardedLiveApiRequest(
+    secret.request,
+    "tenant switch",
+    "put",
+    "/api/v1/tenants/active",
+    context.apiOrigin,
+    {
       headers: adminHeaders(context),
       data: { tenant_id: state.tenantId },
-    }),
+    },
   );
   if (switched.status() !== 200) throw new Error("live fixture tenant switch failed");
   const switchedPayload = await responseRecord(switched, "tenant switch");
@@ -808,23 +967,25 @@ export async function ensureLiveTenantMembership(
     scopeId: tenant.tenantId,
   };
   const secret = privateContext(context);
-  const response = await guardedRequest("tenant membership", () =>
-    secret.request.post(
-      `/api/v1/tenants/${encodeURIComponent(tenant.tenantId)}/members`,
-      {
-        headers: adminHeaders(context),
-        data: {
-          user_id: identity.userId,
-          grants: [
-            {
-              role: grant.role,
-              scope_type: grant.scopeType,
-              scope_id: grant.scopeId,
-            },
-          ],
-        },
+  const response = await guardedLiveApiRequest(
+    secret.request,
+    "tenant membership",
+    "post",
+    `/api/v1/tenants/${encodeURIComponent(tenant.tenantId)}/members`,
+    context.apiOrigin,
+    {
+      headers: adminHeaders(context),
+      data: {
+        user_id: identity.userId,
+        grants: [
+          {
+            role: grant.role,
+            scope_type: grant.scopeType,
+            scope_id: grant.scopeId,
+          },
+        ],
       },
-    ),
+    },
   );
   if (response.status() !== 200) {
     throw new Error("live fixture tenant membership failed");
@@ -1083,20 +1244,30 @@ async function ensureCourse(
   expected: LiveCourseRecord,
 ): Promise<LiveCourseRecord> {
   const secret = privateContext(context);
-  const response = await guardedRequest("course creation", () =>
-    secret.request.post("/api/v1/teaching/courses", {
+  const response = await guardedLiveApiRequest(
+    secret.request,
+    "course creation",
+    "post",
+    "/api/v1/teaching/courses",
+    context.apiOrigin,
+    {
       headers: adminHeaders(context),
       data: { id: expected.id, title: expected.title },
-    }),
+    },
   );
   let payload: Record<string, unknown>;
   if (response.status() === 201) {
     payload = await responseRecord(response, "course creation");
   } else if (response.status() === 409) {
-    const read = await guardedRequest("retained course", () =>
-      secret.request.get("/api/v1/teaching/courses", {
+    const read = await guardedLiveApiRequest(
+      secret.request,
+      "retained course",
+      "get",
+      "/api/v1/teaching/courses",
+      context.apiOrigin,
+      {
         headers: adminHeaders(context),
-      }),
+      },
     );
     if (read.status() !== 200) {
       throw new Error("live fixture retained course read failed");
@@ -1124,14 +1295,29 @@ export async function ensureLiveCourseGenerationPolicy(
   const path = `/api/v1/teaching/courses/${encodeURIComponent(course.id)}/generation-policy`;
   const written = await requestCourseGenerationPolicy(
     () =>
-      secret.request.put(path, {
-        headers: adminHeaders(context),
-        data: STUDENT_COURSE_GENERATION_POLICY,
-      }),
+      guardedLiveApiRequest(
+        secret.request,
+        "course generation policy write",
+        "put",
+        path,
+        context.apiOrigin,
+        {
+          headers: adminHeaders(context),
+          data: STUDENT_COURSE_GENERATION_POLICY,
+        },
+      ),
     course,
   );
   const retained = await requestCourseGenerationPolicy(
-    () => secret.request.get(path, { headers: adminHeaders(context) }),
+    () =>
+      guardedLiveApiRequest(
+        secret.request,
+        "course generation policy read",
+        "get",
+        path,
+        context.apiOrigin,
+        { headers: adminHeaders(context) },
+      ),
     course,
   );
   if (!sameCourseGenerationPolicy(written, retained)) {
@@ -1146,18 +1332,28 @@ async function ensureClass(
 ): Promise<LiveClassRecord> {
   const secret = privateContext(context);
   const base = `/api/v1/teaching/courses/${encodeURIComponent(expected.courseId)}/classes`;
-  const response = await guardedRequest("class creation", () =>
-    secret.request.post(base, {
+  const response = await guardedLiveApiRequest(
+    secret.request,
+    "class creation",
+    "post",
+    base,
+    context.apiOrigin,
+    {
       headers: adminHeaders(context),
       data: { id: expected.id, name: expected.name },
-    }),
+    },
   );
   let payload: Record<string, unknown>;
   if (response.status() === 201) {
     payload = await responseRecord(response, "class creation");
   } else if (response.status() === 409) {
-    const read = await guardedRequest("retained class", () =>
-      secret.request.get(base, { headers: adminHeaders(context) }),
+    const read = await guardedLiveApiRequest(
+      secret.request,
+      "retained class",
+      "get",
+      base,
+      context.apiOrigin,
+      { headers: adminHeaders(context) },
     );
     if (read.status() !== 200) {
       throw new Error("live fixture retained class read failed");
@@ -1183,24 +1379,34 @@ async function ensureSource(
   pdf: Buffer,
 ): Promise<LiveSourceRecord> {
   const secret = privateContext(context);
-  const response = await guardedRequest("source creation", () =>
-    secret.request.post("/api/v1/teaching/sources/pdf", {
+  const response = await guardedLiveApiRequest(
+    secret.request,
+    "source creation",
+    "post",
+    "/api/v1/teaching/sources/pdf",
+    context.apiOrigin,
+    {
       headers: adminHeaders(context),
       multipart: {
         file: { name: expected.filename, mimeType: "application/pdf", buffer: pdf },
         courseId: expected.courseId,
         classId: expected.classId,
       },
-    }),
+    },
   );
   let payload: Record<string, unknown>;
   if (response.status() === 201) {
     payload = await responseRecord(response, "source creation");
   } else if (response.status() === 409) {
-    const read = await guardedRequest("retained source", () =>
-      secret.request.get("/api/v1/teaching/sources", {
+    const read = await guardedLiveApiRequest(
+      secret.request,
+      "retained source",
+      "get",
+      "/api/v1/teaching/sources",
+      context.apiOrigin,
+      {
         headers: adminHeaders(context),
-      }),
+      },
     );
     if (read.status() !== 200) {
       throw new Error("live fixture retained source read failed");
@@ -1230,18 +1436,28 @@ async function ensureEnrollment(
 ): Promise<LiveEnrollmentRecord> {
   const secret = privateContext(context);
   const base = `/api/v1/teaching/classes/${encodeURIComponent(expected.classId)}/enrollments`;
-  const response = await guardedRequest("enrollment creation", () =>
-    secret.request.post(base, {
+  const response = await guardedLiveApiRequest(
+    secret.request,
+    "enrollment creation",
+    "post",
+    base,
+    context.apiOrigin,
+    {
       headers: adminHeaders(context),
       data: { userId: expected.userId },
-    }),
+    },
   );
   let payload: Record<string, unknown>;
   if (response.status() === 201) {
     payload = await responseRecord(response, "enrollment creation");
   } else if (response.status() === 409) {
-    const read = await guardedRequest("retained enrollment", () =>
-      secret.request.get(base, { headers: adminHeaders(context) }),
+    const read = await guardedLiveApiRequest(
+      secret.request,
+      "retained enrollment",
+      "get",
+      base,
+      context.apiOrigin,
+      { headers: adminHeaders(context) },
     );
     if (read.status() !== 200) {
       throw new Error("live fixture retained enrollment read failed");
@@ -1376,20 +1592,102 @@ export async function provisionLiveFixture(
 export async function loginLiveIdentity(
   page: LivePage,
   identity: LiveIdentity,
-  nextPath = "/",
+  nextPath: string,
+  expectedOrigin: string,
 ): Promise<void> {
-  if (!nextPath.startsWith("/") || nextPath.startsWith("//")) {
+  let trustedOrigin: string;
+  try {
+    trustedOrigin = canonicalHttpsOrigin(expectedOrigin);
+  } catch {
+    throw new Error(
+      "live fixture browser login requires the expected HTTPS origin",
+    );
+  }
+  let destination: URL;
+  try {
+    destination = canonicalRelativeUrl(
+      nextPath,
+      trustedOrigin,
+      "login destination",
+    );
+  } catch {
     throw new Error("live fixture login destination is invalid");
   }
   const password = identityPassword(identity);
   try {
-    await page.goto(`/login?next=${encodeURIComponent(nextPath)}`);
+    const loginUrl = new URL("/login", `${trustedOrigin}/`);
+    loginUrl.searchParams.set("next", destination.pathname + destination.search);
+    await page.goto(loginUrl.href);
+  } catch {
+    throw new Error("live fixture browser login failed");
+  }
+  try {
+    sameOriginHttpsUrl(page.url(), trustedOrigin, "browser login page");
+  } catch {
+    throw new Error(
+      "live fixture browser login requires the expected HTTPS origin",
+    );
+  }
+
+  const form = page.locator("form");
+  try {
+    await form.waitFor({ state: "visible", timeout: 10000 });
+    if ((await form.count()) !== 1) {
+      throw new Error("invalid login form");
+    }
+  } catch {
+    throw new Error("live fixture browser login form is invalid");
+  }
+  try {
+    sameOriginHttpsUrl(page.url(), trustedOrigin, "browser login page");
+  } catch {
+    throw new Error(
+      "live fixture browser login requires the expected HTTPS origin",
+    );
+  }
+  const trustedAction = new URL("/api/v1/auth/login", `${trustedOrigin}/`);
+
+  try {
     await page.locator("#username").fill(identity.username);
     await page.locator("#password").fill(password);
-    await Promise.all([
-      page.waitForURL(nextPath),
+    const [submission] = await Promise.all([
+      page.waitForRequest((request) => {
+        if (request.isNavigationRequest()) return false;
+        try {
+          const requestUrl = sameOriginHttpsUrl(
+            request.url(),
+            trustedOrigin,
+            "login submission",
+          );
+          const method = request.method().toUpperCase();
+          return method === "POST" && requestUrl.href === trustedAction.href;
+        } catch {
+          return false;
+        }
+      }),
+      page.waitForURL(destination.href),
       page.locator('button[type="submit"]').click(),
     ]);
+    const submissionUrl = sameOriginHttpsUrl(
+      submission.url(),
+      trustedOrigin,
+      "login submission",
+    );
+    if (
+      submission.isNavigationRequest() ||
+      submission.method().toUpperCase() !== "POST" ||
+      submissionUrl.href !== trustedAction.href
+    ) {
+      throw new Error("live fixture browser login submission was not observed");
+    }
+    const current = sameOriginHttpsUrl(
+      page.url(),
+      trustedOrigin,
+      "browser login destination",
+    );
+    if (current.href !== destination.href) {
+      throw new Error("live fixture browser login origin changed");
+    }
   } catch {
     throw new Error("live fixture browser login failed");
   }

@@ -40,7 +40,9 @@ from capacity_profile_contract import (  # noqa: E402
     derive_learning_event_idempotency_checks,
     parse_capacity_profile_report,
 )
-from render_platform_compose import validate_image_lock_bindings  # noqa: E402
+from render_platform_compose import (  # noqa: E402
+    validated_candidate_artifact_lease,
+)
 
 _PUBLIC_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _OBSERVED_AT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
@@ -182,18 +184,8 @@ CandidateLoader = Callable[[Path], Mapping[str, object]]
 
 
 def _default_candidate_loader(candidate_root: Path) -> dict[str, object]:
-    lock = validate_image_lock_bindings(
-        candidate_root / "deploy" / "image-lock.json",
-        compose_paths=(
-            candidate_root / "docker-compose.platform.yml",
-            candidate_root / "docker-compose.data-plane.yml",
-        ),
-        require_candidate=True,
-    )
-    candidate = lock.get("candidate")
-    if not isinstance(candidate, dict):
-        raise CapacityProbeError("candidate_invalid")
-    return json.loads(json.dumps(candidate))
+    with validated_candidate_artifact_lease(candidate_root) as artifact:
+        return json.loads(json.dumps(artifact.candidate))
 
 
 def _valid_base_url(value: object) -> bool:
@@ -2910,7 +2902,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     _parse_args(argv)
     try:
         config = _load_config(os.environ, cwd=Path.cwd())
-        body = asyncio.run(_run_capacity_probe(config))
+        operation_failed = False
+        try:
+            with validated_candidate_artifact_lease(
+                config.candidate_root,
+                expected_candidate=config.candidate,
+            ):
+                try:
+                    body = asyncio.run(_run_capacity_probe(config))
+                except BaseException:
+                    operation_failed = True
+                    raise
+        except ValueError as exc:
+            if operation_failed:
+                raise
+            raise CapacityProbeError("candidate_invalid") from exc
     except CapacityProbeError as exc:
         print(str(exc), file=sys.stderr)
         return 1

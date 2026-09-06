@@ -8,6 +8,7 @@ import {
   LiveFixtureContext,
   deriveLiveIdentity,
   ensureLiveCatalog,
+  ensureLiveCourseGenerationPolicy,
   ensureLiveTenant,
   ensureLiveTenantMembership,
   ensureLiveUser,
@@ -187,17 +188,80 @@ function studentPollOptions(
 type Call = {
   method: "GET" | "POST" | "PUT";
   url: string;
+  requestUrl: string;
   options: LiveApiRequestOptions | undefined;
 };
+
+const CANONICAL_HTTPS_ORIGIN = "https://candidate.example.test";
+
+type LiveCandidateIdentity = {
+  sourceHead: string;
+  releaseTag: string;
+  candidateSha256: string;
+};
+
+type CanonicalCandidate = {
+  imageDigests: {
+    deeptutor: string;
+    openmaic: string;
+    openmaic_render: string;
+  };
+  openmaicHead: string;
+  releaseTag: string;
+  sourceHead: string;
+  sourceRepository: string;
+};
+
+function candidateIdentity(
+  sourceHead: string,
+  releaseTag: string,
+): LiveCandidateIdentity {
+  return {
+    sourceHead,
+    releaseTag,
+    candidateSha256: sha256(JSON.stringify({ releaseTag, sourceHead })),
+  };
+}
+
+function fullCandidateIdentity(
+  candidate: CanonicalCandidate,
+): LiveCandidateIdentity {
+  const canonical: CanonicalCandidate = {
+    imageDigests: {
+      deeptutor: candidate.imageDigests.deeptutor,
+      openmaic: candidate.imageDigests.openmaic,
+      openmaic_render: candidate.imageDigests.openmaic_render,
+    },
+    openmaicHead: candidate.openmaicHead,
+    releaseTag: candidate.releaseTag,
+    sourceHead: candidate.sourceHead,
+    sourceRepository: candidate.sourceRepository,
+  };
+  return {
+    sourceHead: canonical.sourceHead,
+    releaseTag: canonical.releaseTag,
+    candidateSha256: sha256(JSON.stringify(canonical)),
+  };
+}
+
+const DEFAULT_CANDIDATE = candidateIdentity(
+  "a".repeat(40),
+  "yfeistai-first-release-20260826-aaaaaaaa",
+);
 
 class FakeResponse implements LiveApiResponse {
   constructor(
     private readonly statusCode: number,
     private readonly body: unknown,
+    private readonly responseUrl = `${CANONICAL_HTTPS_ORIGIN}/api/v1/test`,
   ) {}
 
   status(): number {
     return this.statusCode;
+  }
+
+  url(): string {
+    return this.responseUrl;
   }
 
   async json(): Promise<unknown> {
@@ -212,7 +276,7 @@ class FakeRequest implements LiveApiRequestContext {
   constructor(
     private readonly respond: (
       call: Call,
-    ) => FakeResponse | Promise<FakeResponse>,
+    ) => LiveApiResponse | Promise<LiveApiResponse>,
   ) {}
 
   get(url: string, options?: LiveApiRequestOptions): Promise<LiveApiResponse> {
@@ -232,14 +296,202 @@ class FakeRequest implements LiveApiRequestContext {
     url: string,
     options: LiveApiRequestOptions | undefined,
   ): Promise<LiveApiResponse> {
-    const call = { method, url, options };
+    let routeUrl = url;
+    try {
+      const parsed = new URL(url);
+      routeUrl = `${parsed.pathname}${parsed.search}${parsed.hash}`;
+    } catch {
+      // Existing fixture responders intentionally match relative API paths.
+    }
+    const call = { method, url: routeUrl, requestUrl: url, options };
     this.calls.push(call);
     return this.respond(call);
   }
 }
 
-function response(status: number, body: unknown): FakeResponse {
-  return new FakeResponse(status, body);
+function response(
+  status: number,
+  body: unknown,
+  responseUrl?: string,
+): FakeResponse {
+  return new FakeResponse(status, body, responseUrl);
+}
+
+type GuardedLiveApiRequestWithOrigin = (
+  request: LiveApiRequestContext,
+  label: string,
+  method: "get" | "post" | "put",
+  path: string,
+  canonicalOrigin: string,
+  options?: LiveApiRequestOptions,
+) => Promise<LiveApiResponse>;
+
+function guardedLiveApiRequestWithOrigin(): GuardedLiveApiRequestWithOrigin {
+  const candidate = (
+    liveFixtureModule as unknown as Record<string, unknown>
+  ).guardedLiveApiRequest;
+  assert.equal(
+    typeof candidate,
+    "function",
+    "guardedLiveApiRequest must be implemented",
+  );
+  return candidate as GuardedLiveApiRequestWithOrigin;
+}
+
+type FakeLoginRequest = {
+  url(): string;
+  method(): string;
+  isNavigationRequest(): boolean;
+};
+
+type FakeLoginRequestPredicate = (
+  request: FakeLoginRequest,
+) => boolean | Promise<boolean>;
+
+type FakeLoginRequestWaiter = {
+  predicate: FakeLoginRequestPredicate;
+  resolve(request: FakeLoginRequest): void;
+  reject(error: unknown): void;
+};
+
+function fakeLoginPage(
+  options: {
+    origin?: string;
+    formCount?: number;
+    formCountAfterWait?: number;
+    urlAfterFormWait?: string;
+    submissionUrl?: string;
+  } = {},
+) {
+  const origin = options.origin ?? CANONICAL_HTTPS_ORIGIN;
+  let currentUrl = `${origin}/login`;
+  let requestWaiter: FakeLoginRequestWaiter | null = null;
+  let credentialWrites = 0;
+  let observedSubmissions = 0;
+  let ignoredSubmissions = 0;
+  const filled: Record<string, string> = {};
+  const actions: string[] = [];
+  let formCount = options.formCount ?? 1;
+  const submissionUrl =
+    options.submissionUrl ?? `${origin}/api/v1/auth/login`;
+
+  const page = {
+    url() {
+      return currentUrl;
+    },
+    async goto(url: string) {
+      actions.push(`goto:${url}`);
+      currentUrl = new URL(url, origin).href;
+    },
+    locator(selector: string) {
+      if (selector.includes("form")) {
+        return {
+          async waitFor(waitOptions: { state: string; timeout: number }) {
+            actions.push(
+              `form:wait:${waitOptions.state}:${waitOptions.timeout}`,
+            );
+            await Promise.resolve();
+            formCount = options.formCountAfterWait ?? formCount;
+            currentUrl = options.urlAfterFormWait ?? currentUrl;
+            if (formCount === 0) {
+              actions.push("form:wait:timeout");
+              throw new Error("login form wait timed out");
+            }
+            actions.push("form:visible");
+          },
+          async count() {
+            actions.push("form:count");
+            return formCount;
+          },
+          async getAttribute(name: string) {
+            actions.push(`form:${name}`);
+            return null;
+          },
+          async fill(_value: string) {
+            throw new Error(
+              "the login form itself must not receive credentials",
+            );
+          },
+          async click() {
+            throw new Error("the login form itself must not be clicked");
+          },
+        };
+      }
+      return {
+        async count() {
+          return 1;
+        },
+        async getAttribute(_name: string) {
+          return null;
+        },
+        async fill(value: string) {
+          credentialWrites += 1;
+          filled[selector] = value;
+          actions.push(`fill:${selector}`);
+        },
+        async click() {
+          actions.push(`click:${selector}`);
+          const waiter = requestWaiter;
+          if (!waiter) return;
+          const request: FakeLoginRequest = {
+            url: () => submissionUrl,
+            method: () => "POST",
+            isNavigationRequest: () => false,
+          };
+          try {
+            if (await waiter.predicate(request)) {
+              observedSubmissions += 1;
+              waiter.resolve(request);
+            } else {
+              ignoredSubmissions += 1;
+              actions.push("waitForRequest:ignored");
+            }
+          } catch (error) {
+            waiter.reject(error);
+          }
+        },
+      };
+    },
+    async waitForRequest(predicate: FakeLoginRequestPredicate) {
+      actions.push("waitForRequest");
+      if (requestWaiter) throw new Error("login request waiter already exists");
+      return new Promise<FakeLoginRequest>((resolve, reject) => {
+        // Accelerate the browser timeout; nonmatching requests keep waiting.
+        const timeout = setTimeout(() => {
+          requestWaiter = null;
+          actions.push("waitForRequest:timeout");
+          reject(new Error("login request wait timed out"));
+        }, 0);
+        requestWaiter = {
+          predicate,
+          resolve(request) {
+            clearTimeout(timeout);
+            requestWaiter = null;
+            resolve(request);
+          },
+          reject(error) {
+            clearTimeout(timeout);
+            requestWaiter = null;
+            reject(error);
+          },
+        };
+      });
+    },
+    async waitForURL(url: string) {
+      actions.push(`wait:${url}`);
+      await Promise.resolve();
+      currentUrl = new URL(url, origin).href;
+    },
+  };
+
+  return {
+    page,
+    filled,
+    actions,
+    credentialWrites: () => credentialWrites,
+    observedSubmissions: () => observedSubmissions,
+    ignoredSubmissions: () => ignoredSubmissions,
+  };
 }
 
 function data(call: Call): Record<string, unknown> {
@@ -259,20 +511,28 @@ function makeContext(
     evidence?: LiveEvidence;
     releaseRun?: string;
     environment?: string;
+    apiOrigin?: string;
+    candidate?: LiveCandidateIdentity;
     provisioningPollAttempts?: number;
     pause?: (milliseconds: number) => Promise<void>;
   } = {},
 ): LiveFixtureContext {
-  return new LiveFixtureContext({
+  const contextOptions = {
     request,
     adminToken: ADMIN_TOKEN,
     releaseRun: options.releaseRun ?? "release-20260826-a",
     environment: options.environment ?? "candidate-prod-a",
     evidence: options.evidence ?? "teacher_flow",
+    apiOrigin: options.apiOrigin ?? CANONICAL_HTTPS_ORIGIN,
+    candidate: options.candidate ?? DEFAULT_CANDIDATE,
     provisioningPollAttempts: options.provisioningPollAttempts,
     provisioningPollIntervalMs: 0,
     pause: options.pause ?? (async () => undefined),
-  });
+  } as ConstructorParameters<typeof LiveFixtureContext>[0] & {
+    apiOrigin: string;
+    candidate: LiveCandidateIdentity;
+  };
+  return new LiveFixtureContext(contextOptions);
 }
 
 function userCreated(call: Call, userId?: string) {
@@ -401,6 +661,115 @@ test("policy v2 HMAC identities are stable and differ by role and evidence", () 
   assert.equal(author.tenantRole, "content_author");
   assert.equal(reviewer.tenantRole, "content_reviewer");
   assert.equal(publisher.tenantRole, "teacher");
+});
+
+test("candidate identity namespaces accounts tenants and catalog deterministically", async () => {
+  async function namespace(candidate: LiveCandidateIdentity) {
+    let tenantId = "";
+    let tenantKey = "";
+    const request = new FakeRequest((call) => {
+      if (call.method === "POST" && call.url === "/api/v1/tenants") {
+        tenantKey = header(call, "Idempotency-Key");
+        tenantId = `tenant-${sha256(tenantKey).slice(0, 12)}`;
+        return response(202, {
+          tenant_id: tenantId,
+          job_id: `job-${sha256(tenantKey).slice(12, 24)}`,
+          status: "active",
+        });
+      }
+      if (call.method === "PUT" && call.url === "/api/v1/tenants/active") {
+        assert.equal(data(call).tenant_id, tenantId);
+        return response(200, { active_tenant_id: tenantId });
+      }
+      return successfulCatalogWrite(call, tenantId) ?? response(500, {});
+    });
+    const context = makeContext(request, { candidate });
+    const identity = deriveLiveIdentity(context, "teacher");
+    const tenant = await ensureLiveTenant(context);
+    const catalog = await ensureLiveCatalog(context, tenant, {
+      controlledSource: true,
+      enroll: [],
+    });
+    assert.ok(catalog.source);
+    return {
+      username: identity.username,
+      tenantKey,
+      tenantId: tenant.tenantId,
+      courseId: catalog.course.id,
+      classId: catalog.teachingClass.id,
+      sourceBindingId: catalog.source.bindingId,
+    };
+  }
+
+  function assertSeparated(
+    reference: Awaited<ReturnType<typeof namespace>>,
+    other: Awaited<ReturnType<typeof namespace>>,
+    label: string,
+  ): void {
+    for (const key of Object.keys(reference) as (keyof typeof reference)[]) {
+      assert.notEqual(other[key], reference[key], `${label} reused ${key}`);
+    }
+  }
+
+  const canonicalCandidate: CanonicalCandidate = {
+    imageDigests: {
+      deeptutor: `sha256:${"1".repeat(64)}`,
+      openmaic: `sha256:${"2".repeat(64)}`,
+      openmaic_render: `sha256:${"3".repeat(64)}`,
+    },
+    openmaicHead: "0cf2a330411681190e89f48e20f305345ff99f87",
+    releaseTag: "yfeistai-first-release-20260826-aaaaaaaa",
+    sourceHead: "a".repeat(40),
+    sourceRepository: "xinlingzhifei/DeepTutor",
+  };
+  const candidateA = fullCandidateIdentity(canonicalCandidate);
+  const changedSourceHead = fullCandidateIdentity({
+    ...canonicalCandidate,
+    sourceHead: "b".repeat(40),
+  });
+  const changedReleaseTag = fullCandidateIdentity({
+    ...canonicalCandidate,
+    releaseTag: "yfeistai-first-release-20260827-aaaaaaaa",
+  });
+  const changedImageDigest = fullCandidateIdentity({
+    ...canonicalCandidate,
+    imageDigests: {
+      ...canonicalCandidate.imageDigests,
+      deeptutor: `sha256:${"4".repeat(64)}`,
+    },
+  });
+  const changedOpenmaicHead = fullCandidateIdentity({
+    ...canonicalCandidate,
+    openmaicHead: "b".repeat(40),
+  });
+  const candidateAFirst = await namespace(candidateA);
+  const candidateAReplay = await namespace(candidateA);
+  const changedSourceHeadFirst = await namespace(changedSourceHead);
+  const changedReleaseTagFirst = await namespace(changedReleaseTag);
+  const changedImageDigestFirst = await namespace(changedImageDigest);
+  const changedOpenmaicHeadFirst = await namespace(changedOpenmaicHead);
+
+  assert.deepEqual(candidateAReplay, candidateAFirst);
+  assertSeparated(
+    candidateAFirst,
+    changedSourceHeadFirst,
+    "changed source head candidate",
+  );
+  assertSeparated(
+    candidateAFirst,
+    changedReleaseTagFirst,
+    "changed release tag candidate",
+  );
+  assertSeparated(
+    candidateAFirst,
+    changedImageDigestFirst,
+    "changed image digest candidate",
+  );
+  assertSeparated(
+    candidateAFirst,
+    changedOpenmaicHeadFirst,
+    "changed OpenMAIC head candidate",
+  );
 });
 
 test("derived usernames are reserved and strong passwords remain non-enumerable", async () => {
@@ -986,50 +1355,648 @@ test("provisioning retains records and never sends delete or cleanup requests", 
   );
 });
 
-test("real login helper drives the /login UI through a fake Page without interception", async () => {
+test("live fixture pins every API request to a relative no-redirect transport", async () => {
+  const tenantId = "https://attacker.invalid//tenant";
+  const course = {
+    tenantId,
+    id: "https://attacker.invalid//course",
+  };
+  const retainedPolicy = {
+    tenantId,
+    courseId: course.id,
+    allowStudentMicro: true,
+    allowStudentFull: true,
+    allowedContentModes: ["open_creation"],
+    allowWebSearch: false,
+    requireApprovalForRestrictedTopics: true,
+    minorSafetyMode: true,
+    microSceneLimit: 5,
+    fullSceneLimit: 24,
+    dailyStudentUnits: 40,
+    monthlyStudentUnits: 400,
+    updatedBy: "platform-admin-live",
+    updatedAt: "2026-08-26T08:00:00Z",
+  } as const;
+  const request = new FakeRequest((call) => {
+    if (call.url === "/api/v1/auth/users") {
+      return response(201, userCreated(call, "u-teacher"));
+    }
+    if (call.url === "/api/v1/tenants") {
+      return response(202, {
+        tenant_id: tenantId,
+        status: "active",
+        job_id: "j-live-transport",
+      });
+    }
+    if (call.url === "/api/v1/tenants/active") {
+      return response(200, { active_tenant_id: tenantId });
+    }
+    if (call.url.endsWith("/members")) {
+      const body = data(call);
+      const grants = body.grants as Array<Record<string, unknown>>;
+      return response(200, {
+        tenant_id: tenantId,
+        user_id: body.user_id,
+        roles: [grants[0].role],
+        grants,
+      });
+    }
+    if (call.url.endsWith("/generation-policy")) {
+      return response(200, retainedPolicy);
+    }
+    return response(500, {});
+  });
+  const context = makeContext(request, { evidence: "student_micro_flow" });
+
+  const teacher = await ensureLiveUser(context, "teacher");
+  const tenant = await ensureLiveTenant(context);
+  await ensureLiveTenantMembership(context, tenant, teacher);
+  await ensureLiveCourseGenerationPolicy(context, course);
+
+  assert.equal(request.calls.length, 6);
+  for (const call of request.calls) {
+    assert.equal(call.url.startsWith("/") && !call.url.startsWith("//"), true);
+    assert.equal(
+      (call.options as LiveApiRequestOptions & { maxRedirects?: unknown })
+        ?.maxRedirects,
+      0,
+      `${call.method} ${call.url} did not disable redirects`,
+    );
+  }
+});
+
+test("live API transport rejects non-relative paths before invoking the request context", async () => {
+  const guardedRequest = guardedLiveApiRequestWithOrigin();
+  const request = new FakeRequest(() => response(200, {}));
+
+  for (const path of [
+    "https://attacker.invalid/api/v1/escape",
+    "//attacker.invalid/api/v1/escape",
+    "api/v1/missing-leading-slash",
+  ]) {
+    await assert.rejects(
+      guardedRequest(
+        request,
+        "transport contract",
+        "get",
+        path,
+        CANONICAL_HTTPS_ORIGIN,
+      ),
+      /relative API path/i,
+    );
+  }
+  assert.equal(request.calls.length, 0);
+});
+
+test("live API transport binds normalized requests and responses to one canonical HTTPS origin", async () => {
+  const guardedRequest = guardedLiveApiRequestWithOrigin();
+  const dynamicId = encodeURIComponent(
+    "course/https://attacker.invalid/lesson?draft=true",
+  );
+  const path = `/api/v1/teaching/courses/${dynamicId}/generation-policy`;
+  const expectedUrl = new URL(path, CANONICAL_HTTPS_ORIGIN).href;
+  const request = new FakeRequest(() =>
+    response(200, { ok: true }, expectedUrl),
+  );
+
+  const result = await guardedRequest(
+    request,
+    "encoded course read",
+    "get",
+    path,
+    CANONICAL_HTTPS_ORIGIN,
+    { headers: { Authorization: `Bearer ${ADMIN_TOKEN}` } },
+  );
+
+  assert.equal(result.status(), 200);
+  assert.equal(request.calls.length, 1);
+  assert.equal(request.calls[0].requestUrl, expectedUrl);
+  assert.equal(request.calls[0].url, path);
+  assert.equal(request.calls[0].options?.maxRedirects, 0);
+});
+
+test("live API transport rejects ambiguous origins paths and fragments before request dispatch", async () => {
+  const guardedRequest = guardedLiveApiRequestWithOrigin();
+  const cases = [
+    {
+      origin: "http://candidate.example.test",
+      path: "/api/v1/tenants",
+    },
+    {
+      origin: "https://user:password@candidate.example.test",
+      path: "/api/v1/tenants",
+    },
+    {
+      origin: `${CANONICAL_HTTPS_ORIGIN}/api`,
+      path: "/api/v1/tenants",
+    },
+    {
+      origin: `${CANONICAL_HTTPS_ORIGIN}#release-fragment`,
+      path: "/api/v1/tenants",
+    },
+    {
+      origin: CANONICAL_HTTPS_ORIGIN,
+      path: "/\\attacker.invalid/api/v1/escape",
+    },
+    {
+      origin: CANONICAL_HTTPS_ORIGIN,
+      path: "/api/v1/tenants\t/active",
+    },
+    {
+      origin: CANONICAL_HTTPS_ORIGIN,
+      path: "/api/v1/tenants\r\n/active",
+    },
+    {
+      origin: CANONICAL_HTTPS_ORIGIN,
+      path: "/api/v1/tenants#active",
+    },
+  ] as const;
+
+  for (const candidate of cases) {
+    const request = new FakeRequest(() => response(200, {}));
+    await assert.rejects(
+      guardedRequest(
+        request,
+        "transport normalization",
+        "get",
+        candidate.path,
+        candidate.origin,
+      ),
+      Error,
+    );
+    assert.equal(
+      request.calls.length,
+      0,
+      `${candidate.origin} ${JSON.stringify(candidate.path)} was dispatched`,
+    );
+  }
+});
+
+test("live API transport rejects cross-origin successful responses before body access", async () => {
+  const guardedRequest = guardedLiveApiRequestWithOrigin();
+  let bodyReads = 0;
+  const request = new FakeRequest(() => ({
+    status: () => 200,
+    url: () => "https://attacker.example.test/api/v1/tenants",
+    async json() {
+      bodyReads += 1;
+      return { detail: ADMIN_TOKEN };
+    },
+  }));
+
+  await assert.rejects(
+    guardedRequest(
+      request,
+      "cross-origin response",
+      "get",
+      "/api/v1/tenants",
+      CANONICAL_HTTPS_ORIGIN,
+    ),
+    Error,
+  );
+  assert.equal(request.calls.length, 1);
+  assert.equal(bodyReads, 0);
+});
+
+test("live fixture rejects every 3xx API response before reading its body", async () => {
+  for (let status = 300; status <= 399; status += 1) {
+    let responseReads = 0;
+    const request = new FakeRequest(() => ({
+      status: () => status,
+      url: () => `${CANONICAL_HTTPS_ORIGIN}/api/v1/auth/users`,
+      async json() {
+        responseReads += 1;
+        return { detail: ADMIN_TOKEN };
+      },
+    }));
+
+    await assert.rejects(
+      ensureLiveUser(makeContext(request), "teacher"),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /redirect/i);
+        assert.equal(error.message.includes(ADMIN_TOKEN), false);
+        return true;
+      },
+    );
+    assert.equal(responseReads, 0, `HTTP ${status} response body was read`);
+  }
+});
+
+test("browser login follows the React onSubmit fetch without native form attributes", async () => {
   const request = new FakeRequest((call) =>
     response(201, userCreated(call, "u-teacher")),
   );
   const context = makeContext(request);
   const identity = await ensureLiveUser(context, "teacher");
-  const filled: Record<string, string> = {};
-  const actions: string[] = [];
-  const page = {
-    async goto(url: string) {
-      actions.push(`goto:${url}`);
-    },
-    locator(selector: string) {
-      return {
-        async fill(value: string) {
-          filled[selector] = value;
-        },
-        async click() {
-          actions.push(`click:${selector}`);
-        },
+  const login = fakeLoginPage();
+
+  await (
+    loginLiveIdentity as unknown as (
+      candidatePage: typeof login.page,
+      identity: LiveIdentity,
+      nextPath: string,
+      expectedOrigin: string,
+    ) => Promise<void>
+  )(
+    login.page,
+    identity,
+    "/teaching/classrooms/new",
+    CANONICAL_HTTPS_ORIGIN,
+  );
+
+  assert.equal(login.filled["#username"], identity.username);
+  assert.notEqual(login.filled["#password"], "");
+  assert.equal(
+    JSON.stringify(identity).includes(login.filled["#password"]),
+    false,
+  );
+  assert.ok(
+    login.actions.indexOf("form:count") <
+      login.actions.indexOf("fill:#username"),
+  );
+  assert.equal(login.observedSubmissions(), 1);
+  assert.equal(login.ignoredSubmissions(), 0);
+  assert.ok(
+    login.actions.indexOf("waitForRequest") <
+      login.actions.indexOf('click:button[type="submit"]'),
+  );
+});
+
+test("browser login waits for a delayed form before completing the React fetch login", async () => {
+  const request = new FakeRequest((call) =>
+    response(201, userCreated(call, "u-teacher")),
+  );
+  const identity = await ensureLiveUser(makeContext(request), "teacher");
+  const login = fakeLoginPage({ formCount: 0, formCountAfterWait: 1 });
+
+  await (
+    loginLiveIdentity as unknown as (
+      page: typeof login.page,
+      identity: LiveIdentity,
+      nextPath: string,
+      expectedOrigin: string,
+    ) => Promise<void>
+  )(login.page, identity, "/home", CANONICAL_HTTPS_ORIGIN);
+
+  assert.ok(login.actions.includes("form:wait:visible:10000"));
+  assert.ok(
+    login.actions.indexOf("form:visible") <
+      login.actions.indexOf("fill:#username"),
+  );
+  assert.equal(login.credentialWrites(), 2);
+  assert.equal(login.filled["#username"], identity.username);
+  assert.equal(login.observedSubmissions(), 1);
+  assert.equal(login.page.url(), `${CANONICAL_HTTPS_ORIGIN}/home`);
+});
+
+test("browser login fails closed when waiting for the form times out", async () => {
+  const request = new FakeRequest((call) =>
+    response(201, userCreated(call, "u-teacher")),
+  );
+  const identity = await ensureLiveUser(makeContext(request), "teacher");
+  const login = fakeLoginPage({ formCount: 0 });
+
+  await assert.rejects(
+    (
+      loginLiveIdentity as unknown as (
+        page: typeof login.page,
+        identity: LiveIdentity,
+        nextPath: string,
+        expectedOrigin: string,
+      ) => Promise<void>
+    )(login.page, identity, "/home", CANONICAL_HTTPS_ORIGIN),
+    /browser login form is invalid/,
+  );
+
+  assert.ok(login.actions.includes("form:wait:visible:10000"));
+  assert.ok(login.actions.includes("form:wait:timeout"));
+  assert.equal(login.credentialWrites(), 0);
+  assert.equal(login.observedSubmissions(), 0);
+  assert.equal(login.actions.includes("waitForRequest"), false);
+});
+
+test("browser login rejects an origin change during the form wait before credential entry", async () => {
+  const request = new FakeRequest((call) =>
+    response(201, userCreated(call, "u-teacher")),
+  );
+  const identity = await ensureLiveUser(makeContext(request), "teacher");
+  const login = fakeLoginPage({
+    formCount: 0,
+    formCountAfterWait: 1,
+    urlAfterFormWait: "https://attacker.example.test/login",
+  });
+
+  await assert.rejects(
+    (
+      loginLiveIdentity as unknown as (
+        page: typeof login.page,
+        identity: LiveIdentity,
+        nextPath: string,
+        expectedOrigin: string,
+      ) => Promise<void>
+    )(login.page, identity, "/home", CANONICAL_HTTPS_ORIGIN),
+    /HTTPS origin/i,
+  );
+
+  assert.ok(login.actions.includes("form:wait:visible:10000"));
+  assert.ok(login.actions.includes("form:visible"));
+  assert.equal(login.credentialWrites(), 0);
+  assert.equal(login.observedSubmissions(), 0);
+  assert.equal(login.actions.includes("waitForRequest"), false);
+});
+
+test("browser login rejects non-HTTPS or cross-origin pages before filling credentials", async () => {
+  const request = new FakeRequest((call) =>
+    response(201, userCreated(call, "u-teacher")),
+  );
+  const identity = await ensureLiveUser(makeContext(request), "teacher");
+  const secureLogin = loginLiveIdentity as unknown as (
+    page: {
+      url(): string;
+      goto(url: string): Promise<unknown>;
+      locator(selector: string): {
+        fill(value: string): Promise<unknown>;
+        click(): Promise<unknown>;
       };
+      waitForURL(url: string): Promise<unknown>;
     },
-    getByLabel(): never {
-      throw new Error("locale-dependent getByLabel must not be used");
-    },
-    getByRole(): never {
-      throw new Error("locale-dependent getByRole must not be used");
-    },
-    async waitForURL(url: string) {
-      actions.push(`wait:${url}`);
-    },
-  };
+    identity: LiveIdentity,
+    nextPath: string,
+    expectedOrigin: string,
+  ) => Promise<void>;
 
-  await loginLiveIdentity(page, identity, "/teaching/classrooms/new");
+  for (const currentUrl of [
+    "http://candidate.example.test/login",
+    "https://attacker.example.test/login",
+  ]) {
+    let credentialWrites = 0;
+    const page = {
+      url: () => currentUrl,
+      async goto(_url: string) {},
+      locator(_selector: string) {
+        return {
+          async fill(_value: string) {
+            credentialWrites += 1;
+          },
+          async click() {},
+        };
+      },
+      async waitForURL(_url: string) {},
+    };
 
-  assert.equal(filled["#username"], identity.username);
-  assert.notEqual(filled["#password"], "");
-  assert.equal(JSON.stringify(identity).includes(filled["#password"]), false);
-  assert.deepEqual(actions, [
-    "goto:/login?next=%2Fteaching%2Fclassrooms%2Fnew",
-    "wait:/teaching/classrooms/new",
-    'click:button[type="submit"]',
+    await assert.rejects(
+      secureLogin(page, identity, "/", "https://candidate.example.test"),
+      /HTTPS origin/i,
+    );
+    assert.equal(credentialWrites, 0, currentUrl);
+  }
+});
+
+test("browser login rejects missing or ambiguous form surfaces before credential entry", async () => {
+  const request = new FakeRequest((call) =>
+    response(201, userCreated(call, "u-teacher")),
+  );
+  const identity = await ensureLiveUser(makeContext(request), "teacher");
+  const secureLogin = loginLiveIdentity as unknown as (
+    page: ReturnType<typeof fakeLoginPage>["page"],
+    identity: LiveIdentity,
+    nextPath: string,
+    expectedOrigin: string,
+  ) => Promise<void>;
+  const cases = [{ formCount: 0 }, { formCount: 2 }] as const;
+
+  for (const options of cases) {
+    const login = fakeLoginPage(options);
+    await assert.rejects(
+      secureLogin(login.page, identity, "/", CANONICAL_HTTPS_ORIGIN),
+      Error,
+    );
+    assert.equal(login.credentialWrites(), 0, JSON.stringify(options));
+    assert.equal(login.observedSubmissions(), 0, JSON.stringify(options));
+    assert.equal(login.ignoredSubmissions(), 0, JSON.stringify(options));
+  }
+});
+
+test("browser login rejects untrusted submission evidence after the request wait times out", async () => {
+  const request = new FakeRequest((call) =>
+    response(201, userCreated(call, "u-teacher")),
+  );
+  const identity = await ensureLiveUser(makeContext(request), "teacher");
+  const login = fakeLoginPage({
+    submissionUrl: "https://attacker.example.test/capture-login",
+  });
+
+  await assert.rejects(
+    (
+      loginLiveIdentity as unknown as (
+        page: typeof login.page,
+        identity: LiveIdentity,
+        nextPath: string,
+        expectedOrigin: string,
+      ) => Promise<void>
+    )(login.page, identity, "/", CANONICAL_HTTPS_ORIGIN),
+    Error,
+  );
+
+  assert.equal(login.credentialWrites(), 2);
+  assert.equal(login.observedSubmissions(), 0);
+  assert.equal(login.ignoredSubmissions(), 1);
+  assert.ok(
+    login.actions.indexOf("waitForRequest:ignored") <
+      login.actions.indexOf("waitForRequest:timeout"),
+  );
+});
+
+test("browser login rejects WHATWG-ambiguous next paths before navigation", async () => {
+  const request = new FakeRequest((call) =>
+    response(201, userCreated(call, "u-teacher")),
+  );
+  const identity = await ensureLiveUser(makeContext(request), "teacher");
+  const secureLogin = loginLiveIdentity as unknown as (
+    page: ReturnType<typeof fakeLoginPage>["page"],
+    identity: LiveIdentity,
+    nextPath: string,
+    expectedOrigin: string,
+  ) => Promise<void>;
+
+  for (const nextPath of [
+    "/\\attacker.example.test/escape",
+    "/\t\\attacker.example.test/escape",
+    "/\r\n\\attacker.example.test/escape",
+    "/teaching/classrooms#credential-fragment",
+  ]) {
+    const login = fakeLoginPage();
+    await assert.rejects(
+      secureLogin(login.page, identity, nextPath, CANONICAL_HTTPS_ORIGIN),
+      Error,
+    );
+    assert.equal(
+      login.actions.some((action) => action.startsWith("goto:")),
+      false,
+    );
+    assert.equal(login.credentialWrites(), 0);
+  }
+});
+
+test("role-session GET transports disable redirects and validate response origins", () => {
+  const source = readFileSync(
+    "tests/e2e/support/classroom-first-release-live-flows.ts",
+    "utf8",
+  );
+  const pollStart = source.indexOf("async function pollRecord(");
+  const sameSessionStart = source.indexOf(
+    "async function sameSessionGetRecord(",
+  );
+  const safeOptionStart = source.indexOf("function safeOptionValue(");
+  assert.ok(
+    pollStart >= 0 &&
+      sameSessionStart > pollStart &&
+      safeOptionStart > sameSessionStart,
+  );
+
+  const bodies = [
+    ["pollRecord", source.slice(pollStart, sameSessionStart)],
+    ["sameSessionGetRecord", source.slice(sameSessionStart, safeOptionStart)],
+  ] as const;
+  const contract = bodies.map(([name, body]) => ({
+    name,
+    disablesRedirects: /maxRedirects\s*:\s*0/.test(body),
+    readsResponseUrl: /response\.url\(\)/.test(body),
+    avoidsMutablePageOrigin: !/page\.url\(\)/.test(body),
+    bindsExpectedOrigin: /expectedOrigin\s*:\s*string/.test(body),
+    usesSharedOriginValidator:
+      /sameOriginHttpsUrl\s*\(\s*response\.url\(\)\s*,\s*expectedOrigin\s*,/.test(
+        body,
+      ),
+  }));
+
+  assert.deepEqual(contract, [
+    {
+      name: "pollRecord",
+      disablesRedirects: true,
+      readsResponseUrl: true,
+      avoidsMutablePageOrigin: true,
+      bindsExpectedOrigin: true,
+      usesSharedOriginValidator: true,
+    },
+    {
+      name: "sameSessionGetRecord",
+      disablesRedirects: true,
+      readsResponseUrl: true,
+      avoidsMutablePageOrigin: true,
+      bindsExpectedOrigin: true,
+      usesSharedOriginValidator: true,
+    },
   ]);
-  assert.equal("route" in page, false);
+});
+
+test("live spec normalizes WEB_BASE_URL to an exact HTTPS origin and binds every browser login", () => {
+  const spec = readFileSync(
+    "tests/e2e/classroom-first-release.live.spec.ts",
+    "utf8",
+  );
+  const flows = readFileSync(
+    "tests/e2e/support/classroom-first-release-live-flows.ts",
+    "utf8",
+  );
+
+  assert.match(spec, /parsed\.protocol\s*!==\s*["']https:["']/);
+  assert.equal(spec.includes('["http:", "https:"]'), false);
+  assert.match(
+    spec,
+    /function liveBaseUrl\(\): string \{[\s\S]*?const parsed = new URL\(value\);[\s\S]*?return parsed\.origin;/,
+  );
+  assert.match(spec, /loginLiveIdentity\(page, identity, "\/home", baseUrl\)/);
+  assert.match(flows, /loginLiveIdentity\(page, identity, "\/home", baseUrl\)/);
+});
+
+test("live browser evidence binds every response and route landmark to the candidate origin", () => {
+  const spec = readFileSync(
+    "tests/e2e/classroom-first-release.live.spec.ts",
+    "utf8",
+  );
+  const flows = readFileSync(
+    "tests/e2e/support/classroom-first-release-live-flows.ts",
+    "utf8",
+  );
+
+  for (const source of [spec, flows]) {
+    assert.match(
+      source,
+      /sameOriginHttpsUrl\s*\(\s*response\.url\(\)\s*,\s*expectedOrigin\s*,/,
+    );
+    assert.equal(source.includes("new URL(response.url()).pathname"), false);
+  }
+  assert.match(spec, /expect\(currentUrl\.origin\)\.toBe\(expectedOrigin\)/);
+});
+
+test("live sources observe the real login submission without request interception", () => {
+  const liveSources = [
+    [
+      "spec",
+      readFileSync("tests/e2e/classroom-first-release.live.spec.ts", "utf8"),
+    ],
+    [
+      "fixture",
+      readFileSync(
+        "tests/e2e/support/classroom-first-release-live-fixture.ts",
+        "utf8",
+      ),
+    ],
+    [
+      "flows",
+      readFileSync(
+        "tests/e2e/support/classroom-first-release-live-flows.ts",
+        "utf8",
+      ),
+    ],
+  ] as const;
+  const fixture = liveSources.find(([name]) => name === "fixture")?.[1] ?? "";
+  const loginStart = fixture.indexOf("export async function loginLiveIdentity(");
+  assert.ok(loginStart >= 0, "live login helper is missing");
+  const login = fixture.slice(loginStart);
+
+  assert.deepEqual(
+    {
+      observesSubmission: /page\.waitForRequest\(/.test(login),
+      validatesHttpsOrigin:
+        /sameOriginHttpsUrl\([\s\S]*?["']login submission["']/.test(login),
+      validatesLoginEndpoint: /["']\/api\/v1\/auth\/login["']/.test(login),
+      validatesPost: /method\s*===\s*["']POST["']/.test(login),
+      validatesRedirectBoundary:
+        /page\.waitForURL\(destination\.href\)/.test(login) &&
+        /sameOriginHttpsUrl\([\s\S]*?["']browser login destination["']/.test(login),
+    },
+    {
+      observesSubmission: true,
+      validatesHttpsOrigin: true,
+      validatesLoginEndpoint: true,
+      validatesPost: true,
+      validatesRedirectBoundary: true,
+    },
+  );
+
+  const forbidden = [
+    [".route(", /\.\s*route\s*\(/],
+    [".unroute(", /\.\s*unroute\s*\(/],
+    ["route.fulfill(", /\broute\s*\.\s*fulfill\s*\(/],
+    ["route.continue(", /\broute\s*\.\s*continue\s*\(/],
+    ["route.fallback(", /\broute\s*\.\s*fallback\s*\(/],
+    ["route.abort(", /\broute\s*\.\s*abort\s*\(/],
+    [".routeFromHAR(", /\.\s*routeFromHAR\s*\(/],
+  ] as const;
+  const violations = liveSources.flatMap(([name, source]) =>
+    forbidden
+      .filter(([, pattern]) => pattern.test(source))
+      .map(([operation]) => `${name}:${operation}`),
+  );
+
+  assert.deepEqual(
+    violations,
+    [],
+    "live sources must observe real responses or requests without browser/context interception",
+  );
 });
 
 test("live fixture keeps resource-specific API setup explicit", () => {
@@ -1045,6 +2012,17 @@ test("live fixture keeps resource-specific API setup explicit", () => {
     },
     { genericOptionsType: false, genericCreateOrRead: false },
   );
+});
+
+test("live spec consumes the fixed candidate digest without rereading the mutable lock", () => {
+  const source = readFileSync(
+    "tests/e2e/classroom-first-release.live.spec.ts",
+    "utf8",
+  );
+
+  assert.equal(source.includes("YFEISTAI_CANDIDATE_SHA256"), true);
+  assert.equal(source.includes("YFEISTAI_CANDIDATE_ROOT"), false);
+  assert.equal(source.includes("image-lock.json"), false);
 });
 
 test("malformed API errors stay static and redact the admin token and password", async () => {

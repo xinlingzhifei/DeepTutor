@@ -17,6 +17,7 @@ LIVE_FIXTURE_TOKEN = "platform-admin-token-must-never-appear"
 OBSERVER_ATTESTATION_SHA256 = "9" * 64
 OBSERVER_ID = "shared-ingress-observer-openmaic-01"
 OBSERVER_URL = "https://observer.example.test"
+INTERNAL_PROXY_URL = "http://openmaic-shared-ingress-observer:8000"
 SHARED_CONTROL_URL = "https://shared-ingress.example.test/v1/control-canaries"
 DOCKER_HOST_IDENTITY_SHA256 = "1" * 64
 
@@ -115,6 +116,104 @@ def _observer_attestation() -> dict[str, object]:
             "sharedIngressControlUrl": SHARED_CONTROL_URL,
         },
     }
+
+
+def _observer_attestation_v2() -> dict[str, object]:
+    return {
+        "schemaVersion": 2,
+        "producer": "openmaic-shared-ingress-observer",
+        "releaseRun": _release_run(),
+        "observedAt": "2026-08-29T00:00:00Z",
+        "observer": {
+            "observerId": OBSERVER_ID,
+            "observerUrl": OBSERVER_URL,
+            "sharedIngressControlUrl": SHARED_CONTROL_URL,
+            "candidateHealthUrl": (
+                "https://candidate.example.test/api/v1/system/teaching-health/observer-canary"
+            ),
+            "sharedIngressUpstreamUrl": "https://openmaic-upstream.example.test",
+            "internalProxyUrl": INTERNAL_PROXY_URL,
+            "authExpiresAt": "2026-08-29T01:00:00Z",
+        },
+    }
+
+
+def test_observer_attestation_v2_strictly_binds_proxy_routes_and_expiry() -> None:
+    module = _module()
+    report = _observer_attestation_v2()
+
+    parsed = module.parse_openmaic_shared_ingress_observer_attestation(
+        _body(report),
+        release_run=_release_run(),
+    )
+
+    assert parsed == report
+    for path, value in (
+        (("observer", "sharedIngressControlUrl"), "https://shared-ingress.example.test/control"),
+        (("observer", "candidateHealthUrl"), "https://observer.example.test/health"),
+        (("observer", "sharedIngressUpstreamUrl"), SHARED_CONTROL_URL),
+        (("observer", "authExpiresAt"), "not-a-time"),
+        (("observer", "authExpiresAt"), "2026-08-29T03:00:01Z"),
+    ):
+        changed = json.loads(json.dumps(report))
+        cursor = changed
+        for key in path[:-1]:
+            cursor = cursor[key]
+        cursor[path[-1]] = value
+        with pytest.raises(ValueError):
+            module.parse_openmaic_shared_ingress_observer_attestation(
+                _body(changed),
+                release_run=_release_run(),
+            )
+
+
+def test_observer_origins_treat_dns_trailing_dot_as_the_same_origin() -> None:
+    module = _module()
+    report = _observer_attestation_v2()
+    report["observer"]["sharedIngressControlUrl"] = (
+        "https://observer.example.test./v1/control-canaries"
+    )
+
+    with pytest.raises(ValueError, match="observer binding is invalid"):
+        module.parse_openmaic_shared_ingress_observer_attestation(
+            _body(report),
+            release_run=_release_run(),
+        )
+
+
+def test_observer_attestation_v2_binds_normalized_internal_proxy_as_fifth_authority() -> None:
+    module = _module()
+    report = _observer_attestation_v2()
+
+    assert (
+        module.parse_openmaic_shared_ingress_observer_attestation(
+            _body(report),
+            release_run=_release_run(),
+        )["observer"]["internalProxyUrl"]
+        == INTERNAL_PROXY_URL
+    )
+
+    for mutate in (
+        lambda observer: observer.__setitem__(
+            "internalProxyUrl",
+            "http://OPENMAIC-SHARED-INGRESS-OBSERVER:8000",
+        ),
+        lambda observer: observer.__setitem__(
+            "internalProxyUrl",
+            "http://openmaic-shared-ingress-observer:8000/",
+        ),
+        lambda observer: (
+            observer.__setitem__("observerUrl", "https://proxy.example.test:8000"),
+            observer.__setitem__("internalProxyUrl", "http://proxy.example.test:8000"),
+        ),
+    ):
+        changed = copy.deepcopy(report)
+        mutate(changed["observer"])
+        with pytest.raises(ValueError, match="observer binding is invalid"):
+            module.parse_openmaic_shared_ingress_observer_attestation(
+                _body(changed),
+                release_run=_release_run(),
+            )
 
 
 def _parse(report: dict[str, object]) -> dict[str, object]:

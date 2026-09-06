@@ -35,6 +35,7 @@ from deeptutor.teaching.export_worker import (
     load_export_input_bundle,
     stage_and_submit_pinned_export,
 )
+from deeptutor.teaching.health import log_generation_failure
 from deeptutor.teaching.job_errors import (
     JobFailure,
     can_repair_dsl,
@@ -463,6 +464,14 @@ class GenerationWorker:
             failure = classify_worker_error(
                 exc,
                 data_plane_mode=claim.data_plane_mode,
+            )
+            log_generation_failure(
+                tenant_id=claim.tenant_id,
+                job_id=claim.job_id,
+                route_id=claim.data_plane_route_id,
+                error_code=failure.code,
+                source_text=exc,
+                provider_key=claim.provider_profile_id,
             )
             try:
                 if failure.retryable:

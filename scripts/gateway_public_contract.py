@@ -124,11 +124,13 @@ def parse_gateway_candidate_networks(
     *,
     docker_project: str,
     expected_services: Sequence[str],
+    overlay_bodies: Sequence[bytes] = (),
 ) -> dict[str, tuple[str, ...]]:
     """Derive exact Docker network names for runtime services from fixed Compose bytes."""
 
     if (
         not isinstance(compose_body, bytes)
+        or any(not isinstance(body, bytes) for body in overlay_bodies)
         or not isinstance(docker_project, str)
         or not docker_project
         or docker_project != docker_project.strip()
@@ -140,14 +142,29 @@ def parse_gateway_candidate_networks(
         for service in service_names
     ):
         raise ValueError("gateway candidate Compose network set is invalid")
-    try:
-        document = yaml.load(compose_body.decode("utf-8"), Loader=_ComposeLoader)
-    except (UnicodeError, yaml.YAMLError) as exc:
-        raise ValueError("gateway candidate Compose network set is invalid") from exc
-    services = document.get("services") if isinstance(document, dict) else None
-    network_definitions = document.get("networks") if isinstance(document, dict) else None
-    if not isinstance(services, dict) or not isinstance(network_definitions, dict):
-        raise ValueError("gateway candidate Compose network set is invalid")
+    services: dict[str, dict[str, object]] = {}
+    network_definitions: dict[str, object] = {}
+    for index, body in enumerate((compose_body, *overlay_bodies)):
+        try:
+            document = yaml.load(body.decode("utf-8"), Loader=_ComposeLoader)
+        except (UnicodeError, yaml.YAMLError) as exc:
+            raise ValueError("gateway candidate Compose network set is invalid") from exc
+        raw_services = document.get("services") if isinstance(document, dict) else None
+        raw_networks = document.get("networks") if isinstance(document, dict) else None
+        if not isinstance(raw_services, dict) or (
+            index == 0 and not isinstance(raw_networks, dict)
+        ):
+            raise ValueError("gateway candidate Compose network set is invalid")
+        if raw_networks is not None:
+            if not isinstance(raw_networks, dict):
+                raise ValueError("gateway candidate Compose network set is invalid")
+            network_definitions.update(raw_networks)
+        for service_name, raw_service in raw_services.items():
+            if not isinstance(service_name, str) or not isinstance(raw_service, dict):
+                raise ValueError("gateway candidate Compose network set is invalid")
+            merged = dict(services.get(service_name, {}))
+            merged.update(raw_service)
+            services[service_name] = merged
 
     expected: dict[str, tuple[str, ...]] = {}
     for service_name in sorted(service_names):
@@ -157,10 +174,12 @@ def parse_gateway_candidate_networks(
             logical_names = list(raw_networks)
         elif isinstance(raw_networks, list):
             logical_names = raw_networks
+        elif isinstance(service, dict) and service.get("network_mode") == "none":
+            logical_names = []
         else:
             raise ValueError("gateway candidate Compose network set is invalid")
         if (
-            not logical_names
+            (not logical_names and service.get("network_mode") != "none")
             or any(
                 not isinstance(name, str) or not name or name != name.strip()
                 for name in logical_names

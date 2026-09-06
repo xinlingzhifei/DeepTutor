@@ -73,7 +73,7 @@ _REASON_CODES = frozenset(
     }
 )
 
-HealthProbe = Callable[[], Awaitable[None]]
+HealthProbe = Callable[..., Awaitable[None]]
 SessionFactory = Callable[[], AbstractAsyncContextManager[Any]]
 
 
@@ -346,7 +346,7 @@ class DataPlaneHealthRepository(Protocol):
 
 
 class CompatibleOpenMAICClient(Protocol):
-    async def assert_compatible(self) -> object: ...
+    async def assert_compatible(self, *, observer_canary: str | None = None) -> object: ...
 
 
 class OpenMAICHealthClientFactory(Protocol):
@@ -373,12 +373,20 @@ class OpenMAICDataPlaneHealthProbes:
         self._client_factory = client_factory
         self._dedicated_concurrency = dedicated_concurrency
 
-    async def _route_reason(self, route: DataPlaneRouteRecord) -> str | None:
+    async def _route_reason(
+        self,
+        route: DataPlaneRouteRecord,
+        *,
+        observer_canary: str | None = None,
+    ) -> str | None:
         if route.status != "active" or route.mode not in {"shared", "dedicated"}:
             return "route_unavailable"
         try:
             client = await self._client_factory.create(route)
-            await client.assert_compatible()
+            if observer_canary is None:
+                await client.assert_compatible()
+            else:
+                await client.assert_compatible(observer_canary=observer_canary)
         except asyncio.CancelledError:
             raise
         except IncompatibleOpenMAIC:
@@ -387,11 +395,11 @@ class OpenMAICDataPlaneHealthProbes:
             return "route_unavailable"
         return None
 
-    async def probe_shared(self) -> None:
+    async def probe_shared(self, *, observer_canary: str | None = None) -> None:
         route = await self._repository.resolve_shared_health_route()
         if route is None or route.mode != "shared":
             raise HealthProbeFailure("route_unavailable")
-        reason = await self._route_reason(route)
+        reason = await self._route_reason(route, observer_canary=observer_canary)
         if reason is not None:
             raise HealthProbeFailure(reason)
 
@@ -539,10 +547,19 @@ class ActiveHealthProbeService:
             "request timeout",
         )
 
-    async def _run_one(self, probe: HealthProbe) -> ActiveProbeResult:
+    async def _run_one(
+        self,
+        component: str,
+        probe: HealthProbe,
+        *,
+        openmaic_shared_observer_canary: str | None,
+    ) -> ActiveProbeResult:
         try:
             async with asyncio.timeout(self._probe_timeout_seconds):
-                await probe()
+                if component == "openmaic_shared" and openmaic_shared_observer_canary is not None:
+                    await probe(observer_canary=openmaic_shared_observer_canary)
+                else:
+                    await probe()
         except asyncio.CancelledError:
             raise
         except TimeoutError:
@@ -553,10 +570,18 @@ class ActiveHealthProbeService:
             return ActiveProbeResult(status="unhealthy", reason="probe_failed")
         return ActiveProbeResult(status="healthy")
 
-    async def probe(self) -> dict[str, ActiveProbeResult]:
+    async def probe(
+        self,
+        *,
+        openmaic_shared_observer_canary: str | None = None,
+    ) -> dict[str, ActiveProbeResult]:
         tasks = {
             component: asyncio.create_task(
-                self._run_one(probe),
+                self._run_one(
+                    component,
+                    probe,
+                    openmaic_shared_observer_canary=openmaic_shared_observer_canary,
+                ),
                 name=f"teaching-health-probe:{component}",
             )
             for component, probe in self._probes.items()

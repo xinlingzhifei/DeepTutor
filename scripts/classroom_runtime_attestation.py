@@ -27,7 +27,11 @@ if str(SCRIPTS_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_ROOT))
 
 from docker_compose import platform_compose_topology_arguments  # noqa: E402
-from render_platform_compose import load_image_lock  # noqa: E402
+from render_platform_compose import (  # noqa: E402
+    _render_compose_references,
+    _validate_image_lock_binding_bytes,
+    load_image_lock_bytes,
+)
 
 PROJECT = "yfeistai-platform"
 SCHEMA_VERSION = 1
@@ -90,13 +94,57 @@ PS_ARGUMENTS = (
     "--format",
     PS_FORMAT,
 )
-_OS_ENVIRONMENT = frozenset(("SYSTEMROOT", "WINDIR", "TEMP", "TMP", "LANG", "LC_ALL"))
+_OS_ENVIRONMENT = frozenset(
+    (
+        "SYSTEMROOT",
+        "WINDIR",
+        "TEMP",
+        "TMP",
+        "LANG",
+        "LC_ALL",
+        "YFEISTAI_SHARED_INGRESS_OBSERVER_ID",
+        "YFEISTAI_SHARED_INGRESS_OBSERVER_URL",
+        "YFEISTAI_SHARED_INGRESS_CONTROL_URL",
+        "YFEISTAI_SHARED_INGRESS_UPSTREAM_URL",
+        "YFEISTAI_SHARED_INGRESS_CANDIDATE_HEALTH_URL",
+        "YFEISTAI_SHARED_INGRESS_AUTH_EXPIRES_AT",
+        "YFEISTAI_OBSERVER_ATTESTATION_DIR",
+        "YFEISTAI_OBSERVER_TRUST_ROOT",
+        "YFEISTAI_OBSERVER_PUBLIC_KEY_SPKI_SHA256",
+    )
+)
 _DOCKER_HOST_IDENTITY_ENV = "YFEISTAI_GATEWAY_DOCKER_HOST_IDENTITY_SHA256"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_IMMUTABLE_IMAGE_NAME = re.compile(
+    r"^(?=.{1,512}$)"
+    r"(?:[a-z0-9]+(?:[._-][a-z0-9]+)*(?::[0-9]+)?/)*"
+    r"[a-z0-9]+(?:[._-][a-z0-9]+)*"
+    r"(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?$"
+)
 _RELEASE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _OBSERVED_AT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
 _REQUIRED_HEALTHY_SERVICES = frozenset(
-    ("deeptutor", "postgres", "minio", "openmaic", "openmaic-render")
+    (
+        "deeptutor",
+        "postgres",
+        "minio",
+        "openmaic",
+        "openmaic-render",
+        "openmaic-shared-ingress-observer",
+    )
+)
+_OBSERVER_SUPPORT_IMAGE_SERVICES = frozenset(
+    (
+        "openmaic-shared-ingress-observer",
+        "openmaic-observer-attestation-signer",
+    )
+)
+_OBSERVER_SECRET_NAMES = frozenset(
+    (
+        "openmaic_observer_auth_token",
+        "openmaic_observer_health_token",
+        "openmaic_observer_attestation_signing_key",
+    )
 )
 
 
@@ -140,6 +188,81 @@ def _release_run(raw: Mapping[str, object]) -> dict[str, str]:
             raise ValueError("release run identity is invalid")
         result[name] = value
     return result
+
+
+def _observer_secret_preflight(
+    raw: Mapping[str, object],
+    *,
+    release_run_id: str,
+) -> dict[str, object]:
+    if set(raw) != {
+        "schemaVersion",
+        "releaseRunId",
+        "runDirectory",
+        "ownerOnly",
+        "noLinksOrReparsePoints",
+        "distinctSecrets",
+        "observerSignerImage",
+        "secrets",
+    }:
+        raise ValueError("observer secret preflight is invalid")
+    run_directory = raw.get("runDirectory")
+    secrets = raw.get("secrets")
+    observer_signer_image = raw.get("observerSignerImage")
+    if isinstance(observer_signer_image, str):
+        image_name, separator, image_digest = observer_signer_image.rpartition("@sha256:")
+    else:
+        image_name, separator, image_digest = "", "", ""
+    if (
+        type(raw.get("schemaVersion")) is not int
+        or raw.get("schemaVersion") != 1
+        or raw.get("releaseRunId") != release_run_id
+        or not isinstance(run_directory, str)
+        or not Path(run_directory).is_absolute()
+        or Path(run_directory).name != release_run_id
+        or raw.get("ownerOnly") is not True
+        or raw.get("noLinksOrReparsePoints") is not True
+        or raw.get("distinctSecrets") is not True
+        or not separator
+        or _IMMUTABLE_IMAGE_NAME.fullmatch(image_name) is None
+        or _SHA256.fullmatch(image_digest) is None
+        or image_digest == "0" * 64
+        or not isinstance(secrets, dict)
+        or set(secrets) != _OBSERVER_SECRET_NAMES
+    ):
+        raise ValueError("observer secret preflight is invalid")
+    for name, details in secrets.items():
+        if (
+            not isinstance(name, str)
+            or not isinstance(details, dict)
+            or set(details) != {"fileName", "mode", "ownerId", "groupId", "size"}
+            or not isinstance(details.get("fileName"), str)
+            or not details["fileName"]
+            or Path(details["fileName"]).name != details["fileName"]
+            or not isinstance(details.get("mode"), str)
+            or details["mode"] not in {"0400", "0600"}
+            or details.get("ownerId") != 1000
+            or details.get("groupId") != 1000
+            or type(details.get("size")) is not int
+            or details["size"] <= 0
+        ):
+            raise ValueError("observer secret preflight is invalid")
+    return json.loads(json.dumps(raw))
+
+
+def _observer_signer_image_reference(raw: object) -> str:
+    if isinstance(raw, str):
+        image_name, separator, image_digest = raw.rpartition("@sha256:")
+    else:
+        image_name, separator, image_digest = "", "", ""
+    if (
+        not separator
+        or _IMMUTABLE_IMAGE_NAME.fullmatch(image_name) is None
+        or _SHA256.fullmatch(image_digest) is None
+        or image_digest == "0" * 64
+    ):
+        raise ValueError("observer signer image reference is invalid")
+    return raw
 
 
 def _base_url(raw: object) -> str:
@@ -268,7 +391,17 @@ def resolve_fixed_docker(
 
 def _child_environment(environ: Mapping[str, str]) -> dict[str, str]:
     by_upper = {name.upper(): value for name, value in environ.items()}
-    return {name: by_upper[name] for name in _OS_ENVIRONMENT if name in by_upper and by_upper[name]}
+    result = {
+        name: by_upper[name] for name in _OS_ENVIRONMENT if name in by_upper and by_upper[name]
+    }
+    if any(
+        not isinstance(value, str)
+        or len(value) > 4096
+        or any(character in value for character in ("\x00", "\r", "\n"))
+        for value in result.values()
+    ):
+        raise ValueError("runtime Compose environment is invalid")
+    return result
 
 
 def _docker_host_identity_sha256(value: object) -> str:
@@ -311,44 +444,81 @@ def _run_docker(
     )
 
 
-class _ImmutableTextFile:
-    """Minimal read-only path adapter for the shared strict lock parser."""
-
-    def __init__(self, body: bytes) -> None:
-        self._body = body
-
-    def read_text(self, *, encoding: str) -> str:
-        return self._body.decode(encoding)
-
-
 def _load_candidate_token(
-    token: tuple[bytes, bytes],
+    token: tuple[bytes, bytes, bytes, bytes, bytes],
     *,
     expected_candidate: Mapping[str, object] | None = None,
+    observer_signer_image: str | None = None,
 ) -> tuple[dict[str, object], dict[str, dict[str, object]]]:
+    if (
+        not isinstance(token, tuple)
+        or len(token) != 5
+        or not all(isinstance(body, bytes) for body in token)
+    ):
+        raise ValueError("candidate runtime contract token is incomplete or invalid")
     try:
-        lock = load_image_lock(
-            _ImmutableTextFile(token[0]),  # type: ignore[arg-type]
+        lock = load_image_lock_bytes(
+            token[0],
             require_candidate=True,
             expected_candidate=expected_candidate,
         )
+        _validate_image_lock_binding_bytes(
+            lock,
+            (
+                (Path("docker-compose.yml"), token[3]),
+                (Path("docker-compose.platform.yml"), token[1]),
+                (Path("docker-compose.data-plane.yml"), token[4]),
+                (Path("deploy/docker-compose.openmaic-shared-ingress-observer.yml"), token[2]),
+            ),
+        )
         compose = yaml.load(token[1].decode("utf-8"), Loader=_ComposeLoader)
+        observer_overlay_text = token[2].decode("utf-8")
+        observer_overlay = yaml.load(observer_overlay_text, Loader=_ComposeLoader)
     except (OSError, UnicodeError, ValueError, yaml.YAMLError) as exc:
         raise ValueError("candidate runtime contract is unavailable or invalid") from exc
     candidate = lock.get("candidate") if isinstance(lock, dict) else None
     images = lock.get("images") if isinstance(lock, dict) else None
+    support_images = lock.get("supportImages") if isinstance(lock, dict) else None
     services = compose.get("services") if isinstance(compose, dict) else None
+    observer_services = (
+        observer_overlay.get("services") if isinstance(observer_overlay, dict) else None
+    )
     if (
         not isinstance(lock, dict)
-        or lock.get("schemaVersion") != 2
+        or lock.get("schemaVersion") != 3
         or not isinstance(candidate, dict)
         or not isinstance(images, dict)
+        or not isinstance(support_images, dict)
         or not isinstance(services, dict)
+        or not isinstance(observer_services, dict)
     ):
         raise ValueError("candidate runtime contract is unavailable or invalid")
     locked_references = {
         record["reference"] for record in images.values() if isinstance(record, dict)
     }
+    signer_record = support_images.get("observer_signer")
+    if not isinstance(signer_record, dict):
+        raise ValueError("candidate runtime observer signer image is invalid")
+    bound_observer_signer_image = _observer_signer_image_reference(signer_record.get("reference"))
+    if observer_signer_image is not None and (
+        _observer_signer_image_reference(observer_signer_image) != bound_observer_signer_image
+    ):
+        raise ValueError("candidate runtime observer signer image does not match image lock")
+    if bound_observer_signer_image in locked_references:
+        raise ValueError("candidate runtime observer signer image is not independent")
+    try:
+        expected_observer_overlay = _render_compose_references(
+            SCRIPTS_ROOT.parent / "deploy" / "docker-compose.openmaic-shared-ingress-observer.yml",
+            images,
+            support_images,
+        )
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise ValueError("candidate runtime observer Compose is invalid") from exc
+    if observer_overlay_text != expected_observer_overlay:
+        raise ValueError("candidate runtime observer Compose is not the trusted overlay")
+    deeptutor_reference = images.get("deeptutor", {}).get("reference")
+    if not isinstance(deeptutor_reference, str):
+        raise ValueError("candidate runtime observer Compose is invalid")
     expected: dict[str, dict[str, object]] = {}
     for service_name, raw_service in services.items():
         if not isinstance(service_name, str) or not isinstance(raw_service, dict):
@@ -363,6 +533,38 @@ def _load_candidate_token(
             or not isinstance(restart, str)
         ):
             raise ValueError("candidate runtime Compose service is invalid")
+        expected[service_name] = {"image": image, "restart": restart}
+    for service_name, raw_service in observer_services.items():
+        if not isinstance(service_name, str) or not isinstance(raw_service, dict):
+            raise ValueError("candidate runtime observer Compose is invalid")
+        if "profiles" in raw_service:
+            continue
+        image = raw_service.get("image")
+        if image is None:
+            if service_name not in expected:
+                raise ValueError("candidate runtime observer Compose is invalid")
+            continue
+        if (
+            isinstance(image, str)
+            and image.startswith("${YFEISTAI_DEEPTUTOR_IMAGE:?")
+            and image.endswith("}")
+        ):
+            image = deeptutor_reference
+        elif (
+            isinstance(image, str)
+            and image.startswith("${YFEISTAI_OBSERVER_SIGNER_IMAGE:?")
+            and image.endswith("}")
+        ):
+            image = bound_observer_signer_image
+        restart = raw_service.get("restart", "")
+        uses_support_image = service_name in _OBSERVER_SUPPORT_IMAGE_SERVICES
+        valid_image = (
+            image == bound_observer_signer_image
+            if uses_support_image
+            else image in locked_references and image != bound_observer_signer_image
+        )
+        if not valid_image or not isinstance(restart, str):
+            raise ValueError("candidate runtime observer Compose is invalid")
         expected[service_name] = {"image": image, "restart": restart}
     if not expected:
         raise ValueError("candidate runtime Compose services are invalid")
@@ -452,6 +654,8 @@ def _runtime_compose_arguments(
         f"{_CANDIDATE_ROOT_LOGICAL}/docker-compose.yml",
         "-f",
         f"{_CANDIDATE_ROOT_LOGICAL}/docker-compose.platform.yml",
+        "-f",
+        (f"{_CANDIDATE_ROOT_LOGICAL}/deploy/docker-compose.openmaic-shared-ingress-observer.yml"),
         *tail,
     )
     return actual, logical
@@ -1001,7 +1205,7 @@ def _validate_container_facts(
         )
         if not _security_matches(security, expected_security):
             raise ValueError("runtime security-sensitive configuration does not match candidate")
-        one_shot = expected["restart"] == "no"
+        one_shot = expected["restart"] == "no" and service != "openmaic-shared-ingress-observer"
         if one_shot:
             state_is_valid = (
                 fact["state"] == "exited"
@@ -1705,7 +1909,14 @@ def _open_posix_directory_path_no_follow(path: Path) -> tuple[int, tuple[int, in
     current = os.open(candidate.anchor, flags)
     try:
         for component in candidate.relative_to(candidate.anchor).parts:
-            opened = os.open(component, flags, dir_fd=current)
+            try:
+                opened = os.open(component, flags, dir_fd=current)
+            except OSError as exc:
+                if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                    raise ValueError(
+                        "candidate directory lease contains a link or non-directory"
+                    ) from exc
+                raise
             os.close(current)
             current = opened
         details = os.fstat(current)
@@ -1866,6 +2077,8 @@ class _CandidateContractLease:
             self.candidate_root / "deploy" / "image-lock.json",
             self.candidate_root / "docker-compose.platform.yml",
             self.candidate_root / "docker-compose.yml",
+            self.candidate_root / "deploy" / "docker-compose.openmaic-shared-ingress-observer.yml",
+            self.candidate_root / "docker-compose.data-plane.yml",
         )
         self._handles: list[object | int] = []
         self._identities: list[tuple[int, int]] = []
@@ -1908,6 +2121,11 @@ class _CandidateContractLease:
                     (lease._deploy_directory_handle, "image-lock.json"),
                     (lease._candidate_directory_handle, "docker-compose.platform.yml"),
                     (lease._candidate_directory_handle, "docker-compose.yml"),
+                    (
+                        lease._deploy_directory_handle,
+                        "docker-compose.openmaic-shared-ingress-observer.yml",
+                    ),
+                    (lease._candidate_directory_handle, "docker-compose.data-plane.yml"),
                 ):
                     handle = os.open(name, flags, dir_fd=directory_handle)
                     lease._handles.append(handle)
@@ -1932,10 +2150,17 @@ class _CandidateContractLease:
         return False
 
     @property
-    def token(self) -> tuple[bytes, bytes]:
-        if len(self._bodies) != 3:
+    def token(self) -> tuple[bytes, bytes, bytes, bytes, bytes]:
+        if len(self._bodies) != len(self.paths):
             raise ValueError("candidate contract lease is incomplete")
-        return self._bodies[0], self._bodies[1]
+        return (self._bodies[0], self._bodies[1], self._bodies[3], self._bodies[2], self._bodies[4])
+
+    @property
+    def contents(self) -> tuple[tuple[Path, bytes], ...]:
+        """Return the original five candidate paths and their retained bytes."""
+        if len(self._bodies) != len(self.paths):
+            raise ValueError("candidate contract lease is incomplete")
+        return tuple(zip(self.paths, self._bodies, strict=True))
 
     def close(self, *, suppress_errors: bool = False) -> None:
         errors: list[OSError] = []
@@ -2027,6 +2252,11 @@ class _CandidateContractLease:
                 (current_deploy, "image-lock.json"),
                 (current_candidate, "docker-compose.platform.yml"),
                 (current_candidate, "docker-compose.yml"),
+                (
+                    current_deploy,
+                    "docker-compose.openmaic-shared-ingress-observer.yml",
+                ),
+                (current_candidate, "docker-compose.data-plane.yml"),
             )
             for (
                 held_handle,
@@ -2889,6 +3119,7 @@ def _collect_runtime_attestation(
     candidate_lease: _CandidateContractLease,
     deployment_lease: _DeploymentContractLease,
     docker_host_identity_sha256: str | None,
+    observer_signer_image: str,
     deadline_monotonic: float,
 ) -> dict[str, object]:
     docker_config_name = docker_config.name
@@ -3097,7 +3328,10 @@ def _collect_runtime_attestation(
     after_host = inspect_docker_host() if docker_host_identity_sha256 is not None else None
     candidate_lease.assert_unchanged()
     deployment_lease.assert_unchanged()
-    final_candidate, final_expected_services = _load_candidate_token(candidate_lease.token)
+    final_candidate, final_expected_services = _load_candidate_token(
+        candidate_lease.token,
+        observer_signer_image=observer_signer_image,
+    )
     if final_candidate != candidate or final_expected_services != candidate_expected_services:
         raise ValueError("candidate runtime contract changed during final validation")
     before_snapshot = _snapshot(before_facts)
@@ -3150,7 +3384,10 @@ def _collect_runtime_attestation(
             "dockerHostIdentitySha256": docker_host_identity_sha256,
         }
     candidate_lease.assert_unchanged()
-    publish_candidate, publish_expected_services = _load_candidate_token(candidate_lease.token)
+    publish_candidate, publish_expected_services = _load_candidate_token(
+        candidate_lease.token,
+        observer_signer_image=observer_signer_image,
+    )
     if publish_candidate != candidate or publish_expected_services != candidate_expected_services:
         raise ValueError("candidate runtime contract changed before publication")
     return report
@@ -3168,6 +3405,8 @@ def produce_runtime_attestation(
     docker_resolver: Callable[[], Path] = resolve_fixed_docker,
     environ: Mapping[str, str] | None = None,
     docker_host_identity_sha256: str | None = None,
+    observer_signer_image: str,
+    observer_secret_preflight: Mapping[str, object] | None = None,
     timeout_seconds: float = COMMAND_TIMEOUT_SECONDS,
 ) -> dict[str, object]:
     if (
@@ -3178,6 +3417,31 @@ def produce_runtime_attestation(
     ):
         raise ValueError("runtime attestation timeout is invalid")
     deadline_monotonic = time.monotonic() + float(timeout_seconds)
+    bound_release_run = _release_run(release_run)
+    if observer_secret_preflight is None:
+        raise ValueError("observer secret preflight is required")
+    bound_observer_secret_preflight = _observer_secret_preflight(
+        observer_secret_preflight,
+        release_run_id=bound_release_run["runId"],
+    )
+    bound_observer_signer_image = _observer_signer_image_reference(observer_signer_image)
+    if bound_observer_secret_preflight["observerSignerImage"] != bound_observer_signer_image:
+        raise ValueError("observer signer image does not match observer secret preflight")
+    observer_run_directory = Path(str(bound_observer_secret_preflight["runDirectory"]))
+    from platform_preflight import run_preflight
+
+    current_observer_preflight = run_preflight(
+        secret_dir=observer_run_directory.parent,
+        required_secret_names=(),
+        observer_secret_dir=observer_run_directory.parent,
+        release_run_id=bound_release_run["runId"],
+        observer_signer_image=bound_observer_signer_image,
+    )
+    if (
+        current_observer_preflight.errors
+        or current_observer_preflight.observer_secret_preflight != bound_observer_secret_preflight
+    ):
+        raise ValueError("observer secret preflight changed before runtime attestation")
     source_environment = os.environ if environ is None else environ
     expected_docker_host_identity_sha256 = _expected_docker_host_identity_sha256(
         docker_host_identity_sha256,
@@ -3189,7 +3453,10 @@ def produce_runtime_attestation(
         _CandidateContractLease.open(root) as candidate_lease,
         _DeploymentContractLease.open(deployment) as deployment_lease,
     ):
-        candidate, expected_services = _load_candidate_token(candidate_lease.token)
+        candidate, expected_services = _load_candidate_token(
+            candidate_lease.token,
+            observer_signer_image=bound_observer_signer_image,
+        )
         candidate_lease.assert_unchanged()
         bound_run = _release_run(release_run)
         if not _valid_observed_at(observed_at):
@@ -3197,6 +3464,18 @@ def produce_runtime_attestation(
         bound_base_url = _base_url(base_url)
         docker = Path(docker_resolver())
         child_environment = _child_environment(source_environment)
+        child_environment["YFEISTAI_CANDIDATE_ROOT"] = str(root)
+        child_environment["YFEISTAI_CANDIDATE_SHA256"] = hashlib.sha256(
+            _canonical_json_bytes(candidate)
+        ).hexdigest()
+        child_environment["YFEISTAI_IMAGE_LOCK_SHA256"] = hashlib.sha256(
+            candidate_lease.token[0]
+        ).hexdigest()
+        child_environment["YFEISTAI_OBSERVER_SIGNER_IMAGE"] = bound_observer_signer_image
+        child_environment["YFEISTAI_DEEPTUTOR_IMAGE"] = str(expected_services["deeptutor"]["image"])
+        child_environment["YFEISTAI_OBSERVER_SECRET_DIR"] = str(observer_run_directory.parent)
+        child_environment["YFEISTAI_RELEASE_RUN_ID"] = bound_run["runId"]
+        child_environment["YFEISTAI_ENVIRONMENT_ID"] = bound_run["environmentId"]
         safe_bundle_root, runtime_root = _prepare_runtime_root(bundle_root)
         with _RuntimeDirectoryGuard.open(safe_bundle_root, runtime_root) as guard:
             docker_config = guard.create_empty_directory(f".docker-config-{uuid.uuid4().hex}")
@@ -3217,8 +3496,12 @@ def produce_runtime_attestation(
                     candidate_lease=candidate_lease,
                     deployment_lease=deployment_lease,
                     docker_host_identity_sha256=expected_docker_host_identity_sha256,
+                    observer_signer_image=bound_observer_signer_image,
                     deadline_monotonic=deadline_monotonic,
                 )
+                report["observerSignerImage"] = bound_observer_signer_image
+                report["observerSecretPreflight"] = bound_observer_secret_preflight
+                candidate_lease.assert_unchanged()
             except BaseException as error:
                 try:
                     guard.assert_owned_directory_empty(docker_config.name)
@@ -3255,11 +3538,24 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--observed-at", required=True)
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--docker-host-identity-sha256")
+    parser.add_argument("--observer-secret-dir", type=Path, required=True)
+    parser.add_argument("--observer-signer-image", required=True)
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
+    from platform_preflight import run_preflight
+
+    observer_preflight = run_preflight(
+        secret_dir=args.observer_secret_dir,
+        required_secret_names=(),
+        observer_secret_dir=args.observer_secret_dir,
+        release_run_id=args.run_id,
+        observer_signer_image=args.observer_signer_image,
+    )
+    if observer_preflight.errors or observer_preflight.observer_secret_preflight is None:
+        raise ValueError("observer secret preflight failed")
     produce_runtime_attestation(
         candidate_root=args.candidate_root,
         deployment_root=args.deployment_root,
@@ -3268,6 +3564,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         observed_at=args.observed_at,
         base_url=args.base_url,
         docker_host_identity_sha256=args.docker_host_identity_sha256,
+        observer_signer_image=args.observer_signer_image,
+        observer_secret_preflight=observer_preflight.observer_secret_preflight,
     )
     print(Path(args.bundle_root).resolve() / "runtime" / "runtime-attestation.json")
     return 0

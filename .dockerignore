@@ -103,6 +103,10 @@ web/out/
 # ============================================
 Dockerfile*
 docker-compose*.yml
+!docker-compose.yml
+!docker-compose.platform.yml
+!docker-compose.data-plane.yml
+!deploy/docker-compose.openmaic-shared-ingress-observer.yml
 .docker/
 .dockerignore
 

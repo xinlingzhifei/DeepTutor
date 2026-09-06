@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import copy
 import hashlib
 import importlib.util
@@ -12,7 +13,15 @@ import sys
 from types import SimpleNamespace
 import zipfile
 
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 import pytest
+
+from tests.scripts.platform_candidate_test_support import (
+    POCKETBASE_BASE_COMPOSE_DRIFTS,
+    drift_pocketbase_base_compose,
+    write_schema3_candidate_root,
+)
 
 _RELEASE_RUN = {
     "runId": "first-release-run-20260824",
@@ -25,12 +34,42 @@ _GATEWAY_DOCKER_HOST_IDENTITY_SHA256 = "7" * 64
 _OPENMAIC_OBSERVER_ID = "shared-ingress-observer-openmaic-01"
 _OPENMAIC_OBSERVER_ORIGIN = "https://observer.example.test"
 _OPENMAIC_CONTROL_ORIGIN = "https://shared-ingress.example.test"
+_OBSERVER_SIGNER_REPOSITORY = "ghcr.io/xinlingzhifei/yfeistai-observer-signer"
+_OBSERVER_SIGNER_DIGEST = "sha256:" + "d" * 64
+_RELEASE_SUPERVISOR_PRIVATE_KEY = Ed25519PrivateKey.generate()
+_RELEASE_SUPERVISOR_PUBLIC_KEY = _RELEASE_SUPERVISOR_PRIVATE_KEY.public_key()
+_RELEASE_SUPERVISOR_PUBLIC_KEY_BYTES = _RELEASE_SUPERVISOR_PUBLIC_KEY.public_bytes(
+    serialization.Encoding.PEM,
+    serialization.PublicFormat.SubjectPublicKeyInfo,
+)
+_RELEASE_SUPERVISOR_PUBLIC_KEY_SPKI_SHA256 = hashlib.sha256(
+    _RELEASE_SUPERVISOR_PUBLIC_KEY.public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+).hexdigest()
+
+
+def _observer_signer_image(candidate: dict[str, object]) -> str:
+    release_tag = candidate["releaseTag"]
+    assert isinstance(release_tag, str)
+    return f"{_OBSERVER_SIGNER_REPOSITORY}:{release_tag}@{_OBSERVER_SIGNER_DIGEST}"
+
+
+def _observer_signer_image_from_lock(candidate_root: Path) -> str:
+    lock = json.loads((candidate_root / "deploy" / "image-lock.json").read_text(encoding="utf-8"))
+    return str(lock["supportImages"]["observer_signer"]["reference"])
 
 
 @pytest.fixture(autouse=True)
 def _live_fixture_token(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("YFEISTAI_LIVE_FIXTURE_TOKEN", _LIVE_FIXTURE_TOKEN)
+    monkeypatch.setenv(
+        "YFEISTAI_RELEASE_SUPERVISOR_PUBLIC_KEY_SPKI_SHA256",
+        _RELEASE_SUPERVISOR_PUBLIC_KEY_SPKI_SHA256,
+    )
     for name in (
+        "YFEISTAI_OBSERVER_SIGNER_IMAGE",
         "YFEISTAI_GATEWAY_DOCKER_HOST_IDENTITY_SHA256",
         "YFEISTAI_GATEWAY_TRUST_KEYRING",
         "YFEISTAI_GATEWAY_TRUST_KEYRING_SHA256",
@@ -41,6 +80,8 @@ def _live_fixture_token(monkeypatch: pytest.MonkeyPatch) -> None:
         "YFEISTAI_OPENMAIC_EXPECTED_OBSERVER_ID",
         "YFEISTAI_OPENMAIC_EXPECTED_OBSERVER_ORIGIN",
         "YFEISTAI_OPENMAIC_EXPECTED_SHARED_INGRESS_CONTROL_ORIGIN",
+        "YFEISTAI_OPENMAIC_OBSERVER_PUBLIC_KEY_PATH",
+        "YFEISTAI_OPENMAIC_EXPECTED_OBSERVER_PUBLIC_KEY_SPKI_SHA256",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -72,6 +113,45 @@ def _load_verifier():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _load_platform_renderer():
+    path = Path(__file__).parents[2] / "scripts" / "render_platform_compose.py"
+    spec = importlib.util.spec_from_file_location(
+        "render_platform_compose_for_release_verifier",
+        path,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    (
+        "http://candidate.example.test",
+        "https://user@candidate.example.test",
+        "https://candidate.example.test?override=1",
+        "https://candidate.example.test/#fragment",
+    ),
+)
+def test_runtime_base_url_rejects_insecure_or_ambiguous_origins(
+    base_url: str,
+) -> None:
+    module = _load_verifier()
+
+    assert module._runtime_base_url(base_url) is None
+
+
+def test_runtime_base_url_accepts_canonical_https_origin() -> None:
+    module = _load_verifier()
+
+    assert (
+        module._runtime_base_url("https://candidate.example.test")
+        == "https://candidate.example.test"
+    )
 
 
 def _load_classroom_export_support():
@@ -158,6 +238,43 @@ def _gateway_trusted_root(bundle_root: Path) -> Path:
     return bundle_root.parent / f"{bundle_root.name}-trusted-gateway-controller"
 
 
+def _openmaic_observer_trusted_root(bundle_root: Path) -> Path:
+    return bundle_root.parent / f"{bundle_root.name}-trusted-openmaic-observer"
+
+
+def _write_openmaic_observer_public_key(
+    bundle_root: Path,
+) -> tuple[Ed25519PrivateKey, Path, str]:
+    private_key = Ed25519PrivateKey.generate()
+    public_key = private_key.public_key()
+    trusted_root = _openmaic_observer_trusted_root(bundle_root)
+    trusted_root.mkdir(exist_ok=True)
+    public_key_path = trusted_root / "openmaic-observer-attestation-public-key.pem"
+    public_key_path.write_bytes(
+        public_key.public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    )
+    public_key_spki = public_key.public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    return private_key, public_key_path, hashlib.sha256(public_key_spki).hexdigest()
+
+
+def _write_openmaic_observer_signature(
+    bundle_root: Path,
+    private_key: Ed25519PrivateKey,
+    body: bytes,
+) -> tuple[Path, str]:
+    signature_path = bundle_root / "runtime" / "openmaic-shared-ingress-observer-attestation.sig"
+    signature_path.parent.mkdir(parents=True, exist_ok=True)
+    signature_body = base64.b64encode(private_key.sign(body)) + b"\n"
+    signature_path.write_bytes(signature_body)
+    return signature_path, hashlib.sha256(signature_body).hexdigest()
+
+
 def _gateway_trust_pair_from_bundle(bundle_root: Path) -> dict[str, object]:
     support = _load_gateway_public_support()
     keyring_path = _gateway_trusted_root(bundle_root) / "gateway-trust-keyring.json"
@@ -200,8 +317,17 @@ def _gateway_runtime_arguments(bundle_root: Path) -> dict[str, object]:
     }
 
 
-def _openmaic_observer_runtime_arguments(bundle_root: Path) -> dict[str, str]:
+def _openmaic_observer_runtime_arguments(bundle_root: Path) -> dict[str, object]:
     observer_path = bundle_root / "runtime" / "openmaic-shared-ingress-observer-attestation.json"
+    public_key_path = (
+        _openmaic_observer_trusted_root(bundle_root)
+        / "openmaic-observer-attestation-public-key.pem"
+    )
+    public_key = serialization.load_pem_public_key(public_key_path.read_bytes())
+    public_key_spki = public_key.public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
     return {
         "expected_openmaic_observer_attestation_sha256": hashlib.sha256(
             observer_path.read_bytes()
@@ -209,11 +335,26 @@ def _openmaic_observer_runtime_arguments(bundle_root: Path) -> dict[str, str]:
         "expected_openmaic_observer_id": _OPENMAIC_OBSERVER_ID,
         "expected_openmaic_observer_origin": _OPENMAIC_OBSERVER_ORIGIN,
         "expected_openmaic_shared_ingress_control_origin": _OPENMAIC_CONTROL_ORIGIN,
+        "openmaic_observer_public_key_path": public_key_path,
+        "expected_openmaic_observer_public_key_spki_sha256": hashlib.sha256(
+            public_key_spki
+        ).hexdigest(),
     }
 
 
-def _complete_bundle_runtime(module, manifest: Path, **kwargs):
+def _file_release_runtime(module, manifest: Path, **kwargs):
     return module.FileReleaseRuntime(
+        manifest,
+        expected_release_run_id=_RELEASE_RUN["runId"],
+        expected_environment_id=_RELEASE_RUN["environmentId"],
+        expected_supervisor_public_key_spki_sha256=(_RELEASE_SUPERVISOR_PUBLIC_KEY_SPKI_SHA256),
+        **kwargs,
+    )
+
+
+def _complete_bundle_runtime(module, manifest: Path, **kwargs):
+    return _file_release_runtime(
+        module,
         manifest,
         expected_outage_docker_host_identity_sha256=(_GATEWAY_DOCKER_HOST_IDENTITY_SHA256),
         **kwargs,
@@ -222,10 +363,22 @@ def _complete_bundle_runtime(module, manifest: Path, **kwargs):
     )
 
 
+def _release_anchor_cli_arguments() -> list[str]:
+    return [
+        "--expected-release-run-id",
+        _RELEASE_RUN["runId"],
+        "--expected-environment-id",
+        _RELEASE_RUN["environmentId"],
+        "--release-supervisor-public-key-spki-sha256",
+        _RELEASE_SUPERVISOR_PUBLIC_KEY_SPKI_SHA256,
+    ]
+
+
 def _gateway_cli_arguments(bundle_root: Path) -> list[str]:
     arguments = _gateway_runtime_arguments(bundle_root)
     observer_arguments = _openmaic_observer_runtime_arguments(bundle_root)
     return [
+        *_release_anchor_cli_arguments(),
         "--outage-docker-host-identity-sha256",
         _GATEWAY_DOCKER_HOST_IDENTITY_SHA256,
         "--gateway-docker-host-identity-sha256",
@@ -241,18 +394,26 @@ def _gateway_cli_arguments(bundle_root: Path) -> list[str]:
         "--gateway-trusted-now",
         str(arguments["trusted_now"]),
         "--openmaic-observer-attestation-sha256",
-        observer_arguments["expected_openmaic_observer_attestation_sha256"],
+        str(observer_arguments["expected_openmaic_observer_attestation_sha256"]),
         "--openmaic-observer-id",
-        observer_arguments["expected_openmaic_observer_id"],
+        str(observer_arguments["expected_openmaic_observer_id"]),
         "--openmaic-observer-origin",
-        observer_arguments["expected_openmaic_observer_origin"],
+        str(observer_arguments["expected_openmaic_observer_origin"]),
         "--openmaic-shared-ingress-control-origin",
-        observer_arguments["expected_openmaic_shared_ingress_control_origin"],
+        str(observer_arguments["expected_openmaic_shared_ingress_control_origin"]),
+        "--openmaic-observer-public-key",
+        str(observer_arguments["openmaic_observer_public_key_path"]),
+        "--openmaic-observer-public-key-spki-sha256",
+        str(observer_arguments["expected_openmaic_observer_public_key_spki_sha256"]),
     ]
 
 
-def _static_openmaic_cli_arguments() -> list[str]:
+def _static_openmaic_cli_arguments(candidate_root: Path) -> list[str]:
+    _private_key, public_key_path, public_key_spki_sha256 = _write_openmaic_observer_public_key(
+        candidate_root
+    )
     return [
+        *_release_anchor_cli_arguments(),
         "--openmaic-observer-attestation-sha256",
         "9" * 64,
         "--openmaic-observer-id",
@@ -261,6 +422,10 @@ def _static_openmaic_cli_arguments() -> list[str]:
         _OPENMAIC_OBSERVER_ORIGIN,
         "--openmaic-shared-ingress-control-origin",
         _OPENMAIC_CONTROL_ORIGIN,
+        "--openmaic-observer-public-key",
+        str(public_key_path),
+        "--openmaic-observer-public-key-spki-sha256",
+        public_key_spki_sha256,
     ]
 
 
@@ -310,6 +475,7 @@ def test_backup_restore_receipt_without_canonical_provenance_is_rejected(
 ) -> None:
     module = _load_verifier()
     candidate = _candidate("a" * 40)
+    _write_candidate_files(tmp_path, candidate)
     document = _artifact_document(module, candidate, "backup_restore")
 
     error = module.probe_provenance_error(
@@ -901,6 +1067,7 @@ def _openmaic_dedicated_outage_attestation(
     *,
     runtime_attestation_sha256: str,
     observer_attestation_sha256: str,
+    observer_public_key_spki_sha256: str,
     attempt_marker_reference: dict[str, object],
 ) -> dict[str, object]:
     tenant_id = "tenant-openmaic-dedicated-01"
@@ -910,6 +1077,8 @@ def _openmaic_dedicated_outage_attestation(
         "observerId": "shared-ingress-observer-openmaic-01",
         "observerOrigin": "https://observer.example.test",
         "sharedIngressControlOrigin": "https://shared-ingress.example.test",
+        "signatureArtifact": "runtime/openmaic-shared-ingress-observer-attestation.sig",
+        "publicKeySpkiSha256": observer_public_key_spki_sha256,
     }
     report = {
         "schemaVersion": 1,
@@ -928,6 +1097,8 @@ def _openmaic_dedicated_outage_attestation(
             "observerId": "shared-ingress-observer-openmaic-01",
             "observerOrigin": "https://observer.example.test",
             "sharedIngressControlOrigin": "https://shared-ingress.example.test",
+            "signatureArtifact": "runtime/openmaic-shared-ingress-observer-attestation.sig",
+            "publicKeySpkiSha256": observer_public_key_spki_sha256,
         },
         "fixture": {
             "tenantId": tenant_id,
@@ -1018,6 +1189,7 @@ def _openmaic_dedicated_outage_attempt_marker(
     candidate: dict[str, object],
     *,
     observer_attestation_sha256: str,
+    observer_public_key_spki_sha256: str,
 ) -> dict[str, object]:
     return {
         "schemaVersion": 1,
@@ -1029,6 +1201,8 @@ def _openmaic_dedicated_outage_attempt_marker(
             "observerId": "shared-ingress-observer-openmaic-01",
             "observerOrigin": "https://observer.example.test",
             "sharedIngressControlOrigin": "https://shared-ingress.example.test",
+            "signatureArtifact": "runtime/openmaic-shared-ingress-observer-attestation.sig",
+            "publicKeySpkiSha256": observer_public_key_spki_sha256,
         },
         "fixturePlan": {
             "tenantId": "tenant-openmaic-dedicated-01",
@@ -1045,9 +1219,14 @@ def _openmaic_dedicated_outage_attempt_marker(
     }
 
 
-def _openmaic_shared_ingress_observer_attestation() -> dict[str, object]:
-    return {
-        "schemaVersion": 1,
+def _openmaic_shared_ingress_observer_attestation(
+    *,
+    candidate_root: Path,
+    public_key_spki_sha256: str,
+) -> dict[str, object]:
+    contract = sys.modules["openmaic_smoke_contract"]
+    report = {
+        "schemaVersion": contract.OPENMAIC_SHARED_INGRESS_OBSERVER_BOUND_SCHEMA_VERSION,
         "producer": "openmaic-shared-ingress-observer",
         "releaseRun": _RELEASE_RUN,
         "observedAt": "2026-08-24T00:00:00Z",
@@ -1055,8 +1234,21 @@ def _openmaic_shared_ingress_observer_attestation() -> dict[str, object]:
             "observerId": "shared-ingress-observer-openmaic-01",
             "observerUrl": "https://observer.example.test",
             "sharedIngressControlUrl": ("https://shared-ingress.example.test/v1/control-canaries"),
+            "candidateHealthUrl": (
+                "https://candidate-health.example.test/api/v1/system/teaching-health/observer-canary"
+            ),
+            "sharedIngressUpstreamUrl": "https://shared-upstream.example.test",
+            "internalProxyUrl": "http://openmaic-shared-ingress-observer:8000",
+            "authExpiresAt": "2026-08-24T01:00:00Z",
         },
     }
+    report["candidateBinding"] = contract.current_openmaic_observer_candidate_binding(
+        candidate_root
+    )
+    report["attestationChallenge"] = contract.openmaic_observer_attestation_challenge(
+        public_key_spki_sha256
+    )
+    return report
 
 
 def _write_probe_proof(
@@ -1285,12 +1477,18 @@ def _write_probe_proof(
             }
         }
         if plane == "dedicated":
+            observer_private_key, _observer_public_key_path, observer_public_key_spki = (
+                _write_openmaic_observer_public_key(tmp_path)
+            )
             observer_path = (
                 tmp_path / "runtime" / "openmaic-shared-ingress-observer-attestation.json"
             )
             observer_body = (
                 json.dumps(
-                    _openmaic_shared_ingress_observer_attestation(),
+                    _openmaic_shared_ingress_observer_attestation(
+                        candidate_root=tmp_path,
+                        public_key_spki_sha256=observer_public_key_spki,
+                    ),
                     ensure_ascii=False,
                     separators=(",", ":"),
                     sort_keys=True,
@@ -1299,9 +1497,17 @@ def _write_probe_proof(
             ).encode()
             observer_path.write_bytes(observer_body)
             observer_sha256 = hashlib.sha256(observer_body).hexdigest()
+            _observer_signature_path, observer_signature_sha256 = (
+                _write_openmaic_observer_signature(
+                    tmp_path,
+                    observer_private_key,
+                    observer_body,
+                )
+            )
             marker = _openmaic_dedicated_outage_attempt_marker(
                 candidate,
                 observer_attestation_sha256=observer_sha256,
+                observer_public_key_spki_sha256=observer_public_key_spki,
             )
             marker_body = (
                 json.dumps(
@@ -1323,6 +1529,7 @@ def _write_probe_proof(
                 candidate,
                 runtime_attestation_sha256=runtime_sha256,
                 observer_attestation_sha256=observer_sha256,
+                observer_public_key_spki_sha256=observer_public_key_spki,
                 attempt_marker_reference=marker_reference,
             )
             outage_body = (
@@ -1342,6 +1549,11 @@ def _write_probe_proof(
             provenance["openmaicSharedIngressObserverAttestation"] = {
                 "artifact": "runtime/openmaic-shared-ingress-observer-attestation.json",
                 "sha256": observer_sha256,
+                "signatureArtifact": {
+                    "artifact": "runtime/openmaic-shared-ingress-observer-attestation.sig",
+                    "sha256": observer_signature_sha256,
+                },
+                "publicKeySpkiSha256": observer_public_key_spki,
             }
         return provenance
     if evidence == "classroom_exports":
@@ -1460,6 +1672,10 @@ def _write_probe_proof(
     return {
         "recipe": recipe_id,
         "command": command,
+        "finalCommit": {
+            "artifact": f"runtime/probe-commits/{evidence}.json",
+            "authority": "external-supervisor-ed25519",
+        },
         "rawReport": {
             "artifact": raw_path.relative_to(tmp_path).as_posix(),
             "sha256": raw_sha256,
@@ -1470,6 +1686,62 @@ def _write_probe_proof(
         },
         "runtimeAttestation": attestation_proof,
     }
+
+
+def _write_probe_final_commit(
+    tmp_path: Path,
+    module,
+    *,
+    candidate: dict[str, object],
+    evidence: str,
+    receipt_path: Path,
+    provenance: dict[str, object] | None,
+) -> None:
+    if evidence not in module.PROBE_RECIPES:
+        return
+    assert isinstance(provenance, dict)
+    marker_path = tmp_path / "runtime" / "probe-commits" / f"{evidence}.json"
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    claim = {
+        "schemaVersion": 2,
+        "authority": "external-supervisor-ed25519",
+        "candidate": candidate,
+        "releaseRun": _RELEASE_RUN,
+        "evidence": evidence,
+        "artifacts": {
+            "receipt": {
+                "artifact": receipt_path.relative_to(tmp_path).as_posix(),
+                "sha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+            },
+            "rawReport": provenance["rawReport"],
+            "execution": provenance["execution"],
+        },
+    }
+    signature_path = marker_path.with_suffix(".sig")
+    signature_body = (
+        base64.b64encode(
+            _RELEASE_SUPERVISOR_PRIVATE_KEY.sign(
+                (json.dumps(claim, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode(
+                    "utf-8"
+                )
+            )
+        )
+        + b"\n"
+    )
+    signature_path.write_bytes(signature_body)
+    public_key_path = marker_path.parent / "release-supervisor-public-key.pem"
+    public_key_path.write_bytes(_RELEASE_SUPERVISOR_PUBLIC_KEY_BYTES)
+    marker = {
+        **claim,
+        "supervisorSignature": {
+            "artifact": signature_path.relative_to(tmp_path).as_posix(),
+            "sha256": hashlib.sha256(signature_body).hexdigest(),
+            "publicKeyArtifact": public_key_path.relative_to(tmp_path).as_posix(),
+            "publicKeySha256": hashlib.sha256(_RELEASE_SUPERVISOR_PUBLIC_KEY_BYTES).hexdigest(),
+            "publicKeySpkiSha256": _RELEASE_SUPERVISOR_PUBLIC_KEY_SPKI_SHA256,
+        },
+    }
+    marker_path.write_text(json.dumps(marker, sort_keys=True), encoding="utf-8")
 
 
 def _capacity_profile_report(candidate: dict[str, object]) -> dict[str, object]:
@@ -1715,10 +1987,6 @@ def _manifest_document(
 
 
 def _write_candidate_files(tmp_path: Path, candidate: dict[str, object]) -> None:
-    shutil.copyfile(
-        Path(__file__).resolve().parents[2] / "docker-compose.yml",
-        tmp_path / "docker-compose.yml",
-    )
     digests = candidate["imageDigests"]
     assert isinstance(digests, dict)
     release_tag = candidate["releaseTag"]
@@ -1751,9 +2019,21 @@ def _write_candidate_files(tmp_path: Path, candidate: dict[str, object]) -> None
             "RELEASE.2025-04-16T18-13-26Z",
             "sha256:" + "7" * 64,
         ),
+        "pocketbase": (
+            "ghcr.io/muchobien/pocketbase",
+            "latest",
+            "sha256:" + "8" * 64,
+        ),
+    }
+    observer_signer_image = _observer_signer_image(candidate)
+    observer_signer = {
+        "repository": _OBSERVER_SIGNER_REPOSITORY,
+        "tag": release_tag,
+        "digest": _OBSERVER_SIGNER_DIGEST,
+        "reference": observer_signer_image,
     }
     lock = {
-        "schemaVersion": 2,
+        "schemaVersion": 3,
         "candidate": candidate,
         "images": {
             name: {
@@ -1764,6 +2044,7 @@ def _write_candidate_files(tmp_path: Path, candidate: dict[str, object]) -> None
             }
             for name, (repository, tag, digest) in specifications.items()
         },
+        "supportImages": {"observer_signer": observer_signer},
     }
     deploy = tmp_path / "deploy"
     deploy.mkdir()
@@ -1772,68 +2053,33 @@ def _write_candidate_files(tmp_path: Path, candidate: dict[str, object]) -> None
         name: f"{repository}:{tag}@{digest}"
         for name, (repository, tag, digest) in specifications.items()
     }
-    platform_compose_path = tmp_path / "docker-compose.platform.yml"
-    platform_compose_path.write_text(
-        json.dumps(
-            {
-                "services": {
-                    "deeptutor": {"image": references["deeptutor"]},
-                    "gateway": {"image": references["nginx"]},
-                    "postgres": {"image": references["postgres"]},
-                    "minio": {"image": references["minio"]},
-                    "minio-bootstrap": {
-                        "image": references["minio_client"],
-                        "restart": "no",
-                    },
-                    "teaching-migrate": {
-                        "image": references["deeptutor"],
-                        "restart": "no",
-                    },
-                    "tenant-provisioner": {"image": references["deeptutor"]},
-                    "shared-data-plane-bootstrap": {
-                        "image": references["deeptutor"],
-                        "restart": "no",
-                    },
-                    "teaching-dispatcher": {"image": references["deeptutor"]},
-                    "teaching-worker": {"image": references["deeptutor"]},
-                    "teaching-export-worker": {"image": references["deeptutor"]},
-                    "teaching-reaper": {"image": references["deeptutor"]},
-                    "learning-projector": {"image": references["deeptutor"]},
-                    "openmaic": {"image": references["openmaic"]},
-                    "openmaic-render": {"image": references["openmaic_render"]},
-                }
-            }
+    references["observer_signer"] = observer_signer_image
+    renderer = _load_platform_renderer()
+    project_root = Path(__file__).resolve().parents[2]
+    for source, destination in (
+        (
+            project_root / "docker-compose.yml",
+            tmp_path / "docker-compose.yml",
         ),
-        encoding="utf-8",
-    )
-    platform_compose = json.loads(platform_compose_path.read_bytes())
-    platform_services = platform_compose["services"]
-    for service in platform_services.values():
-        service["networks"] = ["platform-internal"]
-    platform_services["deeptutor"]["networks"].append("platform-service-egress")
-    platform_services["gateway"]["networks"].append("platform-edge")
-    platform_services["openmaic"]["networks"].append("shared-provider-egress")
-    platform_compose["networks"] = {
-        "platform-internal": {"internal": True},
-        "platform-edge": {},
-        "platform-service-egress": {},
-        "shared-provider-egress": {},
-    }
-    platform_compose_path.write_text(
-        json.dumps(platform_compose, sort_keys=True),
-        encoding="utf-8",
-    )
-    (tmp_path / "docker-compose.data-plane.yml").write_text(
-        json.dumps(
-            {
-                "services": {
-                    "openmaic": {"image": references["openmaic"]},
-                    "openmaic-render": {"image": references["openmaic_render"]},
-                }
-            }
+        (
+            project_root / "docker-compose.platform.yml",
+            tmp_path / "docker-compose.platform.yml",
         ),
-        encoding="utf-8",
-    )
+        (
+            project_root / "docker-compose.data-plane.yml",
+            tmp_path / "docker-compose.data-plane.yml",
+        ),
+        (
+            project_root / "deploy" / "docker-compose.openmaic-shared-ingress-observer.yml",
+            deploy / "docker-compose.openmaic-shared-ingress-observer.yml",
+        ),
+    ):
+        rendered = renderer._render_compose_references(
+            source,
+            lock["images"],
+            lock["supportImages"],
+        )
+        destination.write_bytes(rendered.encode("utf-8"))
     _write_runtime_attestation(tmp_path, candidate, references)
 
 
@@ -1853,14 +2099,29 @@ def _write_runtime_attestation(
         "openmaic": references["openmaic"],
         "shared-data-plane-bootstrap": references["deeptutor"],
         "openmaic-render": references["openmaic_render"],
+        "openmaic-shared-ingress-observer": references["observer_signer"],
+        "openmaic-observer-attestation-signer": references["observer_signer"],
         "teaching-dispatcher": references["deeptutor"],
         "teaching-worker": references["deeptutor"],
         "teaching-export-worker": references["deeptutor"],
         "teaching-reaper": references["deeptutor"],
         "learning-projector": references["deeptutor"],
     }
-    one_shots = {"minio-bootstrap", "teaching-migrate", "shared-data-plane-bootstrap"}
-    healthy = {"deeptutor", "postgres", "minio", "openmaic", "openmaic-render"}
+    one_shots = {
+        "minio-bootstrap",
+        "teaching-migrate",
+        "shared-data-plane-bootstrap",
+        "openmaic-observer-attestation-signer",
+    }
+    restart_no = {*one_shots, "openmaic-shared-ingress-observer"}
+    healthy = {
+        "deeptutor",
+        "postgres",
+        "minio",
+        "openmaic",
+        "openmaic-render",
+        "openmaic-shared-ingress-observer",
+    }
 
     def repo_digest(reference: str) -> str:
         tagged, digest = reference.rsplit("@", 1)
@@ -1878,7 +2139,7 @@ def _write_runtime_attestation(
         "services": {
             service: {
                 "image": reference,
-                "restart": "no" if service in one_shots else "unless-stopped",
+                "restart": "no" if service in restart_no else "unless-stopped",
                 "profiles": [],
                 "privileged": False,
                 "capAdd": [],
@@ -1984,6 +2245,8 @@ def _write_runtime_attestation(
         "<candidate-root>/docker-compose.yml",
         "-f",
         "<candidate-root>/docker-compose.platform.yml",
+        "-f",
+        "<candidate-root>/deploy/docker-compose.openmaic-shared-ingress-observer.yml",
     ]
     ps = [
         "ps",
@@ -2117,6 +2380,39 @@ def _write_runtime_attestation(
             "endpoint": "npipe:////./pipe/dockerDesktopLinuxEngine",
             "serverId": "daemon-yfeistai-01",
             "dockerHostIdentitySha256": _GATEWAY_DOCKER_HOST_IDENTITY_SHA256,
+        },
+        "observerSignerImage": references["observer_signer"],
+        "observerSecretPreflight": {
+            "schemaVersion": 1,
+            "releaseRunId": _RELEASE_RUN["runId"],
+            "runDirectory": str(root / "operator-observer-secrets" / _RELEASE_RUN["runId"]),
+            "ownerOnly": True,
+            "noLinksOrReparsePoints": True,
+            "distinctSecrets": True,
+            "observerSignerImage": references["observer_signer"],
+            "secrets": {
+                "openmaic_observer_auth_token": {
+                    "fileName": "observer-auth.token",
+                    "mode": "0400",
+                    "ownerId": 1000,
+                    "groupId": 1000,
+                    "size": 32,
+                },
+                "openmaic_observer_health_token": {
+                    "fileName": "candidate-health.token",
+                    "mode": "0400",
+                    "ownerId": 1000,
+                    "groupId": 1000,
+                    "size": 32,
+                },
+                "openmaic_observer_attestation_signing_key": {
+                    "fileName": "attestation-signing-key.pem",
+                    "mode": "0400",
+                    "ownerId": 1000,
+                    "groupId": 1000,
+                    "size": 119,
+                },
+            },
         },
     }
     runtime = root / "runtime"
@@ -2259,6 +2555,14 @@ def _write_complete_bundle(
             sort_keys=True,
         ).encode()
         artifact_path.write_bytes(artifact_body)
+        _write_probe_final_commit(
+            tmp_path,
+            module,
+            candidate=candidate,
+            evidence=name,
+            receipt_path=artifact_path,
+            provenance=provenance,
+        )
         evidence[name] = {
             "status": "pass",
             "detail": f"{name} verified",
@@ -2304,6 +2608,14 @@ def _rewrite_bundle_candidate(
             sort_keys=True,
         ).encode()
         artifact_path.write_bytes(artifact_body)
+        _write_probe_final_commit(
+            tmp_path,
+            module,
+            candidate=candidate,
+            evidence=name,
+            receipt_path=artifact_path,
+            provenance=provenance,
+        )
         raw["artifactSha256"] = hashlib.sha256(artifact_body).hexdigest()
     manifest.write_text(
         json.dumps(_manifest_document(module, candidate, evidence)),
@@ -2443,7 +2755,8 @@ def test_file_runtime_rejects_self_attested_preflight_receipt_without_bound_prov
     )
 
     result = module.verify(
-        module.FileReleaseRuntime(
+        _file_release_runtime(
+            module,
             manifest,
             expected_source_head="a" * 40,
             candidate_root=tmp_path,
@@ -2477,7 +2790,8 @@ def test_file_runtime_rejects_self_attested_capacity_receipt_without_bound_prove
     )
 
     result = module.verify(
-        module.FileReleaseRuntime(
+        _file_release_runtime(
+            module,
             manifest,
             expected_source_head="a" * 40,
             candidate_root=tmp_path,
@@ -2513,7 +2827,8 @@ def test_file_runtime_rejects_self_attested_learning_event_receipt_without_bound
     )
 
     result = module.verify(
-        module.FileReleaseRuntime(
+        _file_release_runtime(
+            module,
             manifest,
             expected_source_head="a" * 40,
             candidate_root=tmp_path,
@@ -2550,7 +2865,8 @@ def test_file_runtime_rejects_self_attested_classroom_exports_without_bound_prov
     )
 
     result = module.verify(
-        module.FileReleaseRuntime(
+        _file_release_runtime(
+            module,
             manifest,
             expected_source_head="a" * 40,
             candidate_root=tmp_path,
@@ -2587,7 +2903,8 @@ def test_file_runtime_rejects_self_attested_tenant_isolation_without_bound_prove
     )
 
     result = module.verify(
-        module.FileReleaseRuntime(
+        _file_release_runtime(
+            module,
             manifest,
             expected_source_head="a" * 40,
             candidate_root=tmp_path,
@@ -2624,7 +2941,8 @@ def test_file_runtime_rejects_self_attested_openmaic_shared_plane_without_bound_
     )
 
     result = module.verify(
-        module.FileReleaseRuntime(
+        _file_release_runtime(
+            module,
             manifest,
             expected_source_head="a" * 40,
             candidate_root=tmp_path,
@@ -2661,7 +2979,8 @@ def test_file_runtime_rejects_self_attested_openmaic_dedicated_plane_without_bou
     )
 
     result = module.verify(
-        module.FileReleaseRuntime(
+        _file_release_runtime(
+            module,
             manifest,
             expected_source_head="a" * 40,
             candidate_root=tmp_path,
@@ -2700,7 +3019,8 @@ def test_file_runtime_rejects_dedicated_success_without_independent_outage_prove
     )
 
     result = module.verify(
-        module.FileReleaseRuntime(
+        _file_release_runtime(
+            module,
             manifest,
             expected_source_head="a" * 40,
             candidate_root=tmp_path,
@@ -2801,6 +3121,17 @@ def test_dedicated_outage_receipt_replays_actual_marker_with_external_docker_anc
     candidate = _candidate("a" * 40)
     observer_sha256 = "7" * 64
     docker_host_sha256 = "6" * 64
+    observer_private_key, observer_public_key_path, observer_public_key_spki = (
+        _write_openmaic_observer_public_key(tmp_path)
+    )
+    _write_openmaic_observer_signature(
+        tmp_path,
+        observer_private_key,
+        b"observer-body",
+    )
+    (tmp_path / "runtime" / "openmaic-shared-ingress-observer-attestation.json").write_bytes(
+        b"observer-body"
+    )
     marker = {
         "schemaVersion": 1,
         "producer": "openmaic-dedicated-outage-attempt",
@@ -2811,6 +3142,8 @@ def test_dedicated_outage_receipt_replays_actual_marker_with_external_docker_anc
             "observerId": "shared-ingress-observer-openmaic-01",
             "observerOrigin": "https://observer.example.test",
             "sharedIngressControlOrigin": "https://shared-ingress.example.test",
+            "signatureArtifact": "runtime/openmaic-shared-ingress-observer-attestation.sig",
+            "publicKeySpkiSha256": observer_public_key_spki,
         },
         "fixturePlan": {
             "tenantId": "tenant-openmaic-dedicated-01",
@@ -2844,6 +3177,8 @@ def test_dedicated_outage_receipt_replays_actual_marker_with_external_docker_anc
             "observerId": "shared-ingress-observer-openmaic-01",
             "observerOrigin": "https://observer.example.test",
             "sharedIngressControlOrigin": "https://shared-ingress.example.test",
+            "signatureArtifact": "runtime/openmaic-shared-ingress-observer-attestation.sig",
+            "publicKeySpkiSha256": observer_public_key_spki,
         },
         "fixture": {
             "tenantId": "tenant-openmaic-dedicated-01",
@@ -2876,21 +3211,23 @@ def test_dedicated_outage_receipt_replays_actual_marker_with_external_docker_anc
     )
     monkeypatch.setattr(
         module,
-        "parse_openmaic_shared_ingress_observer_attestation",
+        "verify_archived_openmaic_shared_ingress_observer_attestation",
         lambda *_args, **_kwargs: {
+            "schemaVersion": module.OPENMAIC_SHARED_INGRESS_OBSERVER_BOUND_SCHEMA_VERSION,
             "observer": {
                 "observerId": "shared-ingress-observer-openmaic-01",
                 "observerUrl": "https://observer.example.test",
                 "sharedIngressControlUrl": (
                     "https://shared-ingress.example.test/v1/control-canaries"
                 ),
-            }
+            },
         },
     )
 
     def replay_marker(*_args, return_body=False, **kwargs):
         assert return_body is True
         assert kwargs["expected_observer_attestation_sha256"] == observer_sha256
+        assert kwargs["expected_observer_public_key_spki_sha256"] == observer_public_key_spki
         replayed.append(kwargs)
         return marker, marker_body
 
@@ -2899,6 +3236,7 @@ def test_dedicated_outage_receipt_replays_actual_marker_with_external_docker_anc
     def parse_outage(_body, **kwargs):
         assert kwargs["attempt_marker_body"] == marker_body
         assert kwargs["expected_docker_host_identity_sha256"] == docker_host_sha256
+        assert kwargs["expected_observer_public_key_spki_sha256"] == observer_public_key_spki
         return {"observedAt": "2026-08-30T00:00:01Z"}
 
     monkeypatch.setattr(module, "parse_openmaic_dedicated_outage_attestation", parse_outage)
@@ -2914,14 +3252,53 @@ def test_dedicated_outage_receipt_replays_actual_marker_with_external_docker_anc
         candidate_root=tmp_path,
         candidate=candidate,
         release_run=_RELEASE_RUN,
+        observer_signer_image=_observer_signer_image(candidate),
         expected_tenant_id="tenant-openmaic-dedicated-01",
         expected_docker_host_identity_sha256=docker_host_sha256,
         expected_openmaic_observer_attestation_sha256=observer_sha256,
         expected_openmaic_observer_id=_OPENMAIC_OBSERVER_ID,
         expected_openmaic_observer_origin=_OPENMAIC_OBSERVER_ORIGIN,
         expected_openmaic_shared_ingress_control_origin=_OPENMAIC_CONTROL_ORIGIN,
+        openmaic_observer_public_key_path=observer_public_key_path,
+        expected_openmaic_observer_public_key_spki_sha256=(observer_public_key_spki),
     ) == ({"noSharedFallback": True}, "2026-08-30T00:00:01Z")
     assert len(replayed) == 1
+
+    for invalid_schema in (1, 2, True):
+        monkeypatch.setattr(
+            module,
+            "verify_archived_openmaic_shared_ingress_observer_attestation",
+            lambda *_args, invalid_schema=invalid_schema, **_kwargs: {
+                "schemaVersion": invalid_schema,
+                "observer": {
+                    "observerId": "shared-ingress-observer-openmaic-01",
+                    "observerUrl": "https://observer.example.test",
+                    "sharedIngressControlUrl": (
+                        "https://shared-ingress.example.test/v1/control-canaries"
+                    ),
+                },
+            },
+        )
+        with pytest.raises(
+            ValueError,
+            match="shared-ingress observer attestation is invalid",
+        ):
+            module.derive_openmaic_dedicated_outage_receipt_checks(
+                body,
+                bundle_root=tmp_path,
+                candidate_root=tmp_path,
+                candidate=candidate,
+                release_run=_RELEASE_RUN,
+                observer_signer_image=_observer_signer_image(candidate),
+                expected_tenant_id="tenant-openmaic-dedicated-01",
+                expected_docker_host_identity_sha256=docker_host_sha256,
+                expected_openmaic_observer_attestation_sha256=observer_sha256,
+                expected_openmaic_observer_id=_OPENMAIC_OBSERVER_ID,
+                expected_openmaic_observer_origin=_OPENMAIC_OBSERVER_ORIGIN,
+                expected_openmaic_shared_ingress_control_origin=_OPENMAIC_CONTROL_ORIGIN,
+                openmaic_observer_public_key_path=observer_public_key_path,
+                expected_openmaic_observer_public_key_spki_sha256=observer_public_key_spki,
+            )
 
 
 def test_file_runtime_rejects_dedicated_success_without_observer_provenance(
@@ -2949,7 +3326,8 @@ def test_file_runtime_rejects_dedicated_success_without_observer_provenance(
     )
 
     result = module.verify(
-        module.FileReleaseRuntime(
+        _file_release_runtime(
+            module,
             manifest,
             expected_source_head="a" * 40,
             candidate_root=tmp_path,
@@ -2973,6 +3351,7 @@ def test_file_runtime_rejects_self_consistent_untrusted_shared_ingress_observer_
         module,
         source_head="a" * 40,
     )
+    observer_arguments = _openmaic_observer_runtime_arguments(tmp_path)
     monkeypatch.setattr(
         module,
         "derive_openmaic_dedicated_plane_receipt_checks",
@@ -2986,11 +3365,19 @@ def test_file_runtime_rejects_self_consistent_untrusted_shared_ingress_observer_
     )
 
     result = module.verify(
-        module.FileReleaseRuntime(
+        _file_release_runtime(
+            module,
             manifest,
             expected_source_head="a" * 40,
             candidate_root=tmp_path,
             expected_outage_docker_host_identity_sha256=(_GATEWAY_DOCKER_HOST_IDENTITY_SHA256),
+            openmaic_observer_public_key_path=observer_arguments[
+                "openmaic_observer_public_key_path"
+            ],
+            expected_openmaic_observer_public_key_spki_sha256=observer_arguments[
+                "expected_openmaic_observer_public_key_spki_sha256"
+            ],
+            expected_observer_signer_image=_observer_signer_image_from_lock(tmp_path),
             **_gateway_runtime_arguments(tmp_path),
         )
     )
@@ -3035,6 +3422,7 @@ def test_openmaic_shared_plane_replay_rejects_bound_proof_tampering(
             candidate_root=tmp_path,
             candidate=candidate,
             release_run=_RELEASE_RUN,
+            observer_signer_image=_observer_signer_image(candidate),
         )
 
 
@@ -3096,6 +3484,7 @@ def test_openmaic_dedicated_plane_replay_rejects_bound_proof_tampering(
                 candidate_root=tmp_path,
                 candidate=candidate,
                 release_run=_RELEASE_RUN,
+                observer_signer_image=_observer_signer_image(candidate),
             )
 
 
@@ -3127,6 +3516,7 @@ def test_openmaic_shared_plane_replay_rejects_current_live_token_in_stdout(
             candidate_root=tmp_path,
             candidate=candidate,
             release_run=_RELEASE_RUN,
+            observer_signer_image=_observer_signer_image(candidate),
         )
 
 
@@ -3162,7 +3552,8 @@ def test_file_runtime_rejects_invalid_classroom_export_raw_boundaries(
                 pytest.skip("file symlinks are unavailable on this test host")
 
     result = module.verify(
-        module.FileReleaseRuntime(
+        _file_release_runtime(
+            module,
             manifest,
             expected_source_head="a" * 40,
             candidate_root=tmp_path,
@@ -3201,6 +3592,7 @@ def test_classroom_export_replay_rejects_raw_drift_during_contract_validation(
             candidate_root=tmp_path,
             candidate=candidate,
             release_run=_RELEASE_RUN,
+            observer_signer_image=_observer_signer_image(candidate),
         )
 
 
@@ -3249,6 +3641,7 @@ def test_classroom_export_raw_snapshot_rejects_directory_aba(
             candidate_root=tmp_path,
             candidate=candidate,
             release_run=_RELEASE_RUN,
+            observer_signer_image=_observer_signer_image(candidate),
         )
 
     assert swapped is True
@@ -3280,6 +3673,7 @@ def test_classroom_export_replay_requires_the_live_fixture_token(
             candidate_root=tmp_path,
             candidate=candidate,
             release_run=_RELEASE_RUN,
+            observer_signer_image=_observer_signer_image(candidate),
         )
 
 
@@ -3303,6 +3697,7 @@ def test_classroom_export_replay_rejects_a_fixture_token_in_bound_evidence(
             candidate_root=tmp_path,
             candidate=candidate,
             release_run=_RELEASE_RUN,
+            observer_signer_image=_observer_signer_image(candidate),
         )
 
 
@@ -3343,6 +3738,7 @@ def test_classroom_export_replay_rejects_secret_bearing_deflated_member(
             candidate_root=tmp_path,
             candidate=candidate,
             release_run=_RELEASE_RUN,
+            observer_signer_image=_observer_signer_image(candidate),
         )
 
 
@@ -3372,6 +3768,7 @@ def test_derive_capacity_profile_tenant_ids_replays_all_executed_tenants(
         candidate_root=tmp_path,
         candidate=candidate,
         release_run=_RELEASE_RUN,
+        observer_signer_image=_observer_signer_image(candidate),
     )
 
     assert tenant_ids == tuple(f"tenant-{index:02d}" for index in range(50))
@@ -3390,6 +3787,7 @@ def test_derive_capacity_profile_tenant_ids_rejects_non_true_checks_and_tamperin
         candidate_root=tmp_path,
         candidate=candidate,
         release_run=_RELEASE_RUN,
+        observer_signer_image=_observer_signer_image(candidate),
     )
 
     for rejected_check in checks:
@@ -3411,6 +3809,7 @@ def test_derive_capacity_profile_tenant_ids_rejects_non_true_checks_and_tamperin
                 candidate_root=tmp_path,
                 candidate=candidate,
                 release_run=_RELEASE_RUN,
+                observer_signer_image=_observer_signer_image(candidate),
             )
 
     monkeypatch.setattr(module, "derive_capacity_profile_receipt_checks", replay_checks)
@@ -3425,6 +3824,7 @@ def test_derive_capacity_profile_tenant_ids_rejects_non_true_checks_and_tamperin
             candidate_root=tmp_path,
             candidate=candidate,
             release_run=_RELEASE_RUN,
+            observer_signer_image=_observer_signer_image(candidate),
         )
 
 
@@ -3437,7 +3837,8 @@ def test_file_runtime_replays_capacity_profile_raw_samples(tmp_path: Path) -> No
     )
 
     result = module.verify(
-        module.FileReleaseRuntime(
+        _file_release_runtime(
+            module,
             manifest,
             expected_source_head="a" * 40,
             candidate_root=tmp_path,
@@ -3484,7 +3885,8 @@ def test_file_runtime_rejects_tampered_capacity_samples_even_when_proof_is_rehas
     _rebind_capacity_proof(tmp_path, module, manifest, evidence_map, candidate)
 
     result = module.verify(
-        module.FileReleaseRuntime(
+        _file_release_runtime(
+            module,
             manifest,
             expected_source_head="a" * 40,
             candidate_root=tmp_path,
@@ -3521,7 +3923,8 @@ def test_file_runtime_rejects_simulated_capacity_profile(tmp_path: Path) -> None
     _rebind_capacity_proof(tmp_path, module, manifest, evidence_map, candidate)
 
     result = module.verify(
-        module.FileReleaseRuntime(
+        _file_release_runtime(
+            module,
             manifest,
             expected_source_head="a" * 40,
             candidate_root=tmp_path,
@@ -3546,7 +3949,8 @@ def test_file_runtime_rejects_capacity_summary_numeric_type_tamper(tmp_path: Pat
     _rebind_capacity_proof(tmp_path, module, manifest, evidence_map, candidate)
 
     result = module.verify(
-        module.FileReleaseRuntime(
+        _file_release_runtime(
+            module,
             manifest,
             expected_source_head="a" * 40,
             candidate_root=tmp_path,
@@ -3579,7 +3983,8 @@ def test_file_runtime_rejects_capacity_raw_change_with_stale_summary(tmp_path: P
     _rebind_capacity_proof(tmp_path, module, manifest, evidence_map, candidate)
 
     result = module.verify(
-        module.FileReleaseRuntime(
+        _file_release_runtime(
+            module,
             manifest,
             expected_source_head="a" * 40,
             candidate_root=tmp_path,
@@ -3611,7 +4016,8 @@ def test_file_runtime_rejects_float_capacity_receipt_schema_version(tmp_path: Pa
     )
 
     result = module.verify(
-        module.FileReleaseRuntime(
+        _file_release_runtime(
+            module,
             manifest,
             expected_source_head="a" * 40,
             candidate_root=tmp_path,
@@ -3690,6 +4096,7 @@ def test_derive_tenant_isolation_receipt_checks_replays_runtime_capacity_and_str
         candidate_root=tmp_path,
         candidate=candidate,
         release_run=_RELEASE_RUN,
+        observer_signer_image=_observer_signer_image(candidate),
     )
 
     assert checks == {
@@ -3749,7 +4156,8 @@ def test_file_runtime_rejects_rehashed_tenant_isolation_dependency_proof_tamperi
     )
 
     result = module.verify(
-        module.FileReleaseRuntime(
+        _file_release_runtime(
+            module,
             manifest,
             expected_source_head="a" * 40,
             candidate_root=tmp_path,
@@ -3791,7 +4199,8 @@ def test_file_runtime_rejects_rehashed_tampered_tenant_isolation_proof(
     )
 
     result = module.verify(
-        module.FileReleaseRuntime(
+        _file_release_runtime(
+            module,
             manifest,
             expected_source_head="a" * 40,
             candidate_root=tmp_path,
@@ -3830,7 +4239,8 @@ def test_file_runtime_rejects_tenant_isolation_capacity_pair_drift(
     )
 
     result = module.verify(
-        module.FileReleaseRuntime(
+        _file_release_runtime(
+            module,
             manifest,
             expected_source_head="a" * 40,
             candidate_root=tmp_path,
@@ -3864,7 +4274,8 @@ def test_file_runtime_rejects_tampered_learning_event_receipt_even_when_rehashed
     )
 
     result = module.verify(
-        module.FileReleaseRuntime(
+        _file_release_runtime(
+            module,
             manifest,
             expected_source_head="a" * 40,
             candidate_root=tmp_path,
@@ -3900,7 +4311,8 @@ def test_file_runtime_replays_learning_event_checks_from_raw_capacity_stdout(
     _rebind_capacity_proof(tmp_path, module, manifest, evidence_map, candidate)
 
     result = module.verify(
-        module.FileReleaseRuntime(
+        _file_release_runtime(
+            module,
             manifest,
             expected_source_head="a" * 40,
             candidate_root=tmp_path,
@@ -3964,7 +4376,8 @@ def test_file_runtime_rejects_tampered_platform_preflight_execution(
     )
 
     result = module.verify(
-        module.FileReleaseRuntime(
+        _file_release_runtime(
+            module,
             manifest,
             expected_source_head="a" * 40,
             candidate_root=tmp_path,
@@ -4006,7 +4419,8 @@ def test_file_runtime_rejects_boolean_platform_preflight_schema_version(
         encoding="utf-8",
     )
     result = module.verify(
-        module.FileReleaseRuntime(
+        _file_release_runtime(
+            module,
             manifest,
             expected_source_head="a" * 40,
             candidate_root=tmp_path,
@@ -4015,6 +4429,75 @@ def test_file_runtime_rejects_boolean_platform_preflight_schema_version(
 
     assert result.layers["database_revisions"].status == "fail"
     assert result.layers["service_health"].status == "fail"
+
+
+def test_generic_proof_is_read_through_a_fixed_no_follow_handle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_verifier()
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    proof_path = artifacts / "teacher_flow.json"
+    body = b'{"outcome":"pass"}\n'
+    proof_path.write_bytes(body)
+    proof = {
+        "artifact": "artifacts/teacher_flow.json",
+        "sha256": hashlib.sha256(body).hexdigest(),
+    }
+    original_read_bytes = Path.read_bytes
+
+    def reject_rebindable_path_read(path: Path) -> bytes:
+        if Path(os.path.abspath(path)) == Path(os.path.abspath(proof_path)):
+            pytest.fail("generic proof must be read through one no-follow handle")
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", reject_rebindable_path_read)
+
+    assert module._proof_bytes(
+        tmp_path,
+        proof,
+        label="generic proof",
+    ) == (body, "artifacts/teacher_flow.json")
+
+
+@pytest.mark.parametrize("case", ("non-regular", "oversized"))
+def test_generic_proof_rejects_non_regular_or_oversized_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    module = _load_verifier()
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    proof_path = artifacts / "teacher_flow.json"
+    if case == "non-regular":
+        proof_path.mkdir()
+        body = b"directory-path-spoof"
+        original_read_bytes = Path.read_bytes
+
+        def spoof_directory_read(path: Path) -> bytes:
+            if Path(os.path.abspath(path)) == Path(os.path.abspath(proof_path)):
+                return body
+            return original_read_bytes(path)
+
+        monkeypatch.setattr(Path, "read_bytes", spoof_directory_read)
+    else:
+        body = b"x" * (module.MAX_RUNTIME_ARTIFACT_BYTES + 1)
+        proof_path.write_bytes(body)
+    proof = {
+        "artifact": "artifacts/teacher_flow.json",
+        "sha256": hashlib.sha256(body).hexdigest(),
+    }
+
+    assert isinstance(
+        module._proof_bytes(
+            tmp_path,
+            proof,
+            label="generic proof",
+        ),
+        str,
+    )
 
 
 def test_platform_preflight_proof_is_read_through_fixed_no_follow_boundary(
@@ -4209,7 +4692,8 @@ def test_file_runtime_rejects_extra_preflight_receipt_fields(
     )
 
     result = module.verify(
-        module.FileReleaseRuntime(
+        _file_release_runtime(
+            module,
             manifest,
             expected_source_head="a" * 40,
             candidate_root=tmp_path,
@@ -4230,7 +4714,7 @@ def test_file_runtime_requires_the_same_candidate_head(
         module,
         source_head="a" * 40,
     )
-    _bind_gateway_expected_environment(monkeypatch, tmp_path)
+    _bind_gateway_expected_environment(monkeypatch, tmp_path, module)
 
     result = module.verify(
         _complete_bundle_runtime(
@@ -4270,7 +4754,8 @@ def test_file_runtime_rejects_bundle_parent_replacement_after_receipt_replay(
         return result
 
     monkeypatch.setattr(module, "probe_provenance_error", replay)
-    runtime = module.FileReleaseRuntime(
+    runtime = _file_release_runtime(
+        module,
         manifest,
         expected_source_head="a" * 40,
         candidate_root=bundle_root,
@@ -4294,7 +4779,7 @@ def test_probe_command_record_is_stable_across_verifier_source_roots(
         module,
         source_head="a" * 40,
     )
-    _bind_gateway_expected_environment(monkeypatch, tmp_path)
+    _bind_gateway_expected_environment(monkeypatch, tmp_path, module)
     module.SCRIPTS_ROOT = Path("E:/different-verifier-root/scripts")
 
     result = module.verify(
@@ -4323,7 +4808,7 @@ def test_file_runtime_rejects_unproven_or_malformed_passes(tmp_path: Path) -> No
         encoding="utf-8",
     )
 
-    result = module.verify(module.FileReleaseRuntime(manifest, expected_source_head="c" * 40))
+    result = module.verify(_file_release_runtime(module, manifest, expected_source_head="c" * 40))
 
     assert result.ok is False
     assert result.layers["teacher_flow"].status == "fail"
@@ -4349,7 +4834,7 @@ def test_file_runtime_rejects_missing_or_tampered_artifacts(tmp_path: Path) -> N
         encoding="utf-8",
     )
 
-    result = module.verify(module.FileReleaseRuntime(manifest, expected_source_head="e" * 40))
+    result = module.verify(_file_release_runtime(module, manifest, expected_source_head="e" * 40))
 
     assert result.layers["teacher_flow"].status == "fail"
     assert "does not exist" in result.layers["teacher_flow"].detail
@@ -4378,7 +4863,7 @@ def test_file_runtime_rejects_artifact_from_another_candidate(tmp_path: Path) ->
         encoding="utf-8",
     )
 
-    result = module.verify(module.FileReleaseRuntime(manifest, expected_source_head="f" * 40))
+    result = module.verify(_file_release_runtime(module, manifest, expected_source_head="f" * 40))
 
     assert result.layers["student_full_flow"].status == "fail"
     assert "candidate" in result.layers["student_full_flow"].detail
@@ -4408,7 +4893,7 @@ def test_file_runtime_rejects_zero_candidate_image_digest(tmp_path: Path) -> Non
         encoding="utf-8",
     )
 
-    result = module.verify(module.FileReleaseRuntime(manifest, expected_source_head="1" * 40))
+    result = module.verify(_file_release_runtime(module, manifest, expected_source_head="1" * 40))
 
     assert result.layers["image_digests"].status == "fail"
     assert "candidate image digests" in result.layers["image_digests"].detail
@@ -4440,10 +4925,212 @@ def test_file_runtime_rejects_nonzero_candidate_digests_that_do_not_match_image_
         encoding="utf-8",
     )
 
-    result = module.verify(module.FileReleaseRuntime(manifest, expected_source_head="2" * 40))
+    result = module.verify(_file_release_runtime(module, manifest, expected_source_head="2" * 40))
 
     assert result.layers["image_digests"].status == "fail"
     assert "image lock" in result.layers["image_digests"].detail
+
+
+def test_file_runtime_derives_observer_signer_image_from_schema3_lock_without_external_input(
+    tmp_path: Path,
+) -> None:
+    module = _load_verifier()
+    manifest, _, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="1" * 40,
+    )
+
+    runtime = _complete_bundle_runtime(
+        module,
+        manifest,
+        expected_source_head="1" * 40,
+    )
+
+    image_digests = runtime.result("image_digests")
+    running_containers = runtime.result("running_containers")
+    assert image_digests is not None and image_digests.status == "pass"
+    assert running_containers is not None and running_containers.status == "pass"
+    assert _observer_signer_image_from_lock(tmp_path) == _observer_signer_image(candidate)
+    contract_services = module._runtime_candidate_contract(tmp_path, candidate=candidate)
+    assert {
+        service: contract_services[service]["image"]
+        for service in (
+            "openmaic-shared-ingress-observer",
+            "openmaic-observer-attestation-signer",
+        )
+    } == {
+        "openmaic-shared-ingress-observer": _observer_signer_image(candidate),
+        "openmaic-observer-attestation-signer": _observer_signer_image(candidate),
+    }
+
+
+def test_file_runtime_rejects_explicit_observer_signer_image_that_differs_from_schema3_lock(
+    tmp_path: Path,
+) -> None:
+    module = _load_verifier()
+    manifest, _, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="2" * 40,
+    )
+    different_signer = _observer_signer_image(candidate).replace("d" * 64, "e" * 64)
+
+    result = _complete_bundle_runtime(
+        module,
+        manifest,
+        expected_source_head="2" * 40,
+        expected_observer_signer_image=different_signer,
+    ).result("image_digests")
+
+    assert result is not None and result.status == "fail"
+    assert "observer signer" in result.detail
+    assert "image lock" in result.detail
+
+
+def test_file_runtime_rejects_observer_overlay_signer_not_bound_to_schema3_lock(
+    tmp_path: Path,
+) -> None:
+    module = _load_verifier()
+    manifest, _, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="3" * 40,
+    )
+    overlay_path = tmp_path / "deploy" / "docker-compose.openmaic-shared-ingress-observer.yml"
+    expected_signer = _observer_signer_image(candidate)
+    different_signer = expected_signer.replace("d" * 64, "e" * 64)
+    overlay = overlay_path.read_text(encoding="utf-8")
+    assert expected_signer in overlay
+    overlay_path.write_text(
+        overlay.replace(expected_signer, different_signer, 1),
+        encoding="utf-8",
+    )
+
+    result = _complete_bundle_runtime(
+        module,
+        manifest,
+        expected_source_head="3" * 40,
+        expected_observer_signer_image=expected_signer,
+    ).result("image_digests")
+
+    assert result is not None and result.status == "fail"
+    assert "production Compose" in result.detail
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "missing",
+        "extra",
+        "zero",
+        "digest-collision",
+        "repository",
+        "tag",
+        "reference",
+    ),
+)
+def test_file_runtime_rejects_invalid_schema3_observer_signer_support_image(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    module = _load_verifier()
+    manifest, _, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="4" * 40,
+    )
+    lock_path = tmp_path / "deploy" / "image-lock.json"
+    lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    support_images = lock["supportImages"]
+    signer = support_images["observer_signer"]
+    if case == "missing":
+        lock.pop("supportImages")
+    elif case == "extra":
+        support_images["unexpected"] = dict(signer)
+    elif case == "zero":
+        signer["digest"] = "sha256:" + "0" * 64
+        signer["reference"] = f"{signer['repository']}:{signer['tag']}@{signer['digest']}"
+    elif case == "digest-collision":
+        signer["digest"] = lock["images"]["deeptutor"]["digest"]
+        signer["reference"] = f"{signer['repository']}:{signer['tag']}@{signer['digest']}"
+    elif case == "repository":
+        signer["repository"] = "ghcr.io/example/observer-signer"
+        signer["reference"] = f"{signer['repository']}:{signer['tag']}@{signer['digest']}"
+    elif case == "tag":
+        signer["tag"] = "latest"
+        signer["reference"] = f"{signer['repository']}:{signer['tag']}@{signer['digest']}"
+    else:
+        signer["reference"] = signer["reference"].replace("d" * 64, "e" * 64)
+    lock_path.write_text(json.dumps(lock), encoding="utf-8")
+
+    result = _complete_bundle_runtime(
+        module,
+        manifest,
+        expected_source_head="4" * 40,
+        expected_observer_signer_image=_observer_signer_image(candidate),
+    ).result("image_digests")
+
+    assert result is not None and result.status == "fail"
+    assert "observer signer support image" in result.detail
+
+
+def test_validate_runtime_attestation_derives_observer_signer_image_from_schema3_lock(
+    tmp_path: Path,
+) -> None:
+    module = _load_verifier()
+    _, _, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="5" * 40,
+    )
+
+    document = module.validate_runtime_attestation(
+        Path("runtime/runtime-attestation.json"),
+        bundle_root=tmp_path,
+        candidate_root=tmp_path,
+        candidate=candidate,
+        release_run=_RELEASE_RUN,
+    )
+
+    assert document["observerSignerImage"] == _observer_signer_image_from_lock(tmp_path)
+
+
+@pytest.mark.parametrize("drift", ("path-replacement", "byte-drift"))
+def test_validate_runtime_attestation_rejects_data_plane_compose_lease_drift(
+    tmp_path: Path,
+    monkeypatch,
+    drift: str,
+) -> None:
+    module = _load_verifier()
+    _, _, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="6" * 40,
+    )
+    data_plane_path = tmp_path / "docker-compose.data-plane.yml"
+    load_candidate_token = module._load_candidate_token
+
+    def drift_data_plane(*args, **kwargs):
+        result = load_candidate_token(*args, **kwargs)
+        if drift == "path-replacement":
+            replacement = tmp_path / "docker-compose.data-plane.replacement.yml"
+            replacement.write_bytes(data_plane_path.read_bytes())
+            replacement.replace(data_plane_path)
+        else:
+            data_plane_path.write_bytes(data_plane_path.read_bytes() + b"\n# drift\n")
+        return result
+
+    monkeypatch.setattr(module, "_load_candidate_token", drift_data_plane)
+
+    with pytest.raises(ValueError, match="candidate runtime contract is unavailable or invalid"):
+        module.validate_runtime_attestation(
+            Path("runtime/runtime-attestation.json"),
+            bundle_root=tmp_path,
+            candidate_root=tmp_path,
+            candidate=candidate,
+            release_run=_RELEASE_RUN,
+        )
 
 
 @pytest.mark.parametrize(
@@ -4482,7 +5169,8 @@ def test_file_runtime_rejects_candidate_metadata_that_does_not_match_image_lock(
     _rewrite_bundle_candidate(tmp_path, module, manifest, evidence, candidate)
 
     result = module.verify(
-        module.FileReleaseRuntime(
+        _file_release_runtime(
+            module,
             manifest,
             expected_source_head=expected_source_head,
         )
@@ -4504,10 +5192,145 @@ def test_file_runtime_rejects_candidate_not_referenced_by_both_production_compos
     data_plane = tmp_path / "docker-compose.data-plane.yml"
     data_plane.write_text("services: {}\n", encoding="utf-8")
 
-    result = module.verify(module.FileReleaseRuntime(manifest, expected_source_head="3" * 40))
+    result = module.verify(_file_release_runtime(module, manifest, expected_source_head="3" * 40))
 
     assert result.layers["image_digests"].status == "fail"
     assert "production Compose" in result.layers["image_digests"].detail
+
+
+@pytest.mark.parametrize("drift", POCKETBASE_BASE_COMPOSE_DRIFTS)
+def test_file_runtime_rejects_schema3_pocketbase_base_compose_drift_before_evidence_probe(
+    tmp_path: Path,
+    drift: str,
+) -> None:
+    module = _load_verifier()
+    manifest, _, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="8" * 40,
+    )
+    lock = json.loads((tmp_path / "deploy" / "image-lock.json").read_text(encoding="utf-8"))
+    assert lock["schemaVersion"] == 3
+    assert "pocketbase" in lock["images"]
+    drift_pocketbase_base_compose(tmp_path, lock, drift)
+
+    error = _file_release_runtime(
+        module,
+        manifest,
+        expected_source_head="8" * 40,
+    )._candidate_binding_error(candidate)
+
+    assert error is not None
+    assert "production Compose" in error
+
+
+def test_file_runtime_rejects_schema3_pocketbase_base_compose_identity_drift_after_verification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_verifier()
+    manifest, _, candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    drift_root, drift_lock = write_schema3_candidate_root(
+        tmp_path.parent / f"{tmp_path.name}-identity-drift"
+    )
+    drift_pocketbase_base_compose(drift_root, drift_lock, "different-digest")
+    base_compose = tmp_path / "docker-compose.yml"
+    drifted_base_compose = drift_root / "docker-compose.yml"
+    assert drift_lock["schemaVersion"] == 3
+    assert base_compose.read_bytes() != drifted_base_compose.read_bytes()
+
+    original_stat = os.stat
+    original_lstat = os.lstat
+    base_key = os.path.normcase(os.path.abspath(base_compose))
+    drift_active = False
+
+    def redirected(path: object) -> bool:
+        try:
+            return os.path.normcase(os.path.abspath(os.fspath(path))) == base_key
+        except TypeError:
+            return False
+
+    def redirected_stat(path, *args, **kwargs):
+        target = drifted_base_compose if drift_active and redirected(path) else path
+        return original_stat(target, *args, **kwargs)
+
+    def redirected_lstat(path, *args, **kwargs):
+        target = drifted_base_compose if drift_active and redirected(path) else path
+        return original_lstat(target, *args, **kwargs)
+
+    runtime = _file_release_runtime(
+        module,
+        manifest,
+        expected_source_head="a" * 40,
+        candidate_root=tmp_path,
+    )
+    original_result = runtime.result
+
+    def result_with_late_drift(name: str):
+        nonlocal drift_active
+        result = original_result(name)
+        if name == module.REQUIRED_LAYERS[-1]:
+            assert runtime.candidate == candidate
+            drift_active = True
+        return result
+
+    monkeypatch.setattr(os, "stat", redirected_stat)
+    monkeypatch.setattr(os, "lstat", redirected_lstat)
+    monkeypatch.setattr(runtime, "result", result_with_late_drift)
+
+    result = module.verify(runtime)
+    payload = module.report_payload(result)
+
+    assert result.status == "not_ready"
+    assert result.layers["image_digests"].status == "fail"
+    assert "candidate" in result.layers["image_digests"].detail.lower()
+    assert payload["status"] == "not_ready"
+    assert payload["ok"] is False
+
+
+def test_file_runtime_fails_closed_when_candidate_lease_cannot_be_established(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_verifier()
+    manifest, _, _candidate = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="a" * 40,
+    )
+    runtime = _file_release_runtime(
+        module,
+        manifest,
+        expected_source_head="a" * 40,
+        candidate_root=tmp_path,
+    )
+
+    class RejectedCandidateLease:
+        def __enter__(self):
+            raise module.CandidateArtifactError("candidate lease topology is invalid")
+
+        def __exit__(self, *_args):
+            return None
+
+    monkeypatch.setattr(
+        module,
+        "validated_candidate_artifact_lease",
+        lambda _root: RejectedCandidateLease(),
+    )
+
+    result = module.verify(runtime)
+    payload = module.report_payload(result)
+
+    assert result.status == "not_ready"
+    assert result.layers["image_digests"].status == "fail"
+    assert "candidate" in result.layers["image_digests"].detail.lower()
+    assert result.candidate is None
+    assert payload["status"] == "not_ready"
+    assert payload["ok"] is False
 
 
 @pytest.mark.parametrize(
@@ -4543,13 +5366,13 @@ def test_file_runtime_rejects_non_service_compose_reference(
         body = json.dumps({"services": services})
     platform_path.write_text(body, encoding="utf-8")
 
-    result = module.verify(module.FileReleaseRuntime(manifest, expected_source_head="9" * 40))
+    result = module.verify(_file_release_runtime(module, manifest, expected_source_head="9" * 40))
 
     assert result.layers["image_digests"].status == "fail"
     assert "production Compose" in result.layers["image_digests"].detail
 
 
-def test_file_runtime_accepts_compose_tags_and_merged_custom_image_services(
+def test_file_runtime_rejects_compose_tags_and_merged_custom_image_services(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4559,7 +5382,7 @@ def test_file_runtime_accepts_compose_tags_and_merged_custom_image_services(
         module,
         source_head="c" * 40,
     )
-    _bind_gateway_expected_environment(monkeypatch, tmp_path)
+    _bind_gateway_expected_environment(monkeypatch, tmp_path, module)
     lock = json.loads((tmp_path / "deploy" / "image-lock.json").read_text())
     references = {name: record["reference"] for name, record in lock["images"].items()}
     platform = f"""\
@@ -4643,15 +5466,15 @@ networks:
 """
     (tmp_path / "docker-compose.platform.yml").write_text(platform, encoding="utf-8")
 
-    result = module.verify(
-        _complete_bundle_runtime(
-            module,
-            manifest,
-            expected_source_head="c" * 40,
-        )
-    )
+    result = _complete_bundle_runtime(
+        module,
+        manifest,
+        expected_source_head="c" * 40,
+    ).result("image_digests")
 
-    assert result.ok is True
+    assert result is not None
+    assert result.status == "fail"
+    assert "production Compose" in result.detail
 
 
 def test_current_schema_one_image_lock_is_historical_not_a_release_candidate(
@@ -4664,7 +5487,8 @@ def test_current_schema_one_image_lock_is_historical_not_a_release_candidate(
     digests = {name: lock["images"][name]["digest"] for name in module.CUSTOM_IMAGE_NAMES}
     candidate = _candidate("f" * 40)
     candidate["imageDigests"] = digests
-    runtime = module.FileReleaseRuntime(
+    runtime = _file_release_runtime(
+        module,
         tmp_path / "unused.json",
         expected_source_head="f" * 40,
     )
@@ -4685,11 +5509,20 @@ def test_file_runtime_rejects_stale_secondary_compose_service_image(
         source_head="d" * 40,
     )
     platform_path = tmp_path / "docker-compose.platform.yml"
-    platform = json.loads(platform_path.read_text(encoding="utf-8"))
-    platform["services"]["teaching-worker"]["image"] = "ghcr.io/example/stale@sha256:" + ("e" * 64)
-    platform_path.write_text(json.dumps(platform), encoding="utf-8")
+    platform = platform_path.read_text(encoding="utf-8")
+    teaching_worker = "  teaching-worker:\n    <<: *teaching-process\n"
+    stale_reference = "ghcr.io/example/stale@sha256:" + ("e" * 64)
+    assert teaching_worker in platform
+    platform_path.write_text(
+        platform.replace(
+            teaching_worker,
+            teaching_worker + f'    image: "{stale_reference}"\n',
+            1,
+        ),
+        encoding="utf-8",
+    )
 
-    result = module.verify(module.FileReleaseRuntime(manifest, expected_source_head="d" * 40))
+    result = module.verify(_file_release_runtime(module, manifest, expected_source_head="d" * 40))
 
     assert result.layers["image_digests"].status == "fail"
     assert "production Compose" in result.layers["image_digests"].detail
@@ -4708,14 +5541,13 @@ def test_file_runtime_rejects_invalid_image_lock_contract(
     )
     lock_path = tmp_path / "deploy" / "image-lock.json"
     lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    record = lock["images"]["deeptutor"]
+    original_reference = record["reference"]
     if case == "schema-version":
         lock["schemaVersion"] = 0
     elif case == "reference":
-        lock["images"]["deeptutor"]["reference"] = (
-            "ghcr.io/xinlingzhifei/deeptutor:first-release@sha256:" + "c" * 64
-        )
+        record["reference"] = "ghcr.io/xinlingzhifei/deeptutor:first-release@sha256:" + "c" * 64
     else:
-        record = lock["images"]["deeptutor"]
         if case == "repository":
             record["repository"] = "ghcr.io/example/deeptutor"
         else:
@@ -4723,14 +5555,18 @@ def test_file_runtime_rejects_invalid_image_lock_contract(
         record["reference"] = f"{record['repository']}:{record['tag']}@{record['digest']}"
     lock_path.write_text(json.dumps(lock), encoding="utf-8")
     if case in {"repository", "tag"}:
-        platform_path = tmp_path / "docker-compose.platform.yml"
-        platform = json.loads(platform_path.read_text(encoding="utf-8"))
-        for service in platform["services"].values():
-            if service.get("image", "").endswith(str(record["digest"])):
-                service["image"] = record["reference"]
-        platform_path.write_text(json.dumps(platform), encoding="utf-8")
+        for compose_path in (
+            tmp_path / "docker-compose.platform.yml",
+            tmp_path / "docker-compose.data-plane.yml",
+            tmp_path / "deploy" / "docker-compose.openmaic-shared-ingress-observer.yml",
+        ):
+            compose = compose_path.read_text(encoding="utf-8")
+            compose_path.write_text(
+                compose.replace(str(original_reference), str(record["reference"])),
+                encoding="utf-8",
+            )
 
-    result = module.verify(module.FileReleaseRuntime(manifest, expected_source_head="b" * 40))
+    result = module.verify(_file_release_runtime(module, manifest, expected_source_head="b" * 40))
 
     assert result.layers["image_digests"].status == "fail"
     assert "image lock" in result.layers["image_digests"].detail
@@ -4745,12 +5581,83 @@ def test_report_payload_binds_candidate_and_evidence_bundle_sha256(tmp_path: Pat
     )
     expected_bundle_sha256 = hashlib.sha256(manifest.read_bytes()).hexdigest()
 
-    result = module.verify(module.FileReleaseRuntime(manifest, expected_source_head="4" * 40))
+    result = module.verify(_file_release_runtime(module, manifest, expected_source_head="4" * 40))
     payload = module.report_payload(result)
 
     assert payload["candidate"] == candidate
     assert payload["releaseRun"] == _RELEASE_RUN
     assert payload["evidenceBundleSha256"] == expected_bundle_sha256
+
+
+def test_file_runtime_requires_a_controller_supplied_release_run_anchor(tmp_path: Path) -> None:
+    module = _load_verifier()
+    manifest = tmp_path / "release-evidence.json"
+
+    with pytest.raises(TypeError):
+        module.FileReleaseRuntime(
+            manifest,
+            expected_source_head="4" * 40,
+            expected_supervisor_public_key_spki_sha256=(_RELEASE_SUPERVISOR_PUBLIC_KEY_SPKI_SHA256),
+        )
+
+
+@pytest.mark.parametrize(
+    ("expected_release_run_id", "expected_environment_id"),
+    (
+        ("other-release-run", _RELEASE_RUN["environmentId"]),
+        (_RELEASE_RUN["runId"], "other-environment"),
+    ),
+    ids=("run-id", "environment-id"),
+)
+def test_file_runtime_rejects_bundle_release_run_outside_the_controller_anchor(
+    tmp_path: Path,
+    expected_release_run_id: str,
+    expected_environment_id: str,
+) -> None:
+    module = _load_verifier()
+    manifest, _, _ = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="4" * 40,
+    )
+
+    runtime = module.FileReleaseRuntime(
+        manifest,
+        expected_source_head="4" * 40,
+        expected_release_run_id=expected_release_run_id,
+        expected_environment_id=expected_environment_id,
+        expected_supervisor_public_key_spki_sha256=(_RELEASE_SUPERVISOR_PUBLIC_KEY_SPKI_SHA256),
+    )
+    result = module.verify(runtime)
+
+    assert runtime.release_run is None
+    assert result.ok is False
+    assert result.release_run is None
+
+
+def test_file_runtime_rejects_probe_marker_from_untrusted_supervisor_key(
+    tmp_path: Path,
+) -> None:
+    module = _load_verifier()
+    manifest, _, _ = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head="4" * 40,
+    )
+
+    result = module.verify(
+        module.FileReleaseRuntime(
+            manifest,
+            expected_source_head="4" * 40,
+            expected_release_run_id=_RELEASE_RUN["runId"],
+            expected_environment_id=_RELEASE_RUN["environmentId"],
+            expected_supervisor_public_key_spki_sha256="f" * 64,
+            candidate_root=tmp_path,
+        )
+    )
+
+    assert result.layers["teacher_flow"].status == "fail"
+    assert "public-key fingerprint does not match" in result.layers["teacher_flow"].detail
 
 
 def test_file_runtime_requires_release_run_and_environment_identity(tmp_path: Path) -> None:
@@ -4764,7 +5671,7 @@ def test_file_runtime_requires_release_run_and_environment_identity(tmp_path: Pa
     document.pop("releaseRun")
     manifest.write_text(json.dumps(document), encoding="utf-8")
 
-    result = module.verify(module.FileReleaseRuntime(manifest, expected_source_head="5" * 40))
+    result = module.verify(_file_release_runtime(module, manifest, expected_source_head="5" * 40))
 
     assert result.layers["source_head"].status == "fail"
     assert "release run" in result.layers["source_head"].detail
@@ -4794,7 +5701,7 @@ def test_file_runtime_rejects_artifact_from_another_run_or_environment(
     manifest_document["evidence"] = evidence
     manifest.write_text(json.dumps(manifest_document), encoding="utf-8")
 
-    result = module.verify(module.FileReleaseRuntime(manifest, expected_source_head="6" * 40))
+    result = module.verify(_file_release_runtime(module, manifest, expected_source_head="6" * 40))
 
     assert result.layers["teacher_flow"].status == "fail"
     assert "release run" in result.layers["teacher_flow"].detail
@@ -4819,7 +5726,7 @@ def test_file_runtime_rejects_minimal_self_attested_artifact(tmp_path: Path) -> 
     document["evidence"] = evidence
     manifest.write_text(json.dumps(document), encoding="utf-8")
 
-    result = module.verify(module.FileReleaseRuntime(manifest, expected_source_head="7" * 40))
+    result = module.verify(_file_release_runtime(module, manifest, expected_source_head="7" * 40))
 
     assert result.layers["teacher_flow"].status == "fail"
     assert "receipt" in result.layers["teacher_flow"].detail
@@ -4874,7 +5781,7 @@ def test_file_runtime_rejects_semantically_invalid_receipt(
     document["evidence"] = evidence
     manifest.write_text(json.dumps(document), encoding="utf-8")
 
-    result = module.verify(module.FileReleaseRuntime(manifest, expected_source_head="a" * 40))
+    result = module.verify(_file_release_runtime(module, manifest, expected_source_head="a" * 40))
 
     assert result.layers["teacher_flow"].status == "fail"
     assert "receipt" in result.layers["teacher_flow"].detail
@@ -4932,7 +5839,7 @@ def test_main_rechecks_source_tree_after_reading_evidence_bundle(
         module,
         source_head=source_head,
     )
-    _bind_gateway_expected_environment(monkeypatch, tmp_path)
+    _bind_gateway_expected_environment(monkeypatch, tmp_path, module)
     observed_heads = iter((source_head, ""))
     monkeypatch.setattr(module, "_git_head", lambda: next(observed_heads))
 
@@ -4952,6 +5859,65 @@ def test_main_rechecks_source_tree_after_reading_evidence_bundle(
     assert "changed during verification" in payload["layers"]["source_head"]["detail"]
 
 
+@pytest.mark.parametrize(
+    ("status_outputs", "expected_status_reads"),
+    (
+        ((" M tracked.py\n",), 1),
+        (("", "?? untracked.txt\n"), 2),
+    ),
+    ids=("tracked-before", "untracked-after"),
+)
+def test_main_rejects_matching_source_receipt_when_worktree_is_dirty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    status_outputs: tuple[str, ...],
+    expected_status_reads: int,
+) -> None:
+    module = _load_verifier()
+    source_head = "e" * 40
+    manifest, _, _ = _write_complete_bundle(
+        tmp_path,
+        module,
+        source_head=source_head,
+    )
+    _bind_gateway_expected_environment(monkeypatch, tmp_path, module)
+    pending_statuses = iter(status_outputs)
+    status_reads = 0
+
+    def run_git(arguments: list[str], **options):
+        nonlocal status_reads
+        assert options["cwd"] == tmp_path
+        if arguments[1:] == ["rev-parse", "HEAD"]:
+            return SimpleNamespace(returncode=0, stdout=source_head + "\n")
+        if tuple(arguments[1:]) in {
+            ("status", "--porcelain=v1", "--untracked-files=normal"),
+            ("status", "--porcelain=v1", "--untracked-files=all"),
+        }:
+            status_reads += 1
+            return SimpleNamespace(returncode=0, stdout=next(pending_statuses))
+        raise AssertionError(f"unexpected command: {arguments}")
+
+    monkeypatch.setattr(module.subprocess, "run", run_git)
+
+    exit_code = module.main(
+        [
+            "--evidence",
+            str(manifest),
+            "--json",
+            *_gateway_cli_arguments(tmp_path),
+        ]
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 1
+    assert payload["status"] == "not_ready"
+    assert payload["layers"]["source_head"]["status"] == "fail"
+    assert status_reads == expected_status_reads
+    with pytest.raises(StopIteration):
+        next(pending_statuses)
+
+
 def test_main_verifies_candidate_artifact_outside_the_clean_source_root(
     tmp_path: Path,
     monkeypatch,
@@ -4966,7 +5932,7 @@ def test_main_verifies_candidate_artifact_outside_the_clean_source_root(
         module,
         source_head=source_head,
     )
-    _bind_gateway_expected_environment(monkeypatch, candidate_root)
+    _bind_gateway_expected_environment(monkeypatch, candidate_root, module)
     clean_source_root = tmp_path / "clean-source"
     clean_source_root.mkdir()
     module.PROJECT_ROOT = clean_source_root
@@ -4987,6 +5953,64 @@ def test_main_verifies_candidate_artifact_outside_the_clean_source_root(
     assert exit_code == 0
     assert payload["status"] == "ready"
     assert payload["candidate"]["sourceHead"] == source_head
+
+
+def test_verify_cli_requires_and_forwards_controller_release_run_anchor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_verifier()
+    captured: dict[str, object] = {}
+    verify_calls = 0
+
+    class CapturingRuntime:
+        def __init__(self, path: Path, **kwargs) -> None:
+            captured["path"] = path
+            captured.update(kwargs)
+
+    result = SimpleNamespace(ok=True)
+
+    def verify(runtime) -> SimpleNamespace:
+        nonlocal verify_calls
+        verify_calls += 1
+        assert isinstance(runtime, CapturingRuntime)
+        return result
+
+    monkeypatch.setattr(module, "FileReleaseRuntime", CapturingRuntime)
+    monkeypatch.setattr(module, "verify", verify)
+    monkeypatch.setattr(module, "report_payload", lambda _result: {"status": "ready"})
+    monkeypatch.setattr(module, "_git_head", lambda: "a" * 40)
+    arguments = [
+        "--evidence",
+        str(tmp_path / "release-evidence.json"),
+        "--gateway-docker-host-identity-sha256",
+        "5" * 64,
+        "--gateway-trust-keyring",
+        str(tmp_path / "gateway-trust-keyring.json"),
+        "--gateway-trust-keyring-sha256",
+        "6" * 64,
+        "--gateway-observer-challenge",
+        "8" * 64,
+        "--gateway-host-challenge",
+        "7" * 64,
+        "--gateway-trusted-now",
+        "2026-08-30T04:05:00Z",
+        "--json",
+        *_static_openmaic_cli_arguments(tmp_path),
+    ]
+
+    assert module.main(arguments) == 0
+    assert captured["expected_release_run_id"] == _RELEASE_RUN["runId"]
+    assert captured["expected_environment_id"] == _RELEASE_RUN["environmentId"]
+
+    for required_flag in ("--expected-release-run-id", "--expected-environment-id"):
+        omitted = list(arguments)
+        index = omitted.index(required_flag)
+        del omitted[index : index + 2]
+        before = verify_calls
+        with pytest.raises(SystemExit):
+            module.main(omitted)
+        assert verify_calls == before
 
 
 @pytest.mark.parametrize("source", ("cli", "environment"))
@@ -5023,7 +6047,7 @@ def test_verifier_cli_resolves_trusted_gateway_docker_host_identity(
         "--gateway-trusted-now",
         "2026-08-30T04:05:00Z",
         "--json",
-        *_static_openmaic_cli_arguments(),
+        *_static_openmaic_cli_arguments(tmp_path),
     ]
     if source == "cli":
         argv.extend(
@@ -5110,6 +6134,7 @@ def test_verify_cli_requires_and_forwards_gateway_external_trust_inputs_before_v
     for _flag, environment_name, _keyword, _value, _mismatch in trust_inputs:
         monkeypatch.delenv(environment_name, raising=False)
     monkeypatch.delenv("YFEISTAI_GATEWAY_DOCKER_HOST_IDENTITY_SHA256", raising=False)
+    openmaic_arguments = _static_openmaic_cli_arguments(tmp_path)
 
     def argv(*, omitted_flag: str | None = None) -> list[str]:
         arguments = [
@@ -5118,7 +6143,7 @@ def test_verify_cli_requires_and_forwards_gateway_external_trust_inputs_before_v
             "--gateway-docker-host-identity-sha256",
             "5" * 64,
             "--json",
-            *_static_openmaic_cli_arguments(),
+            *openmaic_arguments,
         ]
         for flag, _environment_name, _keyword, value, _mismatch in trust_inputs:
             if flag != omitted_flag:
@@ -5153,7 +6178,7 @@ def test_verify_cli_requires_and_forwards_gateway_external_trust_inputs_before_v
         monkeypatch.delenv(environment_name)
 
 
-def test_verify_cli_requires_and_forwards_openmaic_observer_trust_anchor(
+def test_verify_cli_treats_observer_signer_image_as_optional_consistency_check(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5163,6 +6188,9 @@ def test_verify_cli_requires_and_forwards_openmaic_observer_trust_anchor(
         "--openmaic-observer-id",
         "--openmaic-observer-origin",
         "--openmaic-shared-ingress-control-origin",
+        "--openmaic-observer-public-key",
+        "--openmaic-observer-public-key-spki-sha256",
+        "--observer-signer-image",
     }
     assert expected_flags <= set(module._parser()._option_string_actions)
 
@@ -5178,6 +6206,14 @@ def test_verify_cli_requires_and_forwards_openmaic_observer_trust_anchor(
     monkeypatch.setattr(module, "verify", lambda _runtime: result)
     monkeypatch.setattr(module, "report_payload", lambda _result: {"status": "ready"})
     monkeypatch.setattr(module, "_git_head", lambda: "a" * 40)
+    monkeypatch.delenv("YFEISTAI_OBSERVER_SIGNER_IMAGE", raising=False)
+    candidate_root = tmp_path / "candidate-artifact"
+    candidate_root.mkdir()
+    _private_key, observer_public_key_path, observer_public_key_spki_sha256 = (
+        _write_openmaic_observer_public_key(candidate_root)
+    )
+    assert observer_public_key_path.is_file()
+    assert not observer_public_key_path.is_relative_to(candidate_root)
 
     observer_inputs = (
         (
@@ -5196,12 +6232,30 @@ def test_verify_cli_requires_and_forwards_openmaic_observer_trust_anchor(
             "expected_openmaic_shared_ingress_control_origin",
             _OPENMAIC_CONTROL_ORIGIN,
         ),
+        (
+            "--openmaic-observer-public-key",
+            "openmaic_observer_public_key_path",
+            observer_public_key_path,
+        ),
+        (
+            "--openmaic-observer-public-key-spki-sha256",
+            "expected_openmaic_observer_public_key_spki_sha256",
+            observer_public_key_spki_sha256,
+        ),
     )
+    observer_signer_image = _observer_signer_image(_candidate("a" * 40))
 
-    def argv(*, omitted_flag: str | None = None) -> list[str]:
+    def argv(
+        *,
+        omitted_flag: str | None = None,
+        expected_observer_signer_image: str | None = None,
+    ) -> list[str]:
         arguments = [
             "--evidence",
             str(tmp_path / "release-evidence.json"),
+            *_release_anchor_cli_arguments(),
+            "--candidate-root",
+            str(candidate_root),
             "--gateway-docker-host-identity-sha256",
             "5" * 64,
             "--gateway-trust-keyring",
@@ -5218,16 +6272,32 @@ def test_verify_cli_requires_and_forwards_openmaic_observer_trust_anchor(
         ]
         for flag, _keyword, value in observer_inputs:
             if flag != omitted_flag:
-                arguments.extend((flag, value))
+                arguments.extend((flag, str(value)))
+        if expected_observer_signer_image is not None:
+            arguments.extend(("--observer-signer-image", expected_observer_signer_image))
         return arguments
 
     assert module.main(argv()) == 0
+    assert captured["expected_observer_signer_image"] is None
     for _flag, keyword, value in observer_inputs:
         assert captured[keyword] == value
 
     for flag, _keyword, _value in observer_inputs:
         with pytest.raises(SystemExit):
             module.main(argv(omitted_flag=flag))
+
+    captured.clear()
+    assert module.main(argv(expected_observer_signer_image=observer_signer_image)) == 0
+    assert captured["expected_observer_signer_image"] == observer_signer_image
+
+    monkeypatch.setenv("YFEISTAI_OBSERVER_SIGNER_IMAGE", observer_signer_image)
+    assert module.main(argv(expected_observer_signer_image=observer_signer_image)) == 0
+    monkeypatch.setenv(
+        "YFEISTAI_OBSERVER_SIGNER_IMAGE",
+        observer_signer_image.replace("d" * 64, "e" * 64),
+    )
+    with pytest.raises(SystemExit):
+        module.main(argv(expected_observer_signer_image=observer_signer_image))
 
 
 @pytest.mark.parametrize("case", ("missing", "zero"))
@@ -5265,6 +6335,7 @@ def test_verifier_cli_rejects_absent_or_zero_gateway_docker_host_identity(
                 [
                     "--evidence",
                     str(tmp_path / "evidence.json"),
+                    *_release_anchor_cli_arguments(),
                     "--gateway-trust-keyring",
                     str(tmp_path / "gateway-trust-keyring.json"),
                     "--gateway-trust-keyring-sha256",
@@ -5306,7 +6377,8 @@ def test_missing_evidence_manifest_fails_closed(tmp_path: Path) -> None:
     module = _load_verifier()
 
     result = module.verify(
-        module.FileReleaseRuntime(
+        _file_release_runtime(
+            module,
             tmp_path / "missing.json",
             expected_source_head="d" * 40,
         )
@@ -5369,6 +6441,41 @@ def test_open_windows_directory_no_follow_closes_current_on_system_exit(
     assert closed == [current_handle]
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="exercises Windows directory access")
+def test_open_windows_directory_no_follow_does_not_request_delete_access_on_volume_anchor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_verifier()
+    anchor_handle = object()
+    bundle_handle = object()
+    runtime_handle = object()
+    opened: list[tuple[object, str]] = []
+    closed: list[object] = []
+
+    def open_anchor(path: Path) -> tuple[object, tuple[int, int]]:
+        assert path == Path("C:/")
+        return anchor_handle, (1, 1)
+
+    def open_relative(handle: object, component: str) -> tuple[object, tuple[int, int]]:
+        opened.append((handle, component))
+        if handle is anchor_handle and component == "bundle":
+            return bundle_handle, (1, 2)
+        if handle is bundle_handle and component == "runtime":
+            return runtime_handle, (1, 3)
+        raise AssertionError((handle, component))
+
+    monkeypatch.setattr(module, "_open_windows_directory_handle", open_anchor)
+    monkeypatch.setattr(module, "_open_windows_directory_relative", open_relative)
+    monkeypatch.setattr(module, "_close_windows_handle", closed.append)
+
+    handle, identity = module._open_windows_directory_no_follow(Path("C:/bundle/runtime"))
+
+    assert handle is runtime_handle
+    assert identity == (1, 3)
+    assert opened == [(anchor_handle, "bundle"), (bundle_handle, "runtime")]
+    assert closed == [anchor_handle, bundle_handle]
+
+
 def _rewrite_gateway_artifact(
     tmp_path: Path,
     module,
@@ -5388,10 +6495,29 @@ def _rewrite_gateway_artifact(
     )
 
 
+def _install_gateway_fixture_verifier(module, monkeypatch: pytest.MonkeyPatch) -> None:
+    private_verifier = module.verify_gateway_trust_pair.__globals__["_verify_gateway_trust_pair"]
+
+    def verify_gateway_trust_pair_for_fixture(**kwargs):
+        return private_verifier(
+            **kwargs,
+            trusted_keyring_platform_name=None,
+            trusted_owner_uid=None,
+        )
+
+    monkeypatch.setattr(
+        module,
+        "verify_gateway_trust_pair",
+        verify_gateway_trust_pair_for_fixture,
+    )
+
+
 def _bind_gateway_expected_environment(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    module,
 ) -> str:
+    _install_gateway_fixture_verifier(module, monkeypatch)
     support = _load_gateway_public_support()
     attestation_path = tmp_path / "runtime" / "gateway-external-observer-attestation.json"
     monkeypatch.setenv(
@@ -5438,7 +6564,7 @@ def _gateway_host_identity_proof(
         return json.loads(runtime_path.read_bytes())
 
     monkeypatch.setattr(module, "validate_runtime_attestation", validate_runtime)
-    _bind_gateway_expected_environment(monkeypatch, tmp_path)
+    _bind_gateway_expected_environment(monkeypatch, tmp_path, module)
     proof = json.loads((tmp_path / "runtime" / "gateway-only-public-attestation.json").read_bytes())
     proof["docker"]["daemon"]["context"] = proof_context or support.DOCKER_CONTEXT
     proof["docker"]["daemon"]["endpoint"] = proof_endpoint or support.DOCKER_ENDPOINT
@@ -5470,7 +6596,7 @@ def _gateway_external_trust_proof(
         return json.loads(runtime_path.read_bytes())
 
     monkeypatch.setattr(module, "validate_runtime_attestation", validate_runtime)
-    _bind_gateway_expected_environment(monkeypatch, tmp_path)
+    _bind_gateway_expected_environment(monkeypatch, tmp_path, module)
     monkeypatch.setenv(
         support.EXPECTED_DOCKER_HOST_IDENTITY_ENV,
         str(trust_pair["host_receipt_sha256"]),
@@ -5530,6 +6656,7 @@ def test_gateway_only_public_verifier_replays_external_trust_pair(
         "candidate_root": tmp_path,
         "candidate": candidate,
         "release_run": _RELEASE_RUN,
+        "observer_signer_image": _observer_signer_image(candidate),
         "expected_docker_host_identity_sha256": str(trust_pair["host_receipt_sha256"]),
         **support.gateway_trust_arguments(trust_pair),
     }
@@ -5582,6 +6709,7 @@ def test_gateway_verifier_uses_signed_observer_policy_without_legacy_trust_envir
         candidate_root=tmp_path,
         candidate=candidate,
         release_run=_RELEASE_RUN,
+        observer_signer_image=_observer_signer_image(candidate),
         expected_docker_host_identity_sha256=str(trust_pair["host_receipt_sha256"]),
         **support.gateway_trust_arguments(trust_pair),
     )
@@ -5649,7 +6777,8 @@ def test_file_runtime_replays_gateway_external_trust_pair(
     artifact["provenance"] = support.receipt_provenance(proof_path)
     _rewrite_gateway_artifact(tmp_path, module, manifest, evidence_map, artifact)
 
-    runtime = module.FileReleaseRuntime(
+    runtime = _file_release_runtime(
+        module,
         manifest,
         expected_source_head=str(candidate["sourceHead"]),
         candidate_root=tmp_path,
@@ -5663,33 +6792,6 @@ def test_file_runtime_replays_gateway_external_trust_pair(
     else:
         assert result.status == "fail"
         assert "gateway trust" in result.detail
-
-
-def _write_fixed_gateway_candidate_networks(tmp_path: Path, support) -> None:
-    runtime = json.loads((tmp_path / "runtime" / "runtime-attestation.json").read_bytes())
-    fixed_compose = Path(__file__).resolve().parents[2] / "docker-compose.platform.yml"
-    expected_networks = support.expected_service_networks(fixed_compose, runtime)
-    prefix = f"{support.DOCKER_PROJECT}_"
-    logical_networks = {
-        service: [name.removeprefix(prefix) for name in networks]
-        for service, networks in expected_networks.items()
-    }
-    assert all(
-        name.startswith(prefix) for networks in expected_networks.values() for name in networks
-    )
-
-    compose_path = tmp_path / "docker-compose.platform.yml"
-    compose = json.loads(compose_path.read_bytes())
-    services = compose["services"]
-    for service, networks in logical_networks.items():
-        services[service]["networks"] = networks
-    compose["networks"] = {
-        network: {}
-        for network in sorted(
-            {network for networks in logical_networks.values() for network in networks}
-        )
-    }
-    compose_path.write_text(json.dumps(compose, sort_keys=True), encoding="utf-8")
 
 
 def test_gateway_only_public_uses_external_probe_contract() -> None:
@@ -5719,6 +6821,7 @@ def test_gateway_only_public_verifier_binds_runtime_and_proof_to_trusted_docker_
         candidate_root=tmp_path,
         candidate=candidate,
         release_run=_RELEASE_RUN,
+        observer_signer_image=_observer_signer_image(candidate),
         expected_docker_host_identity_sha256=str(trust_pair["host_receipt_sha256"]),
         **support.gateway_trust_arguments(trust_pair),
     )
@@ -5761,6 +6864,7 @@ def test_gateway_only_public_verifier_rejects_self_consistent_untrusted_docker_h
             candidate_root=tmp_path,
             candidate=candidate,
             release_run=_RELEASE_RUN,
+            observer_signer_image=_observer_signer_image(candidate),
             expected_docker_host_identity_sha256=str(trust_pair["host_receipt_sha256"]),
             **support.gateway_trust_arguments(trust_pair),
         )
@@ -5842,6 +6946,7 @@ def test_gateway_only_public_verifier_rejects_byte_identical_raw_ancestor_replac
             candidate_root=tmp_path,
             candidate=candidate,
             release_run=_RELEASE_RUN,
+            observer_signer_image=_observer_signer_image(candidate),
             expected_docker_host_identity_sha256=str(trust_pair["host_receipt_sha256"]),
             **support.gateway_trust_arguments(trust_pair),
         )
@@ -5863,7 +6968,7 @@ def test_file_runtime_accepts_replayed_gateway_only_public_proof(
         module,
         source_head="a" * 40,
     )
-    sentinel = _bind_gateway_expected_environment(monkeypatch, tmp_path)
+    sentinel = _bind_gateway_expected_environment(monkeypatch, tmp_path, module)
 
     result = module.verify(
         _complete_bundle_runtime(
@@ -5891,8 +6996,7 @@ def test_file_runtime_accepts_gateway_proof_with_exact_candidate_compose_network
         source_head="a" * 40,
     )
     trust_pair = _gateway_trust_pair_from_bundle(tmp_path)
-    sentinel = _bind_gateway_expected_environment(monkeypatch, tmp_path)
-    _write_fixed_gateway_candidate_networks(tmp_path, support)
+    sentinel = _bind_gateway_expected_environment(monkeypatch, tmp_path, module)
     proof_path = tmp_path / "runtime" / "gateway-only-public-attestation.json"
     observer_sha256 = hashlib.sha256(
         (tmp_path / "runtime" / "gateway-external-observer-attestation.json").read_bytes()
@@ -5943,8 +7047,7 @@ def test_file_runtime_rejects_gateway_network_set_tamper(
         source_head="a" * 40,
     )
     trust_pair = _gateway_trust_pair_from_bundle(tmp_path)
-    _bind_gateway_expected_environment(monkeypatch, tmp_path)
-    _write_fixed_gateway_candidate_networks(tmp_path, support)
+    _bind_gateway_expected_environment(monkeypatch, tmp_path, module)
     proof_path = tmp_path / "runtime" / "gateway-only-public-attestation.json"
     observer_sha256 = hashlib.sha256(
         (tmp_path / "runtime" / "gateway-external-observer-attestation.json").read_bytes()
@@ -5991,7 +7094,7 @@ def test_file_runtime_rejects_handwritten_gateway_self_attestation(
         module,
         source_head="a" * 40,
     )
-    _bind_gateway_expected_environment(monkeypatch, tmp_path)
+    _bind_gateway_expected_environment(monkeypatch, tmp_path, module)
     document = _artifact_document(module, candidate, "gateway_only_public")
     _rewrite_gateway_artifact(tmp_path, module, manifest, evidence_map, document)
 
@@ -6041,7 +7144,7 @@ def test_file_runtime_rejects_gateway_provenance_tamper(
         source_head="a" * 40,
     )
     trust_pair = _gateway_trust_pair_from_bundle(tmp_path)
-    _bind_gateway_expected_environment(monkeypatch, tmp_path)
+    _bind_gateway_expected_environment(monkeypatch, tmp_path, module)
     entry = evidence_map["gateway_only_public"]
     assert isinstance(entry, dict)
     artifact_path = tmp_path / str(entry["artifact"])

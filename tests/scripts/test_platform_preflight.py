@@ -7,8 +7,10 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
+from types import SimpleNamespace
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -20,6 +22,11 @@ import pytest
 import deeptutor.services.config as config_module
 from deeptutor.services.config import PlatformSettings
 from deeptutor.teaching.secret_permissions import restrict_secret_file
+from tests.scripts.platform_candidate_test_support import (
+    POCKETBASE_BASE_COMPOSE_DRIFTS,
+    drift_pocketbase_base_compose,
+    write_schema3_candidate_root,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -70,6 +77,73 @@ def _write_tls_pair(
     )
     restrict_secret_file(certificate_path)
     restrict_secret_file(private_key_path)
+
+
+def test_observer_runtime_secret_metadata_requires_container_uid_and_gid() -> None:
+    module = _module()
+
+    for owner_id, group_id in ((0, 1000), (1000, 0), (1001, 1000), (1000, 1001)):
+        details = SimpleNamespace(
+            st_uid=owner_id,
+            st_gid=group_id,
+            st_mode=stat.S_IFREG | 0o400,
+            st_size=32,
+        )
+
+        with pytest.raises(ValueError, match="observer container identity"):
+            module._observer_runtime_secret_proof(
+                details,
+                file_name="observer-auth.token",
+                platform_name="posix",
+            )
+
+
+def test_observer_runtime_secret_proof_replays_owner_group_and_mode() -> None:
+    module = _module()
+
+    for mode in (0o400, 0o600):
+        details = SimpleNamespace(
+            st_uid=1000,
+            st_gid=1000,
+            st_mode=stat.S_IFREG | mode,
+            st_size=32,
+        )
+
+        assert module._observer_runtime_secret_proof(
+            details,
+            file_name="observer-auth.token",
+            platform_name="posix",
+        ) == {
+            "fileName": "observer-auth.token",
+            "mode": f"{mode:04o}",
+            "ownerId": 1000,
+            "groupId": 1000,
+            "size": 32,
+        }
+
+    with pytest.raises(ValueError, match="POSIX ownership metadata"):
+        module._observer_runtime_secret_proof(
+            SimpleNamespace(
+                st_uid=1000,
+                st_gid=1000,
+                st_mode=stat.S_IFREG | 0o400,
+                st_size=32,
+            ),
+            file_name="observer-auth.token",
+            platform_name="nt",
+        )
+
+    with pytest.raises(ValueError, match="mode is not restricted"):
+        module._observer_runtime_secret_proof(
+            SimpleNamespace(
+                st_uid=1000,
+                st_gid=1000,
+                st_mode=stat.S_IFREG | 0o640,
+                st_size=32,
+            ),
+            file_name="observer-auth.token",
+            platform_name="posix",
+        )
 
 
 def test_preflight_rejects_world_readable_secret(tmp_path: Path) -> None:
@@ -254,6 +328,53 @@ def test_main_rejects_legacy_image_lock_before_runtime_probes(
     assert runtime_calls == []
 
 
+def test_main_rejects_explicit_image_lock_compatibility_path_before_any_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = _module()
+    calls: list[str] = []
+    monkeypatch.setattr(
+        module,
+        "run_preflight",
+        lambda **_kwargs: calls.append("static") or module.PreflightResult(()),
+    )
+    monkeypatch.setattr(
+        module,
+        "validated_candidate_artifact_lease",
+        lambda *_args, **_kwargs: calls.append("candidate"),
+    )
+
+    async def record_runtime(**_kwargs) -> tuple[str, ...]:
+        calls.append("runtime")
+        return ()
+
+    monkeypatch.setattr(
+        module,
+        "run_runtime_preflight",
+        record_runtime,
+    )
+    monkeypatch.setattr(config_module, "load_platform_settings", lambda _path: object())
+
+    exit_code = module.main(
+        [
+            "--config",
+            str(ROOT / "deploy" / "platform.example.json"),
+            "--secret-dir",
+            str(tmp_path),
+            "--image-lock",
+            str(tmp_path / "detached-image-lock.json"),
+            "--hostname",
+            "classroom.example.com",
+        ]
+    )
+
+    assert exit_code == 1
+    assert capsys.readouterr().out.splitlines() == ["image lock candidate"]
+    assert calls == []
+
+
 def _write_preflight_candidate_root(tmp_path: Path) -> Path:
     renderer_path = ROOT / "scripts" / "render_platform_compose.py"
     spec = importlib.util.spec_from_file_location(
@@ -271,15 +392,22 @@ def _write_preflight_candidate_root(tmp_path: Path) -> Path:
     deploy_dir = candidate_root / "deploy"
     deploy_dir.mkdir(parents=True)
     compose_paths = (
+        candidate_root / "docker-compose.yml",
         candidate_root / "docker-compose.platform.yml",
         candidate_root / "docker-compose.data-plane.yml",
+        deploy_dir / "docker-compose.openmaic-shared-ingress-observer.yml",
     )
-    for source_name, destination in zip(
-        ("docker-compose.platform.yml", "docker-compose.data-plane.yml"),
+    for source, destination in zip(
+        (
+            ROOT / "docker-compose.yml",
+            ROOT / "docker-compose.platform.yml",
+            ROOT / "docker-compose.data-plane.yml",
+            ROOT / "deploy" / "docker-compose.openmaic-shared-ingress-observer.yml",
+        ),
         compose_paths,
         strict=True,
     ):
-        destination.write_bytes((ROOT / source_name).read_bytes())
+        destination.write_bytes(source.read_bytes())
     digest_index = 0
 
     def resolve_digest(_reference: str) -> str:
@@ -300,12 +428,193 @@ def _write_preflight_candidate_root(tmp_path: Path) -> Path:
     return candidate_root
 
 
+def _write_preflight_observer_manifest(candidate_root: Path, tmp_path: Path, monkeypatch):
+    import docker_compose
+
+    from tests.scripts import test_provision_openmaic_observer_secrets as support
+
+    module = _module()
+    roots = (
+        candidate_root,
+        tmp_path / "observer-secrets",
+        tmp_path / "observer-trust",
+        tmp_path / "observer-attestations",
+    )
+    for root in roots[1:]:
+        root.mkdir(mode=0o700)
+    provisioner = support._provisioner()
+    support._install_metadata_seam(provisioner, monkeypatch, roots)
+    support._provision(provisioner, roots)
+    manifest_path = support._manifest_path(roots[2])
+    lock = json.loads((candidate_root / "deploy" / "image-lock.json").read_bytes())
+    admission = provisioner.load_committed_observer_release_manifest(
+        manifest_path=manifest_path,
+        candidate_root=candidate_root,
+        observer_signer_image=lock["supportImages"]["observer_signer"]["reference"],
+    )
+    load_neighbor = docker_compose._load_neighbor_script
+
+    def load_with_permission_seam(filename, *args):
+        if filename == "provision_openmaic_observer_secrets.py":
+            return provisioner
+        if filename == "platform_preflight.py":
+            return module
+        return load_neighbor(filename, *args)
+
+    monkeypatch.setattr(docker_compose, "_load_neighbor_script", load_with_permission_seam)
+    # Keep the real consumer, secret snapshots and revalidation; POSIX DAC is separate.
+    monkeypatch.setattr(
+        module, "_inspect_observer_secret_preflight", lambda *_args: ((), {"ownerOnly": True})
+    )
+    return manifest_path, admission
+
+
+@pytest.mark.parametrize("change_after", (None, "static", "database", "version", "config"))
+def test_host_preflight_binds_committed_observer_manifest_through_compose(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    change_after: str | None,
+) -> None:
+    module = _module()
+    candidate_root = _write_preflight_candidate_root(tmp_path)
+    manifest, admission = _write_preflight_observer_manifest(candidate_root, tmp_path, monkeypatch)
+    expected_environment = admission["environment"]
+    secret = Path(admission["paths"]["observerAuthToken"])
+    deployment_root = tmp_path / "deployment"
+    deployment_root.mkdir()
+    monkeypatch.setattr(module, "PROJECT_ROOT", deployment_root)
+    for name in (*expected_environment, "YFEISTAI_CANDIDATE_ROOT"):
+        monkeypatch.setenv(name, "ambient-wrong-value")
+    monkeypatch.setenv("YFEISTAI_OBSERVER_RELEASE_MANIFEST", "ambient-wrong-manifest")
+    commands: list[list[str]] = []
+    events: list[str] = []
+    static_inputs: list[dict[str, object]] = []
+    lock = json.loads((candidate_root / "deploy" / "image-lock.json").read_bytes())
+    services = {
+        name: {"image": lock["images"][image]["reference"]}
+        for name, image in (
+            ("deeptutor", "deeptutor"),
+            ("gateway", "nginx"),
+            ("minio", "minio"),
+            ("minio-bootstrap", "minio_client"),
+            ("openmaic", "openmaic"),
+            ("openmaic-render", "openmaic_render"),
+            ("pocketbase", "pocketbase"),
+            ("postgres", "postgres"),
+        )
+    }
+    services["gateway"]["ports"] = [{"published": "80"}, {"published": "443"}]
+    for name in ("openmaic-observer-attestation-signer", "openmaic-shared-ingress-observer"):
+        services[name] = {"image": lock["supportImages"]["observer_signer"]["reference"]}
+    services["openmaic-shared-ingress-observer"]["environment"] = _observer_compose_environment(
+        admission
+    )
+
+    def mark_event(name):
+        events.append(name)
+        if change_after == name:
+            secret.write_bytes(b"replacement-that-must-not-be-admitted\n")
+
+    def static(**kwargs):
+        static_inputs.append(kwargs)
+        mark_event("static")
+        return module.PreflightResult(())
+
+    async def database(_settings):
+        mark_event("database")
+        return module._DatabaseInspection((), (), None)
+
+    async def successful_dependency(*_args):
+        return ()
+
+    def runner(command, **kwargs):
+        commands.append(command)
+        assert {
+            name: kwargs["env"].get(name) for name in expected_environment
+        } == expected_environment
+        assert kwargs["env"]["YFEISTAI_CANDIDATE_ROOT"] == str(candidate_root)
+        assert "YFEISTAI_OBSERVER_RELEASE_MANIFEST" not in kwargs["env"]
+        version = command[-2:] == ["version", "--short"]
+        mark_event("version" if version else "config")
+        return subprocess.CompletedProcess(
+            command, 0, "2.24.4\n" if version else json.dumps({"services": services}), ""
+        )
+
+    compose_probe = module._inspect_compose_runtime
+    monkeypatch.setattr(module, "run_preflight", static)
+    monkeypatch.setattr(module, "_inspect_database_runtime", database)
+    monkeypatch.setattr(module, "_inspect_object_store_runtime", successful_dependency)
+    monkeypatch.setattr(module, "_inspect_openmaic_runtime", successful_dependency)
+    monkeypatch.setattr(
+        module,
+        "_inspect_compose_runtime",
+        lambda *args, **kwargs: compose_probe(*args, **kwargs, runner=runner),
+    )
+    monkeypatch.setattr(config_module, "load_platform_settings", lambda _path: object())
+    try:
+        result = module.main(
+            [
+                "--candidate-root",
+                str(candidate_root),
+                "--observer-release-manifest",
+                str(manifest),
+                "--config",
+                str(ROOT / "deploy" / "platform.example.json"),
+                "--secret-dir",
+                str(tmp_path / "platform-secrets"),
+                "--hostname",
+                "classroom.example.com",
+            ]
+        )
+    except SystemExit as exc:
+        result = exc.code
+
+    assert result == (0 if change_after is None else 1)
+    assert {name: static_inputs[0][name] for name in admission["platformPreflightInputs"]} == {
+        name: Path(value) if name == "observer_secret_dir" else value
+        for name, value in admission["platformPreflightInputs"].items()
+    }
+    assert (
+        len(commands)
+        == {None: 2, "static": 0, "database": 0, "version": 1, "config": 2}[change_after]
+    )
+    if change_after is not None:
+        assert "observer release" in capsys.readouterr().out
+    assert os.environ["YFEISTAI_CANDIDATE_ROOT"] == "ambient-wrong-value"
+
+
+def test_host_preflight_requires_manifest_before_runtime_dependencies(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = _module()
+    candidate_root = _write_preflight_candidate_root(tmp_path)
+    calls: list[str] = []
+    monkeypatch.setattr(module, "run_preflight", lambda **_kwargs: module.PreflightResult(()))
+    monkeypatch.setattr(config_module, "load_platform_settings", lambda _path: object())
+
+    async def runtime(**_kwargs):
+        calls.append("runtime")
+        return ()
+
+    monkeypatch.setattr(module, "run_runtime_preflight", runtime)
+    result = module.main(
+        ["--candidate-root", str(candidate_root), "--hostname", "classroom.example.com"]
+    )
+    assert result == 1
+    assert "observer release manifest required" in capsys.readouterr().out
+    assert calls == []
+
+
 def test_main_uses_external_candidate_root_for_lock_and_runtime_compose(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
     module = _module()
     candidate_root = _write_preflight_candidate_root(tmp_path)
+    manifest, _admission = _write_preflight_observer_manifest(candidate_root, tmp_path, monkeypatch)
     calls: dict[str, dict[str, object]] = {}
 
     def record_static(**kwargs) -> object:
@@ -329,6 +638,8 @@ def test_main_uses_external_candidate_root_for_lock_and_runtime_compose(
                 str(tmp_path / "secrets"),
                 "--candidate-root",
                 str(candidate_root.resolve()),
+                "--observer-release-manifest",
+                str(manifest),
                 "--hostname",
                 "classroom.example.com",
             ]
@@ -431,13 +742,225 @@ def test_main_rejects_external_candidate_compose_drift_before_runtime_probes(
     assert runtime_calls == []
 
 
-def test_runtime_compose_probe_uses_external_candidate_root(
+def test_main_rejects_candidate_drift_after_static_preflight_before_runtime_probes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = _module()
+    candidate_root = _write_preflight_candidate_root(tmp_path)
+    platform_compose = candidate_root / "docker-compose.platform.yml"
+    original_compose = platform_compose.read_bytes()
+    drifted_compose = original_compose + b"\n# Candidate changed after static checks.\n"
+    runtime_calls: list[str] = []
+
+    def complete_static_preflight(**_kwargs) -> object:
+        platform_compose.write_bytes(drifted_compose)
+        return module.PreflightResult(())
+
+    async def record_runtime(**_kwargs) -> tuple[str, ...]:
+        runtime_calls.append("runtime")
+        return ()
+
+    monkeypatch.setattr(module, "run_preflight", complete_static_preflight)
+    monkeypatch.setattr(module, "run_runtime_preflight", record_runtime)
+    monkeypatch.setattr(config_module, "load_platform_settings", lambda _path: object())
+
+    result = module.main(
+        [
+            "--config",
+            str(ROOT / "deploy" / "platform.example.json"),
+            "--secret-dir",
+            str(tmp_path / "secrets"),
+            "--candidate-root",
+            str(candidate_root),
+            "--hostname",
+            "classroom.example.com",
+        ]
+    )
+
+    assert platform_compose.read_bytes() == drifted_compose
+    assert result == 1
+    assert capsys.readouterr().out.splitlines() == ["image lock candidate"]
+    assert runtime_calls == []
+
+
+@pytest.mark.parametrize("drift", POCKETBASE_BASE_COMPOSE_DRIFTS)
+def test_main_rejects_schema3_pocketbase_base_compose_drift_before_runtime_probes(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+    drift: str,
+) -> None:
+    module = _module()
+    candidate_root = _write_preflight_candidate_root(tmp_path)
+    lock = json.loads((candidate_root / "deploy" / "image-lock.json").read_text(encoding="utf-8"))
+    assert lock["schemaVersion"] == 3
+    assert "pocketbase" in lock["images"]
+    drift_pocketbase_base_compose(candidate_root, lock, drift)
+    runtime_calls: list[str] = []
+
+    async def record_runtime(**_kwargs) -> tuple[str, ...]:
+        runtime_calls.append("runtime")
+        return ()
+
+    monkeypatch.setattr(
+        module,
+        "run_preflight",
+        lambda **_kwargs: module.PreflightResult(()),
+    )
+    monkeypatch.setattr(module, "run_runtime_preflight", record_runtime)
+    monkeypatch.setattr(config_module, "load_platform_settings", lambda _path: object())
+
+    assert (
+        module.main(
+            [
+                "--config",
+                str(ROOT / "deploy" / "platform.example.json"),
+                "--secret-dir",
+                str(tmp_path / "secrets"),
+                "--candidate-root",
+                str(candidate_root),
+                "--hostname",
+                "classroom.example.com",
+            ]
+        )
+        == 1
+    )
+
+    assert "image lock candidate" in capsys.readouterr().out
+    assert runtime_calls == []
+
+
+def test_main_rejects_schema3_pocketbase_base_compose_identity_drift_after_runtime_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = _module()
+    candidate_root, lock = write_schema3_candidate_root(tmp_path / "stable")
+    manifest, _admission = _write_preflight_observer_manifest(candidate_root, tmp_path, monkeypatch)
+    drift_root, drift_lock = write_schema3_candidate_root(tmp_path / "identity-drift")
+    drift_pocketbase_base_compose(drift_root, drift_lock, "different-digest")
+    base_compose = candidate_root / "docker-compose.yml"
+    drifted_base_compose = drift_root / "docker-compose.yml"
+    assert lock["schemaVersion"] == drift_lock["schemaVersion"] == 3
+    assert base_compose.read_bytes() != drifted_base_compose.read_bytes()
+
+    original_stat = os.stat
+    original_lstat = os.lstat
+    base_key = os.path.normcase(os.path.abspath(base_compose))
+    drift_active = False
+    runtime_calls: list[str] = []
+
+    def redirected(path: object) -> bool:
+        try:
+            return os.path.normcase(os.path.abspath(os.fspath(path))) == base_key
+        except TypeError:
+            return False
+
+    def redirected_stat(path, *args, **kwargs):
+        target = drifted_base_compose if drift_active and redirected(path) else path
+        return original_stat(target, *args, **kwargs)
+
+    def redirected_lstat(path, *args, **kwargs):
+        target = drifted_base_compose if drift_active and redirected(path) else path
+        return original_lstat(target, *args, **kwargs)
+
+    async def complete_runtime_probe(**_kwargs) -> tuple[str, ...]:
+        nonlocal drift_active
+        runtime_calls.append("runtime")
+        drift_active = True
+        return ()
+
+    monkeypatch.setattr(os, "stat", redirected_stat)
+    monkeypatch.setattr(os, "lstat", redirected_lstat)
+    monkeypatch.setattr(
+        module,
+        "run_preflight",
+        lambda **_kwargs: module.PreflightResult(()),
+    )
+    monkeypatch.setattr(module, "run_runtime_preflight", complete_runtime_probe)
+    monkeypatch.setattr(config_module, "load_platform_settings", lambda _path: object())
+
+    result = module.main(
+        [
+            "--config",
+            str(ROOT / "deploy" / "platform.example.json"),
+            "--secret-dir",
+            str(tmp_path / "secrets"),
+            "--candidate-root",
+            str(candidate_root),
+            "--observer-release-manifest",
+            str(manifest),
+            "--hostname",
+            "classroom.example.com",
+        ]
+    )
+
+    assert result == 1
+    assert capsys.readouterr().out.splitlines() == ["image lock candidate"]
+    assert runtime_calls == ["runtime"]
+
+
+def _stub_admitted_observer_for_compose_unit_probe():
+    # Compose output/version units isolate admission; the host test uses the real consumer.
+    from tests.scripts.test_provision_openmaic_observer_secrets import _deployment_environment
+
+    return {
+        "environment": {
+            **dict.fromkeys(_module()._OBSERVER_RUNTIME_ENVIRONMENT, "admitted-unit-value"),
+            **_deployment_environment(),
+        },
+        "_revalidate": lambda: None,
+    }
+
+
+def _observer_compose_environment(admission=None):
+    admitted = (admission or _stub_admitted_observer_for_compose_unit_probe())["environment"]
+    from tests.scripts.test_provision_openmaic_observer_secrets import _deployment_environment
+
+    return {
+        **{
+            name: admitted[name]
+            for name in (
+                "YFEISTAI_RELEASE_RUN_ID",
+                "YFEISTAI_CANDIDATE_SHA256",
+                "YFEISTAI_IMAGE_LOCK_SHA256",
+                "YFEISTAI_OBSERVER_PUBLIC_KEY_SPKI_SHA256",
+            )
+        },
+        **{name: admitted[name] for name in _deployment_environment()},
+        "YFEISTAI_SHARED_INGRESS_INTERNAL_PROXY_URL": "http://openmaic-shared-ingress-observer:8000",
+    }
+
+
+def test_runtime_compose_probe_uses_schema3_observer_signer_from_external_candidate_root(
     tmp_path: Path,
 ) -> None:
     module = _module()
     candidate_root = _write_preflight_candidate_root(tmp_path)
+    deployment_root = tmp_path / "deployment"
+    env_file = deployment_root / "data" / "user" / "settings" / "docker.env"
+    env_file.parent.mkdir(parents=True)
+    env_file.write_bytes(b"DEEPTUTOR_DOCKER_BACKEND_PORT=8999\n")
+    original_inputs = {
+        path: path.read_bytes()
+        for path in (
+            env_file,
+            candidate_root / "docker-compose.yml",
+            candidate_root / "docker-compose.platform.yml",
+            candidate_root / "deploy" / "docker-compose.openmaic-shared-ingress-observer.yml",
+        )
+    }
     lock_path = candidate_root / "deploy" / "image-lock.json"
-    images = json.loads(lock_path.read_text(encoding="utf-8"))["images"]
+    lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    images = lock["images"]
+    observer_signer = lock["supportImages"]["observer_signer"]
+    pocketbase = images["pocketbase"]
+    assert lock["schemaVersion"] == 3
+    assert pocketbase["digest"] != "sha256:" + "0" * 64
+    assert pocketbase["reference"].endswith(f"@{pocketbase['digest']}")
     commands: list[list[str]] = []
 
     def runner(command, **_kwargs):
@@ -454,29 +977,71 @@ def test_runtime_compose_probe_uses_external_candidate_root(
             "minio-bootstrap": {"image": images["minio_client"]["reference"]},
             "openmaic": {"image": images["openmaic"]["reference"]},
             "openmaic-render": {"image": images["openmaic_render"]["reference"]},
+            "openmaic-observer-attestation-signer": {"image": observer_signer["reference"]},
+            "openmaic-shared-ingress-observer": {
+                "image": observer_signer["reference"],
+                "environment": _observer_compose_environment(),
+            },
+            "pocketbase": {"image": pocketbase["reference"]},
             "postgres": {"image": images["postgres"]["reference"]},
         }
         return subprocess.CompletedProcess(command, 0, json.dumps({"services": services}), "")
 
     assert (
         module._inspect_compose_runtime(
-            ROOT,
+            deployment_root,
             candidate_root=candidate_root,
             image_lock_path=lock_path,
+            observer_admission=_stub_admitted_observer_for_compose_unit_probe(),
             runner=runner,
         )
         == ()
     )
-    assert str(candidate_root / "docker-compose.platform.yml") in commands[1]
+    assert commands == [
+        ["docker", "compose", "version", "--short"],
+        [
+            "docker",
+            "compose",
+            "--env-file",
+            str(env_file),
+            "--project-directory",
+            str(deployment_root),
+            "--project-name",
+            "yfeistai-platform",
+            "-f",
+            str(candidate_root / "docker-compose.yml"),
+            "-f",
+            str(candidate_root / "docker-compose.platform.yml"),
+            "-f",
+            str(candidate_root / "deploy" / "docker-compose.openmaic-shared-ingress-observer.yml"),
+            "--profile",
+            "legacy-local",
+            "config",
+            "--format",
+            "json",
+        ],
+    ]
+    assert {path: path.read_bytes() for path in original_inputs} == original_inputs
 
 
-def test_runtime_compose_probe_defaults_to_external_candidate_lock(
+@pytest.mark.parametrize(
+    ("service_name", "lock_name"),
+    (
+        pytest.param("deeptutor", "deeptutor", id="deeptutor"),
+        pytest.param("pocketbase", "pocketbase", id="pocketbase"),
+    ),
+)
+def test_runtime_compose_probe_reports_locked_service_drift_with_matching_observer_signer(
     tmp_path: Path,
+    service_name: str,
+    lock_name: str,
 ) -> None:
     module = _module()
     candidate_root = _write_preflight_candidate_root(tmp_path)
     lock_path = candidate_root / "deploy" / "image-lock.json"
-    images = json.loads(lock_path.read_text(encoding="utf-8"))["images"]
+    lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    images = lock["images"]
+    observer_signer = lock["supportImages"]["observer_signer"]
 
     def runner(command, **_kwargs):
         if command[-2:] == ["version", "--short"]:
@@ -486,18 +1051,26 @@ def test_runtime_compose_probe_defaults_to_external_candidate_lock(
                 "image": images["nginx"]["reference"],
                 "ports": [{"published": "80"}, {"published": "443"}],
             },
-            "deeptutor": {"image": "ghcr.io/xinlingzhifei/deeptutor@sha256:" + "f" * 64},
+            "deeptutor": {"image": images["deeptutor"]["reference"]},
             "minio": {"image": images["minio"]["reference"]},
             "minio-bootstrap": {"image": images["minio_client"]["reference"]},
             "openmaic": {"image": images["openmaic"]["reference"]},
             "openmaic-render": {"image": images["openmaic_render"]["reference"]},
+            "openmaic-observer-attestation-signer": {"image": observer_signer["reference"]},
+            "openmaic-shared-ingress-observer": {
+                "image": observer_signer["reference"],
+                "environment": _observer_compose_environment(),
+            },
+            "pocketbase": {"image": images["pocketbase"]["reference"]},
             "postgres": {"image": images["postgres"]["reference"]},
         }
+        services[service_name]["image"] = f"{images[lock_name]['repository']}@sha256:" + "f" * 64
         return subprocess.CompletedProcess(command, 0, json.dumps({"services": services}), "")
 
     assert module._inspect_compose_runtime(
         ROOT,
         candidate_root=candidate_root,
+        observer_admission=_stub_admitted_observer_for_compose_unit_probe(),
         runner=runner,
     ) == ("image lock match",)
 
@@ -555,8 +1128,10 @@ def test_runtime_preflight_fails_closed_for_every_required_dependency(
             image_lock_path: Path,
             project_root: Path,
             candidate_root: Path,
+            observer_admission: dict[str, object] | None = None,
         ) -> tuple[str, ...]:
             assert settings.enabled is True
+            assert observer_admission is None
             calls.append((secret_dir, image_lock_path, project_root, candidate_root))
             return expected
 
@@ -833,7 +1408,7 @@ def test_runtime_phase_cli_skips_host_candidate_checks(
     monkeypatch.setattr(config_module, "load_platform_settings", lambda path: settings)
     monkeypatch.setattr(module, "inspect_candidate_network_phase", inspect)
     monkeypatch.setattr(module, "run_preflight", forbidden)
-    monkeypatch.setattr(module, "validate_image_lock_bindings", forbidden)
+    monkeypatch.setattr(module, "validated_candidate_artifact_lease", forbidden)
 
     exit_code = module.main(
         [
@@ -900,6 +1475,7 @@ def test_runtime_compose_probe_rejects_old_cli_and_non_gateway_ports(
     module = _module()
     monkeypatch.setenv("COMPOSE_FILE", "host-compose.yml")
     monkeypatch.setenv("COMPOSE_PROFILES", "dangerous")
+    monkeypatch.setenv("COMPOSE_PROJECT_NAME", "foreign-project")
     calls: list[tuple[tuple[str, ...], dict[str, str]]] = []
 
     def runner(command, **kwargs):
@@ -914,18 +1490,24 @@ def test_runtime_compose_probe_rejects_old_cli_and_non_gateway_ports(
                     "services": {
                         "gateway": {"ports": [{"published": "443"}]},
                         "deeptutor": {"ports": [{"published": "8001"}]},
+                        "openmaic-shared-ingress-observer": {
+                            "environment": _observer_compose_environment(),
+                        },
                     }
                 }
             ),
             "",
         )
 
-    errors = module._inspect_compose_runtime(ROOT, runner=runner)
+    errors = module._inspect_compose_runtime(
+        ROOT, runner=runner, observer_admission=_stub_admitted_observer_for_compose_unit_probe()
+    )
 
     assert errors == ("Docker Compose version", "gateway-only public ports")
     assert len(calls) == 2
     assert all("COMPOSE_FILE" not in environment for _command, environment in calls)
     assert all("COMPOSE_PROFILES" not in environment for _command, environment in calls)
+    assert all("COMPOSE_PROJECT_NAME" not in environment for _command, environment in calls)
 
 
 def test_runtime_compose_probe_does_not_require_packaging_dependency(
@@ -950,11 +1532,19 @@ def test_runtime_compose_probe_does_not_require_packaging_dependency(
                                 {"published": "80"},
                                 {"published": "443"},
                             ]
-                        }
+                        },
+                        "openmaic-shared-ingress-observer": {
+                            "environment": _observer_compose_environment(),
+                        },
                     }
                 }
             ),
             "",
         )
 
-    assert module._inspect_compose_runtime(ROOT, runner=runner) == ()
+    assert (
+        module._inspect_compose_runtime(
+            ROOT, runner=runner, observer_admission=_stub_admitted_observer_for_compose_unit_probe()
+        )
+        == ()
+    )

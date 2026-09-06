@@ -72,12 +72,17 @@ export function InteractiveScene({
         return
       }
       if (!message) return
+      const acceptedMessage = message
       const accepted = eventQueue.enqueue(async () => {
         if (!active) return
-        await dispatchEvent(message)
+        await dispatchEvent(acceptedMessage)
         if (!active) return
         frameRef.current?.contentWindow?.postMessage(
-          { sessionNonce, eventId: message.eventId, type: 'interactive.ack' },
+          {
+            sessionNonce,
+            eventId: acceptedMessage.eventId,
+            type: 'interactive.ack',
+          },
           '*'
         )
       })

@@ -124,7 +124,8 @@ Expected: 提交只包含该子计划列出的文件；用户原有未跟踪文�
 - Test: `tests/e2e/test_content_operations_flow.py`
 - Test: `tests/integration/test_tenant_isolation.py`
 - Test: `tests/integration/test_generation_recovery.py`
-- Test: `web/tests/e2e/classroom-first-release.spec.ts`
+- Test: `web/tests/e2e/classroom-first-release.live.spec.ts`
+- Regression: `web/tests/e2e/classroom-first-release.spec.ts`（仅 mocked 快速回归）
 - Verify: `docker-compose.platform.yml`
 
 - [ ] Step 1: 执行后端契约、隔离与恢复测试
@@ -145,7 +146,7 @@ Run:
 npm --prefix web run test:node
 npm --prefix web run i18n:check
 npm --prefix web run build
-npm --prefix web exec playwright -- test tests/e2e/classroom-first-release.spec.ts
+pnpm --dir web exec playwright test --project=first-release-live
 ```
 
 Expected: 全部通过，桌面与移动端、明暗主题、中英文均有证据。
@@ -163,7 +164,9 @@ Expected: 验证器确认服务健康、迁移版本、对象存储、20 个平�
 
 - [ ] Step 4: 核对首期范围
 
-必须同时给出以下证据：
+以下 12 个 acceptance receipts 与 6 个 operational layers
+（`source_head`、`image_digests`、`database_revisions`、
+`running_containers`、`service_health`、`capacity_profile`）必须同时给出：
 
 ```text
 teacher_flow=pass

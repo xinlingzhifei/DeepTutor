@@ -1235,6 +1235,39 @@ async def test_shared_openmaic_probe_uses_active_contract_not_cached_health() ->
 
 
 @pytest.mark.asyncio
+async def test_observer_canary_is_forwarded_only_to_the_shared_openmaic_probe() -> None:
+    seen: list[tuple[str, str | None]] = []
+
+    class Client:
+        def __init__(self, route_id: str) -> None:
+            self.route_id = route_id
+
+        async def assert_compatible(self, *, observer_canary=None) -> None:
+            seen.append((self.route_id, observer_canary))
+
+    class Factory:
+        async def create(self, route: DataPlaneRouteRecord) -> Client:
+            return Client(route.route_id)
+
+    dedicated = _route("dedicated-route")
+    probes = OpenMAICDataPlaneHealthProbes(
+        repository=_DataPlaneHealthRepository(
+            shared=_route("shared", mode="shared"),
+            dedicated=DedicatedDataPlaneHealthInventory(1, (dedicated,), 0),
+        ),
+        client_factory=Factory(),
+    )
+
+    await probes.probe_shared(observer_canary="observer-canary-" + "7" * 48)
+    await probes.probe_dedicated()
+
+    assert seen == [
+        ("shared", "observer-canary-" + "7" * 48),
+        ("dedicated-route", None),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_shared_openmaic_probe_maps_contract_mismatch() -> None:
     probes = OpenMAICDataPlaneHealthProbes(
         repository=_DataPlaneHealthRepository(shared=_route("shared", mode="shared")),
@@ -1483,6 +1516,54 @@ async def test_credential_free_health_client_redacts_endpoint_at_info(caplog) ->
     assert endpoint not in rendered
     assert tenant not in rendered
     assert route not in rendered
+
+
+@pytest.mark.asyncio
+async def test_shared_health_client_forwards_only_an_explicit_observer_canary() -> None:
+    payload = {
+        "service": "openmaic",
+        "upstreamCommit": EXPECTED_UPSTREAM_COMMIT,
+        "appVersion": EXPECTED_APP_VERSION,
+        "contractVersions": [SUPPORTED_CONTRACT_VERSION],
+        "capabilities": sorted(REQUIRED_CAPABILITIES),
+        "exportFormats": sorted(REQUIRED_EXPORT_FORMATS),
+    }
+    challenge = "observer-canary-" + "7" * 48
+    seen: list[str | None] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("x-yfeistai-observer-canary"))
+        return httpx.Response(200, json=payload)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        client = OpenMAICContractHealthClient(
+            http_client,
+            base_url="http://openmaic-shared.internal:3000",
+        )
+        await client.assert_compatible(observer_canary=challenge)
+        await client.assert_compatible()
+
+    assert seen == [challenge, None]
+
+
+@pytest.mark.asyncio
+async def test_shared_health_client_rejects_invalid_observer_canary_before_http() -> None:
+    requested = False
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal requested
+        requested = True
+        return httpx.Response(500)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        client = OpenMAICContractHealthClient(
+            http_client,
+            base_url="http://openmaic-shared.internal:3000",
+        )
+        with pytest.raises(ValueError, match="observer canary is invalid"):
+            await client.health(observer_canary="invalid canary")
+
+    assert requested is False
 
 
 def test_health_json_logging_cannot_reintroduce_private_context() -> None:

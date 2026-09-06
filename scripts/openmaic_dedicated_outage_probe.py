@@ -36,10 +36,11 @@ from classroom_runtime_attestation import (  # noqa: E402
 )
 from openmaic_smoke_contract import (  # noqa: E402
     OPENMAIC_DEDICATED_OUTAGE_PRODUCER,
+    OPENMAIC_SHARED_INGRESS_OBSERVER_BOUND_SCHEMA_VERSION,
     OPENMAIC_SMOKE_SCHEMA_VERSION,
     canonical_openmaic_dedicated_outage_attempt_marker,
     canonical_openmaic_dedicated_outage_attestation,
-    parse_openmaic_shared_ingress_observer_attestation,
+    verify_openmaic_shared_ingress_observer_attestation,
 )
 from openmaic_smoke_probe import (  # noqa: E402
     _BINDING_RESPONSE_FIELDS,
@@ -59,12 +60,30 @@ from openmaic_smoke_probe import (
 from openmaic_smoke_probe import (
     _public_id as _smoke_public_id,
 )
-from render_platform_compose import validate_image_lock_bindings  # noqa: E402
+from render_platform_compose import (  # noqa: E402
+    validated_candidate_artifact_lease,
+)
 
 _PUBLIC_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _CONTAINER_ID = re.compile(r"^[0-9a-f]{64}$")
 _PROJECT = re.compile(r"^yfeistai-outage-[a-z0-9][a-z0-9_-]{0,62}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_RUN_AUTH_TOKEN = re.compile(r"^[A-Za-z0-9_-]{48,128}$")
+_MAX_AUTH_TOKEN_BYTES = 129
+_OBSERVER_CONTROL_SETUP_MARGIN_SECONDS = 60
+_OBSERVER_TWO_CONTROL_CALLS_MARGIN_SECONDS = 40
+_OBSERVER_RESTORE_READY_MAX_SECONDS = 120
+_OUTAGE_STOP_START_MARGIN_SECONDS = 120
+_FIXTURE_CLEANUP_MARGIN_SECONDS = 60
+_MAX_AUTH_LIFETIME_SECONDS = 7_200
+_FIXED_AUTH_BUDGET_SECONDS = (
+    _OBSERVER_CONTROL_SETUP_MARGIN_SECONDS
+    + _OBSERVER_TWO_CONTROL_CALLS_MARGIN_SECONDS
+    + _OBSERVER_RESTORE_READY_MAX_SECONDS
+    + _OUTAGE_STOP_START_MARGIN_SECONDS
+    + _FIXTURE_CLEANUP_MARGIN_SECONDS
+)
+_MAX_OUTAGE_TIMEOUT_SECONDS = (_MAX_AUTH_LIFETIME_SECONDS - _FIXED_AUTH_BUDGET_SECONDS) // 2
 
 
 class OpenMAICDedicatedOutageProbeError(RuntimeError):
@@ -79,6 +98,7 @@ class _StableArgumentParser(argparse.ArgumentParser):
 @dataclass(frozen=True, slots=True)
 class OutageProbeConfig:
     admin_token: SecretStr
+    observer_auth_token: SecretStr
     attempt_marker_path: Path
     base_url: str
     candidate: Mapping[str, object]
@@ -92,17 +112,23 @@ class OutageProbeConfig:
     release_run: Mapping[str, str]
     observer_attestation_path: Path
     observer_attestation_sha256: str
+    observer_auth_expires_at: str
     observer_id: str
     observer_url: str
     observer_origin: str
+    candidate_health_url: str
     shared_ingress_control_url: str
     shared_ingress_control_origin: str
+    shared_ingress_upstream_url: str
     output_path: Path
     runtime_attestation_sha256: str
     timeout_seconds: int
     docker_config_dir: Path | None = None
     docker_host: str = ""
     docker_host_identity_sha256: str = ""
+    observer_attestation_signature_path: Path = Path()
+    observer_attestation_public_key_path: Path = Path()
+    observer_attestation_public_key_spki_sha256: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -329,21 +355,16 @@ DockerRunner: TypeAlias = Callable[..., subprocess.CompletedProcess[bytes]]
 
 
 def _default_candidate_loader(candidate_root: Path) -> tuple[dict[str, object], str]:
-    lock = validate_image_lock_bindings(
-        candidate_root / "deploy" / "image-lock.json",
-        compose_paths=(
-            candidate_root / "docker-compose.platform.yml",
-            candidate_root / "docker-compose.data-plane.yml",
-        ),
-        require_candidate=True,
-    )
-    candidate = lock.get("candidate")
-    images = lock.get("images")
-    openmaic = images.get("openmaic") if isinstance(images, dict) else None
-    reference = openmaic.get("reference") if isinstance(openmaic, dict) else None
-    if not isinstance(candidate, dict) or not isinstance(reference, str):
-        raise OpenMAICDedicatedOutageProbeError("candidate_invalid")
-    return dict(candidate), reference
+    with validated_candidate_artifact_lease(candidate_root) as artifact:
+        images = artifact.image_lock.get("images")
+        openmaic = images.get("openmaic") if isinstance(images, Mapping) else None
+        reference = openmaic.get("reference") if isinstance(openmaic, Mapping) else None
+        if not isinstance(reference, str):
+            raise OpenMAICDedicatedOutageProbeError("candidate_invalid")
+        candidate = json.loads(json.dumps(artifact.candidate))
+        if not isinstance(candidate, dict):
+            raise OpenMAICDedicatedOutageProbeError("candidate_invalid")
+        return candidate, reference
 
 
 def _valid_base_url(value: object, *, allow_remote_http: bool = False) -> bool:
@@ -404,7 +425,9 @@ def _canonical_origin(value: str) -> tuple[str, str, int]:
         hostname = parsed.hostname
         if hostname is None:
             raise ValueError
-        canonical_host = hostname.encode("idna").decode("ascii").lower()
+        canonical_host = hostname.encode("idna").decode("ascii").lower().rstrip(".")
+        if not canonical_host:
+            raise ValueError
     except (UnicodeError, ValueError) as exc:
         raise OpenMAICDedicatedOutageProbeError("endpoint_origin_invalid") from exc
     scheme = parsed.scheme.lower()
@@ -439,6 +462,83 @@ def _explicit_regular_file_outside_candidate(
     except (OSError, OpenMAICDedicatedOutageProbeError) as exc:
         raise OpenMAICDedicatedOutageProbeError("shared_ingress_observer_invalid") from exc
     return resolved, body
+
+
+def _is_reparse_point(path: Path) -> bool:
+    try:
+        details = path.lstat()
+    except OSError:
+        return True
+    attributes = getattr(details, "st_file_attributes", 0)
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return stat.S_ISLNK(details.st_mode) or bool(attributes & reparse_flag)
+
+
+def _path_has_reparse_component(path: Path) -> bool:
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        if _is_reparse_point(current):
+            return True
+    return False
+
+
+def _secret_file_identity(details: os.stat_result) -> tuple[int, ...]:
+    return (
+        details.st_dev,
+        details.st_ino,
+        details.st_size,
+        details.st_mtime_ns,
+        details.st_ctime_ns,
+        details.st_mode,
+        details.st_uid,
+    )
+
+
+def _load_run_auth_token(raw_path: object, *, candidate_root: Path) -> SecretStr:
+    if not isinstance(raw_path, str) or not raw_path:
+        raise OpenMAICDedicatedOutageProbeError("shared_ingress_auth_invalid")
+    supplied = Path(raw_path)
+    descriptor: int | None = None
+    try:
+        if not supplied.is_absolute() or _path_has_reparse_component(supplied):
+            raise OSError
+        resolved = supplied.resolve(strict=True)
+        if supplied != resolved or resolved == candidate_root or candidate_root in resolved.parents:
+            raise OSError
+        before = resolved.lstat()
+        if not stat.S_ISREG(before.st_mode):
+            raise OSError
+        if os.name == "posix" and (
+            before.st_uid != os.geteuid() or stat.S_IMODE(before.st_mode) & 0o077
+        ):
+            raise OSError
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(resolved, flags)
+        opened = os.fstat(descriptor)
+        if _secret_file_identity(opened) != _secret_file_identity(before):
+            raise OSError
+        body = os.read(descriptor, _MAX_AUTH_TOKEN_BYTES)
+        if os.read(descriptor, 1):
+            raise OSError
+        after = os.fstat(descriptor)
+        final = resolved.lstat()
+        identity = _secret_file_identity(opened)
+        if identity != _secret_file_identity(after) or identity != _secret_file_identity(final):
+            raise OSError
+        token = body.decode("ascii").strip()
+        if _RUN_AUTH_TOKEN.fullmatch(token) is None or body not in {
+            token.encode("ascii"),
+            token.encode("ascii") + b"\n",
+            token.encode("ascii") + b"\r\n",
+        }:
+            raise OSError
+    except (OSError, UnicodeError) as exc:
+        raise OpenMAICDedicatedOutageProbeError("shared_ingress_auth_invalid") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    return SecretStr(token)
 
 
 def _isolated_docker_config(raw_path: object) -> Path:
@@ -494,6 +594,7 @@ def _load_config(
     cwd: Path,
     candidate_loader: CandidateLoader = _default_candidate_loader,
     docker_resolver: DockerResolver = resolve_fixed_docker,
+    now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
 ) -> OutageProbeConfig:
     raw_root = environment.get("YFEISTAI_CANDIDATE_ROOT")
     if not isinstance(raw_root, str) or not raw_root:
@@ -577,22 +678,76 @@ def _load_config(
         environment.get("YFEISTAI_SHARED_INGRESS_OBSERVER_ATTESTATION_PATH"),
         candidate_root=candidate_root,
     )
+    observer_attestation_signature_path, observer_signature = (
+        _explicit_regular_file_outside_candidate(
+            environment.get("YFEISTAI_SHARED_INGRESS_OBSERVER_ATTESTATION_SIGNATURE_PATH"),
+            candidate_root=candidate_root,
+        )
+    )
+    observer_attestation_public_key_path, _public_key_body = (
+        _explicit_regular_file_outside_candidate(
+            environment.get("YFEISTAI_SHARED_INGRESS_OBSERVER_ATTESTATION_PUBLIC_KEY_PATH"),
+            candidate_root=candidate_root,
+        )
+    )
+    observer_attestation_public_key_spki_sha256 = environment.get(
+        "YFEISTAI_SHARED_INGRESS_OBSERVER_ATTESTATION_PUBLIC_KEY_SPKI_SHA256"
+    )
+    if (
+        not isinstance(observer_attestation_public_key_spki_sha256, str)
+        or _SHA256.fullmatch(observer_attestation_public_key_spki_sha256) is None
+        or observer_attestation_public_key_spki_sha256 == "0" * 64
+    ):
+        raise OpenMAICDedicatedOutageProbeError("shared_ingress_observer_invalid")
+    observer_auth_token = _load_run_auth_token(
+        environment.get("YFEISTAI_SHARED_INGRESS_AUTH_TOKEN_FILE"),
+        candidate_root=candidate_root,
+    )
     observer_sha256 = hashlib.sha256(observer_body).hexdigest()
     if observer_sha256 != expected_observer_sha256:
         raise OpenMAICDedicatedOutageProbeError("shared_ingress_observer_invalid")
+    trusted_now = now()
     try:
-        observer_report = parse_openmaic_shared_ingress_observer_attestation(
+        observer_report = verify_openmaic_shared_ingress_observer_attestation(
             observer_body,
             release_run=release_run,
+            signature=observer_signature,
+            public_key_path=observer_attestation_public_key_path,
+            candidate_root=candidate_root,
+            expected_public_key_spki_sha256=(observer_attestation_public_key_spki_sha256),
+            trusted_now=trusted_now,
         )
     except ValueError as exc:
         raise OpenMAICDedicatedOutageProbeError("shared_ingress_observer_invalid") from exc
     observer_binding = observer_report.get("observer")
+    candidate_health_url = environment.get("YFEISTAI_SHARED_INGRESS_CANDIDATE_HEALTH_URL")
+    upstream_url = environment.get("YFEISTAI_SHARED_INGRESS_UPSTREAM_URL")
+    auth_expires_at = environment.get("YFEISTAI_SHARED_INGRESS_AUTH_EXPIRES_AT")
     if (
-        not isinstance(observer_binding, dict)
+        observer_report.get("schemaVersion")
+        != OPENMAIC_SHARED_INGRESS_OBSERVER_BOUND_SCHEMA_VERSION
+        or not isinstance(observer_binding, dict)
         or observer_binding.get("observerId") != observer_id
         or observer_binding.get("observerUrl") != observer_url
         or observer_binding.get("sharedIngressControlUrl") != control_url
+        or observer_binding.get("candidateHealthUrl") != candidate_health_url
+        or observer_binding.get("sharedIngressUpstreamUrl") != upstream_url
+        or observer_binding.get("authExpiresAt") != auth_expires_at
+        or not _valid_endpoint_url(candidate_health_url)
+        or not isinstance(candidate_health_url, str)
+        or urlsplit(candidate_health_url).path != "/api/v1/system/teaching-health/observer-canary"
+        or _canonical_origin(candidate_health_url) != _canonical_origin(base_url)
+        or not _valid_base_url(upstream_url)
+        or not isinstance(upstream_url, str)
+        or len(
+            {
+                _canonical_origin(observer_url),
+                _canonical_origin(control_url),
+                _canonical_origin(candidate_health_url),
+                _canonical_origin(upstream_url),
+            }
+        )
+        != 4
     ):
         raise OpenMAICDedicatedOutageProbeError("shared_ingress_observer_invalid")
     runtime_sha256 = environment.get("YFEISTAI_RUNTIME_ATTESTATION_SHA256")
@@ -606,8 +761,25 @@ def _load_config(
         timeout_seconds = int(environment.get("YFEISTAI_OPENMAIC_OUTAGE_TIMEOUT_SECONDS", ""))
     except ValueError as exc:
         raise OpenMAICDedicatedOutageProbeError("timeout_invalid") from exc
-    if timeout_seconds < 60 or timeout_seconds > 3_600:
+    if timeout_seconds < 60 or timeout_seconds > _MAX_OUTAGE_TIMEOUT_SECONDS:
         raise OpenMAICDedicatedOutageProbeError("timeout_invalid")
+    try:
+        if not isinstance(auth_expires_at, str) or not auth_expires_at.endswith("Z"):
+            raise ValueError
+        expires_at = datetime.fromisoformat(auth_expires_at[:-1] + "+00:00")
+        remaining = (expires_at - trusted_now).total_seconds()
+    except (TypeError, ValueError) as exc:
+        raise OpenMAICDedicatedOutageProbeError("shared_ingress_auth_invalid") from exc
+    required_auth_seconds = (
+        timeout_seconds * 2
+        + min(_OBSERVER_RESTORE_READY_MAX_SECONDS, timeout_seconds)
+        + _OBSERVER_CONTROL_SETUP_MARGIN_SECONDS
+        + _OBSERVER_TWO_CONTROL_CALLS_MARGIN_SECONDS
+        + _OUTAGE_STOP_START_MARGIN_SECONDS
+        + _FIXTURE_CLEANUP_MARGIN_SECONDS
+    )
+    if remaining < required_auth_seconds or remaining > _MAX_AUTH_LIFETIME_SECONDS:
+        raise OpenMAICDedicatedOutageProbeError("shared_ingress_auth_invalid")
     docker_config_dir = _isolated_docker_config(environment.get("YFEISTAI_OUTAGE_DOCKER_CONFIG"))
     docker_host, docker_host_identity_sha256 = _canonical_docker_host(
         environment.get("YFEISTAI_OUTAGE_DOCKER_HOST")
@@ -624,6 +796,7 @@ def _load_config(
 
     return OutageProbeConfig(
         admin_token=SecretStr(token),
+        observer_auth_token=observer_auth_token,
         attempt_marker_path=runtime_root / "openmaic-dedicated-outage-attempt.json",
         base_url=base_url,
         candidate=dict(candidate),
@@ -637,17 +810,23 @@ def _load_config(
         release_run=release_run,
         observer_attestation_path=observer_attestation_path,
         observer_attestation_sha256=observer_sha256,
+        observer_auth_expires_at=auth_expires_at,
         observer_id=observer_id,
         observer_url=observer_url,
         observer_origin=observer_origin,
+        candidate_health_url=candidate_health_url,
         shared_ingress_control_url=control_url,
         shared_ingress_control_origin=control_origin,
+        shared_ingress_upstream_url=upstream_url,
         output_path=runtime_root / "openmaic-dedicated-outage-attestation.json",
         runtime_attestation_sha256=runtime_sha256,
         timeout_seconds=timeout_seconds,
         docker_config_dir=docker_config_dir,
         docker_host=docker_host,
         docker_host_identity_sha256=docker_host_identity_sha256,
+        observer_attestation_signature_path=(observer_attestation_signature_path),
+        observer_attestation_public_key_path=(observer_attestation_public_key_path),
+        observer_attestation_public_key_spki_sha256=(observer_attestation_public_key_spki_sha256),
     )
 
 
@@ -954,7 +1133,10 @@ class SharedIngressObserver:
             timeout=httpx.Timeout(min(float(config.timeout_seconds), 20.0)),
             transport=observer_transport,
             trust_env=False,
-            headers={"Accept": "application/json"},
+            headers={
+                "Accept": "application/json",
+                "Authorization": (f"Bearer {config.observer_auth_token.get_secret_value()}"),
+            },
         )
         self._control_client = httpx.AsyncClient(
             follow_redirects=False,
@@ -963,6 +1145,7 @@ class SharedIngressObserver:
             trust_env=False,
             headers={
                 "Accept": "application/json",
+                "Authorization": (f"Bearer {config.observer_auth_token.get_secret_value()}"),
                 "Content-Type": "application/json",
             },
         )
@@ -981,23 +1164,52 @@ class SharedIngressObserver:
         finally:
             await self._control_client.aclose()
 
-    async def _request(self, method: str, path: str, *, status: int) -> httpx.Response:
+    @staticmethod
+    async def _bounded_request(
+        client: httpx.AsyncClient,
+        method: str,
+        path: str,
+        *,
+        max_response_bytes: int,
+        json_body: Mapping[str, object] | None = None,
+    ) -> tuple[int, bool, bytes]:
         try:
-            response = await self._observer_client.request(method, path)
+            async with client.stream(method, path, json=json_body) as response:
+                content_lengths = response.headers.get_list("content-length")
+                if (
+                    response.headers.get_list("content-encoding")
+                    or content_lengths
+                    and (
+                        len(content_lengths) != 1
+                        or re.fullmatch(r"[0-9]+", content_lengths[0]) is None
+                        or int(content_lengths[0]) > max_response_bytes
+                    )
+                ):
+                    raise OpenMAICDedicatedOutageProbeError("shared_ingress_observer_invalid")
+                body = bytearray()
+                async for chunk in response.aiter_bytes():
+                    if len(body) + len(chunk) > max_response_bytes:
+                        raise OpenMAICDedicatedOutageProbeError("shared_ingress_observer_invalid")
+                    body.extend(chunk)
+                return response.status_code, response.is_redirect, bytes(body)
         except httpx.HTTPError as exc:
             raise OpenMAICDedicatedOutageProbeError("shared_ingress_observer_unavailable") from exc
-        if (
-            response.is_redirect
-            or response.status_code != status
-            or len(response.content) > 64 * 1024
-        ):
+
+    async def _request(self, method: str, path: str, *, status: int) -> bytes:
+        status_code, is_redirect, body = await self._bounded_request(
+            self._observer_client,
+            method,
+            path,
+            max_response_bytes=64 * 1024,
+        )
+        if is_redirect or status_code != status:
             raise OpenMAICDedicatedOutageProbeError("shared_ingress_observer_invalid")
-        return response
+        return body
 
     async def read(self) -> SharedIngressObservation:
-        response = await self._request("GET", self._path, status=200)
+        body = await self._request("GET", self._path, status=200)
         try:
-            document = response.json()
+            document = json.loads(body)
         except (UnicodeError, ValueError) as exc:
             raise OpenMAICDedicatedOutageProbeError("shared_ingress_observer_invalid") from exc
         if not isinstance(document, dict) or set(document) != {
@@ -1032,9 +1244,12 @@ class SharedIngressObserver:
         if canary_id == before.last_canary_id:
             raise OpenMAICDedicatedOutageProbeError("shared_ingress_control_invalid")
         try:
-            response = await self._control_client.post(
+            status_code, is_redirect, body = await self._bounded_request(
+                self._control_client,
+                "POST",
                 self._config.shared_ingress_control_url,
-                json={
+                max_response_bytes=4096,
+                json_body={
                     "schemaVersion": 1,
                     "runId": self._config.release_run["runId"],
                     "environmentId": self._config.release_run["environmentId"],
@@ -1042,12 +1257,12 @@ class SharedIngressObserver:
                     "kind": "openmaic-shared-ingress-control",
                 },
             )
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, OpenMAICDedicatedOutageProbeError) as exc:
             raise OpenMAICDedicatedOutageProbeError("shared_ingress_control_invalid") from exc
-        if response.is_redirect or response.status_code != 202 or len(response.content) > 4096:
+        if is_redirect or status_code != 202:
             raise OpenMAICDedicatedOutageProbeError("shared_ingress_control_invalid")
         try:
-            accepted = response.json()
+            accepted = json.loads(body)
         except (UnicodeError, ValueError) as exc:
             raise OpenMAICDedicatedOutageProbeError("shared_ingress_control_invalid") from exc
         if accepted != {"accepted": True, "canaryId": canary_id}:
@@ -1682,17 +1897,25 @@ def _atomic_publish(target: Path, body: bytes) -> None:
 
 
 def _claim_run_attempt(config: OutageProbeConfig) -> str:
+    observer_trust_anchor: dict[str, object] = {
+        "sha256": config.observer_attestation_sha256,
+        "observerId": config.observer_id,
+        "observerOrigin": config.observer_origin,
+        "sharedIngressControlOrigin": config.shared_ingress_control_origin,
+    }
+    if config.observer_attestation_public_key_spki_sha256:
+        observer_trust_anchor.update(
+            {
+                "signatureArtifact": ("runtime/openmaic-shared-ingress-observer-attestation.sig"),
+                "publicKeySpkiSha256": (config.observer_attestation_public_key_spki_sha256),
+            }
+        )
     marker = {
         "schemaVersion": OPENMAIC_SMOKE_SCHEMA_VERSION,
         "producer": "openmaic-dedicated-outage-attempt",
         "candidate": dict(config.candidate),
         "releaseRun": dict(config.release_run),
-        "observerTrustAnchor": {
-            "sha256": config.observer_attestation_sha256,
-            "observerId": config.observer_id,
-            "observerOrigin": config.observer_origin,
-            "sharedIngressControlOrigin": config.shared_ingress_control_origin,
-        },
+        "observerTrustAnchor": observer_trust_anchor,
         "fixturePlan": {
             "tenantId": config.dedicated_tenant_id,
             "routeId": config.dedicated_route_id,
@@ -1845,6 +2068,17 @@ async def run_dedicated_outage_probe(
         "observerOrigin": config.observer_origin,
         "sharedIngressControlOrigin": config.shared_ingress_control_origin,
     }
+    observer_attestation_reference = {
+        "artifact": "runtime/openmaic-shared-ingress-observer-attestation.json",
+        **observer_trust_anchor,
+    }
+    if config.observer_attestation_public_key_spki_sha256:
+        signed_binding = {
+            "signatureArtifact": "runtime/openmaic-shared-ingress-observer-attestation.sig",
+            "publicKeySpkiSha256": config.observer_attestation_public_key_spki_sha256,
+        }
+        observer_trust_anchor.update(signed_binding)
+        observer_attestation_reference.update(signed_binding)
     report = {
         "schemaVersion": OPENMAIC_SMOKE_SCHEMA_VERSION,
         "producer": OPENMAIC_DEDICATED_OUTAGE_PRODUCER,
@@ -1856,13 +2090,7 @@ async def run_dedicated_outage_probe(
             "artifact": "runtime/runtime-attestation.json",
             "sha256": config.runtime_attestation_sha256,
         },
-        "observerAttestation": {
-            "artifact": "runtime/openmaic-shared-ingress-observer-attestation.json",
-            "sha256": config.observer_attestation_sha256,
-            "observerId": config.observer_id,
-            "observerOrigin": config.observer_origin,
-            "sharedIngressControlOrigin": config.shared_ingress_control_origin,
-        },
+        "observerAttestation": observer_attestation_reference,
         "fixture": {
             "tenantId": config.dedicated_tenant_id,
             "attemptMarker": attempt_marker_reference,
@@ -1949,10 +2177,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         _parse_args(argv)
         config = _load_config(os.environ, cwd=Path.cwd())
-        body = asyncio.run(_run_main(config))
-        token = config.admin_token.get_secret_value().encode("utf-8")
-        if token in body:
-            raise OpenMAICDedicatedOutageProbeError("attestation_contains_secret")
+        operation_failed = False
+        try:
+            with validated_candidate_artifact_lease(
+                config.candidate_root,
+                expected_candidate=config.candidate,
+            ):
+                try:
+                    body = asyncio.run(_run_main(config))
+                    secrets = (
+                        config.admin_token.get_secret_value().encode("utf-8"),
+                        config.observer_auth_token.get_secret_value().encode("utf-8"),
+                    )
+                    if any(secret in body for secret in secrets):
+                        raise OpenMAICDedicatedOutageProbeError("attestation_contains_secret")
+                except BaseException:
+                    operation_failed = True
+                    raise
+        except ValueError as exc:
+            if operation_failed:
+                raise
+            raise OpenMAICDedicatedOutageProbeError("candidate_invalid") from exc
         sys.stdout.buffer.write(body)
         sys.stdout.buffer.flush()
         return 0

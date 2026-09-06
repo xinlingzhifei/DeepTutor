@@ -11,6 +11,12 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
+from tests.scripts.platform_candidate_test_support import (
+    POCKETBASE_BASE_COMPOSE_DRIFTS,
+    drift_pocketbase_base_compose,
+    write_schema3_candidate_root,
+)
+
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -58,6 +64,17 @@ def _environment(root: Path, staging: Path) -> dict[str, str]:
     }
 
 
+@pytest.fixture
+def cli_candidate_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    candidate_root, _lock = write_schema3_candidate_root(tmp_path)
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    monkeypatch.chdir(candidate_root)
+    for name, value in _environment(candidate_root, staging).items():
+        monkeypatch.setenv(name, value)
+    return candidate_root
+
+
 def test_load_config_requires_unique_empty_external_staging_and_hides_token(
     tmp_path: Path,
 ) -> None:
@@ -83,6 +100,66 @@ def test_load_config_requires_unique_empty_external_staging_and_hides_token(
     assert config.tenant_id == "tenant-acceptance-a"
     assert config.admin_token.get_secret_value() == "secret-platform-admin-token"
     assert "secret-platform-admin-token" not in repr(config)
+
+
+@pytest.mark.parametrize("drift", POCKETBASE_BASE_COMPOSE_DRIFTS)
+def test_default_candidate_loader_rejects_schema3_pocketbase_base_compose_drift_before_probe(
+    tmp_path: Path,
+    drift: str,
+) -> None:
+    module = _module()
+    candidate_root, lock = write_schema3_candidate_root(tmp_path)
+    drift_pocketbase_base_compose(candidate_root, lock, drift)
+
+    with pytest.raises(ValueError, match="production Compose image references"):
+        module._default_candidate_loader(candidate_root)
+
+
+def test_export_command_revalidates_schema3_candidate_after_probe_before_stdout(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    tmp_path: Path,
+) -> None:
+    module = _module()
+    candidate_root, _lock = write_schema3_candidate_root(tmp_path)
+    shadow_root, shadow_lock = write_schema3_candidate_root(tmp_path / "shadow")
+    drift_pocketbase_base_compose(shadow_root, shadow_lock, "different-digest")
+    candidate_base = candidate_root / "docker-compose.yml"
+    shadow_base = shadow_root / "docker-compose.yml"
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    real_stat = Path.stat
+    real_lstat = Path.lstat
+    swapped = False
+
+    def stat_with_candidate_swap(path: Path, *args, **kwargs):
+        if swapped and Path(path) == candidate_base:
+            return real_stat(shadow_base, *args, **kwargs)
+        return real_stat(path, *args, **kwargs)
+
+    def lstat_with_candidate_swap(path: Path):
+        if swapped and Path(path) == candidate_base:
+            return real_lstat(shadow_base)
+        return real_lstat(path)
+
+    async def successful_probe(_config) -> bytes:
+        nonlocal swapped
+        swapped = True
+        return b'{"probe":"succeeded"}\n'
+
+    monkeypatch.setattr(Path, "stat", stat_with_candidate_swap)
+    monkeypatch.setattr(Path, "lstat", lstat_with_candidate_swap)
+    monkeypatch.setattr(module, "_run_export_probe", successful_probe)
+    monkeypatch.chdir(candidate_root)
+    for name, value in _environment(candidate_root, staging).items():
+        monkeypatch.setenv(name, value)
+
+    exit_code = module.main(["--profile", "first-release"])
+    captured = capsysbinary.readouterr()
+
+    assert swapped is True
+    assert tuple(staging.iterdir()) == ()
+    assert (exit_code, captured.out) == (1, b"")
 
 
 @pytest.mark.parametrize("case", ["inside_candidate", "nonempty", "relative"])
@@ -1964,17 +2041,19 @@ def test_run_probe_preserves_keyboard_interrupt_when_cleanup_also_fails(
 def test_main_emits_a_stable_interrupt_without_stdout(
     monkeypatch: pytest.MonkeyPatch,
     capsysbinary: pytest.CaptureFixture[bytes],
+    cli_candidate_root: Path,
 ) -> None:
     module = _module()
+    probe_roots: list[Path] = []
 
-    async def interrupted(_config):
+    async def interrupted(config):
+        probe_roots.append(config.candidate_root)
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(module, "_parse_args", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(module, "_load_config", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(module, "_run_export_probe", interrupted)
 
-    assert module.main([]) == 130
+    assert module.main(["--profile", "first-release"]) == 130
+    assert probe_roots == [cli_candidate_root]
     captured = capsysbinary.readouterr()
     assert captured.out == b""
     assert captured.err == b"classroom_export_probe_interrupted\n"
@@ -1982,9 +2061,15 @@ def test_main_emits_a_stable_interrupt_without_stdout(
 
 def test_main_flushes_the_complete_report_before_reporting_success(
     monkeypatch: pytest.MonkeyPatch,
+    cli_candidate_root: Path,
 ) -> None:
     module = _module()
     report = b'{"schemaVersion":1}\n'
+    probe_roots: list[Path] = []
+
+    async def successful_probe(config):
+        probe_roots.append(config.candidate_root)
+        return report
 
     class Buffer:
         def __init__(self) -> None:
@@ -2000,12 +2085,11 @@ def test_main_flushes_the_complete_report_before_reporting_success(
 
     buffer = Buffer()
     stdout = SimpleNamespace(buffer=buffer)
-    monkeypatch.setattr(module, "_parse_args", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(module, "_load_config", lambda *_args, **_kwargs: object())
-    monkeypatch.setattr(module, "_run_export_probe", lambda _config: _async_value(report))
+    monkeypatch.setattr(module, "_run_export_probe", successful_probe)
     monkeypatch.setattr(module.sys, "stdout", stdout)
 
-    assert module.main([]) == 0
+    assert module.main(["--profile", "first-release"]) == 0
+    assert probe_roots == [cli_candidate_root]
     assert buffer.writes == [report]
     assert buffer.flushed is True
 
@@ -2024,8 +2108,10 @@ def test_invalid_arguments_emit_only_a_stable_error_code(
 def test_stdout_report_never_contains_credentials_or_tickets(
     monkeypatch: pytest.MonkeyPatch,
     capsysbinary: pytest.CaptureFixture[bytes],
+    cli_candidate_root: Path,
 ) -> None:
     module = _module()
+    probe_roots: list[Path] = []
     report = {
         "schemaVersion": 1,
         "producer": "classroom-export-probe",
@@ -2038,21 +2124,21 @@ def test_stdout_report_never_contains_credentials_or_tickets(
         "exports": {},
     }
     body = (json.dumps(report, separators=(",", ":"), sort_keys=True) + "\n").encode()
-    monkeypatch.setattr(module, "_load_config", lambda *_args, **_kwargs: object())
-    monkeypatch.setattr(module, "_parse_args", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(module, "_run_export_probe", lambda _config: _async_value(body))
 
-    assert module.main([]) == 0
+    async def successful_probe(config):
+        probe_roots.append(config.candidate_root)
+        return body
+
+    monkeypatch.setattr(module, "_run_export_probe", successful_probe)
+
+    assert module.main(["--profile", "first-release"]) == 0
+    assert probe_roots == [cli_candidate_root]
     captured = capsysbinary.readouterr()
     assert captured.out == body
     assert captured.err == b""
     lowered = captured.out.lower()
     for forbidden in (b"token", b"cookie", b"password", b"ticket", b"secret"):
         assert forbidden not in lowered
-
-
-async def _async_value(value: bytes) -> bytes:
-    return value
 
 
 def test_download_open_is_exclusive_and_never_overwrites(tmp_path: Path) -> None:

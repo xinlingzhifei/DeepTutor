@@ -1,7 +1,6 @@
 name: Private Platform Images
 
 on:
-  workflow_dispatch:
   push:
     tags:
       - "yfeistai-first-release-*"
@@ -29,6 +28,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = "push"
+          test "$GITHUB_RUN_ATTEMPT" = "1"
           test "$GITHUB_REF_TYPE" = "tag"
           printf '%s\n' "$GITHUB_REF_NAME" | grep -Eq '^yfeistai-first-release-[0-9]{8}-[0-9a-f]{8}$'
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
@@ -44,6 +45,7 @@ jobs:
           cp docker-compose.yml release-candidate/docker-compose.yml
           cp docker-compose.platform.yml release-candidate/docker-compose.platform.yml
           cp docker-compose.data-plane.yml release-candidate/docker-compose.data-plane.yml
+          cp deploy/docker-compose.openmaic-shared-ingress-observer.yml release-candidate/deploy/docker-compose.openmaic-shared-ingress-observer.yml
 
       - name: Checkout OpenMAIC
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -63,26 +65,34 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Reject existing candidate image tags
+      - name: Reject existing final candidate tags
         shell: bash
         run: |
           set -euo pipefail
-          for image in \
-            ghcr.io/xinlingzhifei/deeptutor \
-            ghcr.io/xinlingzhifei/openmaic \
-            ghcr.io/xinlingzhifei/openmaic-render
-          do
-            candidate="$image:$GITHUB_REF_NAME"
-            if diagnostic="$(docker buildx imagetools inspect "$candidate" 2>&1)"; then
-              echo "::error::candidate image tag already exists: $candidate"
-              exit 1
+
+          reject_existing_tag() {
+            local name="$1"
+            local repository="$2"
+            local final_ref="$repository:$GITHUB_REF_NAME"
+            local final_raw="$RUNNER_TEMP/${name}-final-prebuild.raw"
+            local final_error="$RUNNER_TEMP/${name}-final-prebuild.err"
+
+            if docker buildx imagetools inspect --raw "$final_ref" >"$final_raw" 2>"$final_error"; then
+              echo "::error::candidate tag already exists; refusing once-only publication: $final_ref"
+              return 1
             fi
-            if ! grep -Eqi 'manifest unknown|name unknown|not found' <<<"$diagnostic"; then
-              echo "::error::candidate image tag could not be checked: $candidate"
-              printf '%s\n' "$diagnostic"
-              exit 1
+            if ! grep -Eqi 'manifest unknown|name unknown|not found' "$final_error"; then
+              echo "::error::candidate image tag could not be checked: $final_ref"
+              sed 's/^/  /' "$final_error" >&2
+              return 1
             fi
-          done
+            printf 'Candidate tag is available for one-time publication: %s\n' "$final_ref"
+          }
+
+          reject_existing_tag deeptutor ghcr.io/xinlingzhifei/deeptutor
+          reject_existing_tag openmaic ghcr.io/xinlingzhifei/openmaic
+          reject_existing_tag openmaic-render ghcr.io/xinlingzhifei/openmaic-render
+          reject_existing_tag observer-signer ghcr.io/xinlingzhifei/yfeistai-observer-signer
 
       - name: Build and push yFeiSTAI
         id: build_deeptutor
@@ -93,7 +103,8 @@ jobs:
           target: production
           platforms: linux/amd64
           push: true
-          tags: ghcr.io/xinlingzhifei/deeptutor:${{ github.ref_name }}
+          provenance: false
+          tags: ghcr.io/xinlingzhifei/deeptutor:staging-${{ github.run_id }}-${{ github.run_attempt }}
           cache-from: type=gha,scope=deeptutor-first-release
           cache-to: type=gha,mode=max,scope=deeptutor-first-release
 
@@ -105,7 +116,8 @@ jobs:
           file: ./integrations/openmaic/Dockerfile
           platforms: linux/amd64
           push: true
-          tags: ghcr.io/xinlingzhifei/openmaic:${{ github.ref_name }}
+          provenance: false
+          tags: ghcr.io/xinlingzhifei/openmaic:staging-${{ github.run_id }}-${{ github.run_attempt }}
           cache-from: type=gha,scope=openmaic-0.3.1-0cf2a330
           cache-to: type=gha,mode=max,scope=openmaic-0.3.1-0cf2a330
 
@@ -117,27 +129,83 @@ jobs:
           file: ./openmaic-upstream/render-service/Dockerfile
           platforms: linux/amd64
           push: true
-          tags: ghcr.io/xinlingzhifei/openmaic-render:${{ github.ref_name }}
+          provenance: false
+          tags: ghcr.io/xinlingzhifei/openmaic-render:staging-${{ github.run_id }}-${{ github.run_attempt }}
           cache-from: type=gha,scope=openmaic-render-0.3.1-0cf2a330
           cache-to: type=gha,mode=max,scope=openmaic-render-0.3.1-0cf2a330
 
+      - name: Build and push OpenMAIC Observer Signer
+        id: build_observer_signer
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: ./Dockerfile
+          target: observer-signer
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: ghcr.io/xinlingzhifei/yfeistai-observer-signer:staging-${{ github.run_id }}-${{ github.run_attempt }}
+          cache-from: type=gha,scope=observer-signer-first-release
+          cache-to: type=gha,mode=max,scope=observer-signer-first-release
+
+      - name: Validate staged image digests
+        env:
+          DEEPTUTOR_DIGEST: ${{ steps.build_deeptutor.outputs.digest }}
+          OPENMAIC_DIGEST: ${{ steps.build_openmaic.outputs.digest }}
+          OPENMAIC_RENDER_DIGEST: ${{ steps.build_openmaic_render.outputs.digest }}
+          OBSERVER_SIGNER_DIGEST: ${{ steps.build_observer_signer.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          import re
+
+          digests = [
+              os.environ["DEEPTUTOR_DIGEST"],
+              os.environ["OPENMAIC_DIGEST"],
+              os.environ["OPENMAIC_RENDER_DIGEST"],
+              os.environ["OBSERVER_SIGNER_DIGEST"],
+          ]
+          pattern = re.compile(r"^sha256:[0-9a-f]{64}$")
+          if not all(pattern.fullmatch(digest) for digest in digests):
+              raise ValueError("a staged image digest is invalid")
+          if "sha256:" + ("0" * 64) in digests:
+              raise ValueError("a staged image digest is zero")
+          if not len(set(digests)) == len(digests):
+              raise ValueError("staged image digests must be distinct")
+          PY
+
       - name: Record image digests
+        env:
+          DEEPTUTOR_DIGEST: ${{ steps.build_deeptutor.outputs.digest }}
+          OPENMAIC_DIGEST: ${{ steps.build_openmaic.outputs.digest }}
+          OPENMAIC_RENDER_DIGEST: ${{ steps.build_openmaic_render.outputs.digest }}
+          OBSERVER_SIGNER_DIGEST: ${{ steps.build_observer_signer.outputs.digest }}
+        shell: bash
         run: >-
           python scripts/render_platform_compose.py
           --write-image-lock
           --lock-path release-candidate/deploy/image-lock.json
+          --compose-path release-candidate/docker-compose.yml
           --compose-path release-candidate/docker-compose.platform.yml
           --compose-path release-candidate/docker-compose.data-plane.yml
+          --compose-path release-candidate/deploy/docker-compose.openmaic-shared-ingress-observer.yml
           --source-repository "$GITHUB_REPOSITORY"
           --source-head "$GITHUB_SHA"
           --release-tag "$GITHUB_REF_NAME"
           --openmaic-head 0cf2a330411681190e89f48e20f305345ff99f87
+          --digest "deeptutor=$DEEPTUTOR_DIGEST"
+          --digest "openmaic=$OPENMAIC_DIGEST"
+          --digest "openmaic_render=$OPENMAIC_RENDER_DIGEST"
+          --digest "observer_signer=$OBSERVER_SIGNER_DIGEST"
 
       - name: Verify image lock
         env:
           DEEPTUTOR_DIGEST: ${{ steps.build_deeptutor.outputs.digest }}
           OPENMAIC_DIGEST: ${{ steps.build_openmaic.outputs.digest }}
           OPENMAIC_RENDER_DIGEST: ${{ steps.build_openmaic_render.outputs.digest }}
+          OBSERVER_SIGNER_DIGEST: ${{ steps.build_observer_signer.outputs.digest }}
         run: |
           python - <<'PY'
           import os
@@ -145,11 +213,13 @@ jobs:
 
           from scripts.render_platform_compose import validate_image_lock_bindings
 
-          validate_image_lock_bindings(
+          image_lock = validate_image_lock_bindings(
               Path("release-candidate/deploy/image-lock.json"),
               compose_paths=(
+                  Path("release-candidate/docker-compose.yml"),
                   Path("release-candidate/docker-compose.platform.yml"),
                   Path("release-candidate/docker-compose.data-plane.yml"),
+                  Path("release-candidate/deploy/docker-compose.openmaic-shared-ingress-observer.yml"),
               ),
               expected_candidate={
                   "sourceRepository": os.environ["GITHUB_REPOSITORY"],
@@ -163,7 +233,259 @@ jobs:
                   },
               }
           )
+          observer_signer = image_lock["supportImages"]["observer_signer"]
+          observer_signer_digest = os.environ["OBSERVER_SIGNER_DIGEST"]
+          expected_reference = (
+              "ghcr.io/xinlingzhifei/yfeistai-observer-signer:"
+              f"{os.environ['GITHUB_REF_NAME']}@{observer_signer_digest}"
+          )
+          if observer_signer["digest"] != observer_signer_digest:
+              raise ValueError("observer signer digest does not match build output")
+          if observer_signer["reference"] != expected_reference:
+              raise ValueError("observer signer reference does not match build output")
+          if observer_signer_digest in image_lock["candidate"]["imageDigests"].values():
+              raise ValueError("observer signer digest collides with a workload image")
+          pocketbase = image_lock["images"]["pocketbase"]
+          expected_pocketbase_reference = (
+              "ghcr.io/muchobien/pocketbase:latest@" + pocketbase["digest"]
+          )
+          if pocketbase["reference"] != expected_pocketbase_reference:
+              raise ValueError("PocketBase reference does not match its remote manifest digest")
           PY
+
+      - name: Record promotion intent
+        env:
+          DEEPTUTOR_DIGEST: ${{ steps.build_deeptutor.outputs.digest }}
+          OPENMAIC_DIGEST: ${{ steps.build_openmaic.outputs.digest }}
+          OPENMAIC_RENDER_DIGEST: ${{ steps.build_openmaic_render.outputs.digest }}
+          OBSERVER_SIGNER_DIGEST: ${{ steps.build_observer_signer.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          from scripts.render_platform_compose import load_image_lock, promotion_image_digests
+
+          image_lock = load_image_lock(Path("release-candidate/deploy/image-lock.json"))
+          candidate = image_lock["candidate"]
+          image_digests = promotion_image_digests(image_lock)
+          build_digests = {
+              "deeptutor": os.environ["DEEPTUTOR_DIGEST"],
+              "openmaic": os.environ["OPENMAIC_DIGEST"],
+              "openmaic_render": os.environ["OPENMAIC_RENDER_DIGEST"],
+              "observer_signer": os.environ["OBSERVER_SIGNER_DIGEST"],
+          }
+          if any(image_digests[name] != digest for name, digest in build_digests.items()):
+              raise ValueError("promotion intent does not match build outputs")
+          expected_candidate = {
+              "sourceRepository": os.environ["GITHUB_REPOSITORY"],
+              "sourceHead": os.environ["GITHUB_SHA"],
+              "releaseTag": os.environ["GITHUB_REF_NAME"],
+              "openmaicHead": "0cf2a330411681190e89f48e20f305345ff99f87",
+          }
+          if any(candidate.get(name) != value for name, value in expected_candidate.items()):
+              raise ValueError("promotion intent candidate is invalid")
+
+          intent = {
+              "schemaVersion": 1,
+              **expected_candidate,
+              "imageDigests": image_digests,
+          }
+          body = (json.dumps(intent, sort_keys=True, separators=(",", ":")) + "\n").encode(
+              "utf-8"
+          )
+          Path("release-candidate/artifacts/promotion_intent.json").write_bytes(body)
+          PY
+
+      - name: Promote candidate image digests
+        env:
+          DEEPTUTOR_DIGEST: ${{ steps.build_deeptutor.outputs.digest }}
+          OPENMAIC_DIGEST: ${{ steps.build_openmaic.outputs.digest }}
+          OPENMAIC_RENDER_DIGEST: ${{ steps.build_openmaic_render.outputs.digest }}
+          OBSERVER_SIGNER_DIGEST: ${{ steps.build_observer_signer.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          inspect_digest() {
+            local reference="$1"
+            local raw_path="$2"
+            local error_path="$3"
+            if docker buildx imagetools inspect --raw "$reference" >"$raw_path" 2>"$error_path"; then
+              printf 'sha256:%s\n' "$(sha256sum "$raw_path" | awk '{print $1}')"
+              return 0
+            fi
+            return 1
+          }
+
+          promote_digest() {
+            local name="$1"
+            local repository="$2"
+            local digest="$3"
+            local final_ref="$repository:$GITHUB_REF_NAME"
+            local source_ref="$repository@$digest"
+            local final_raw="$RUNNER_TEMP/${name}-final-before.raw"
+            local final_error="$RUNNER_TEMP/${name}-final-before.err"
+            local source_raw="$RUNNER_TEMP/${name}-source.raw"
+            local source_error="$RUNNER_TEMP/${name}-source.err"
+            local source_digest
+
+            if inspect_digest "$final_ref" "$final_raw" "$final_error" >/dev/null; then
+              echo "::error::candidate tag already exists; refusing once-only publication: $final_ref"
+              return 1
+            fi
+
+            if ! grep -Eqi 'manifest unknown|name unknown|not found' "$final_error"; then
+              echo "::error::candidate image tag could not be checked: $final_ref"
+              sed 's/^/  /' "$final_error" >&2
+              return 1
+            fi
+
+            if ! source_digest="$(inspect_digest "$source_ref" "$source_raw" "$source_error")"; then
+              echo "::error::staged image digest could not be inspected: $source_ref"
+              sed 's/^/  /' "$source_error" >&2
+              return 1
+            fi
+            if [[ "$source_digest" != "$digest" ]]; then
+              echo "::error::staged image manifest does not match build digest: $source_ref"
+              return 1
+            fi
+
+            docker buildx imagetools create --prefer-index=false --tag "$final_ref" "$source_ref"
+          }
+
+          promote_digest deeptutor ghcr.io/xinlingzhifei/deeptutor "$DEEPTUTOR_DIGEST"
+          promote_digest openmaic ghcr.io/xinlingzhifei/openmaic "$OPENMAIC_DIGEST"
+          promote_digest openmaic-render ghcr.io/xinlingzhifei/openmaic-render "$OPENMAIC_RENDER_DIGEST"
+          promote_digest observer-signer ghcr.io/xinlingzhifei/yfeistai-observer-signer "$OBSERVER_SIGNER_DIGEST"
+
+      - name: Verify promoted candidate digests
+        env:
+          DEEPTUTOR_DIGEST: ${{ steps.build_deeptutor.outputs.digest }}
+          OPENMAIC_DIGEST: ${{ steps.build_openmaic.outputs.digest }}
+          OPENMAIC_RENDER_DIGEST: ${{ steps.build_openmaic_render.outputs.digest }}
+          OBSERVER_SIGNER_DIGEST: ${{ steps.build_observer_signer.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          verify_digest() {
+            local name="$1"
+            local repository="$2"
+            local digest="$3"
+            local final_ref="$repository:$GITHUB_REF_NAME"
+            local raw_path="$RUNNER_TEMP/${name}-final-after.raw"
+            local error_path="$RUNNER_TEMP/${name}-final-after.err"
+            local remote_digest
+
+            if ! docker buildx imagetools inspect --raw "$final_ref" >"$raw_path" 2>"$error_path"; then
+              echo "::error::promoted candidate image could not be inspected: $final_ref"
+              sed 's/^/  /' "$error_path" >&2
+              return 1
+            fi
+            remote_digest="sha256:$(sha256sum "$raw_path" | awk '{print $1}')"
+            if [[ "$remote_digest" == "$digest" ]]; then
+              printf 'Verified promoted candidate digest: %s\n' "$final_ref"
+              return 0
+            fi
+            echo "::error::promoted candidate digest does not match build output: $final_ref"
+            return 1
+          }
+
+          verify_digest deeptutor ghcr.io/xinlingzhifei/deeptutor "$DEEPTUTOR_DIGEST"
+          verify_digest openmaic ghcr.io/xinlingzhifei/openmaic "$OPENMAIC_DIGEST"
+          verify_digest openmaic-render ghcr.io/xinlingzhifei/openmaic-render "$OPENMAIC_RENDER_DIGEST"
+          verify_digest observer-signer ghcr.io/xinlingzhifei/yfeistai-observer-signer "$OBSERVER_SIGNER_DIGEST"
+
+      - name: Log out of GHCR
+        if: ${{ always() }}
+        shell: bash
+        run: docker logout ghcr.io
+
+      - name: Record verified promotion receipt
+        env:
+          DEEPTUTOR_DIGEST: ${{ steps.build_deeptutor.outputs.digest }}
+          OPENMAIC_DIGEST: ${{ steps.build_openmaic.outputs.digest }}
+          OPENMAIC_RENDER_DIGEST: ${{ steps.build_openmaic_render.outputs.digest }}
+          OBSERVER_SIGNER_DIGEST: ${{ steps.build_observer_signer.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          from scripts.render_platform_compose import (
+              _read_canonical_promotion_document,
+              load_image_lock,
+              promotion_image_digests,
+          )
+
+          image_lock = load_image_lock(Path("release-candidate/deploy/image-lock.json"))
+          candidate = image_lock["candidate"]
+          image_digests = promotion_image_digests(image_lock)
+          build_digests = {
+              "deeptutor": os.environ["DEEPTUTOR_DIGEST"],
+              "openmaic": os.environ["OPENMAIC_DIGEST"],
+              "openmaic_render": os.environ["OPENMAIC_RENDER_DIGEST"],
+              "observer_signer": os.environ["OBSERVER_SIGNER_DIGEST"],
+          }
+          if any(image_digests[name] != digest for name, digest in build_digests.items()):
+              raise ValueError("promotion receipt does not match build outputs")
+          expected_candidate = {
+              "sourceRepository": os.environ["GITHUB_REPOSITORY"],
+              "sourceHead": os.environ["GITHUB_SHA"],
+              "releaseTag": os.environ["GITHUB_REF_NAME"],
+              "openmaicHead": "0cf2a330411681190e89f48e20f305345ff99f87",
+          }
+          if any(candidate.get(name) != value for name, value in expected_candidate.items()):
+              raise ValueError("promotion receipt candidate is invalid")
+
+          intent_path = Path("release-candidate/artifacts/promotion_intent.json")
+          intent, intent_body = _read_canonical_promotion_document(
+              intent_path,
+              label="promotion intent",
+          )
+          expected_intent = {
+              "schemaVersion": 1,
+              **expected_candidate,
+              "imageDigests": image_digests,
+          }
+          expected_body = (
+              json.dumps(expected_intent, sort_keys=True, separators=(",", ":")) + "\n"
+          ).encode("utf-8")
+          if intent != expected_intent or intent_body != expected_body:
+              raise ValueError("promotion intent is not the canonical candidate intent")
+
+          receipt = {
+              "schemaVersion": 2,
+              **expected_candidate,
+              "githubRunId": os.environ["GITHUB_RUN_ID"],
+              "githubRunAttempt": int(os.environ["GITHUB_RUN_ATTEMPT"]),
+              "githubWorkflowRef": os.environ["GITHUB_WORKFLOW_REF"],
+              "promotionIntentSha256": "sha256:" + hashlib.sha256(intent_body).hexdigest(),
+              "imageDigests": image_digests,
+          }
+          body = (json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n").encode(
+              "utf-8"
+          )
+          Path("release-candidate/artifacts/promotion_receipt.json").write_bytes(body)
+          PY
+
+      - name: Verify promotion receipt
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/render_platform_compose.py \
+            --verify-promotion-receipt \
+            --candidate-root "$GITHUB_WORKSPACE/release-candidate" \
+            --expected-github-run-id "$GITHUB_RUN_ID" \
+            --expected-github-run-attempt "$GITHUB_RUN_ATTEMPT"
 
       - name: Install release receipt dependencies
         shell: bash
@@ -181,18 +503,43 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          umask 077
+          receipt_publisher_uid="$(id -u)"
+          receipt_worker_uid="$(id -u nobody)"
+          [[ "$receipt_worker_uid" -gt 0 ]]
+          [[ "$receipt_worker_uid" -ne "$receipt_publisher_uid" ]]
+          receipt_recovery_root="$(mktemp -d "$GITHUB_WORKSPACE/../.receipt-recovery.XXXXXXXX")"
+          receipt_recovery_root="$(realpath -e "$receipt_recovery_root")"
+          chmod 700 "$receipt_recovery_root"
+          [[ "$(stat -c %d "$receipt_recovery_root")" == "$(stat -c %d "$GITHUB_WORKSPACE/release-candidate")" ]]
+          python - "$receipt_recovery_root" "$receipt_worker_uid" <<'PY'
+          from pathlib import Path
+          import sys
+
+          sys.path.insert(0, "scripts")
+          from receipt_recovery import PosixReceiptRecovery
+
+          with PosixReceiptRecovery.open(Path(sys.argv[1]), worker_uid=int(sys.argv[2])):
+              pass
+          PY
+          # These receipt-only commands run as the trusted publisher. This does
+          # not launch a worker or provision deployment isolation/accounts.
           observed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           release_run="github-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          python scripts/classroom_release_evidence.py source-head \
+          python scripts/classroom_release_evidence.py \
+            --receipt-recovery-root "$receipt_recovery_root" \
+            --receipt-worker-uid "$receipt_worker_uid" source-head \
             --output release-candidate/artifacts/source_head.json \
-            --candidate-root release-candidate \
+            --candidate-root "$GITHUB_WORKSPACE/release-candidate" \
             --source-root . \
             --run-id "$release_run" \
             --environment-id ghcr-production \
             --observed-at "$observed_at"
-          python scripts/classroom_release_evidence.py image-digests \
+          python scripts/classroom_release_evidence.py \
+            --receipt-recovery-root "$receipt_recovery_root" \
+            --receipt-worker-uid "$receipt_worker_uid" image-digests \
             --output release-candidate/artifacts/image_digests.json \
-            --candidate-root release-candidate \
+            --candidate-root "$GITHUB_WORKSPACE/release-candidate" \
             --run-id "$release_run" \
             --environment-id ghcr-production \
             --observed-at "$observed_at"
@@ -206,6 +553,9 @@ jobs:
             release-candidate/docker-compose.yml
             release-candidate/docker-compose.platform.yml
             release-candidate/docker-compose.data-plane.yml
+            release-candidate/deploy/docker-compose.openmaic-shared-ingress-observer.yml
             release-candidate/artifacts/source_head.json
             release-candidate/artifacts/image_digests.json
+            release-candidate/artifacts/promotion_intent.json
+            release-candidate/artifacts/promotion_receipt.json
           if-no-files-found: error

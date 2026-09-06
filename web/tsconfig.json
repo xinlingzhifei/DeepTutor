@@ -26,5 +26,5 @@
     ".next-deeptutor/types/**/*.ts",
     ".next-deeptutor/dev/types/**/*.ts"
   ],
-  "exclude": ["node_modules"]
+  "exclude": ["node_modules", "output"]
 }

@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 import base64
 from collections.abc import Callable, Mapping, Sequence
+import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
@@ -30,7 +32,9 @@ TIMEOUT_EXIT = 124
 TERMINATION_WAIT_SECONDS = 5
 
 _IDENTITY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _LIVE_SECRET_ENVIRONMENT = ("YFEISTAI_LIVE_FIXTURE_TOKEN",)
+_LIVE_FIXTURE_ROLES = ("teacher", "student", "author", "reviewer", "publisher")
 _OS_ENVIRONMENT = (
     "SYSTEMROOT",
     "WINDIR",
@@ -45,6 +49,7 @@ _OS_ENVIRONMENT = (
 _FIXED_CHILD_ENVIRONMENT = (
     "WEB_BASE_URL",
     "YFEISTAI_CANDIDATE_ROOT",
+    "YFEISTAI_CANDIDATE_SHA256",
     "YFEISTAI_RELEASE_RUN_ID",
     "YFEISTAI_ENVIRONMENT_ID",
     "YFEISTAI_EVIDENCE",
@@ -110,24 +115,43 @@ def _run(
     tree_terminator: Callable[..., None] = _terminate_owned_process_tree,
     platform: str = sys.platform,
 ) -> subprocess.CompletedProcess[bytes]:
-    options: dict[str, object] = {"cwd": cwd, "env": env, "stdout": stdout}
+    options: dict[str, object] = {
+        "cwd": cwd,
+        "env": env,
+        "stdout": stdout,
+        "stderr": subprocess.PIPE,
+    }
     if platform == "win32":
         options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     else:
         options["start_new_session"] = True
     process = popen_factory(arguments, **options)
     try:
-        captured, _stderr = process.communicate(timeout=timeout_seconds)  # type: ignore[attr-defined]
+        captured, captured_stderr = process.communicate(  # type: ignore[attr-defined]
+            timeout=timeout_seconds
+        )
         returncode = process.returncode  # type: ignore[attr-defined]
     except subprocess.TimeoutExpired:
         tree_terminator(process, platform=platform)
-        captured, _stderr = process.communicate()  # type: ignore[attr-defined]
+        captured, captured_stderr = process.communicate()  # type: ignore[attr-defined]
         returncode = TIMEOUT_EXIT
     if not isinstance(captured, bytes):
         captured = b""
-    completed = subprocess.CompletedProcess(arguments, returncode, stdout=captured)
+    if not isinstance(captured_stderr, bytes):
+        captured_stderr = b""
+    completed = subprocess.CompletedProcess(
+        arguments,
+        returncode,
+        stdout=captured,
+        stderr=captured_stderr,
+    )
     if check and completed.returncode:
-        raise subprocess.CalledProcessError(completed.returncode, arguments, output=captured)
+        raise subprocess.CalledProcessError(
+            completed.returncode,
+            arguments,
+            output=captured,
+            stderr=captured_stderr,
+        )
     return completed
 
 
@@ -137,6 +161,7 @@ def _required_environment(environ: Mapping[str, str], evidence: str) -> dict[str
         for name in (
             "YFEISTAI_EVIDENCE_REPORT",
             "YFEISTAI_CANDIDATE_ROOT",
+            "YFEISTAI_CANDIDATE_SHA256",
             "YFEISTAI_RELEASE_RUN_ID",
             "YFEISTAI_ENVIRONMENT_ID",
             "YFEISTAI_EVIDENCE",
@@ -145,11 +170,14 @@ def _required_environment(environ: Mapping[str, str], evidence: str) -> dict[str
             "WEB_BASE_URL",
         )
     }
-    if (
-        any(not value for value in required.values())
-        or not required["YFEISTAI_LIVE_FIXTURE_TOKEN"].strip()
-    ):
+    if any(not value for value in required.values()):
         raise ValueError("probe environment is incomplete")
+    fixture_token = required["YFEISTAI_LIVE_FIXTURE_TOKEN"]
+    if fixture_token != fixture_token.strip():
+        raise ValueError("probe environment is incomplete")
+    candidate_sha256 = required["YFEISTAI_CANDIDATE_SHA256"]
+    if _SHA256.fullmatch(candidate_sha256) is None or candidate_sha256 == "0" * 64:
+        raise ValueError("probe candidate identity is invalid")
     report = Path(required["YFEISTAI_EVIDENCE_REPORT"])
     candidate_root = Path(required["YFEISTAI_CANDIDATE_ROOT"])
     if not report.is_absolute() or not candidate_root.is_absolute() or not candidate_root.is_dir():
@@ -162,8 +190,13 @@ def _required_environment(environ: Mapping[str, str], evidence: str) -> dict[str
     ):
         raise ValueError("probe release identity is invalid")
     base_url = urlsplit(required["WEB_BASE_URL"])
-    if base_url.scheme not in {"http", "https"} or not base_url.netloc:
-        raise ValueError("probe web base URL is invalid")
+    if (
+        base_url.scheme != "https"
+        or not base_url.hostname
+        or base_url.username is not None
+        or base_url.password is not None
+    ):
+        raise ValueError("probe web base URL must use HTTPS")
     return required
 
 
@@ -268,6 +301,26 @@ def _secret_fingerprints(secret: str) -> tuple[bytes, ...]:
     return tuple(sorted((item for item in fingerprints if item), key=len, reverse=True))
 
 
+def _live_fixture_secrets(required: Mapping[str, str]) -> tuple[str, ...]:
+    token = required["YFEISTAI_LIVE_FIXTURE_TOKEN"]
+    values = [token]
+    for role in _LIVE_FIXTURE_ROLES:
+        material = "\0".join(
+            (
+                "policyVersion=2",
+                f"releaseRun={required['YFEISTAI_RELEASE_RUN_ID']}",
+                f"environment={required['YFEISTAI_ENVIRONMENT_ID']}",
+                f"evidence={required['YFEISTAI_EVIDENCE']}",
+                f"candidateSha256={required['YFEISTAI_CANDIDATE_SHA256']}",
+                f"role={role}",
+            )
+        ).encode("utf-8")
+        digest = hmac.new(token.encode("utf-8"), material, hashlib.sha256).digest()
+        password = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+        values.append(f"Yf!2-{password}")
+    return tuple(values)
+
+
 def _validate_persistable_playwright_output(raw: bytes) -> None:
     try:
         document = json.loads(raw)
@@ -305,11 +358,15 @@ def main(
         raise ValueError("Playwright stdout is unavailable")
     if not isinstance(completed.returncode, int) or isinstance(completed.returncode, bool):
         raise ValueError("Playwright native exit is invalid")
+    stderr = completed.stderr if isinstance(completed.stderr, bytes) else b""
+    native_output = (completed.stdout, stderr)
     if any(
-        fingerprint in completed.stdout
-        for fingerprint in _secret_fingerprints(required["YFEISTAI_LIVE_FIXTURE_TOKEN"])
+        fingerprint in output
+        for secret in _live_fixture_secrets(required)
+        for fingerprint in _secret_fingerprints(secret)
+        for output in native_output
     ):
-        raise ValueError("Playwright output contains live secret")
+        raise ValueError("playwright_native_output_contains_live_secret")
     if completed.returncode != 0:
         return completed.returncode
     try:

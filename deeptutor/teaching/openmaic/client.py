@@ -85,6 +85,7 @@ _JOB_STATUSES = {
     ),
 }
 _JOB_ID = re.compile(r"^[A-Za-z0-9._~-]+$")
+_OBSERVER_CANARY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _ARTIFACT_PATH = re.compile(
     r"^/api/yfeistai/v1/artifacts/(?P<job_id>[^/\s:]+)/(?P<relative>[A-Za-z0-9._~/-]+)$"
 )
@@ -830,17 +831,25 @@ class OpenMAICContractHealthClient:
         self._base_url = _validated_base_url(base_url)
         self._timeouts = timeouts or ClientTimeouts()
 
-    async def health(self) -> OpenMAICHealth:
+    async def health(self, *, observer_canary: str | None = None) -> OpenMAICHealth:
+        if observer_canary is not None and (
+            not isinstance(observer_canary, str)
+            or _OBSERVER_CANARY.fullmatch(observer_canary) is None
+        ):
+            raise ValueError("OpenMAIC observer canary is invalid")
+        headers = {
+            "accept": "application/json",
+            "accept-encoding": "identity",
+        }
+        if observer_canary is not None:
+            headers["x-yfeistai-observer-canary"] = observer_canary
         try:
             with redact_health_transport_logs():
                 async with asyncio.timeout(self._timeouts.total):
                     async with self._http.stream(
                         "GET",
                         f"{self._base_url}/api/yfeistai/v1/health",
-                        headers={
-                            "accept": "application/json",
-                            "accept-encoding": "identity",
-                        },
+                        headers=headers,
                         timeout=self._timeouts.httpx_timeout(),
                         follow_redirects=False,
                     ) as response:
@@ -864,8 +873,12 @@ class OpenMAICContractHealthClient:
             raise InvalidOpenMAICResponse()
         return parse_openmaic_health(value)
 
-    async def assert_compatible(self) -> OpenMAICHealth:
-        return assert_compatible_openmaic_health(await self.health())
+    async def assert_compatible(
+        self,
+        *,
+        observer_canary: str | None = None,
+    ) -> OpenMAICHealth:
+        return assert_compatible_openmaic_health(await self.health(observer_canary=observer_canary))
 
 
 class ClientRouteBindingRepository(Protocol):

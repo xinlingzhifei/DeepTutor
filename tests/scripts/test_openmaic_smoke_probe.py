@@ -11,6 +11,12 @@ import sys
 import httpx
 import pytest
 
+from tests.scripts.platform_candidate_test_support import (
+    POCKETBASE_BASE_COMPOSE_DRIFTS,
+    drift_pocketbase_base_compose,
+    write_schema3_candidate_root,
+)
+
 ROOT = Path(__file__).resolve().parents[2]
 BASE_URL = "https://candidate.example.test"
 ADMIN_TOKEN = "platform-admin-token-must-never-appear"
@@ -54,6 +60,72 @@ def _candidate() -> dict[str, object]:
             "openmaic_render": "sha256:" + "f" * 64,
         },
     }
+
+
+@pytest.mark.parametrize("drift", POCKETBASE_BASE_COMPOSE_DRIFTS)
+def test_default_candidate_loader_rejects_schema3_pocketbase_base_compose_drift_before_probe(
+    tmp_path: Path,
+    drift: str,
+) -> None:
+    module = _probe_module()
+    candidate_root, lock = write_schema3_candidate_root(tmp_path)
+    drift_pocketbase_base_compose(candidate_root, lock, drift)
+
+    with pytest.raises(ValueError, match="production Compose image references"):
+        module._default_candidate_loader(candidate_root)
+
+
+def test_openmaic_smoke_command_revalidates_schema3_candidate_after_probe_before_stdout(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    tmp_path: Path,
+) -> None:
+    module = _probe_module()
+    candidate_root, _lock = write_schema3_candidate_root(tmp_path)
+    shadow_root, shadow_lock = write_schema3_candidate_root(tmp_path / "shadow")
+    drift_pocketbase_base_compose(shadow_root, shadow_lock, "different-digest")
+    candidate_base = candidate_root / "docker-compose.yml"
+    shadow_base = shadow_root / "docker-compose.yml"
+    real_stat = Path.stat
+    real_lstat = Path.lstat
+    swapped = False
+
+    def stat_with_candidate_swap(path: Path, *args, **kwargs):
+        if swapped and Path(path) == candidate_base:
+            return real_stat(shadow_base, *args, **kwargs)
+        return real_stat(path, *args, **kwargs)
+
+    def lstat_with_candidate_swap(path: Path):
+        if swapped and Path(path) == candidate_base:
+            return real_lstat(shadow_base)
+        return real_lstat(path)
+
+    async def successful_probe(_config) -> bytes:
+        nonlocal swapped
+        swapped = True
+        return b'{"probe":"succeeded"}\n'
+
+    environment = {
+        "YFEISTAI_LIVE_FIXTURE_TOKEN": ADMIN_TOKEN,
+        "YFEISTAI_CANDIDATE_ROOT": str(candidate_root),
+        "YFEISTAI_RELEASE_RUN_ID": "run-openmaic-shared-smoke",
+        "YFEISTAI_ENVIRONMENT_ID": "environment-openmaic-shared-smoke",
+        "YFEISTAI_RUNTIME_ATTESTATION_SHA256": RUNTIME_ATTESTATION_SHA256,
+        "YFEISTAI_OPENMAIC_SMOKE_TIMEOUT_SECONDS": "570",
+        "WEB_BASE_URL": BASE_URL,
+    }
+    monkeypatch.setattr(Path, "stat", stat_with_candidate_swap)
+    monkeypatch.setattr(Path, "lstat", lstat_with_candidate_swap)
+    monkeypatch.setattr(module, "_run_main", successful_probe)
+    monkeypatch.chdir(candidate_root)
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+    exit_code = module.main(["--plane", "shared", "--profile", "first-release"])
+    captured = capsysbinary.readouterr()
+
+    assert swapped is True
+    assert (exit_code, captured.out) == (1, b"")
 
 
 def _tenant_create_idempotency_key() -> str:

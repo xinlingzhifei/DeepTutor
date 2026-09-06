@@ -33,7 +33,9 @@ from openmaic_smoke_contract import (  # noqa: E402
     canonical_openmaic_smoke_report,
     parse_openmaic_smoke_report,
 )
-from render_platform_compose import validate_image_lock_bindings  # noqa: E402
+from render_platform_compose import (  # noqa: E402
+    validated_candidate_artifact_lease,
+)
 
 _PUBLIC_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _LOCAL_USER_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -182,17 +184,8 @@ CandidateLoader = Callable[[Path], Mapping[str, object]]
 
 
 def _default_candidate_loader(candidate_root: Path) -> dict[str, object]:
-    lock = validate_image_lock_bindings(
-        candidate_root / "deploy" / "image-lock.json",
-        compose_paths=(
-            candidate_root / "docker-compose.platform.yml",
-            candidate_root / "docker-compose.data-plane.yml",
-        ),
-        require_candidate=True,
-    )
-    candidate = lock.get("candidate")
-    if not isinstance(candidate, dict):
-        raise OpenMAICSmokeProbeError("candidate_invalid")
+    with validated_candidate_artifact_lease(candidate_root) as artifact:
+        candidate = artifact.candidate
     try:
         copied = json.loads(json.dumps(candidate, allow_nan=False))
     except (TypeError, ValueError) as exc:
@@ -1448,7 +1441,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         arguments = _parse_args(argv)
         config = _load_config(os.environ, plane=arguments.plane, cwd=Path.cwd())
-        body = asyncio.run(_run_main(config))
+        operation_failed = False
+        try:
+            with validated_candidate_artifact_lease(
+                config.candidate_root,
+                expected_candidate=config.candidate,
+            ):
+                try:
+                    body = asyncio.run(_run_main(config))
+                except BaseException:
+                    operation_failed = True
+                    raise
+        except ValueError as exc:
+            if operation_failed:
+                raise
+            raise OpenMAICSmokeProbeError("candidate_invalid") from exc
         sys.stdout.buffer.write(body)
         sys.stdout.buffer.flush()
         return 0

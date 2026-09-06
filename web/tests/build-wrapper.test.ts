@@ -7,6 +7,14 @@ const webRoot = process.cwd();
 const read = (...parts: string[]) =>
   readFileSync(path.join(webRoot, ...parts), "utf8");
 
+test("application typecheck excludes generated verification output", () => {
+  const config = JSON.parse(read("tsconfig.json"));
+  assert.ok(
+    config.exclude.includes("output"),
+    "generated upstream replay sources must not enter the application typecheck",
+  );
+});
+
 test("npm build routes through the generated-file wrapper", () => {
   const scripts = JSON.parse(read("package.json")).scripts as Record<
     string,
