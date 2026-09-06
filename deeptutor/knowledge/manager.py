@@ -24,6 +24,7 @@ from deeptutor.knowledge.kb_types import (
     LIGHTRAG_SERVER_KB_TYPE,
     LINKED_KB_TYPE,
     OBSIDIAN_KB_TYPE,
+    RAGFLOW_KB_TYPE,
     SUBAGENT_KB_TYPE,
     external_root_of,
     is_connected_kb,
@@ -1004,6 +1005,73 @@ class KnowledgeBaseManager:
         if search_mode:
             entry["search_mode"] = search_mode
         return self._register_new_entry(name, entry)
+
+    def register_ragflow_kb(
+        self,
+        name: str,
+        profile_id: str,
+        dataset_id: str,
+        *,
+        credential_owner_id: str,
+        ownership: str = "attached",
+        access_mode: str = "read_only",
+        description: str = "",
+    ) -> dict:
+        """Register an identity-bound remote KB without creating a local index."""
+        from deeptutor.knowledge.ragflow.profiles import safe_component
+
+        name = str(name or "").strip()
+        if not name or any(c in name for c in "/\\\x00\r\n") or name in {".", ".."}:
+            raise ValueError("Invalid knowledge base name")
+        safe_component(profile_id)
+        safe_component(credential_owner_id)
+        if dataset_id:
+            safe_component(dataset_id)
+        if ownership not in {"managed", "attached"}:
+            raise ValueError("Invalid RAGFlow ownership")
+        if access_mode not in {"read_only", "manage_documents"}:
+            raise ValueError("Invalid RAGFlow access mode")
+        if not dataset_id and ownership != "managed":
+            raise ValueError("RAGFlow dataset is required")
+        now = datetime.now().isoformat()
+        entry = {
+            "path": name,
+            "type": RAGFLOW_KB_TYPE,
+            "rag_provider": "ragflow",
+            "description": description,
+            "status": "ready" if dataset_id else "initializing",
+            "needs_reindex": False,
+            "created_at": now,
+            "updated_at": now,
+            "ragflow": {
+                "schema_version": 1,
+                "profile_id": profile_id,
+                "credential_owner_id": credential_owner_id,
+                "dataset_id": dataset_id,
+                "ownership": ownership,
+                "access_mode": access_mode,
+                "binding_version": 1,
+                "lifecycle_state": "active" if dataset_id else "provisioning",
+                "remote_delete_policy": "explicit_only",
+            },
+        }
+
+        def register(config: dict) -> dict:
+            entries = config.setdefault("knowledge_bases", {})
+            if name in entries:
+                raise ValueError(f"A knowledge base named '{name}' already exists.")
+            if dataset_id and any(
+                other.get("type") == RAGFLOW_KB_TYPE
+                and other.get("ragflow", {}).get("dataset_id") == dataset_id
+                for other in entries.values()
+            ):
+                raise ValueError(
+                    "RAGFlow Dataset is already bound in this workspace; share the existing KB instead"
+                )
+            entries[name] = entry
+            return entry
+
+        return self._mutate_config(register)
 
     def register_ima_kb(
         self,

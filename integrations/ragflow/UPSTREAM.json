@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "repository": "https://github.com/infiniflow/ragflow.git",
+  "tag": "v0.27.1",
+  "commit": "b9df87c4c75a5b0d35c90d15329fc0f6f91cb73e",
+  "license": "Apache-2.0",
+  "sourceDirectory": "upstream",
+  "cloneDepth": 1,
+  "sparseCheckout": false,
+  "httpApiReference": "docs/references/http_api_reference.md",
+  "httpApiReferenceSha256": "3aa926033d0d84553272b52b1a3a1298fb4ad5f00741428037c1e71f4287dd4f",
+  "verifiedOn": "2026-09-06"
+}

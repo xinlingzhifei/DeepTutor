@@ -28,6 +28,8 @@ export interface RagProviderSummary {
   configured?: boolean;
   /** Whether the engine needs an API key configured before use. */
   requires_api_key?: boolean;
+  /** Availability of the adapter is distinct from per-KB remote connectivity. */
+  requires_connection?: boolean;
   /** Retrieval modes this engine supports (empty for mode-less engines). */
   modes?: string[];
   /** The active default retrieval mode for this engine. */

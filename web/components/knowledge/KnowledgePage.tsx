@@ -5,7 +5,9 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { useTranslation } from "react-i18next";
 import { Loader2 } from "lucide-react";
 import { useKnowledgeBases } from "@/hooks/useKnowledgeBases";
-import { updateRagProviderMode } from "@/lib/knowledge-api";
+import { deleteKnowledgeBase, invalidateKnowledgeCaches, updateRagProviderMode } from "@/lib/knowledge-api";
+import { kbProvider, resolveKnowledgeSelection } from "@/lib/knowledge-helpers";
+import RagflowKnowledgeDetail from "./ragflow/RagflowKnowledgeDetail";
 import KnowledgeBaseDetail from "./KnowledgeBaseDetail";
 import KnowledgeHome from "./KnowledgeHome";
 import EngineDetail from "./EngineDetail";
@@ -88,20 +90,9 @@ export default function KnowledgePage() {
     setView("engine");
   }, []);
 
-  // Derive the effective selection: respect the user's pick if it still
-  // exists, otherwise fall back to the default KB (or the first one). No
-  // useEffect chains — keeps state out of effects.
-  const selectedKbName = useMemo<string | null>(() => {
-    if (explicitSelection && kbs.some((kb) => kb.name === explicitSelection)) {
-      return explicitSelection;
-    }
-    if (!kbs.length) return null;
-    return kbs.find((kb) => kb.is_default)?.name ?? kbs[0].name;
-  }, [explicitSelection, kbs]);
-
   const selectedKb = useMemo(
-    () => kbs.find((kb) => kb.name === selectedKbName) ?? null,
-    [kbs, selectedKbName],
+    () => resolveKnowledgeSelection(kbs, explicitSelection),
+    [kbs, explicitSelection],
   );
 
   // The effective engine selection: respect the pick if it still exists.
@@ -112,7 +103,7 @@ export default function KnowledgePage() {
 
   // Keep ?kb / ?engine in sync with the effective selection so deep links work.
   // The Overview view carries neither, so reloading the console stays on it.
-  const urlKb = view === "kb" ? (selectedKbName ?? null) : null;
+  const urlKb = view === "kb" ? (selectedKb?.id ?? selectedKb?.name ?? explicitSelection) : null;
   const urlEngine = view === "engine" ? (selectedProvider?.id ?? null) : null;
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -143,6 +134,20 @@ export default function KnowledgePage() {
     },
     [createKb, openKb, setError],
   );
+
+  const handleRagflowConnected = useCallback(async (kbRef: string) => {
+    invalidateKnowledgeCaches();
+    await refresh({ force: true, showSpinner: false });
+    openKb(kbRef);
+  }, [refresh, openKb]);
+
+  const handleRagflowDisconnect = useCallback(async (kbRef: string) => {
+    await deleteKnowledgeBase(kbRef);
+    invalidateKnowledgeCaches();
+    await refresh({ force: true });
+    setExplicitSelection(null);
+    setView("home");
+  }, [refresh]);
 
   const handleSetDefault = useCallback(
     async (name: string) => {
@@ -265,7 +270,8 @@ export default function KnowledgePage() {
               onBack={() => setView("home")}
               onOpenKb={openKb}
               onSelectMode={handleSelectMode}
-              onChanged={() => void refresh({ force: true })}
+              onConnectRagflow={handleRagflowConnected}
+              onChanged={() => void refresh({ force: true, showSpinner: false })}
               onError={(message) => setError(message)}
             />
           ) : view === "engine" ? (
@@ -277,6 +283,14 @@ export default function KnowledgePage() {
               onOpenEngine={openEngine}
               onCreate={openCreate}
               onConnectObsidian={openObsidian}
+            />
+          ) : selectedKb && kbProvider(selectedKb) === "ragflow" ? (
+            <RagflowKnowledgeDetail
+              key={selectedKb.id ?? selectedKb.name}
+              kb={selectedKb}
+              onBack={() => setView("home")}
+              onChanged={() => void refresh({ force: true, showSpinner: false })}
+              onDisconnect={handleRagflowDisconnect}
             />
           ) : (
             <KnowledgeBaseDetail
@@ -307,6 +321,7 @@ export default function KnowledgePage() {
         onConnectObsidian={connectObsidian}
         onConnectLightRagServer={connectLightRagServer}
         onConnectIma={connectIma}
+        onConnectRagflow={handleRagflowConnected}
         initialMode={createPreset?.mode}
         initialSource={createPreset?.source}
         onConfigureProvider={() => {

@@ -22,12 +22,13 @@ from fastapi import (
     BackgroundTasks,
     File,
     Form,
+    Header,
     HTTPException,
     UploadFile,
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from deeptutor.api.utils.progress_broadcaster import ProgressBroadcaster
@@ -1589,6 +1590,19 @@ async def update_kb_config(kb_name: str, config: dict):
         from deeptutor.services.rag.index_probe import has_ready_provider_index
 
         config = dict(config or {})
+        service = get_kb_config_service()
+        current_config = service.get_kb_config(kb_name)
+        if (
+            "ragflow" in config
+            or config.get("type") == "ragflow"
+            or config.get("rag_provider") == "ragflow"
+            or current_config.get("type") == "ragflow"
+            or current_config.get("rag_provider") == "ragflow"
+        ):
+            raise HTTPException(
+                409,
+                "Use the typed RAGFlow endpoints; binding ownership cannot be edited through generic config",
+            )
         if "rag_provider" in config:
             requested_provider = _validate_registered_provider(config.get("rag_provider"))
             service = get_kb_config_service()
@@ -2498,15 +2512,30 @@ async def upload_files(
     files: list[UploadFile] = File(...),
     rag_provider: str = Form(None),
     rel_paths: list[str] = Form(None),
+    idempotency_key: str | None = Header(None),
 ):
     """Upload files to a knowledge base and process them in background."""
     try:
+        kb_ref = kb_name
         manager, kb_name, kb_base_dir = _writable_kb(kb_name)
         requested_provider = None
         if rag_provider is not None and str(rag_provider).strip():
             requested_provider = _validate_registered_provider(rag_provider)
 
         kb_entry = _load_kb_entry_or_404(manager, kb_name)
+        if kb_entry.get("type") == "ragflow":
+            from deeptutor.api.routers.ragflow_knowledge import upload_files as upload_ragflow
+            from deeptutor.knowledge.ragflow.operations import OperationConflict
+
+            if requested_provider and requested_provider != "ragflow":
+                raise HTTPException(400, "Requested provider does not match the knowledge base")
+            if rel_paths:
+                raise HTTPException(400, "RAGFlow uploads do not support local folder paths")
+            try:
+                result = await upload_ragflow(kb_ref, files, background_tasks, idempotency_key)
+            except OperationConflict:
+                raise HTTPException(409, "ragflow_operation_conflict") from None
+            return JSONResponse(status_code=202, content=result)
         _assert_kb_writable_or_409(kb_name, kb_entry)
         kb_path = manager.get_knowledge_base_path(kb_name)
         raw_dir = kb_path / "raw"
@@ -2573,12 +2602,35 @@ async def upload_files(
 async def create_knowledge_base(
     background_tasks: BackgroundTasks,
     name: str = Form(...),
-    files: list[UploadFile] = File(...),
+    files: list[UploadFile] | None = File(None),
     rag_provider: str = Form(DEFAULT_PROVIDER),
     rel_paths: list[str] = Form(None),
+    profile_id: str | None = Form(None),
+    idempotency_key: str | None = Header(None),
 ):
     """Create a new knowledge base and initialize it with files."""
     try:
+        if str(rag_provider).strip().lower() == "ragflow":
+            from deeptutor.api.routers.ragflow_knowledge import CreateInput, create_managed
+            from deeptutor.knowledge.ragflow.operations import OperationConflict
+            from deeptutor.services.rag.pipelines.ragflow.client import RagflowError
+
+            if files or rel_paths:
+                raise HTTPException(400, "ragflow_create_then_upload")
+            if not profile_id:
+                raise HTTPException(400, "ragflow_profile_required")
+            try:
+                return await create_managed(
+                    CreateInput(name=name, profile_id=profile_id), idempotency_key
+                )
+            except RagflowError as error:
+                raise HTTPException(502, error.error_type) from None
+            except OperationConflict:
+                raise HTTPException(409, "ragflow_operation_conflict") from None
+            except ValueError:
+                raise HTTPException(400, "invalid_ragflow_request") from None
+        if not files:
+            raise HTTPException(422, "At least one document is required")
         try:
             name = validate_knowledge_base_name(name)
         except ValueError as exc:

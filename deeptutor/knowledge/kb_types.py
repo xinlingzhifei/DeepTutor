@@ -73,6 +73,7 @@ LIGHTRAG_SERVER_KB_TYPE = "lightrag_server"
 # and no local index — retrieval is offloaded over HTTPS to IMA's
 # ``search_knowledge`` OpenAPI by the ``ima`` provider.
 IMA_KB_TYPE = "ima"
+RAGFLOW_KB_TYPE = "ragflow"
 
 # Every pointer/connected KB type. Membership here is what makes the manager
 # skip the index pipeline, the orphan prune and the embedding reconcile.
@@ -83,6 +84,7 @@ CONNECTED_KB_TYPES = frozenset(
         SUBAGENT_KB_TYPE,
         LIGHTRAG_SERVER_KB_TYPE,
         IMA_KB_TYPE,
+        RAGFLOW_KB_TYPE,
     }
 )
 
@@ -102,6 +104,13 @@ def supports_local_raw_files(entry: Any) -> bool:
     return isinstance(entry, dict) and not is_connected_kb(entry)
 
 
+def supports_document_upload(entry: Any) -> bool:
+    """Remote document management does not imply ownership of local raw files."""
+    if isinstance(entry, dict) and entry.get("type") == RAGFLOW_KB_TYPE:
+        return entry.get("ragflow", {}).get("access_mode") == "manage_documents"
+    return supports_local_raw_files(entry)
+
+
 def external_root_of(entry: Any) -> str | None:
     """Absolute path a connected KB points at, or ``None`` for ordinary KBs.
 
@@ -119,8 +128,10 @@ __all__ = [
     "SUBAGENT_KB_TYPE",
     "LIGHTRAG_SERVER_KB_TYPE",
     "IMA_KB_TYPE",
+    "RAGFLOW_KB_TYPE",
     "CONNECTED_KB_TYPES",
     "is_connected_kb",
     "supports_local_raw_files",
+    "supports_document_upload",
     "external_root_of",
 ]

@@ -50,9 +50,9 @@ export default function SessionLoadingView({
         <img
           src="/logo_black.png"
           alt="yFeiSTAI"
-          width={752}
-          height={460}
-          className="h-7 w-auto select-none"
+          width={512}
+          height={512}
+          className="h-12 w-12 object-contain select-none"
           draggable={false}
         />
         <Loader2 className="h-5 w-5 animate-spin text-[var(--primary)]" />

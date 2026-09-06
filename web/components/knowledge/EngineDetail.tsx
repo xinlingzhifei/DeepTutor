@@ -25,6 +25,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import Link from "next/link";
+import RagflowConnectionPanel from "./ragflow/RagflowConnectionPanel";
 import {
   getEngineModelOptions,
   getEnginePreflight,
@@ -65,6 +66,7 @@ interface EngineDetailProps {
   kbs: KnowledgeBase[];
   onBack: () => void;
   onOpenKb: (name: string) => void;
+  onConnectRagflow: (kbRef: string) => void;
   onSelectMode: (providerId: string, mode: string) => Promise<void> | void;
   /** Called after a config change so the parent can refresh provider state. */
   onChanged: () => void;
@@ -77,6 +79,7 @@ const ENGINE_ICONS: Record<string, LucideIcon> = {
   graphrag: Network,
   lightrag: Workflow,
   "lightrag-server": Server,
+  ragflow: Server,
 };
 
 const INSTALL_HINTS: Record<string, string> = {
@@ -170,7 +173,7 @@ function StatusBadge({ status }: { status: ProviderConnectionStatus }) {
   }
   return (
     <span className="inline-flex items-center rounded-full bg-[var(--muted)] px-2 py-0.5 text-[10.5px] font-medium text-[var(--muted-foreground)]">
-      {t("Not installed")}
+      {status === "connection" ? t("Per-KB connection") : t("Not installed")}
     </span>
   );
 }
@@ -1445,6 +1448,7 @@ export default function EngineDetail({
   kbs,
   onBack,
   onOpenKb,
+  onConnectRagflow,
   onSelectMode,
   onChanged,
   onError,
@@ -1492,12 +1496,16 @@ export default function EngineDetail({
 
         {/* Requirements & environment — collapsible, unified across engines.
             Auto-opens when the engine isn't ready so the gap is obvious. */}
-        <EnvRequirements
+        {provider.id === "ragflow" ? (
+          <Section label={t("RAGFlow connections")} icon={Server}>
+            <RagflowConnectionPanel mode="settings" onConnected={onConnectRagflow} onChanged={onChanged} />
+          </Section>
+        ) : <EnvRequirements
           providerId={provider.id}
           installHint={installHint}
           defaultOpen={status !== "ready"}
           onError={onError}
-        />
+        />}
 
         {/* Retrieval modes (graphrag / lightrag) */}
         {hasModes && (
@@ -1547,7 +1555,7 @@ export default function EngineDetail({
         )}
 
         {/* Models — in-place pickers for the kinds this engine needs */}
-        <ModelsSection providerId={provider.id} onError={onError} />
+        {provider.id !== "ragflow" && <ModelsSection providerId={provider.id} onError={onError} />}
 
         {/* Knowledge bases on this engine */}
         <Section
@@ -1565,9 +1573,9 @@ export default function EngineDetail({
                 const ready = resolveKbStatus(kb) === "ready";
                 return (
                   <button
-                    key={kb.name}
+                    key={kb.id ?? kb.name}
                     type="button"
-                    onClick={() => onOpenKb(kb.name)}
+                    onClick={() => onOpenKb(kb.id ?? kb.name)}
                     className={`flex w-full items-center justify-between gap-3 px-4 py-2.5 text-left transition-colors hover:bg-[var(--muted)]/40 ${
                       i > 0 ? "border-t border-[var(--border)]" : ""
                     }`}

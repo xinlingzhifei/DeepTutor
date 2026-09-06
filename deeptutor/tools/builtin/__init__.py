@@ -134,6 +134,8 @@ class RAGTool(_PromptHintsMixin, BaseTool):
             **extra_kwargs,
         )
         content = result.get("answer") or result.get("content", "")
+        if result.get("provider") == "ragflow" and result.get("error_type"):
+            return ToolResult(content=content, metadata=result, success=False)
         return ToolResult(
             content=content,
             sources=_rag_sources(result, query=query, kb_name=kb_name),

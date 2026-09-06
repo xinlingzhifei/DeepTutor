@@ -93,16 +93,18 @@ export interface KnowledgeBase {
   available?: boolean;
 }
 
-export type ProviderConnectionStatus = "ready" | "needs_key" | "unavailable";
+export type ProviderConnectionStatus = "ready" | "needs_key" | "unavailable" | "connection";
 
 export const providerConnectionStatus = (provider: {
   id: string;
   configured?: boolean;
   requires_api_key?: boolean;
+  requires_connection?: boolean;
 }): ProviderConnectionStatus => {
   if (provider.requires_api_key && provider.configured === false)
     return "needs_key";
   if (provider.configured === false) return "unavailable";
+  if (provider.requires_connection) return "connection";
   return "ready";
 };
 
@@ -164,11 +166,24 @@ export const formatKnowledgeTimestamp = (value?: string): string | null => {
 /** The retrieval engine a KB is bound to. Connected vaults badge by source. */
 export const kbProvider = (kb: KnowledgeBase): string => {
   if (kb.metadata?.type === "obsidian") return "obsidian";
+  if (kb.metadata?.type === "ragflow") return "ragflow";
   return (
     (kb.statistics?.rag_provider as string | undefined) ||
     (kb.metadata?.rag_provider as string | undefined) ||
     "llamaindex"
   );
+};
+
+/** Prefer immutable references; ambiguous legacy display-name links fail closed. */
+export const resolveKnowledgeSelection = (
+  kbs: KnowledgeBase[],
+  reference: string | null,
+): KnowledgeBase | null => {
+  if (!reference) return kbs.find((kb) => kb.is_default) ?? kbs[0] ?? null;
+  const exact = kbs.find((kb) => kb.id === reference);
+  if (exact) return exact;
+  const byName = kbs.filter((kb) => kb.name === reference);
+  return byName.length === 1 ? byName[0] : null;
 };
 
 /** Source-document count for a KB, or null when unknown. */
@@ -263,6 +278,8 @@ const LIVE_PROGRESS_STAGES = new Set([
 ]);
 
 export const kbHasLiveProgress = (kb: KnowledgeBase): boolean => {
+  // RAGFlow work is tracked by its durable operations, not local index SSE.
+  if (kbProvider(kb) === "ragflow") return false;
   const status = resolveKbStatus(kb);
   if (status === "ready" || status === "error" || status === "needs_reindex") {
     return false;

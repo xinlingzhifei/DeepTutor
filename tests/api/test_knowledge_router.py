@@ -158,6 +158,7 @@ def test_rag_providers_lists_llamaindex_and_pageindex(monkeypatch) -> None:
         "lightrag",
         "lightrag-server",
         "ima",
+        "ragflow",
     }
     # LlamaIndex works out of the box; PageIndex needs an API key; GraphRAG and
     # LightRAG are optional local engines (no API key, configured = installed).

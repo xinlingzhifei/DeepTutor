@@ -30,6 +30,7 @@ import {
 import { validateFiles } from "@/lib/knowledge-helpers";
 import FileDropZone from "./FileDropZone";
 import ImaConnectionFields from "./ImaConnectionFields";
+import RagflowConnectionPanel from "./ragflow/RagflowConnectionPanel";
 
 // Mirrors SUPPORTED_EXTENSIONS in the backend pageindex pipeline (PageIndex POST /doc/).
 const PAGEINDEX_FORMATS = [
@@ -90,6 +91,7 @@ interface CreateKbModalProps {
   }) => Promise<void>;
   /** Open the RAG pipeline settings (to add a missing API key). */
   onConfigureProvider?: () => void;
+  onConnectRagflow?: (kbRef: string) => void;
   /** Open straight into a given mode (e.g. "link" from the Obsidian card). */
   initialMode?: Mode;
   /** Pre-select a link source (engine id or "obsidian") when opening in link mode. */
@@ -107,6 +109,7 @@ export default function CreateKbModal({
   onConnectLightRagServer,
   onConnectIma,
   onConfigureProvider,
+  onConnectRagflow,
   initialMode = "new",
   initialSource,
 }: CreateKbModalProps) {
@@ -202,6 +205,7 @@ export default function CreateKbModal({
   const providerUnavailable = activeProvider?.configured === false;
   const isPageIndex = provider === "pageindex";
   const isLightRagServer = provider === LIGHTRAG_SERVER_PROVIDER;
+  const isRagflow = mode === "new" && provider === "ragflow";
   const serverModeOptions = activeProvider?.modes ?? [];
   const effectiveServerMode =
     serverMode || activeProvider?.default_mode || serverModeOptions[0] || "";
@@ -274,7 +278,7 @@ export default function CreateKbModal({
   };
 
   const handleSubmit = async () => {
-    if (!canSubmit) return;
+    if (!canSubmit || isRagflow) return;
     setSubmitting(true);
     setError(null);
     try {
@@ -337,7 +341,7 @@ export default function CreateKbModal({
       width="lg"
       closeOnBackdrop={!submitting}
       closeOnEscape={!submitting}
-      footer={
+      footer={isRagflow ? null :
         <div className="flex items-center justify-end gap-2">
           <button
             type="button"
@@ -374,7 +378,7 @@ export default function CreateKbModal({
           t={t}
         />
 
-        <div>
+        {!isRagflow && <div>
           <label className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-[var(--muted-foreground)]">
             {t("Knowledge base name")}
           </label>
@@ -386,7 +390,7 @@ export default function CreateKbModal({
             placeholder={t("e.g. project-papers")}
             className="w-full rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 py-2 text-[13px] text-[var(--foreground)] outline-none transition-colors focus:border-[var(--foreground)]/25 disabled:opacity-50"
           />
-        </div>
+        </div>}
 
         {mode === "new" ? (
           <NewModeFields
@@ -402,7 +406,12 @@ export default function CreateKbModal({
             setFiles={setFiles}
             policyForProvider={policyForProvider}
             connectionForm={
-              isLightRagServer ? (
+              isRagflow && isOpen ? (
+                <RagflowConnectionPanel onConnected={(kbRef) => {
+                  onConnectRagflow?.(kbRef);
+                  handleClose();
+                }} />
+              ) : isLightRagServer ? (
                 <LightRagServerFields
                   serverUrl={serverUrl}
                   setServerUrl={setServerUrl}

@@ -46,6 +46,7 @@ const ENGINE_ICONS: Record<string, LucideIcon> = {
   graphrag: Network,
   lightrag: Workflow,
   "lightrag-server": Server,
+  ragflow: Server,
 };
 
 function EngineStatusBadge({ status }: { status: ProviderConnectionStatus }) {
@@ -67,7 +68,7 @@ function EngineStatusBadge({ status }: { status: ProviderConnectionStatus }) {
   }
   return (
     <span className="inline-flex items-center rounded-full bg-[var(--muted)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--muted-foreground)]">
-      {t("Not installed")}
+      {status === "connection" ? t("Per-KB connection") : t("Not installed")}
     </span>
   );
 }
@@ -286,9 +287,9 @@ export default function KnowledgeHome({
                 const docs = kbDocCount(kb);
                 return (
                   <button
-                    key={kb.name}
+                    key={kb.id ?? kb.name}
                     type="button"
-                    onClick={() => onOpenKb(kb.name)}
+                    onClick={() => onOpenKb(kb.id ?? kb.name)}
                     className="group flex flex-col gap-2 rounded-2xl border border-[var(--border)] p-4 text-left transition-colors hover:border-[var(--ring)]"
                   >
                     <div className="flex items-center gap-2">

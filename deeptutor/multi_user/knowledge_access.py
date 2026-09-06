@@ -34,6 +34,7 @@ class AuthorizedKnowledgeSource:
     resource_owner_id: str
     read_only: bool
     retrieval_provider: str
+    retrieval_binding_fingerprint: str = ""
 
     def __post_init__(self) -> None:
         if (
@@ -382,6 +383,11 @@ def _authorized_source_descriptor(
     from deeptutor.services.rag.provider_binding import resolve_bound_provider
 
     provider = resolve_bound_provider(base_dir, resource.name)
+    binding_fingerprint = ""
+    if provider == "ragflow":
+        from deeptutor.knowledge.ragflow.binding import resolve_binding
+
+        binding_fingerprint = resolve_binding(resource.id).fingerprint
     return AuthorizedKnowledgeSource(
         resource_id=resource.id,
         generation_id=resource.generation_id,
@@ -390,6 +396,7 @@ def _authorized_source_descriptor(
         resource_owner_id=owner_id,
         read_only=True,
         retrieval_provider=provider,
+        retrieval_binding_fingerprint=binding_fingerprint,
     )
 
 
@@ -426,6 +433,11 @@ async def _search_authorized_source(
         user = get_current_user()
         owner_id = ADMIN_KNOWLEDGE_OWNER_ID if resource.source == "admin" else user.id
         provider = resolve_bound_provider(resource.base_dir.resolve(), resource.name)
+        binding_fingerprint = ""
+        if provider == "ragflow":
+            from deeptutor.knowledge.ragflow.binding import resolve_binding
+
+            binding_fingerprint = resolve_binding(resource.id).fingerprint
         if (
             resource.id != descriptor.resource_id
             or resource.generation_id != descriptor.generation_id
@@ -433,6 +445,7 @@ async def _search_authorized_source(
             or resource.source != descriptor.source
             or owner_id != descriptor.resource_owner_id
             or provider != descriptor.retrieval_provider
+            or binding_fingerprint != descriptor.retrieval_binding_fingerprint
         ):
             raise HTTPException(
                 status_code=409,

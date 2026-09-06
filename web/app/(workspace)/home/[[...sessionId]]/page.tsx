@@ -2219,9 +2219,9 @@ export default function ChatPage() {
                   <img
                     src="/logo_black.png"
                     alt="yFeiSTAI"
-                    width={752}
-                    height={460}
-                    className="h-10 w-auto select-none"
+                    width={512}
+                    height={512}
+                    className="h-16 w-16 object-contain select-none"
                     draggable={false}
                   />
                   <h1 className="font-serif text-[40px] font-medium leading-[1.1] tracking-[-0.015em] text-[var(--foreground)]">

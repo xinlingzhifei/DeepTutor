@@ -33,6 +33,7 @@ GRAPHRAG_PROVIDER = "graphrag"
 LIGHTRAG_PROVIDER = "lightrag"
 LIGHTRAG_SERVER_PROVIDER = "lightrag-server"
 IMA_PROVIDER = "ima"
+RAGFLOW_PROVIDER = "ragflow"
 
 # Providers the factory can instantiate. Unknown / legacy strings fall back to
 # the default with a re-index hint upstream.
@@ -44,6 +45,7 @@ KNOWN_PROVIDERS = frozenset(
         LIGHTRAG_PROVIDER,
         LIGHTRAG_SERVER_PROVIDER,
         IMA_PROVIDER,
+        RAGFLOW_PROVIDER,
     }
 )
 
@@ -86,6 +88,7 @@ def version_matches_provider(entry: dict[str, Any], provider: Optional[str]) -> 
             LIGHTRAG_PROVIDER,
             LIGHTRAG_SERVER_PROVIDER,
             IMA_PROVIDER,
+            RAGFLOW_PROVIDER,
         }
 
     return entry_provider == resolved or signature == resolved
@@ -118,6 +121,13 @@ def provider_failure_summary(
 
 
 def _build_pipeline(provider: str, kb_base_dir: Optional[str], **kwargs: Any):
+    if provider == RAGFLOW_PROVIDER:
+        from .pipelines.ragflow.pipeline import RagflowPipeline
+
+        if kb_base_dir is not None:
+            kwargs.setdefault("kb_base_dir", kb_base_dir)
+        return RagflowPipeline(**kwargs)
+
     if provider == PAGEINDEX_PROVIDER:
         from .pipelines.pageindex.pipeline import PageIndexPipeline
 
@@ -280,6 +290,14 @@ def list_pipelines() -> List[Dict[str, Any]]:
             "configured": ima_ready,
             "requires_api_key": True,
         },
+        {
+            "id": RAGFLOW_PROVIDER,
+            "name": "RAGFlow",
+            "description": "Managed remote knowledge, document lifecycle and retrieval over HTTP.",
+            "configured": True,
+            "requires_api_key": True,
+            "requires_connection": True,
+        },
     ]
 
 
@@ -290,6 +308,7 @@ __all__ = [
     "LIGHTRAG_PROVIDER",
     "LIGHTRAG_SERVER_PROVIDER",
     "IMA_PROVIDER",
+    "RAGFLOW_PROVIDER",
     "KNOWN_PROVIDERS",
     "get_pipeline",
     "has_ready_provider_index",

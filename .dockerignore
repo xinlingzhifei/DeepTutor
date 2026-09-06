@@ -12,6 +12,9 @@
 .gitignore
 .gitattributes
 
+# Independently deployed RAGFlow source checkout
+integrations/ragflow/upstream/
+
 # ============================================
 # Documentation
 # ============================================

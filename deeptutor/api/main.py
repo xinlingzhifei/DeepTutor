@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 import logging
 import sys
@@ -170,7 +171,20 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"v1 memory migration failed: {e}")
 
-    yield
+    from deeptutor.knowledge.ragflow.recovery import run_recovery
+
+    ragflow_stop = asyncio.Event()
+    ragflow_recovery = asyncio.create_task(run_recovery(ragflow_stop), name="ragflow-recovery")
+    try:
+        yield
+    finally:
+        ragflow_stop.set()
+        try:
+            await asyncio.wait_for(ragflow_recovery, timeout=10)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            # A cancelled remote mutation retains SEND_STARTED and is reconciled
+            # after restart; it must never be blindly reissued during shutdown.
+            pass
 
     # Execute on shutdown
     logger.info("Application shutdown")
@@ -599,6 +613,11 @@ app.include_router(
 app.include_router(chat.router, prefix="/api/v1", tags=["chat"], dependencies=_auth)
 app.include_router(
     question.router, prefix="/api/v1/question", tags=["question"], dependencies=_auth
+)
+from deeptutor.api.routers import ragflow_knowledge
+
+app.include_router(
+    ragflow_knowledge.router, prefix="/api/v1/knowledge", tags=["ragflow"], dependencies=_auth
 )
 app.include_router(
     knowledge.router, prefix="/api/v1/knowledge", tags=["knowledge"], dependencies=_auth

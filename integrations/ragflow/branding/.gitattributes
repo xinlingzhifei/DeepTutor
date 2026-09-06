@@ -1,0 +1,3 @@
+# Keep the generated patch byte-stable when checking out on Windows.
+yfei.patch text eol=lf
+*.mjs text eol=lf

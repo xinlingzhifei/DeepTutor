@@ -1,6 +1,6 @@
 <div align="center">
 
-<p align="center"><img src="../../assets/figs/logo/logo.png" alt="شعار yFeiSTAI" height="56" style="vertical-align: middle;">&nbsp;<img src="../../assets/figs/logo/banner.png" alt="yFeiSTAI" height="48" style="vertical-align: middle;"></p>
+<p align="center"><img src="../../assets/figs/logo/logo.png" alt="شعار yFeiSTAI" height="160"></p>
 
 # yFeiSTAI: تدريس شخصي مدى الحياة
 

@@ -216,9 +216,9 @@ export function SidebarShell({
             <Image
               src="/logo.png"
               alt="yFeiSTAI"
-              width={752}
-              height={460}
-              className="h-[18px] w-auto"
+              width={512}
+              height={512}
+              className="h-9 w-9 object-contain"
             />
           </Link>
           <button
@@ -343,21 +343,14 @@ export function SidebarShell({
     <aside className="flex w-[220px] h-dvh shrink-0 flex-col bg-[var(--secondary)] transition-all duration-200">
       {/* Header: logo + collapse toggle */}
       <div className="flex h-14 items-center justify-between px-4">
-        <Link href="/" className="group flex items-center gap-1.5">
+        <Link href="/" className="group flex items-center">
           <Image
             src="/logo.png"
             alt="yFeiSTAI"
-            width={752}
-            height={460}
-            className="h-[22px] w-auto transition-transform duration-200 group-hover:scale-105"
-          />
-          <Image
-            src="/banner.png"
-            alt="yFeiSTAI"
-            width={902}
-            height={208}
+            width={512}
+            height={512}
             priority
-            className="h-[20px] w-auto transition-transform duration-200 group-hover:scale-105"
+            className="h-12 w-12 object-contain transition-transform duration-200 group-hover:scale-105"
           />
         </Link>
         {/* The rail is a desktop affordance; in the drawer the scrim and the
