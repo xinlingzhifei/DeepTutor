@@ -154,9 +154,10 @@ const IMAGE_UPLOAD_MIME_TYPES = [
 
 function normalizeUploadPolicy(data: unknown): KnowledgeUploadPolicy {
   const payload = data as Partial<KnowledgeUploadPolicy> | null | undefined;
+  const configuredExtensions = payload?.extensions;
   const extensions = Array.from(
     new Set([
-      ...(Array.isArray(payload?.extensions) ? payload.extensions : []),
+      ...(Array.isArray(configuredExtensions) ? configuredExtensions : []),
       ...IMAGE_UPLOAD_EXTENSIONS,
     ]),
   ).sort();

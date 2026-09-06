@@ -44,8 +44,12 @@ def test_shared_bootstrap_verifies_contract_before_persisting() -> None:
             export_formats=("classroom_zip", "pptx", "offline_html", "mp4"),
         )
 
-    async def persist(candidate):
+    def assert_candidate_unchanged() -> None:
+        return None
+
+    async def persist(candidate, *, assert_candidate_unchanged):
         assert candidate == registration
+        assert_candidate_unchanged()
         calls.append("persist")
 
     asyncio.run(
@@ -53,6 +57,7 @@ def test_shared_bootstrap_verifies_contract_before_persisting() -> None:
             registration,
             verify_health=verify_health,
             persist=persist,
+            assert_candidate_unchanged=assert_candidate_unchanged,
         )
     )
 
@@ -73,8 +78,12 @@ def test_shared_bootstrap_rejects_incompatible_contract_without_persisting() -> 
             export_formats=("classroom_zip", "pptx", "offline_html", "mp4"),
         )
 
-    async def persist(_registration):
+    def assert_candidate_unchanged() -> None:
+        return None
+
+    async def persist(_registration, *, assert_candidate_unchanged):
         nonlocal persisted
+        assert_candidate_unchanged()
         persisted = True
 
     with pytest.raises(ValueError, match="contract"):
@@ -83,6 +92,7 @@ def test_shared_bootstrap_rejects_incompatible_contract_without_persisting() -> 
                 module.SharedDataPlaneRegistration(),
                 verify_health=verify_health,
                 persist=persist,
+                assert_candidate_unchanged=assert_candidate_unchanged,
             )
         )
 

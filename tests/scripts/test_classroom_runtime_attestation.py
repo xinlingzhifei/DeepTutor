@@ -15,6 +15,10 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 RELEASE_RUN = {"runId": "release-run-1", "environmentId": "staging-1"}
+OBSERVER_SIGNER_IMAGE = (
+    "ghcr.io/xinlingzhifei/yfeistai-observer-signer:"
+    "yfeistai-first-release-20260825-aaaaaaaa@sha256:" + "d" * 64
+)
 CANDIDATE = {
     "sourceRepository": "xinlingzhifei/DeepTutor",
     "sourceHead": "a" * 40,
@@ -28,12 +32,57 @@ CANDIDATE = {
 }
 SERVICES = {
     "deeptutor": {"restart": "unless-stopped", "health": "healthy"},
+    "gateway": {"restart": "unless-stopped", "health": "none"},
     "postgres": {"restart": "unless-stopped", "health": "healthy"},
     "minio": {"restart": "unless-stopped", "health": "healthy"},
+    "minio-bootstrap": {"restart": "no", "health": "none"},
     "openmaic": {"restart": "unless-stopped", "health": "healthy"},
     "openmaic-render": {"restart": "unless-stopped", "health": "healthy"},
     "teaching-migrate": {"restart": "no", "health": "none"},
+    "shared-data-plane-bootstrap": {"restart": "no", "health": "none"},
+    "tenant-provisioner": {"restart": "unless-stopped", "health": "none"},
+    "teaching-dispatcher": {"restart": "unless-stopped", "health": "none"},
+    "teaching-worker": {"restart": "unless-stopped", "health": "none"},
+    "teaching-export-worker": {"restart": "unless-stopped", "health": "none"},
+    "teaching-reaper": {"restart": "unless-stopped", "health": "none"},
+    "learning-projector": {"restart": "unless-stopped", "health": "none"},
 }
+
+
+def _observer_secret_preflight(candidate_root: Path) -> dict[str, object]:
+    run_directory = candidate_root.parent / "observer-secrets" / RELEASE_RUN["runId"]
+    return {
+        "schemaVersion": 1,
+        "releaseRunId": RELEASE_RUN["runId"],
+        "runDirectory": str(run_directory.resolve()),
+        "ownerOnly": True,
+        "noLinksOrReparsePoints": True,
+        "distinctSecrets": True,
+        "observerSignerImage": OBSERVER_SIGNER_IMAGE,
+        "secrets": {
+            "openmaic_observer_auth_token": {
+                "fileName": "observer-auth.token",
+                "mode": "0400",
+                "ownerId": 1000,
+                "groupId": 1000,
+                "size": 32,
+            },
+            "openmaic_observer_health_token": {
+                "fileName": "candidate-health.token",
+                "mode": "0400",
+                "ownerId": 1000,
+                "groupId": 1000,
+                "size": 32,
+            },
+            "openmaic_observer_attestation_signing_key": {
+                "fileName": "attestation-signing-key.pem",
+                "mode": "0600",
+                "ownerId": 1000,
+                "groupId": 1000,
+                "size": 119,
+            },
+        },
+    }
 
 
 def _load_module():
@@ -45,6 +94,26 @@ def _load_module():
     sys.modules[spec.name] = module
     try:
         spec.loader.exec_module(module)
+        produce = module.produce_runtime_attestation
+
+        def produce_with_observer_defaults(*args, **kwargs):
+            candidate_root = Path(kwargs["candidate_root"])
+            proof = _observer_secret_preflight(candidate_root)
+            kwargs.setdefault("observer_signer_image", OBSERVER_SIGNER_IMAGE)
+            kwargs.setdefault("observer_secret_preflight", proof)
+            import platform_preflight
+
+            original_preflight = platform_preflight.run_preflight
+            platform_preflight.run_preflight = lambda **_options: SimpleNamespace(
+                errors=(),
+                observer_secret_preflight=proof,
+            )
+            try:
+                return produce(*args, **kwargs)
+            finally:
+                platform_preflight.run_preflight = original_preflight
+
+        module.produce_runtime_attestation = produce_with_observer_defaults
         return module
     finally:
         sys.modules.pop(spec.name, None)
@@ -58,6 +127,13 @@ def _load_verifier():
     sys.modules[spec.name] = module
     try:
         spec.loader.exec_module(module)
+        validate = module.validate_runtime_attestation
+
+        def validate_with_observer_defaults(*args, **kwargs):
+            kwargs.setdefault("observer_signer_image", OBSERVER_SIGNER_IMAGE)
+            return validate(*args, **kwargs)
+
+        module.validate_runtime_attestation = validate_with_observer_defaults
         return module
     finally:
         sys.modules.pop(spec.name, None)
@@ -98,6 +174,7 @@ def _candidate_root(tmp_path: Path) -> tuple[Path, dict[str, str]]:
             "RELEASE.2025-04-16T18-13-26Z",
             "sha256:" + "7" * 64,
         ),
+        "pocketbase": ("ghcr.io/muchobien/pocketbase", "latest", "sha256:" + "8" * 64),
     }
     images = {
         name: {
@@ -108,35 +185,181 @@ def _candidate_root(tmp_path: Path) -> tuple[Path, dict[str, str]]:
         }
         for name, (repository, tag, digest) in specifications.items()
     }
+    support_images = {
+        "observer_signer": {
+            "repository": "ghcr.io/xinlingzhifei/yfeistai-observer-signer",
+            "tag": release_tag,
+            "digest": "sha256:" + "d" * 64,
+            "reference": OBSERVER_SIGNER_IMAGE,
+        }
+    }
     (deploy / "image-lock.json").write_text(
-        json.dumps({"schemaVersion": 2, "candidate": CANDIDATE, "images": images}),
+        json.dumps(
+            {
+                "schemaVersion": 3,
+                "candidate": CANDIDATE,
+                "images": images,
+                "supportImages": support_images,
+            }
+        ),
         encoding="utf-8",
     )
     image_references = {name: record["reference"] for name, record in images.items()}
     service_images = {
         "deeptutor": image_references["deeptutor"],
+        "gateway": image_references["nginx"],
         "postgres": image_references["postgres"],
         "minio": image_references["minio"],
+        "minio-bootstrap": image_references["minio_client"],
         "openmaic": image_references["openmaic"],
         "openmaic-render": image_references["openmaic_render"],
         "teaching-migrate": image_references["deeptutor"],
+        "shared-data-plane-bootstrap": image_references["deeptutor"],
+        "tenant-provisioner": image_references["deeptutor"],
+        "teaching-dispatcher": image_references["deeptutor"],
+        "teaching-worker": image_references["deeptutor"],
+        "teaching-export-worker": image_references["deeptutor"],
+        "teaching-reaper": image_references["deeptutor"],
+        "learning-projector": image_references["deeptutor"],
     }
-    compose_services = {
-        service: {"image": service_images[service], "restart": settings["restart"]}
-        for service, settings in SERVICES.items()
-    }
-    compose_services["profiled-debug"] = {
-        "image": image_references["deeptutor"],
-        "profiles": ["debug"],
-    }
-    (root / "docker-compose.platform.yml").write_text(
-        json.dumps({"services": compose_services}), encoding="utf-8"
-    )
-    (root / "docker-compose.yml").write_text(json.dumps({"services": {}}), encoding="utf-8")
+    _write_trusted_candidate_templates(root)
     settings = root / "data" / "user" / "settings"
     settings.mkdir(parents=True)
     (settings / "docker.env").write_text("", encoding="utf-8")
+    service_images["openmaic-shared-ingress-observer"] = OBSERVER_SIGNER_IMAGE
+    service_images["openmaic-observer-attestation-signer"] = OBSERVER_SIGNER_IMAGE
     return root, service_images
+
+
+def _write_trusted_candidate_templates(candidate_root: Path) -> None:
+    from tests.scripts.platform_candidate_test_support import _renderer
+
+    renderer = _renderer()
+    lock = json.loads((candidate_root / "deploy" / "image-lock.json").read_bytes())
+    for relative in (
+        "docker-compose.yml",
+        "docker-compose.platform.yml",
+        "docker-compose.data-plane.yml",
+        "deploy/docker-compose.openmaic-shared-ingress-observer.yml",
+    ):
+        (candidate_root / relative).write_bytes(
+            renderer._render_compose_references(
+                ROOT / relative, lock["images"], lock["supportImages"]
+            ).encode("utf-8")
+        )
+
+
+def _drift_retained_candidate(candidate_root: Path, drift: str) -> None:
+    module = _load_module()
+    names = {
+        "base": "docker-compose.yml",
+        "platform": "docker-compose.platform.yml",
+        "data-plane": "docker-compose.data-plane.yml",
+        "observer": "deploy/docker-compose.openmaic-shared-ingress-observer.yml",
+    }
+    path = candidate_root / names[drift]
+    document = module.yaml.load(path.read_text(encoding="utf-8"), Loader=module._ComposeLoader)
+    service = {
+        "base": "pocketbase",
+        "platform": "deeptutor",
+        "data-plane": "openmaic",
+        "observer": "openmaic-shared-ingress-observer",
+    }[drift]
+    document["services"][service]["privileged"] = True
+    path.write_text(module.yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+
+
+def test_candidate_token_retains_all_five_candidate_files(tmp_path: Path) -> None:
+    candidate_root, _references = _candidate_root(tmp_path)
+    module = _load_module()
+    expected = tuple(
+        (candidate_root / relative).read_bytes()
+        for relative in (
+            "deploy/image-lock.json",
+            "docker-compose.platform.yml",
+            "deploy/docker-compose.openmaic-shared-ingress-observer.yml",
+            "docker-compose.yml",
+            "docker-compose.data-plane.yml",
+        )
+    )
+    with module._CandidateContractLease.open(candidate_root) as lease:
+        assert lease.token == expected
+
+
+def test_runtime_rejects_truncated_three_file_candidate_token(tmp_path: Path) -> None:
+    candidate_root, _references = _candidate_root(tmp_path)
+    module = _load_module()
+    with module._CandidateContractLease.open(candidate_root) as lease:
+        with pytest.raises(ValueError, match="candidate runtime"):
+            module._load_candidate_token(lease.token[:3])
+
+
+@pytest.mark.parametrize("consumer", ("runtime", "verifier"))
+@pytest.mark.parametrize("drift", ("base", "platform", "data-plane", "observer"))
+def test_runtime_consumers_reject_stable_candidate_topology_tampering(
+    tmp_path: Path,
+    consumer: str,
+    drift: str,
+) -> None:
+    candidate_root, _references = _candidate_root(tmp_path)
+    _drift_retained_candidate(candidate_root, drift)
+    with pytest.raises(ValueError, match="candidate runtime"):
+        if consumer == "runtime":
+            _load_module()._load_candidate(candidate_root)
+        else:
+            _load_verifier()._runtime_candidate_contract(candidate_root, candidate=CANDIDATE)
+
+
+@pytest.mark.parametrize("drift", ("base", "platform", "data-plane"))
+def test_runtime_producer_rejects_tampered_candidate_before_docker_or_publication(
+    tmp_path: Path,
+    drift: str,
+) -> None:
+    candidate_root, _references = _candidate_root(tmp_path)
+    _drift_retained_candidate(candidate_root, drift)
+    module = _load_module()
+    bundle_root = tmp_path / "bundle"
+    runtime_root = bundle_root / "runtime"
+    runtime_root.mkdir(parents=True)
+    canonical = runtime_root / "runtime-attestation.json"
+    canonical.write_bytes(b"existing-canonical-evidence\n")
+
+    def forbidden_docker(*_args, **_kwargs):
+        pytest.fail("tampered candidate reached Docker resolution or execution")
+
+    with pytest.raises(ValueError, match="candidate runtime"):
+        module.produce_runtime_attestation(
+            candidate_root=candidate_root,
+            bundle_root=bundle_root,
+            release_run=RELEASE_RUN,
+            observed_at="2026-08-25T00:00:00Z",
+            base_url="https://candidate.example.test",
+            runner=forbidden_docker,
+            docker_resolver=forbidden_docker,
+            environ={},
+        )
+    assert canonical.read_bytes() == b"existing-canonical-evidence\n"
+    assert list(runtime_root.iterdir()) == [canonical]
+
+
+def test_runtime_validates_retained_candidate_bytes_without_reopening_inputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate_root, _references = _candidate_root(tmp_path)
+    module = _load_module()
+    original_open = Path.open
+
+    def no_candidate_reopen(path, *args, **kwargs):
+        if Path(path).is_relative_to(candidate_root):
+            pytest.fail("runtime validation reopened a retained candidate pathname")
+        return original_open(path, *args, **kwargs)
+
+    with module._CandidateContractLease.open(candidate_root) as lease:
+        monkeypatch.setattr(Path, "open", no_candidate_reopen)
+        candidate, services = module._load_candidate_token(lease.token)
+    assert candidate == CANDIDATE
+    assert services["deeptutor"]["image"].endswith(CANDIDATE["imageDigests"]["deeptutor"])
 
 
 def _repo_digest(reference: str) -> str:
@@ -152,13 +375,21 @@ def _compose_config_hash(service: str) -> str:
     return hashlib.sha256(f"compose:{service}".encode()).hexdigest()
 
 
+def _service_settings(service: str) -> dict[str, str]:
+    if service == "openmaic-shared-ingress-observer":
+        return {"restart": "no", "health": "healthy"}
+    if service == "openmaic-observer-attestation-signer":
+        return {"restart": "no", "health": "none"}
+    return SERVICES[service]
+
+
 def _compose_config(references: dict[str, str]) -> dict[str, object]:
     return {
         "name": "yfeistai-platform",
         "services": {
             service: {
                 "image": reference,
-                "restart": SERVICES[service]["restart"],
+                "restart": _service_settings(service)["restart"],
                 "privileged": False,
                 "cap_add": [],
                 "cap_drop": [],
@@ -176,15 +407,16 @@ def _compose_config(references: dict[str, str]) -> dict[str, object]:
 
 
 def _container(service: str, reference: str) -> dict[str, object]:
-    running = SERVICES[service]["restart"] != "no"
+    settings = _service_settings(service)
+    running = service == "openmaic-shared-ingress-observer" or settings["restart"] != "no"
     state: dict[str, object] = {
         "Status": "running" if running else "exited",
         "Running": running,
         "Restarting": False,
         "ExitCode": 0,
     }
-    if SERVICES[service]["health"] != "none":
-        state["Health"] = {"Status": SERVICES[service]["health"]}
+    if settings["health"] != "none":
+        state["Health"] = {"Status": settings["health"]}
     return {
         "Id": f"container-{service}",
         "Image": _local_image_id(reference),
@@ -320,6 +552,96 @@ class FakeDocker:
         return subprocess.CompletedProcess(arguments, 0, stdout=body, stderr=b"")
 
 
+@pytest.mark.parametrize("environment_mode", ("clean", "host-spoof"))
+def test_runtime_compose_environment_binds_original_candidate_inputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    environment_mode: str,
+) -> None:
+    module = _load_module()
+    candidate_root, references = _candidate_root(tmp_path)
+    bundle_root = tmp_path / "bundle"
+    retained = {
+        relative: (candidate_root / relative).read_bytes()
+        for relative in (
+            "deploy/image-lock.json",
+            "docker-compose.yml",
+            "docker-compose.platform.yml",
+            "docker-compose.data-plane.yml",
+            "deploy/docker-compose.openmaic-shared-ingress-observer.yml",
+        )
+    }
+    candidate = json.loads(retained["deploy/image-lock.json"])["candidate"]
+    canonical_candidate = json.dumps(
+        candidate,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    assert not canonical_candidate.endswith(b"\n")
+    expected = {
+        "YFEISTAI_CANDIDATE_ROOT": str(candidate_root.resolve()),
+        "YFEISTAI_CANDIDATE_SHA256": hashlib.sha256(canonical_candidate).hexdigest(),
+        "YFEISTAI_IMAGE_LOCK_SHA256": hashlib.sha256(
+            retained["deploy/image-lock.json"]
+        ).hexdigest(),
+    }
+    observer_overlay = retained["deploy/docker-compose.openmaic-shared-ingress-observer.yml"]
+    assert all(f"${{{name}:?".encode() in observer_overlay for name in expected)
+    environment = {"SystemRoot": "C:/Windows"}
+    if environment_mode == "host-spoof":
+        environment.update(
+            {
+                "YFEISTAI_CANDIDATE_ROOT": str(tmp_path / "foreign-candidate"),
+                "YFEISTAI_CANDIDATE_SHA256": "e" * 64,
+                "YFEISTAI_IMAGE_LOCK_SHA256": "f" * 64,
+            }
+        )
+    fake_docker = FakeDocker(references)
+    compose_inputs = []
+    original_open = Path.open
+
+    def no_candidate_reopen(path, *args, **kwargs):
+        if Path(path).is_relative_to(candidate_root):
+            pytest.fail("Compose binding reopened a retained candidate pathname")
+        return original_open(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+
+        def docker_resolver():
+            # Resolution occurs after the real candidate/deployment leases open.
+            patch.setattr(Path, "open", no_candidate_reopen)
+            return tmp_path / "trusted-docker.exe"
+
+        def runner(arguments, **options):
+            if arguments[5] == "compose":
+                supplied = {name: options["env"].get(name) for name in expected}
+                compose_inputs.append(supplied)
+                if len(compose_inputs) == 1:
+                    assert arguments[-3:] == ["config", "--format", "json"]
+                    assert not fake_docker.calls
+                assert supplied == expected, (
+                    "Compose interpolation lacks original candidate binding"
+                )
+            return fake_docker(arguments, **options)
+
+        report = module.produce_runtime_attestation(
+            candidate_root=candidate_root,
+            bundle_root=bundle_root,
+            release_run=RELEASE_RUN,
+            observed_at="2026-08-25T00:00:00Z",
+            base_url="https://candidate.example.test",
+            runner=runner,
+            docker_resolver=docker_resolver,
+            environ=environment,
+        )
+
+    assert compose_inputs and all(supplied == expected for supplied in compose_inputs)
+    assert report["candidate"] == candidate
+    assert {relative: (candidate_root / relative).read_bytes() for relative in retained} == retained
+
+
 def test_stable_runtime_is_attested_with_only_fixed_read_only_docker_commands(
     tmp_path: Path,
 ) -> None:
@@ -368,8 +690,10 @@ def test_stable_runtime_is_attested_with_only_fixed_read_only_docker_commands(
     assert report["releaseRun"] == RELEASE_RUN
     assert report["project"] == "yfeistai-platform"
     assert report["beforeSnapshot"] == report["afterSnapshot"]
-    assert [item["service"] for item in report["containers"]] == sorted(SERVICES)
-    assert "profiled-debug" not in json.dumps(report)
+    assert [item["service"] for item in report["containers"]] == sorted(references)
+    assert not {"pocketbase", "sandbox-runner"}.intersection(
+        item["service"] for item in report["containers"]
+    )
     for command in report["commands"]:
         assert set(command) == {"argv", "nativeExit", "stdout", "stdoutSha256"}
         raw_stdout = command["stdout"].encode("utf-8")
@@ -416,7 +740,29 @@ def test_stable_runtime_is_attested_with_only_fixed_read_only_docker_commands(
         assert options["timeout"] == 30
         assert options["check"] is False
         assert options["capture_output"] is True
-        assert options["env"] == {"SYSTEMROOT": "C:/Windows", "TEMP": "C:/Temp"}
+        assert options["env"] == {
+            "SYSTEMROOT": "C:/Windows",
+            "TEMP": "C:/Temp",
+            "YFEISTAI_CANDIDATE_ROOT": str(candidate_root.resolve()),
+            "YFEISTAI_CANDIDATE_SHA256": hashlib.sha256(
+                json.dumps(
+                    CANDIDATE,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest(),
+            "YFEISTAI_DEEPTUTOR_IMAGE": references["deeptutor"],
+            "YFEISTAI_ENVIRONMENT_ID": RELEASE_RUN["environmentId"],
+            "YFEISTAI_IMAGE_LOCK_SHA256": hashlib.sha256(
+                (candidate_root / "deploy" / "image-lock.json").read_bytes()
+            ).hexdigest(),
+            "YFEISTAI_OBSERVER_SECRET_DIR": str(
+                (candidate_root.parent / "observer-secrets").resolve()
+            ),
+            "YFEISTAI_OBSERVER_SIGNER_IMAGE": OBSERVER_SIGNER_IMAGE,
+            "YFEISTAI_RELEASE_RUN_ID": RELEASE_RUN["runId"],
+        }
     for arguments, _options in runner.calls:
         assert arguments[1] == "--config"
         isolated_config = Path(arguments[2])
@@ -474,16 +820,6 @@ def test_runtime_attestation_binds_effective_security_without_persisting_environ
     )
     runner.compose_config["volumes"] = {"cache": {"name": "fixed-cache"}}
     runner.compose_config["secrets"] = {"ticket": {"file": secret_source}}
-    teaching_migrate = services["teaching-migrate"]
-    assert isinstance(teaching_migrate, dict)
-    teaching_migrate["volumes"] = [
-        {
-            "type": "volume",
-            "source": "cache",
-            "target": "/cache",
-            "read_only": False,
-        }
-    ]
     reference = references["deeptutor"]
     runner.image_entrypoint_overrides[reference] = ["/image-entrypoint"]
     runner.image_user_overrides[reference] = "999:999"
@@ -507,15 +843,37 @@ def test_runtime_attestation_binds_effective_security_without_persisting_environ
             ],
         }
     )
-    teaching_migrate_config = runner.by_id["container-teaching-migrate"]["Config"]
-    assert isinstance(teaching_migrate_config, dict)
-    teaching_migrate_config.update(
-        {
-            "Entrypoint": ["/image-entrypoint"],
-            "User": "999:999",
-            "Env": ["PATH=/usr/bin", "BASE_TOKEN=image-secret"],
-        }
-    )
+    for service_name, service_reference in references.items():
+        if service_name == "deeptutor" or service_reference != reference:
+            continue
+        service = services[service_name]
+        assert isinstance(service, dict)
+        service["volumes"] = [
+            {
+                "type": "volume",
+                "source": "cache",
+                "target": "/cache",
+                "read_only": False,
+            }
+        ]
+        shared_config = runner.by_id[f"container-{service_name}"]["Config"]
+        assert isinstance(shared_config, dict)
+        shared_config.update(
+            {
+                "Entrypoint": ["/image-entrypoint"],
+                "User": "999:999",
+                "Env": ["PATH=/usr/bin", "BASE_TOKEN=image-secret"],
+            }
+        )
+        runner.by_id[f"container-{service_name}"]["Mounts"] = [
+            {
+                "Type": "volume",
+                "Source": "fixed-cache",
+                "Destination": "/cache",
+                "RW": True,
+                "Propagation": "",
+            }
+        ]
     container["HostConfig"] = {
         "Privileged": False,
         "CapAdd": ["CAP_NET_ADMIN"],
@@ -544,16 +902,6 @@ def test_runtime_attestation_binds_effective_security_without_persisting_environ
             "Propagation": "rprivate",
         },
     ]
-    runner.by_id["container-teaching-migrate"]["Mounts"] = [
-        {
-            "Type": "volume",
-            "Source": "fixed-cache",
-            "Destination": "/cache",
-            "RW": True,
-            "Propagation": "",
-        }
-    ]
-
     path = _produce(tmp_path, runner)
     body = path.read_bytes()
 
@@ -1279,7 +1627,7 @@ def test_attestation_rejects_nonzero_native_exit(tmp_path: Path) -> None:
         "wrong-fixed-image-tag",
     ),
 )
-def test_attestation_rejects_invalid_schema_v2_candidate_lock(tmp_path: Path, case: str) -> None:
+def test_attestation_rejects_invalid_schema_v3_candidate_lock(tmp_path: Path, case: str) -> None:
     candidate_root, references = _candidate_root(tmp_path)
     lock_path = candidate_root / "deploy" / "image-lock.json"
     lock = json.loads(lock_path.read_text(encoding="utf-8"))
@@ -1305,6 +1653,68 @@ def test_attestation_rejects_invalid_schema_v2_candidate_lock(tmp_path: Path, ca
 
     assert runner.calls == []
     assert not (tmp_path / "bundle" / "runtime" / "runtime-attestation.json").exists()
+
+
+def test_runtime_candidate_derives_observer_signer_from_schema_v3_lock(tmp_path: Path) -> None:
+    candidate_root, _references = _candidate_root(tmp_path)
+    module = _load_module()
+
+    candidate, services = module._load_candidate(candidate_root)
+
+    assert candidate == CANDIDATE
+    assert {
+        service: services[service]
+        for service in (
+            "openmaic-shared-ingress-observer",
+            "openmaic-observer-attestation-signer",
+        )
+    } == {
+        "openmaic-shared-ingress-observer": {
+            "image": OBSERVER_SIGNER_IMAGE,
+            "restart": "no",
+        },
+        "openmaic-observer-attestation-signer": {
+            "image": OBSERVER_SIGNER_IMAGE,
+            "restart": "no",
+        },
+    }
+
+
+def test_runtime_candidate_rejects_support_image_on_a_third_observer_overlay_service(
+    tmp_path: Path,
+) -> None:
+    candidate_root, references = _candidate_root(tmp_path)
+    module = _load_module()
+    overlay_path = candidate_root / "deploy" / "docker-compose.openmaic-shared-ingress-observer.yml"
+    overlay = module.yaml.load(
+        overlay_path.read_text(encoding="utf-8"),
+        Loader=module._ComposeLoader,
+    )
+    services = overlay.get("services") if isinstance(overlay, dict) else None
+    assert isinstance(services, dict)
+    shared_bootstrap = services.get("shared-data-plane-bootstrap")
+    assert isinstance(shared_bootstrap, dict) and "image" not in shared_bootstrap
+    shared_bootstrap["image"] = OBSERVER_SIGNER_IMAGE
+    candidate_overlay = module.yaml.safe_dump(overlay, sort_keys=False)
+    overlay_path.write_text(candidate_overlay, encoding="utf-8")
+
+    with module._CandidateContractLease.open(candidate_root) as lease:
+        with pytest.raises(ValueError, match="candidate runtime"):
+            module._load_candidate_token(lease.token)
+
+
+def test_runtime_candidate_rejects_external_observer_signer_drift(tmp_path: Path) -> None:
+    candidate_root, _references = _candidate_root(tmp_path)
+    module = _load_module()
+    with module._CandidateContractLease.open(candidate_root) as lease:
+        with pytest.raises(ValueError, match="candidate runtime"):
+            module._load_candidate_token(
+                lease.token,
+                observer_signer_image=(
+                    "ghcr.io/xinlingzhifei/yfeistai-observer-signer:"
+                    "yfeistai-first-release-20260825-aaaaaaaa@sha256:" + "e" * 64
+                ),
+            )
 
 
 @pytest.mark.parametrize("link_location", ("root", "ancestor"))
@@ -1402,17 +1812,22 @@ def test_verifier_rejects_candidate_root_or_ancestor_link(
 
 
 @pytest.mark.skipif(os.name == "nt", reason="exercises POSIX nonblocking contract opens")
-@pytest.mark.parametrize("contract_file", ("lock", "compose"))
+@pytest.mark.parametrize(
+    "contract_file",
+    ("lock", "platform-compose", "observer-compose"),
+)
 def test_producer_rejects_candidate_contract_fifo_without_running_docker(
     tmp_path: Path,
     contract_file: str,
 ) -> None:
     candidate_root, references = _candidate_root(tmp_path)
-    contract_path = (
-        candidate_root / "deploy" / "image-lock.json"
-        if contract_file == "lock"
-        else candidate_root / "docker-compose.platform.yml"
-    )
+    contract_path = {
+        "lock": candidate_root / "deploy" / "image-lock.json",
+        "platform-compose": candidate_root / "docker-compose.platform.yml",
+        "observer-compose": (
+            candidate_root / "deploy" / "docker-compose.openmaic-shared-ingress-observer.yml"
+        ),
+    }[contract_file]
     contract_path.rename(contract_path.with_name(f"{contract_path.name}.real"))
     os.mkfifo(contract_path)
     runner = FakeDocker(references)
@@ -1463,17 +1878,22 @@ def test_verifier_rejects_runtime_attestation_fifo_without_blocking(tmp_path: Pa
         )
 
 
-@pytest.mark.parametrize("contract_file", ("lock", "compose"))
+@pytest.mark.parametrize(
+    "contract_file",
+    ("lock", "platform-compose", "observer-compose"),
+)
 def test_attestation_rejects_candidate_contract_byte_drift_without_overwriting_canonical(
     tmp_path: Path, contract_file: str
 ) -> None:
     candidate_root, references = _candidate_root(tmp_path)
     runner = FakeDocker(references)
-    path = (
-        candidate_root / "deploy" / "image-lock.json"
-        if contract_file == "lock"
-        else candidate_root / "docker-compose.platform.yml"
-    )
+    path = {
+        "lock": candidate_root / "deploy" / "image-lock.json",
+        "platform-compose": candidate_root / "docker-compose.platform.yml",
+        "observer-compose": (
+            candidate_root / "deploy" / "docker-compose.openmaic-shared-ingress-observer.yml"
+        ),
+    }[contract_file]
     original_contract = path.read_bytes()
     mutation_attempted = False
     mutation_blocked = False
@@ -1599,7 +2019,10 @@ def test_attestation_replace_boundary_race_cannot_publish_in_moved_runtime(
 
 
 @pytest.mark.parametrize("prior_canonical", (False, True))
-@pytest.mark.parametrize("contract_file", ("lock", "platform-compose", "base-compose"))
+@pytest.mark.parametrize(
+    "contract_file",
+    ("lock", "platform-compose", "base-compose", "observer-compose"),
+)
 def test_attestation_publish_time_contract_drift_rolls_back_canonical(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1616,6 +2039,9 @@ def test_attestation_publish_time_contract_drift_rolls_back_canonical(
         "lock": candidate_root / "deploy" / "image-lock.json",
         "platform-compose": candidate_root / "docker-compose.platform.yml",
         "base-compose": candidate_root / "docker-compose.yml",
+        "observer-compose": (
+            candidate_root / "deploy" / "docker-compose.openmaic-shared-ingress-observer.yml"
+        ),
     }[contract_file]
     module = _load_module()
     real_replace = module._RuntimeDirectoryGuard.replace
@@ -1797,7 +2223,10 @@ def test_posix_candidate_change_during_commit_cleanup_still_rolls_back(
 
 
 @pytest.mark.skipif(os.name == "nt", reason="exercises POSIX candidate path re-open binding")
-@pytest.mark.parametrize("contract_file", ("lock", "compose"))
+@pytest.mark.parametrize(
+    "contract_file",
+    ("lock", "platform-compose", "observer-compose"),
+)
 def test_posix_same_byte_contract_replacement_during_final_assert_rolls_back(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1808,11 +2237,13 @@ def test_posix_same_byte_contract_replacement_during_final_assert_rolls_back(
     runtime_root.mkdir(parents=True)
     canonical = runtime_root / "runtime-attestation.json"
     canonical.write_bytes(b"existing canonical")
-    contract_path = (
-        candidate_root / "deploy" / "image-lock.json"
-        if contract_file == "lock"
-        else candidate_root / "docker-compose.platform.yml"
-    )
+    contract_path = {
+        "lock": candidate_root / "deploy" / "image-lock.json",
+        "platform-compose": candidate_root / "docker-compose.platform.yml",
+        "observer-compose": (
+            candidate_root / "deploy" / "docker-compose.openmaic-shared-ingress-observer.yml"
+        ),
+    }[contract_file]
     recovery = contract_path.with_name(f"{contract_path.name}.identity-recovery")
     contract_body = contract_path.read_bytes()
     module = _load_module()
@@ -2226,6 +2657,10 @@ def test_cli_has_no_runtime_or_result_override(forbidden_option: str) -> None:
                 "2026-08-25T00:00:00Z",
                 "--base-url",
                 "https://candidate.example.test",
+                "--observer-secret-dir",
+                str(ROOT / "observer-secrets"),
+                "--observer-signer-image",
+                OBSERVER_SIGNER_IMAGE,
                 forbidden_option,
                 "attacker",
             ]

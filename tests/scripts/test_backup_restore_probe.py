@@ -11,12 +11,14 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 import threading
 from types import SimpleNamespace
 import uuid
+import venv
 
 import pytest
 
@@ -355,6 +357,114 @@ def _fixture(tmp_path: Path):
         forbidden_secret_values=(SECRET_VALUE,),
     )
     return config, backup, target
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlink venv entrypoint")
+def test_probe_preserves_symlink_venv_prefix_and_dependencies_in_real_child(
+    tmp_path: Path,
+) -> None:
+    config, backup, target = _fixture(tmp_path)
+    virtual_environment = tmp_path / "operator-venv"
+    venv.EnvBuilder(with_pip=False, symlinks=True).create(virtual_environment)
+    executable = virtual_environment / "bin" / "python"
+    assert executable.is_symlink()
+    site_packages = (
+        virtual_environment
+        / "lib"
+        / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        / "site-packages"
+    )
+    dependency = site_packages / "_yfeistai_venv_dependency.py"
+    dependency.write_text("VALUE = 'venv-only-dependency'\n", encoding="utf-8")
+    config = replace(config, python_executable=executable)
+    observations: list[dict[str, str]] = []
+
+    class InterpreterObserved(Exception):
+        pass
+
+    def runner(arguments: list[str], **options: object) -> subprocess.CompletedProcess[bytes]:
+        assert arguments[0] == str(executable)
+        child = subprocess.run(
+            [
+                arguments[0],
+                "-I",
+                "-B",
+                "-c",
+                "import json, sys, _yfeistai_venv_dependency as dependency; "
+                "print(json.dumps({'prefix': sys.prefix, 'value': dependency.VALUE, "
+                "'module': dependency.__file__}))",
+            ],
+            cwd=options["cwd"],
+            env=options["env"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=20,
+        )
+        observations.append(json.loads(child.stdout))
+        # Only exercise interpreter startup, never the database restore operator.
+        raise InterpreterObserved
+
+    with pytest.raises(InterpreterObserved):
+        _module().run_backup_restore_probe(
+            config,
+            verified_backup_loader=lambda path: _snapshot_backup(backup, path),
+            target_config_loader=lambda path: target,
+            command_runner=runner,
+        )
+
+    assert observations == [
+        {
+            "prefix": str(virtual_environment),
+            "value": "venv-only-dependency",
+            "module": str(dependency),
+        }
+    ]
+    assert not (config.output_directory / "backup-restore-report.json").exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX executable/link validation")
+@pytest.mark.parametrize(
+    "kind", ["missing", "directory", "fifo", "non-executable", "dangling", "loop"]
+)
+def test_probe_rejects_unavailable_python_before_output_or_runner(
+    tmp_path: Path, kind: str
+) -> None:
+    config, _backup, _target = _fixture(tmp_path)
+    executable = tmp_path / "invalid-python"
+    if kind == "directory":
+        executable.mkdir()
+    elif kind == "fifo":
+        os.mkfifo(executable)
+    elif kind == "non-executable":
+        executable.write_bytes(b"not executable")
+        executable.chmod(0o600)
+    elif kind == "dangling":
+        executable.symlink_to(tmp_path / "missing-target")
+    elif kind == "loop":
+        executable.symlink_to(executable)
+    config = replace(config, python_executable=executable)
+
+    def must_not_run(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("invalid interpreter reached the restore runner")
+
+    with pytest.raises(ValueError, match="Python executable is unavailable"):
+        _module().run_backup_restore_probe(config, command_runner=must_not_run)
+    assert not config.output_directory.exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX pg_restore symlink validation")
+def test_probe_still_rejects_symlink_pg_restore_before_output(tmp_path: Path) -> None:
+    config, _backup, _target = _fixture(tmp_path)
+    alias = tmp_path / "pg-restore-alias"
+    alias.symlink_to(config.pg_restore_executable)
+    # Use a non-link Python to isolate the pg_restore rule even before the fix.
+    config = replace(
+        config, python_executable=Path(sys.executable).resolve(), pg_restore_executable=alias
+    )
+    with pytest.raises(ValueError, match="pg_restore executable is unavailable"):
+        _module().run_backup_restore_probe(config)
+    assert not config.output_directory.exists()
 
 
 def write_release_probe_fixture(
@@ -943,11 +1053,11 @@ def test_probe_passes_owned_private_secret_snapshot_and_reconciles_cleanup(
     handed_off_snapshots: list[Path] = []
     real_open = module.os.open
 
-    def tracking_open(path: object, flags: int, *args: object) -> int:
+    def tracking_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
         candidate = Path(path)
         if candidate.parent == live_secret_directory:
             opened_live_secrets.append((candidate.name, flags))
-        return real_open(path, flags, *args)
+        return real_open(path, flags, *args, **kwargs)
 
     monkeypatch.setattr(module.os, "open", tracking_open)
 

@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
 from typing import Any, Protocol
@@ -22,6 +23,16 @@ if str(PROJECT_ROOT) not in sys.path:
 if str(SCRIPTS_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_ROOT))
 
+from docker_compose import (
+    _OBSERVER_RUNTIME_ENVIRONMENT,
+    load_observer_release_admission,
+    platform_compose_topology_arguments,
+)
+from openmaic_observer_service import (
+    OpenMAICObserverServiceError,
+    parse_observer_auth_expiry,
+    validate_observer_endpoints,
+)
 from platform_preflight_contract import (
     PHASES,
     canonical_candidate_network_report,
@@ -29,9 +40,10 @@ from platform_preflight_contract import (
     parse_candidate_network_report,
 )
 from render_platform_compose import (
+    CandidateArtifactError,
     candidate_artifact_paths,
     load_image_lock,
-    validate_image_lock_bindings,
+    validated_candidate_artifact_lease,
 )
 
 from deeptutor.teaching.secret_permissions import secret_file_is_restricted
@@ -47,6 +59,22 @@ DEFAULT_REQUIRED_SECRETS = (
     "classroom_ticket_secret",
     "openmaic_service_secret",
 )
+OBSERVER_SECRET_FILES = {
+    "openmaic_observer_auth_token": "observer-auth.token",
+    "openmaic_observer_health_token": "candidate-health.token",
+    "openmaic_observer_attestation_signing_key": "attestation-signing-key.pem",
+}
+_RELEASE_RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_IMMUTABLE_IMAGE_NAME = re.compile(
+    r"^(?=.{1,512}$)"
+    r"(?:[a-z0-9]+(?:[._-][a-z0-9]+)*(?::[0-9]+)?/)*"
+    r"[a-z0-9]+(?:[._-][a-z0-9]+)*"
+    r"(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?$"
+)
+_MAX_OBSERVER_SECRET_BYTES = 1024 * 1024
+_OBSERVER_CONTAINER_UID = 1000
+_OBSERVER_CONTAINER_GID = 1000
+OBSERVER_SECRET_PREFLIGHT_FIELD = "observerSecretPreflight"
 
 
 def _dns_name_matches(pattern: str, hostname: str) -> bool:
@@ -61,6 +89,7 @@ def _dns_name_matches(pattern: str, hostname: str) -> bool:
 @dataclass(frozen=True, slots=True)
 class PreflightResult:
     errors: tuple[str, ...]
+    observer_secret_preflight: dict[str, object] | None = None
 
     @property
     def ok(self) -> bool:
@@ -76,6 +105,7 @@ class RuntimePreflightProbe(Protocol):
         image_lock_path: Path,
         project_root: Path,
         candidate_root: Path,
+        observer_admission: dict[str, object] | None = None,
     ) -> tuple[str, ...]: ...
 
 
@@ -86,6 +116,7 @@ async def run_runtime_preflight(
     image_lock_path: Path,
     project_root: Path,
     candidate_root: Path,
+    observer_admission: dict[str, object] | None = None,
     probe: RuntimePreflightProbe | None = None,
 ) -> tuple[str, ...]:
     runtime_probe = probe or DefaultRuntimePreflightProbe()
@@ -95,6 +126,7 @@ async def run_runtime_preflight(
         image_lock_path=Path(image_lock_path),
         project_root=Path(project_root),
         candidate_root=Path(candidate_root),
+        observer_admission=observer_admission,
     )
     return tuple(dict.fromkeys(errors))
 
@@ -421,7 +453,12 @@ class DefaultRuntimePreflightProbe:
         image_lock_path: Path,
         project_root: Path,
         candidate_root: Path,
+        observer_admission: dict[str, object] | None = None,
     ) -> tuple[str, ...]:
+        try:
+            _validated_observer_environment(observer_admission)
+        except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+            return ("observer release manifest unavailable or changed",)
         database = await _inspect_database_runtime(settings)
         errors = list(database.errors)
         errors.extend(
@@ -437,9 +474,71 @@ class DefaultRuntimePreflightProbe:
                 project_root,
                 candidate_root=candidate_root,
                 image_lock_path=image_lock_path,
+                observer_admission=observer_admission,
             )
         )
         return tuple(dict.fromkeys(errors))
+
+
+def _validated_observer_environment(admission: dict[str, object] | None) -> dict[str, str]:
+    if admission is None:
+        raise ValueError("observer release manifest required")
+    environment = admission.get("environment")
+    revalidate = admission.get("_revalidate")
+    if (
+        not isinstance(environment, dict)
+        or set(environment) != set(_OBSERVER_RUNTIME_ENVIRONMENT)
+        or any(not isinstance(value, str) or not value for value in environment.values())
+        or not callable(revalidate)
+    ):
+        raise ValueError("observer release admission is invalid")
+    revalidate()
+    return dict(environment)
+
+
+def _inspect_observer_compose_environment(
+    service: object, *, admitted_environment: dict[str, str]
+) -> tuple[str, ...]:
+    try:
+        environment = service.get("environment") if isinstance(service, dict) else None
+        if not isinstance(environment, dict):
+            raise ValueError("observer environment missing")
+        validate_observer_endpoints(
+            environment_id=environment.get("YFEISTAI_ENVIRONMENT_ID", ""),
+            observer_id=environment.get("YFEISTAI_SHARED_INGRESS_OBSERVER_ID", ""),
+            release_run_id=environment.get("YFEISTAI_RELEASE_RUN_ID", ""),
+            observer_url=environment.get("YFEISTAI_SHARED_INGRESS_OBSERVER_URL", ""),
+            shared_ingress_control_url=environment.get("YFEISTAI_SHARED_INGRESS_CONTROL_URL", ""),
+            candidate_health_url=environment.get(
+                "YFEISTAI_SHARED_INGRESS_CANDIDATE_HEALTH_URL", ""
+            ),
+            shared_ingress_upstream_url=environment.get("YFEISTAI_SHARED_INGRESS_UPSTREAM_URL", ""),
+            internal_proxy_url=environment.get("YFEISTAI_SHARED_INGRESS_INTERNAL_PROXY_URL", ""),
+        )
+        parse_observer_auth_expiry(
+            environment.get("YFEISTAI_SHARED_INGRESS_AUTH_EXPIRES_AT"), now=datetime.now(UTC)
+        )
+        if any(
+            environment.get(name) != admitted_environment[name]
+            for name in (
+                "YFEISTAI_RELEASE_RUN_ID",
+                "YFEISTAI_CANDIDATE_SHA256",
+                "YFEISTAI_IMAGE_LOCK_SHA256",
+                "YFEISTAI_OBSERVER_PUBLIC_KEY_SPKI_SHA256",
+                "YFEISTAI_ENVIRONMENT_ID",
+                "YFEISTAI_SHARED_INGRESS_OBSERVER_ID",
+                "YFEISTAI_SHARED_INGRESS_OBSERVER_URL",
+                "YFEISTAI_SHARED_INGRESS_CONTROL_URL",
+                "YFEISTAI_SHARED_INGRESS_UPSTREAM_URL",
+                "YFEISTAI_SHARED_INGRESS_CANDIDATE_HEALTH_URL",
+                "YFEISTAI_SHARED_INGRESS_AUTH_EXPIRES_AT",
+            )
+        ):
+            raise ValueError("observer release binding changed")
+    except (OpenMAICObserverServiceError, KeyError, TypeError, ValueError):
+        # Never expose supplied URLs (which may contain credentials) in diagnostics.
+        return ("observer deployment configuration",)
+    return ()
 
 
 def _inspect_compose_runtime(
@@ -447,6 +546,7 @@ def _inspect_compose_runtime(
     *,
     candidate_root: Path | None = None,
     image_lock_path: Path | None = None,
+    observer_admission: dict[str, object] | None = None,
     runner=subprocess.run,
 ) -> tuple[str, ...]:
     root = Path(project_root)
@@ -459,8 +559,20 @@ def _inspect_compose_runtime(
         else None
     )
     environment = os.environ.copy()
-    environment.pop("COMPOSE_FILE", None)
-    environment.pop("COMPOSE_PROFILES", None)
+    for name in (
+        "COMPOSE_FILE",
+        "COMPOSE_PROFILES",
+        "COMPOSE_PROJECT_NAME",
+        "YFEISTAI_CANDIDATE_ROOT",
+        "YFEISTAI_OBSERVER_RELEASE_MANIFEST",
+        *_OBSERVER_RUNTIME_ENVIRONMENT,
+    ):
+        environment.pop(name, None)
+    try:
+        environment.update(_validated_observer_environment(observer_admission))
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+        return ("observer release manifest unavailable or changed",)
+    environment["YFEISTAI_CANDIDATE_ROOT"] = str(artifact_paths.root)
     errors: list[str] = []
     try:
         version_result = runner(
@@ -483,14 +595,21 @@ def _inspect_compose_runtime(
         errors.append("Docker Compose version")
 
     try:
+        _validated_observer_environment(observer_admission)
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+        return (*errors, "observer release manifest unavailable or changed")
+    try:
         config_result = runner(
             [
                 "docker",
                 "compose",
-                "-f",
-                str(root / "docker-compose.yml"),
-                "-f",
-                str(artifact_paths.platform_compose),
+                *platform_compose_topology_arguments(
+                    deployment_root=root,
+                    candidate_root=candidate_root or root,
+                    env_file=root / "data" / "user" / "settings" / "docker.env",
+                ),
+                "--profile",
+                "legacy-local",
                 "config",
                 "--format",
                 "json",
@@ -504,6 +623,12 @@ def _inspect_compose_runtime(
         )
         payload = json.loads(config_result.stdout)
         services = payload["services"]
+        errors.extend(
+            _inspect_observer_compose_environment(
+                services.get("openmaic-shared-ingress-observer"),
+                admitted_environment=environment,
+            )
+        )
         published_services = {
             service_name for service_name, service in services.items() if service.get("ports")
         }
@@ -521,6 +646,7 @@ def _inspect_compose_runtime(
         if effective_image_lock_path is not None:
             lock = json.loads(effective_image_lock_path.read_text(encoding="utf-8"))
             images = lock["images"]
+            support_images = lock["supportImages"]
             service_images = {
                 "deeptutor": "deeptutor",
                 "gateway": "nginx",
@@ -528,16 +654,29 @@ def _inspect_compose_runtime(
                 "minio-bootstrap": "minio_client",
                 "openmaic": "openmaic",
                 "openmaic-render": "openmaic_render",
+                "pocketbase": "pocketbase",
                 "postgres": "postgres",
+            }
+            support_service_images = {
+                "openmaic-observer-attestation-signer": "observer_signer",
+                "openmaic-shared-ingress-observer": "observer_signer",
             }
             if any(
                 services.get(service_name, {}).get("image")
                 != images.get(lock_name, {}).get("reference")
                 for service_name, lock_name in service_images.items()
+            ) or any(
+                services.get(service_name, {}).get("image")
+                != support_images.get(lock_name, {}).get("reference")
+                for service_name, lock_name in support_service_images.items()
             ):
                 errors.append("image lock match")
     except (KeyError, OSError, TypeError, ValueError, subprocess.SubprocessError):
         errors.append("gateway-only public ports")
+    try:
+        _validated_observer_environment(observer_admission)
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+        errors.append("observer release manifest unavailable or changed")
     return tuple(dict.fromkeys(errors))
 
 
@@ -643,6 +782,169 @@ def _inspect_platform_config(path: Path) -> tuple[str, ...]:
     return tuple(errors)
 
 
+def _is_link_or_reparse(path: Path) -> bool:
+    try:
+        details = Path(path).lstat()
+    except OSError:
+        return False
+    if stat.S_ISLNK(details.st_mode):
+        return True
+    is_junction = getattr(Path(path), "is_junction", None)
+    try:
+        if callable(is_junction) and is_junction():
+            return True
+    except OSError:
+        return True
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return bool(reparse_flag and getattr(details, "st_file_attributes", 0) & reparse_flag)
+
+
+def _observer_runtime_secret_proof(
+    details: Any,
+    *,
+    file_name: str,
+    platform_name: str = os.name,
+) -> dict[str, object]:
+    if platform_name != "posix":
+        raise ValueError("observer runtime secret requires POSIX ownership metadata")
+    if (
+        type(details.st_uid) is not int
+        or type(details.st_gid) is not int
+        or details.st_uid != _OBSERVER_CONTAINER_UID
+        or details.st_gid != _OBSERVER_CONTAINER_GID
+    ):
+        raise ValueError("observer runtime secret is not bound to observer container identity")
+    mode = stat.S_IMODE(details.st_mode)
+    if mode not in {0o400, 0o600}:
+        raise ValueError("observer runtime secret mode is not restricted")
+    return {
+        "fileName": file_name,
+        "mode": f"{mode:04o}",
+        "ownerId": int(details.st_uid),
+        "groupId": int(details.st_gid),
+        "size": int(details.st_size),
+    }
+
+
+def _inspect_observer_secret_preflight(
+    observer_secret_dir: Path,
+    release_run_id: str,
+    observer_signer_image: str,
+) -> tuple[tuple[str, ...], dict[str, object] | None]:
+    root = Path(observer_secret_dir)
+    errors: list[str] = []
+    if not root.is_absolute():
+        return ("observer secret directory must be absolute",), None
+    if _RELEASE_RUN_ID.fullmatch(release_run_id) is None:
+        return ("observer secret release run id is invalid",), None
+    image_name, separator, image_digest = observer_signer_image.rpartition("@sha256:")
+    if (
+        not separator
+        or _IMMUTABLE_IMAGE_NAME.fullmatch(image_name) is None
+        or _DIGEST.fullmatch(f"sha256:{image_digest}") is None
+        or image_digest == "0" * 64
+    ):
+        return ("observer signer image is not immutable",), None
+    run_directory = root / release_run_id
+    if run_directory.parent != root or run_directory.name != release_run_id:
+        return ("observer secret run directory is invalid",), None
+    try:
+        resolved_root = root.resolve(strict=True)
+        resolved_run_directory = run_directory.resolve(strict=True)
+        root_details = root.lstat()
+        run_details = run_directory.lstat()
+    except OSError:
+        return ("observer secret run directory is unavailable",), None
+    if (
+        not stat.S_ISDIR(root_details.st_mode)
+        or not stat.S_ISDIR(run_details.st_mode)
+        or resolved_run_directory.parent != resolved_root
+        or _is_link_or_reparse(root)
+        or _is_link_or_reparse(run_directory)
+    ):
+        return ("observer secret run directory boundary is invalid",), None
+    expected_owner_id = os.geteuid() if hasattr(os, "geteuid") else int(run_details.st_uid)
+    run_mode = stat.S_IMODE(run_details.st_mode)
+    if run_details.st_uid != expected_owner_id or run_mode & 0o077:
+        errors.append("observer secret run directory is not owner-only")
+
+    identities: set[tuple[int, int]] = set()
+    values: set[bytes] = set()
+    secret_proof: dict[str, object] = {}
+    for name, file_name in OBSERVER_SECRET_FILES.items():
+        path = run_directory / file_name
+        try:
+            details = path.lstat()
+            if (
+                _is_link_or_reparse(path)
+                or not stat.S_ISREG(details.st_mode)
+                or details.st_size <= 0
+                or details.st_size > _MAX_OBSERVER_SECRET_BYTES
+            ):
+                raise ValueError
+            try:
+                proof = _observer_runtime_secret_proof(
+                    details,
+                    file_name=file_name,
+                )
+            except ValueError:
+                errors.append(f"{name} is not bound to the observer container identity")
+                proof = None
+            if not secret_file_is_restricted(path):
+                errors.append(f"{name} is not owner-only")
+            body = path.read_bytes()
+            confirmed = path.lstat()
+            if (
+                len(body) != details.st_size
+                or _is_link_or_reparse(path)
+                or (confirmed.st_dev, confirmed.st_ino) != (details.st_dev, details.st_ino)
+                or confirmed.st_mode != details.st_mode
+                or confirmed.st_uid != details.st_uid
+                or confirmed.st_gid != details.st_gid
+                or confirmed.st_size != details.st_size
+            ):
+                raise ValueError
+        except (OSError, ValueError):
+            errors.append(f"{name} is unavailable or invalid")
+            continue
+        identity = (details.st_dev, details.st_ino)
+        if identity in identities or body in values:
+            errors.append("observer secrets are not distinct")
+        identities.add(identity)
+        values.add(body)
+        if proof is not None:
+            secret_proof[name] = proof
+    errors = list(dict.fromkeys(errors))
+    try:
+        confirmed_run = run_directory.lstat()
+        confirmed_root = root.lstat()
+    except OSError:
+        errors.append("observer secret run directory changed during preflight")
+    else:
+        if (
+            (confirmed_root.st_dev, confirmed_root.st_ino)
+            != (root_details.st_dev, root_details.st_ino)
+            or (confirmed_run.st_dev, confirmed_run.st_ino)
+            != (run_details.st_dev, run_details.st_ino)
+            or _is_link_or_reparse(root)
+            or _is_link_or_reparse(run_directory)
+        ):
+            errors.append("observer secret run directory changed during preflight")
+    errors = list(dict.fromkeys(errors))
+    if errors or set(secret_proof) != set(OBSERVER_SECRET_FILES):
+        return tuple(errors or ("observer secret preflight is incomplete",)), None
+    return (), {
+        "schemaVersion": 1,
+        "releaseRunId": release_run_id,
+        "runDirectory": str(resolved_run_directory),
+        "ownerOnly": True,
+        "noLinksOrReparsePoints": True,
+        "distinctSecrets": True,
+        "observerSignerImage": observer_signer_image,
+        "secrets": secret_proof,
+    }
+
+
 def run_preflight(
     *,
     secret_dir: Path,
@@ -650,6 +952,9 @@ def run_preflight(
     tls_hostname: str | None = None,
     image_lock_path: Path | None = None,
     platform_config_path: Path | None = None,
+    observer_secret_dir: Path | None = None,
+    release_run_id: str | None = None,
+    observer_signer_image: str | None = None,
 ) -> PreflightResult:
     errors: list[str] = []
     root = Path(secret_dir)
@@ -661,7 +966,27 @@ def run_preflight(
         errors.extend(_inspect_image_lock(Path(image_lock_path)))
     if platform_config_path is not None:
         errors.extend(_inspect_platform_config(Path(platform_config_path)))
-    return PreflightResult(tuple(dict.fromkeys(errors)))
+    observer_secret_preflight_proof: dict[str, object] | None = None
+    observer_inputs = (observer_secret_dir, release_run_id, observer_signer_image)
+    if any(value is not None for value in observer_inputs) and not all(
+        value is not None for value in observer_inputs
+    ):
+        errors.append("observer secret preflight inputs are incomplete")
+    elif (
+        observer_secret_dir is not None
+        and release_run_id is not None
+        and observer_signer_image is not None
+    ):
+        observer_errors, observer_secret_preflight_proof = _inspect_observer_secret_preflight(
+            observer_secret_dir,
+            release_run_id,
+            observer_signer_image,
+        )
+        errors.extend(observer_errors)
+    return PreflightResult(
+        tuple(dict.fromkeys(errors)),
+        observer_secret_preflight=observer_secret_preflight_proof,
+    )
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -671,6 +996,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--candidate-root", type=Path)
     parser.add_argument("--image-lock", type=Path)
     parser.add_argument("--hostname")
+    parser.add_argument("--observer-secret-dir", type=Path)
+    parser.add_argument("--observer-release-manifest", type=Path)
+    parser.add_argument("--release-run-id")
+    parser.add_argument("--observer-signer-image")
     parser.add_argument("--offline-contract-check", action="store_true")
     parser.add_argument("--runtime-phase", choices=PHASES)
     return parser
@@ -684,6 +1013,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             arguments.candidate_root is not None
             or arguments.image_lock is not None
             or arguments.hostname is not None
+            or arguments.observer_secret_dir is not None
+            or arguments.observer_release_manifest is not None
+            or arguments.release_run_id is not None
+            or arguments.observer_signer_image is not None
             or arguments.offline_contract_check
         ):
             parser.error("--runtime-phase cannot be combined with host preflight options")
@@ -733,55 +1066,100 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0 if not errors and all(value is True for value in checks.values()) else 1
     if arguments.candidate_root is not None and arguments.image_lock is not None:
         parser.error("--candidate-root cannot be combined with --image-lock")
+    if arguments.image_lock is not None:
+        print("image lock candidate")
+        return 1
+    observer_inputs = (
+        arguments.observer_secret_dir,
+        arguments.release_run_id,
+        arguments.observer_signer_image,
+    )
+    if arguments.observer_release_manifest is not None:
+        if not arguments.observer_release_manifest.is_absolute():
+            parser.error("--observer-release-manifest must be an absolute path")
+        if any(value is not None for value in observer_inputs):
+            parser.error(
+                "--observer-release-manifest cannot be combined with manual observer inputs"
+            )
+    if any(value is not None for value in observer_inputs) and not all(
+        value is not None for value in observer_inputs
+    ):
+        parser.error(
+            "--observer-secret-dir, --release-run-id, and --observer-signer-image "
+            "must be provided together"
+        )
     candidate_root = arguments.candidate_root or PROJECT_ROOT
     if not candidate_root.is_absolute():
         parser.error("--candidate-root must be an absolute path")
     candidate_root = candidate_root.resolve()
     artifact_paths = candidate_artifact_paths(candidate_root)
-    image_lock_path = arguments.image_lock or artifact_paths.image_lock
-    result = run_preflight(
-        secret_dir=arguments.secret_dir,
-        required_secret_names=(
-            () if arguments.offline_contract_check else DEFAULT_REQUIRED_SECRETS
-        ),
-        tls_hostname=(None if arguments.offline_contract_check else arguments.hostname),
-        image_lock_path=image_lock_path,
-        platform_config_path=arguments.config,
-    )
-    errors = list(result.errors)
+    image_lock_path = artifact_paths.image_lock
+    candidate_lease = validated_candidate_artifact_lease(candidate_root)
+    errors: list[str] = []
     try:
-        validate_image_lock_bindings(
-            image_lock_path,
-            compose_paths=(
-                artifact_paths.platform_compose,
-                artifact_paths.data_plane_compose,
-            ),
-            require_candidate=True,
-        )
-    except ValueError:
-        errors.append("image lock candidate")
-    if not arguments.offline_contract_check:
-        if arguments.hostname is None:
-            errors.append("gateway TLS hostname")
-        if not errors:
-            try:
-                from deeptutor.services.config import load_platform_settings
-
-                settings = load_platform_settings(arguments.config)
-            except Exception:
-                errors.append("platform settings")
-            else:
-                errors.extend(
-                    asyncio.run(
-                        run_runtime_preflight(
-                            settings=settings,
-                            secret_dir=arguments.secret_dir,
-                            image_lock_path=image_lock_path,
-                            project_root=PROJECT_ROOT,
-                            candidate_root=candidate_root,
-                        )
+        with candidate_lease as artifact:
+            observer_admission = None
+            preflight_observer_inputs = {
+                "observer_secret_dir": arguments.observer_secret_dir,
+                "release_run_id": arguments.release_run_id,
+                "observer_signer_image": arguments.observer_signer_image,
+            }
+            if arguments.observer_release_manifest is not None:
+                try:
+                    observer_admission = load_observer_release_admission(
+                        manifest_path=arguments.observer_release_manifest,
+                        candidate_root=candidate_root,
+                        image_lock_bytes=artifact.image_lock_bytes,
                     )
-                )
+                    inputs = observer_admission["platformPreflightInputs"]
+                    preflight_observer_inputs = {
+                        "observer_secret_dir": Path(inputs["observer_secret_dir"]),
+                        "release_run_id": inputs["release_run_id"],
+                        "observer_signer_image": inputs["observer_signer_image"],
+                    }
+                except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+                    print("observer release manifest unavailable or invalid")
+                    return 1
+            result = run_preflight(
+                secret_dir=arguments.secret_dir,
+                required_secret_names=(
+                    () if arguments.offline_contract_check else DEFAULT_REQUIRED_SECRETS
+                ),
+                tls_hostname=(None if arguments.offline_contract_check else arguments.hostname),
+                image_lock_path=image_lock_path,
+                platform_config_path=arguments.config,
+                **preflight_observer_inputs,
+            )
+            errors.extend(result.errors)
+            if not arguments.offline_contract_check:
+                artifact.check_unchanged()
+                if observer_admission is None:
+                    errors.append("observer release manifest required")
+                if arguments.hostname is None:
+                    errors.append("gateway TLS hostname")
+                if not errors:
+                    try:
+                        from deeptutor.services.config import load_platform_settings
+
+                        settings = load_platform_settings(arguments.config)
+                    except Exception:
+                        errors.append("platform settings")
+                    else:
+                        artifact.check_unchanged()
+                        errors.extend(
+                            asyncio.run(
+                                run_runtime_preflight(
+                                    settings=settings,
+                                    secret_dir=arguments.secret_dir,
+                                    image_lock_path=image_lock_path,
+                                    project_root=PROJECT_ROOT,
+                                    candidate_root=candidate_root,
+                                    observer_admission=observer_admission,
+                                )
+                            )
+                        )
+    except CandidateArtifactError:
+        errors.append("image lock candidate")
     errors = list(dict.fromkeys(errors))
     if errors:
         for error in errors:

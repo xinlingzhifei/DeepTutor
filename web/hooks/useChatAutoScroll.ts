@@ -282,7 +282,7 @@ export function useChatAutoScroll({
   // imperative "jump to latest" button) but kept ``instant`` so it
   // never animates against an active stream.
   const scrollToBottom = useCallback(
-    (_behavior: ScrollBehavior) => {
+    (_behavior: ScrollBehavior | "instant") => {
       void _behavior;
       pinToBottom();
     },

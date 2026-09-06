@@ -43,7 +43,14 @@ GATEWAY_OBSERVER_CHALLENGE = "8" * 64
 GATEWAY_HOST_CHALLENGE = "9" * 64
 GATEWAY_TRUST_ISSUED_AT = "2026-08-30T04:00:00Z"
 GATEWAY_TRUST_EXPIRES_AT = "2026-08-30T04:10:00Z"
-GATEWAY_TRUST_SIGNATURE_DOMAIN = b"yfeistai.gateway-trust-envelope.v1\0"
+GATEWAY_TRUST_SIGNATURE_DOMAIN = b"yfeistai.gateway-trust-envelope.v2\0"
+GATEWAY_CANDIDATE_ARTIFACTS = (
+    "deploy/image-lock.json",
+    "docker-compose.yml",
+    "docker-compose.platform.yml",
+    "docker-compose.data-plane.yml",
+    "deploy/docker-compose.openmaic-shared-ingress-observer.yml",
+)
 EXPECTED_DOCKER_HOST_IDENTITY_ENV = "YFEISTAI_GATEWAY_DOCKER_HOST_IDENTITY_SHA256"
 DOCKER_LOGICAL_PREFIX = [
     "docker",
@@ -117,6 +124,16 @@ def canonical_json(document: object) -> bytes:
     ).encode("utf-8")
 
 
+def _gateway_candidate_contract(root: Path) -> dict[str, object]:
+    return {
+        "schemaVersion": 1,
+        "artifacts": {
+            relative: {"sha256": hashlib.sha256((root / relative).read_bytes()).hexdigest()}
+            for relative in GATEWAY_CANDIDATE_ARTIFACTS
+        },
+    }
+
+
 def _gateway_trust_spki(private_key: Ed25519PrivateKey) -> bytes:
     return private_key.public_key().public_bytes(
         encoding=serialization.Encoding.DER,
@@ -141,7 +158,7 @@ def _gateway_trust_envelope(
     )
     return canonical_json(
         {
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "payloadType": payload_type,
             "algorithm": "ed25519",
             "keyId": _gateway_trust_key_id(private_key),
@@ -168,6 +185,7 @@ def write_gateway_trust_pair(
     assert trusted_root.resolve() not in root.resolve().parents
     observer_key = Ed25519PrivateKey.generate()
     host_key = Ed25519PrivateKey.generate()
+    candidate_contract = _gateway_candidate_contract(root)
     keyring_path = trusted_root / "gateway-trust-keyring.json"
     keyring_path.parent.mkdir(parents=True, exist_ok=True)
     keyring_body = canonical_json(
@@ -196,9 +214,10 @@ def write_gateway_trust_pair(
     keyring_path.write_bytes(keyring_body)
 
     host_receipt = {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "producer": "gateway-docker-host-provisioner",
         "candidate": copy.deepcopy(candidate),
+        "candidateContract": copy.deepcopy(candidate_contract),
         "releaseRun": copy.deepcopy(release_run),
         "environmentId": release_run["environmentId"],
         "host": {
@@ -230,12 +249,13 @@ def write_gateway_trust_pair(
     )
 
     observer_payload = {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "issuer": "external-observer-authority",
         "issuedAt": GATEWAY_TRUST_ISSUED_AT,
         "expiresAt": GATEWAY_TRUST_EXPIRES_AT,
         "challenge": GATEWAY_OBSERVER_CHALLENGE,
         "candidate": copy.deepcopy(candidate),
+        "candidateContract": copy.deepcopy(candidate_contract),
         "releaseRun": copy.deepcopy(release_run),
         "environmentId": release_run["environmentId"],
         "claims": {
@@ -244,12 +264,13 @@ def write_gateway_trust_pair(
         },
     }
     host_payload = {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "issuer": "deployment-authority",
         "issuedAt": GATEWAY_TRUST_ISSUED_AT,
         "expiresAt": GATEWAY_TRUST_EXPIRES_AT,
         "challenge": GATEWAY_HOST_CHALLENGE,
         "candidate": copy.deepcopy(candidate),
+        "candidateContract": copy.deepcopy(candidate_contract),
         "releaseRun": copy.deepcopy(release_run),
         "environmentId": release_run["environmentId"],
         "claims": {
@@ -344,10 +365,23 @@ def expected_service_networks(
     compose_path: Path,
     runtime: dict[str, object],
 ) -> dict[str, list[str]]:
-    document = yaml.load(compose_path.read_text(encoding="utf-8"), Loader=_ComposeLoader)
-    services = document.get("services") if isinstance(document, dict) else None
+    compose_paths = [compose_path]
+    observer_overlay = (
+        compose_path.parent / "deploy" / "docker-compose.openmaic-shared-ingress-observer.yml"
+    )
+    if observer_overlay != compose_path and observer_overlay.is_file():
+        compose_paths.append(observer_overlay)
+    services: dict[str, dict[str, object]] = {}
+    for candidate_path in compose_paths:
+        document = yaml.load(candidate_path.read_text(encoding="utf-8"), Loader=_ComposeLoader)
+        raw_services = document.get("services") if isinstance(document, dict) else None
+        assert isinstance(raw_services, dict)
+        for service, raw_definition in raw_services.items():
+            assert isinstance(service, str) and isinstance(raw_definition, dict)
+            definition = dict(services.get(service, {}))
+            definition.update(raw_definition)
+            services[service] = definition
     containers = runtime.get("containers")
-    assert isinstance(services, dict)
     assert isinstance(containers, list)
     expected: dict[str, list[str]] = {}
     for container in containers:
@@ -359,6 +393,8 @@ def expected_service_networks(
         raw_networks = definition.get("networks")
         if isinstance(raw_networks, dict):
             logical_names = list(raw_networks)
+        elif raw_networks is None and definition.get("network_mode") == "none":
+            logical_names = []
         else:
             assert isinstance(raw_networks, list)
             logical_names = raw_networks
@@ -532,7 +568,8 @@ def _network_mode(
     if service == "deeptutor" and drift == "network-mode":
         return "host"
     if expected_networks is not None:
-        return expected_networks[service][-1]
+        networks = expected_networks[service]
+        return networks[-1] if networks else "none"
     return f"{DOCKER_PROJECT}_default"
 
 

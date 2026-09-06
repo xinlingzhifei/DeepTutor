@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from concurrent.futures import ThreadPoolExecutor
 import copy
+from datetime import datetime, timedelta, timezone
+import gzip
 import hashlib
 import importlib.util
 import json
@@ -11,10 +14,18 @@ import sys
 import threading
 from types import SimpleNamespace
 
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 import httpx
 from pydantic import SecretStr
 import pytest
 import yaml
+
+from tests.scripts.platform_candidate_test_support import (
+    POCKETBASE_BASE_COMPOSE_DRIFTS,
+    drift_pocketbase_base_compose,
+    write_schema3_candidate_root,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_PATH = PROJECT_ROOT / "scripts" / "openmaic_dedicated_outage_probe.py"
@@ -24,6 +35,17 @@ BASE_URL = "https://candidate.example.test"
 OBSERVER_ID = "shared-ingress-observer-environment-dedicated-01"
 OBSERVER_URL = "https://observer.example.test"
 SHARED_CONTROL_URL = "https://shared-ingress.example.test/v1/control-canaries"
+OBSERVER_AUTH_TOKEN = "observer-run-token-" + "7" * 48
+CANDIDATE_HEALTH_URL = BASE_URL + "/api/v1/system/teaching-health/observer-canary"
+SHARED_UPSTREAM_URL = "https://openmaic-upstream.example.test"
+INTERNAL_PROXY_URL = "http://openmaic-shared-ingress-observer:8000"
+OBSERVER_OBSERVED_AT = datetime.now(timezone.utc).replace(microsecond=0)
+OBSERVER_AUTH_EXPIRES_AT = (
+    (OBSERVER_OBSERVED_AT + timedelta(hours=1))
+    .replace(microsecond=0)
+    .isoformat()
+    .replace("+00:00", "Z")
+)
 DOCKER_HOST_IDENTITY_SHA256 = hashlib.sha256(
     b'{"scheme":"unix","socketPath":"/var/run/docker.sock"}\n'
 ).hexdigest()
@@ -53,33 +75,257 @@ def _candidate() -> dict[str, object]:
     }
 
 
+@pytest.mark.parametrize("drift", POCKETBASE_BASE_COMPOSE_DRIFTS)
+def test_default_candidate_loader_rejects_schema3_pocketbase_base_compose_drift_before_probe(
+    tmp_path: Path,
+    drift: str,
+) -> None:
+    module = _module()
+    candidate_root, lock = write_schema3_candidate_root(tmp_path)
+    drift_pocketbase_base_compose(candidate_root, lock, drift)
+
+    with pytest.raises(ValueError, match="production Compose image references"):
+        module._default_candidate_loader(candidate_root)
+
+
+def test_dedicated_outage_command_revalidates_schema3_candidate_after_restoration_before_attestation(
+    monkeypatch: pytest.MonkeyPatch,
+    capsysbinary: pytest.CaptureFixture[bytes],
+    tmp_path: Path,
+) -> None:
+    module = _module()
+    candidate_root, _lock = write_schema3_candidate_root(tmp_path)
+    (candidate_root / "runtime").mkdir()
+    shadow_root, shadow_lock = write_schema3_candidate_root(tmp_path / "shadow")
+    drift_pocketbase_base_compose(shadow_root, shadow_lock, "different-digest")
+    candidate_base = candidate_root / "docker-compose.yml"
+    shadow_base = shadow_root / "docker-compose.yml"
+    private_key, signature_path, public_key_path, public_key_spki_sha256 = (
+        _observer_signature_fixture(tmp_path)
+    )
+    observer_body = _observer_attestation_body(
+        _bound_observer_attestation(
+            candidate_root,
+            public_key_spki_sha256=public_key_spki_sha256,
+        )
+    )
+    _write_observer_signature(private_key, signature_path, observer_body)
+    observer_path = tmp_path / "external-observer-attestation.json"
+    observer_path.write_bytes(observer_body)
+    auth_path = tmp_path / "shared-ingress-auth.token"
+    auth_path.write_text(OBSERVER_AUTH_TOKEN + "\n", encoding="utf-8")
+    docker_path = tmp_path / "docker"
+    docker_path.write_bytes(b"docker")
+    docker_config = tmp_path / "docker-config"
+    docker_config.mkdir()
+    real_stat = Path.stat
+    real_lstat = Path.lstat
+    swapped = False
+
+    def stat_with_candidate_swap(path: Path, *args, **kwargs):
+        if swapped and Path(path) == candidate_base:
+            return real_stat(shadow_base, *args, **kwargs)
+        return real_stat(path, *args, **kwargs)
+
+    def lstat_with_candidate_swap(path: Path):
+        if swapped and Path(path) == candidate_base:
+            return real_lstat(shadow_base)
+        return real_lstat(path)
+
+    class DriftingRuntime(_Runtime):
+        def docker_boundary_attestation(self) -> dict[str, str]:
+            nonlocal swapped
+            assert "start" in self.events
+            assert "ready" in self.events
+            assert "canary" in self.events
+            assert "exit" in self.events
+            swapped = True
+            return super().docker_boundary_attestation()
+
+    runtime = DriftingRuntime(module)
+    environment = {
+        "YFEISTAI_CANDIDATE_ROOT": str(candidate_root),
+        "YFEISTAI_LIVE_FIXTURE_TOKEN": "admin-token-never-serialize",
+        "YFEISTAI_RELEASE_RUN_ID": "run-dedicated-01",
+        "YFEISTAI_ENVIRONMENT_ID": "environment-dedicated-01",
+        "YFEISTAI_RUNTIME_ATTESTATION_SHA256": RUNTIME_SHA256,
+        "YFEISTAI_OPENMAIC_OUTAGE_TIMEOUT_SECONDS": "300",
+        "YFEISTAI_DEDICATED_TENANT_ID": "tenant-dedicated-01",
+        "YFEISTAI_DEDICATED_OUTAGE_CONTAINER_ID": "f" * 64,
+        "YFEISTAI_DEDICATED_OUTAGE_PROJECT": "yfeistai-outage-run-dedicated-01",
+        "YFEISTAI_DEDICATED_ROUTE_ID": "dedicated-tenant-dedicated-01",
+        "YFEISTAI_SHARED_INGRESS_OBSERVER_ID": OBSERVER_ID,
+        "YFEISTAI_SHARED_INGRESS_OBSERVER_URL": OBSERVER_URL,
+        "YFEISTAI_SHARED_INGRESS_CONTROL_URL": SHARED_CONTROL_URL,
+        "YFEISTAI_SHARED_INGRESS_CANDIDATE_HEALTH_URL": CANDIDATE_HEALTH_URL,
+        "YFEISTAI_SHARED_INGRESS_UPSTREAM_URL": SHARED_UPSTREAM_URL,
+        "YFEISTAI_SHARED_INGRESS_AUTH_EXPIRES_AT": OBSERVER_AUTH_EXPIRES_AT,
+        "YFEISTAI_SHARED_INGRESS_OBSERVER_ATTESTATION_SHA256": hashlib.sha256(
+            observer_body
+        ).hexdigest(),
+        "YFEISTAI_SHARED_INGRESS_OBSERVER_ATTESTATION_PATH": str(observer_path),
+        "YFEISTAI_SHARED_INGRESS_OBSERVER_ATTESTATION_SIGNATURE_PATH": str(signature_path),
+        "YFEISTAI_SHARED_INGRESS_OBSERVER_ATTESTATION_PUBLIC_KEY_PATH": str(public_key_path),
+        "YFEISTAI_SHARED_INGRESS_OBSERVER_ATTESTATION_PUBLIC_KEY_SPKI_SHA256": (
+            public_key_spki_sha256
+        ),
+        "YFEISTAI_SHARED_INGRESS_AUTH_TOKEN_FILE": str(auth_path),
+        "YFEISTAI_OUTAGE_DOCKER_CONFIG": str(docker_config),
+        "YFEISTAI_OUTAGE_DOCKER_HOST": "unix:///var/run/docker.sock",
+        "WEB_BASE_URL": BASE_URL,
+    }
+    real_load_config = module._load_config
+
+    def load_config_with_fixed_docker(environment, *, cwd):
+        return real_load_config(
+            environment,
+            cwd=cwd,
+            docker_resolver=lambda: docker_path,
+            now=lambda: OBSERVER_OBSERVED_AT,
+        )
+
+    monkeypatch.setattr(Path, "stat", stat_with_candidate_swap)
+    monkeypatch.setattr(Path, "lstat", lstat_with_candidate_swap)
+    monkeypatch.setattr(module, "_load_config", load_config_with_fixed_docker)
+    monkeypatch.setattr(module, "LiveDedicatedOutageRuntime", lambda _config: runtime)
+    monkeypatch.chdir(candidate_root)
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+    exit_code = module.main(["--profile", "first-release"])
+    captured = capsysbinary.readouterr()
+
+    assert swapped is True
+    assert runtime.events[-5:] == ["start", "ready", "canary", "control-2", "exit"]
+    assert (candidate_root / "runtime" / "openmaic-dedicated-outage-attempt.json").is_file()
+    assert not (candidate_root / "runtime" / "openmaic-dedicated-outage-attestation.json").exists()
+    assert (exit_code, captured.out) == (1, b"")
+
+
 def _observer_attestation() -> dict[str, object]:
     return {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "producer": "openmaic-shared-ingress-observer",
         "releaseRun": {
             "runId": "run-dedicated-01",
             "environmentId": "environment-dedicated-01",
         },
-        "observedAt": "2026-08-30T00:00:00Z",
+        "observedAt": OBSERVER_OBSERVED_AT.isoformat().replace("+00:00", "Z"),
         "observer": {
             "observerId": OBSERVER_ID,
             "observerUrl": OBSERVER_URL,
             "sharedIngressControlUrl": SHARED_CONTROL_URL,
+            "candidateHealthUrl": CANDIDATE_HEALTH_URL,
+            "sharedIngressUpstreamUrl": SHARED_UPSTREAM_URL,
+            "internalProxyUrl": INTERNAL_PROXY_URL,
+            "authExpiresAt": OBSERVER_AUTH_EXPIRES_AT,
         },
     }
 
 
-def _observer_attestation_body() -> bytes:
+def _observer_attestation_body(
+    report: dict[str, object] | None = None,
+) -> bytes:
     return (
         json.dumps(
-            _observer_attestation(),
+            report if report is not None else _observer_attestation(),
             ensure_ascii=False,
             separators=(",", ":"),
             sort_keys=True,
         )
         + "\n"
     ).encode("utf-8")
+
+
+def _write_observer_signature(
+    private_key: Ed25519PrivateKey,
+    signature_path: Path,
+    body: bytes,
+) -> None:
+    signature_path.write_bytes(base64.b64encode(private_key.sign(body)) + b"\n")
+
+
+def _observer_signature_fixture(
+    tmp_path: Path,
+    body: bytes | None = None,
+) -> tuple[Ed25519PrivateKey, Path, Path, str]:
+    private_key = Ed25519PrivateKey.generate()
+    public_key = private_key.public_key()
+    public_key_path = tmp_path / "external-observer-public-key.pem"
+    public_key_path.write_bytes(
+        public_key.public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+    )
+    public_key_spki = public_key.public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    signature_path = tmp_path / "external-observer-attestation.sig"
+    if body is not None:
+        _write_observer_signature(private_key, signature_path, body)
+    return (
+        private_key,
+        signature_path,
+        public_key_path,
+        hashlib.sha256(public_key_spki).hexdigest(),
+    )
+
+
+def _write_candidate_image_lock(candidate_root: Path) -> None:
+    deploy = candidate_root / "deploy"
+    deploy.mkdir(parents=True, exist_ok=True)
+    body = (
+        json.dumps(
+            {
+                "schemaVersion": 3,
+                "candidate": _candidate(),
+                "images": {},
+                "supportImages": {},
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+    (deploy / "image-lock.json").write_bytes(body)
+
+
+def _bound_observer_attestation(
+    candidate_root: Path,
+    *,
+    public_key_spki_sha256: str,
+) -> dict[str, object]:
+    contract = sys.modules["openmaic_smoke_contract"]
+    report = _observer_attestation()
+    report["schemaVersion"] = contract.OPENMAIC_SHARED_INGRESS_OBSERVER_BOUND_SCHEMA_VERSION
+    report["candidateBinding"] = contract.current_openmaic_observer_candidate_binding(
+        candidate_root
+    )
+    report["attestationChallenge"] = contract.openmaic_observer_attestation_challenge(
+        public_key_spki_sha256
+    )
+    return report
+
+
+def _bound_observer_signature_fixture(
+    tmp_path: Path,
+    candidate_root: Path,
+) -> tuple[bytes, Ed25519PrivateKey, Path, Path, str]:
+    _write_candidate_image_lock(candidate_root)
+    private_key, signature_path, public_key_path, public_key_spki_sha256 = (
+        _observer_signature_fixture(tmp_path)
+    )
+    body = _observer_attestation_body(
+        _bound_observer_attestation(
+            candidate_root,
+            public_key_spki_sha256=public_key_spki_sha256,
+        )
+    )
+    _write_observer_signature(private_key, signature_path, body)
+    return body, private_key, signature_path, public_key_path, public_key_spki_sha256
 
 
 def _docker_boundary() -> dict[str, str]:
@@ -151,6 +397,7 @@ def _config(module, tmp_path: Path):
     docker_config.mkdir(exist_ok=True)
     return module.OutageProbeConfig(
         admin_token=SecretStr("admin-token-never-serialize"),
+        observer_auth_token=SecretStr(OBSERVER_AUTH_TOKEN),
         attempt_marker_path=runtime_root / "openmaic-dedicated-outage-attempt.json",
         base_url=BASE_URL,
         candidate=_candidate(),
@@ -169,11 +416,14 @@ def _config(module, tmp_path: Path):
         },
         observer_attestation_path=observer_path,
         observer_attestation_sha256=hashlib.sha256(observer_body).hexdigest(),
+        observer_auth_expires_at=OBSERVER_AUTH_EXPIRES_AT,
         observer_id=OBSERVER_ID,
         observer_url=OBSERVER_URL,
         observer_origin="https://observer.example.test",
+        candidate_health_url=CANDIDATE_HEALTH_URL,
         shared_ingress_control_url=SHARED_CONTROL_URL,
         shared_ingress_control_origin="https://shared-ingress.example.test",
+        shared_ingress_upstream_url=SHARED_UPSTREAM_URL,
         output_path=runtime_root / "openmaic-dedicated-outage-attestation.json",
         runtime_attestation_sha256=RUNTIME_SHA256,
         timeout_seconds=300,
@@ -827,9 +1077,17 @@ def test_config_is_candidate_run_container_and_observer_bound_without_serializin
     candidate_root.mkdir()
     runtime_root = candidate_root / "runtime"
     runtime_root.mkdir()
-    observer_body = _observer_attestation_body()
+    (
+        observer_body,
+        observer_private_key,
+        signature_path,
+        public_key_path,
+        public_key_spki_sha256,
+    ) = _bound_observer_signature_fixture(tmp_path, candidate_root)
     observer_path = tmp_path / "external-observer-attestation.json"
     observer_path.write_bytes(observer_body)
+    auth_path = tmp_path / "shared-ingress-auth.token"
+    auth_path.write_text(OBSERVER_AUTH_TOKEN + "\n", encoding="utf-8")
     docker_path = tmp_path / "docker"
     docker_path.write_bytes(b"docker")
     docker_config = tmp_path / "docker-config"
@@ -848,10 +1106,19 @@ def test_config_is_candidate_run_container_and_observer_bound_without_serializin
         "YFEISTAI_SHARED_INGRESS_OBSERVER_ID": OBSERVER_ID,
         "YFEISTAI_SHARED_INGRESS_OBSERVER_URL": OBSERVER_URL,
         "YFEISTAI_SHARED_INGRESS_CONTROL_URL": SHARED_CONTROL_URL,
+        "YFEISTAI_SHARED_INGRESS_CANDIDATE_HEALTH_URL": CANDIDATE_HEALTH_URL,
+        "YFEISTAI_SHARED_INGRESS_UPSTREAM_URL": SHARED_UPSTREAM_URL,
+        "YFEISTAI_SHARED_INGRESS_AUTH_EXPIRES_AT": OBSERVER_AUTH_EXPIRES_AT,
         "YFEISTAI_SHARED_INGRESS_OBSERVER_ATTESTATION_SHA256": hashlib.sha256(
             observer_body
         ).hexdigest(),
         "YFEISTAI_SHARED_INGRESS_OBSERVER_ATTESTATION_PATH": str(observer_path),
+        "YFEISTAI_SHARED_INGRESS_OBSERVER_ATTESTATION_SIGNATURE_PATH": str(signature_path),
+        "YFEISTAI_SHARED_INGRESS_OBSERVER_ATTESTATION_PUBLIC_KEY_PATH": str(public_key_path),
+        "YFEISTAI_SHARED_INGRESS_OBSERVER_ATTESTATION_PUBLIC_KEY_SPKI_SHA256": (
+            public_key_spki_sha256
+        ),
+        "YFEISTAI_SHARED_INGRESS_AUTH_TOKEN_FILE": str(auth_path),
         "YFEISTAI_OUTAGE_DOCKER_CONFIG": str(docker_config),
         "YFEISTAI_OUTAGE_DOCKER_HOST": "unix:///var/run/docker.sock",
         "WEB_BASE_URL": BASE_URL,
@@ -883,6 +1150,102 @@ def test_config_is_candidate_run_container_and_observer_bound_without_serializin
     }
     assert "admin-token-never-serialize" not in repr(config)
 
+    current = datetime.now(timezone.utc).replace(microsecond=0)
+    insufficient_expiry = current + timedelta(
+        seconds=int(environment["YFEISTAI_OPENMAIC_OUTAGE_TIMEOUT_SECONDS"]) + 120
+    )
+    insufficient_report = json.loads(observer_body)
+    insufficient_report["observedAt"] = (
+        (current - timedelta(seconds=1)).isoformat().replace("+00:00", "Z")
+    )
+    insufficient_report["observer"]["authExpiresAt"] = insufficient_expiry.isoformat().replace(
+        "+00:00", "Z"
+    )
+    insufficient_body = (
+        json.dumps(
+            insufficient_report,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode()
+    observer_path.write_bytes(insufficient_body)
+    _write_observer_signature(observer_private_key, signature_path, insufficient_body)
+    insufficient = dict(environment)
+    insufficient["YFEISTAI_SHARED_INGRESS_AUTH_EXPIRES_AT"] = insufficient_report["observer"][
+        "authExpiresAt"
+    ]
+    insufficient["YFEISTAI_SHARED_INGRESS_OBSERVER_ATTESTATION_SHA256"] = hashlib.sha256(
+        insufficient_body
+    ).hexdigest()
+    with pytest.raises(module.OpenMAICDedicatedOutageProbeError, match="auth_invalid"):
+        module._load_config(
+            insufficient,
+            cwd=candidate_root,
+            candidate_loader=lambda _root: (
+                _candidate(),
+                "ghcr.io/xinlingzhifei/openmaic:0.3.1-0cf2a330@sha256:" + "d" * 64,
+            ),
+            docker_resolver=lambda: docker_path,
+            now=lambda: current,
+        )
+
+    observer_path.write_bytes(observer_body)
+    _write_observer_signature(observer_private_key, signature_path, observer_body)
+    excessive_timeout = dict(environment)
+    excessive_timeout["YFEISTAI_OPENMAIC_OUTAGE_TIMEOUT_SECONDS"] = "3511"
+    with pytest.raises(module.OpenMAICDedicatedOutageProbeError, match="timeout_invalid"):
+        module._load_config(
+            excessive_timeout,
+            cwd=candidate_root,
+            candidate_loader=lambda _root: (
+                _candidate(),
+                "ghcr.io/xinlingzhifei/openmaic:0.3.1-0cf2a330@sha256:" + "d" * 64,
+            ),
+            docker_resolver=lambda: docker_path,
+        )
+
+    boundary_expiry = current + timedelta(seconds=7_200)
+    boundary_report = json.loads(observer_body)
+    boundary_report["observedAt"] = current.isoformat().replace("+00:00", "Z")
+    boundary_report["observer"]["authExpiresAt"] = boundary_expiry.isoformat().replace(
+        "+00:00", "Z"
+    )
+    boundary_body = (
+        json.dumps(
+            boundary_report,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode()
+    observer_path.write_bytes(boundary_body)
+    _write_observer_signature(observer_private_key, signature_path, boundary_body)
+    boundary = dict(environment)
+    boundary["YFEISTAI_OPENMAIC_OUTAGE_TIMEOUT_SECONDS"] = "3510"
+    boundary["YFEISTAI_SHARED_INGRESS_AUTH_EXPIRES_AT"] = boundary_report["observer"][
+        "authExpiresAt"
+    ]
+    boundary["YFEISTAI_SHARED_INGRESS_OBSERVER_ATTESTATION_SHA256"] = hashlib.sha256(
+        boundary_body
+    ).hexdigest()
+    with pytest.raises(module.OpenMAICDedicatedOutageProbeError):
+        module._load_config(
+            boundary,
+            cwd=candidate_root,
+            candidate_loader=lambda _root: (
+                _candidate(),
+                "ghcr.io/xinlingzhifei/openmaic:0.3.1-0cf2a330@sha256:" + "d" * 64,
+            ),
+            docker_resolver=lambda: docker_path,
+            now=lambda: current,
+        )
+
+    observer_path.write_bytes(observer_body)
+    _write_observer_signature(observer_private_key, signature_path, observer_body)
+
     for name, value in (
         ("YFEISTAI_DEDICATED_OUTAGE_CONTAINER_ID", "short"),
         ("YFEISTAI_DEDICATED_OUTAGE_PROJECT", "other-project"),
@@ -902,16 +1265,20 @@ def test_config_is_candidate_run_container_and_observer_bound_without_serializin
             )
 
 
-def test_config_requires_exact_candidate_independent_observer_attestation_before_mutation(
+def test_config_loads_external_shared_ingress_auth_token_without_serializing_it(
     tmp_path: Path,
 ) -> None:
     module = _module()
     candidate_root = tmp_path / "candidate"
     runtime_root = candidate_root / "runtime"
     runtime_root.mkdir(parents=True)
-    observer_body = _observer_attestation_body()
+    observer_body, _, signature_path, public_key_path, public_key_spki_sha256 = (
+        _bound_observer_signature_fixture(tmp_path, candidate_root)
+    )
     observer_path = tmp_path / "external-observer-attestation.json"
     observer_path.write_bytes(observer_body)
+    auth_path = tmp_path / "shared-ingress-auth.token"
+    auth_path.write_text(OBSERVER_AUTH_TOKEN + "\n", encoding="utf-8")
     docker_path = tmp_path / "docker"
     docker_path.write_bytes(b"docker")
     docker_config = tmp_path / "docker-config"
@@ -930,10 +1297,161 @@ def test_config_requires_exact_candidate_independent_observer_attestation_before
         "YFEISTAI_SHARED_INGRESS_OBSERVER_ID": OBSERVER_ID,
         "YFEISTAI_SHARED_INGRESS_OBSERVER_URL": OBSERVER_URL,
         "YFEISTAI_SHARED_INGRESS_CONTROL_URL": SHARED_CONTROL_URL,
+        "YFEISTAI_SHARED_INGRESS_CANDIDATE_HEALTH_URL": CANDIDATE_HEALTH_URL,
+        "YFEISTAI_SHARED_INGRESS_UPSTREAM_URL": SHARED_UPSTREAM_URL,
+        "YFEISTAI_SHARED_INGRESS_AUTH_EXPIRES_AT": OBSERVER_AUTH_EXPIRES_AT,
         "YFEISTAI_SHARED_INGRESS_OBSERVER_ATTESTATION_SHA256": hashlib.sha256(
             observer_body
         ).hexdigest(),
         "YFEISTAI_SHARED_INGRESS_OBSERVER_ATTESTATION_PATH": str(observer_path),
+        "YFEISTAI_SHARED_INGRESS_OBSERVER_ATTESTATION_SIGNATURE_PATH": str(signature_path),
+        "YFEISTAI_SHARED_INGRESS_OBSERVER_ATTESTATION_PUBLIC_KEY_PATH": str(public_key_path),
+        "YFEISTAI_SHARED_INGRESS_OBSERVER_ATTESTATION_PUBLIC_KEY_SPKI_SHA256": (
+            public_key_spki_sha256
+        ),
+        "YFEISTAI_SHARED_INGRESS_AUTH_TOKEN_FILE": str(auth_path),
+        "YFEISTAI_OUTAGE_DOCKER_CONFIG": str(docker_config),
+        "YFEISTAI_OUTAGE_DOCKER_HOST": "unix:///var/run/docker.sock",
+        "WEB_BASE_URL": BASE_URL,
+    }
+
+    config = module._load_config(
+        environment,
+        cwd=candidate_root,
+        candidate_loader=lambda _root: (
+            _candidate(),
+            "ghcr.io/xinlingzhifei/openmaic:0.3.1-0cf2a330@sha256:" + "d" * 64,
+        ),
+        docker_resolver=lambda: docker_path,
+    )
+
+    assert config.observer_auth_token.get_secret_value() == OBSERVER_AUTH_TOKEN
+    assert OBSERVER_AUTH_TOKEN not in repr(config)
+    assert OBSERVER_AUTH_TOKEN.encode() not in observer_body
+
+
+def test_probe_observer_secret_loader_rejects_same_size_identity_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+    candidate_root = (tmp_path / "candidate").resolve()
+    candidate_root.mkdir()
+    secret_path = (tmp_path / "observer-auth.token").resolve()
+    secret_path.write_text(OBSERVER_AUTH_TOKEN + "\n", encoding="utf-8")
+    if sys.platform != "win32":
+        secret_path.chmod(0o600)
+    real_fstat = module.os.fstat
+    calls = 0
+
+    def drifting_fstat(descriptor):
+        nonlocal calls
+        calls += 1
+        details = real_fstat(descriptor)
+        if calls != 2:
+            return details
+        return SimpleNamespace(
+            st_dev=details.st_dev,
+            st_ino=details.st_ino,
+            st_size=details.st_size,
+            st_mtime_ns=details.st_mtime_ns + 1,
+            st_ctime_ns=details.st_ctime_ns,
+            st_mode=details.st_mode,
+            st_uid=details.st_uid,
+        )
+
+    monkeypatch.setattr(module.os, "fstat", drifting_fstat)
+
+    with pytest.raises(
+        module.OpenMAICDedicatedOutageProbeError,
+        match="shared_ingress_auth_invalid",
+    ):
+        module._load_run_auth_token(str(secret_path), candidate_root=candidate_root)
+
+
+def test_probe_observer_secret_loader_binds_full_lstat_to_open_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _module()
+    candidate_root = (tmp_path / "candidate").resolve()
+    candidate_root.mkdir()
+    secret_path = (tmp_path / "observer-auth.token").resolve()
+    secret_path.write_text(OBSERVER_AUTH_TOKEN, encoding="ascii")
+    if module.os.name == "posix":
+        secret_path.chmod(0o600)
+    real_lstat = module.Path.lstat
+    calls = 0
+
+    def drifting_lstat(path):
+        nonlocal calls
+        details = real_lstat(path)
+        if module.Path(path) != secret_path:
+            return details
+        calls += 1
+        if calls != 2:
+            return details
+        return SimpleNamespace(
+            st_dev=details.st_dev,
+            st_ino=details.st_ino,
+            st_size=details.st_size,
+            st_mtime_ns=details.st_mtime_ns + 1,
+            st_ctime_ns=details.st_ctime_ns,
+            st_mode=details.st_mode,
+            st_uid=details.st_uid,
+        )
+
+    monkeypatch.setattr(module.Path, "lstat", drifting_lstat)
+
+    with pytest.raises(module.OpenMAICDedicatedOutageProbeError, match="auth_invalid"):
+        module._load_run_auth_token(str(secret_path), candidate_root=candidate_root)
+
+
+def test_config_requires_exact_candidate_independent_observer_attestation_before_mutation(
+    tmp_path: Path,
+) -> None:
+    module = _module()
+    candidate_root = tmp_path / "candidate"
+    runtime_root = candidate_root / "runtime"
+    runtime_root.mkdir(parents=True)
+    observer_body, _, signature_path, public_key_path, public_key_spki_sha256 = (
+        _bound_observer_signature_fixture(tmp_path, candidate_root)
+    )
+    observer_path = tmp_path / "external-observer-attestation.json"
+    observer_path.write_bytes(observer_body)
+    auth_path = tmp_path / "shared-ingress-auth.token"
+    auth_path.write_text(OBSERVER_AUTH_TOKEN + "\n", encoding="utf-8")
+    docker_path = tmp_path / "docker"
+    docker_path.write_bytes(b"docker")
+    docker_config = tmp_path / "docker-config"
+    docker_config.mkdir()
+    environment = {
+        "YFEISTAI_CANDIDATE_ROOT": str(candidate_root),
+        "YFEISTAI_LIVE_FIXTURE_TOKEN": "admin-token-never-serialize",
+        "YFEISTAI_RELEASE_RUN_ID": "run-dedicated-01",
+        "YFEISTAI_ENVIRONMENT_ID": "environment-dedicated-01",
+        "YFEISTAI_RUNTIME_ATTESTATION_SHA256": RUNTIME_SHA256,
+        "YFEISTAI_OPENMAIC_OUTAGE_TIMEOUT_SECONDS": "300",
+        "YFEISTAI_DEDICATED_TENANT_ID": "tenant-dedicated-01",
+        "YFEISTAI_DEDICATED_OUTAGE_CONTAINER_ID": "f" * 64,
+        "YFEISTAI_DEDICATED_OUTAGE_PROJECT": "yfeistai-outage-run-dedicated-01",
+        "YFEISTAI_DEDICATED_ROUTE_ID": "dedicated-tenant-dedicated-01",
+        "YFEISTAI_SHARED_INGRESS_OBSERVER_ID": OBSERVER_ID,
+        "YFEISTAI_SHARED_INGRESS_OBSERVER_URL": OBSERVER_URL,
+        "YFEISTAI_SHARED_INGRESS_CONTROL_URL": SHARED_CONTROL_URL,
+        "YFEISTAI_SHARED_INGRESS_CANDIDATE_HEALTH_URL": CANDIDATE_HEALTH_URL,
+        "YFEISTAI_SHARED_INGRESS_UPSTREAM_URL": SHARED_UPSTREAM_URL,
+        "YFEISTAI_SHARED_INGRESS_AUTH_EXPIRES_AT": OBSERVER_AUTH_EXPIRES_AT,
+        "YFEISTAI_SHARED_INGRESS_OBSERVER_ATTESTATION_SHA256": hashlib.sha256(
+            observer_body
+        ).hexdigest(),
+        "YFEISTAI_SHARED_INGRESS_OBSERVER_ATTESTATION_PATH": str(observer_path),
+        "YFEISTAI_SHARED_INGRESS_OBSERVER_ATTESTATION_SIGNATURE_PATH": str(signature_path),
+        "YFEISTAI_SHARED_INGRESS_OBSERVER_ATTESTATION_PUBLIC_KEY_PATH": str(public_key_path),
+        "YFEISTAI_SHARED_INGRESS_OBSERVER_ATTESTATION_PUBLIC_KEY_SPKI_SHA256": (
+            public_key_spki_sha256
+        ),
+        "YFEISTAI_SHARED_INGRESS_AUTH_TOKEN_FILE": str(auth_path),
         "YFEISTAI_OUTAGE_DOCKER_CONFIG": str(docker_config),
         "YFEISTAI_OUTAGE_DOCKER_HOST": "unix:///var/run/docker.sock",
         "WEB_BASE_URL": BASE_URL,
@@ -956,6 +1474,9 @@ def test_config_requires_exact_candidate_independent_observer_attestation_before
     assert config.shared_ingress_control_url == SHARED_CONTROL_URL
     assert config.observer_origin == "https://observer.example.test"
     assert config.shared_ingress_control_origin == "https://shared-ingress.example.test"
+    assert config.candidate_health_url == CANDIDATE_HEALTH_URL
+    assert config.shared_ingress_upstream_url == SHARED_UPSTREAM_URL
+    assert config.observer_auth_expires_at == OBSERVER_AUTH_EXPIRES_AT
 
     for name, value in (
         ("YFEISTAI_SHARED_INGRESS_OBSERVER_ATTESTATION_SHA256", "a" * 64),
@@ -997,9 +1518,13 @@ def test_config_requires_observer_trust_anchor_outside_candidate_and_rejects_ali
     module = _module()
     candidate_root = tmp_path / "candidate"
     (candidate_root / "runtime").mkdir(parents=True)
-    observer_body = _observer_attestation_body()
+    observer_body, _, signature_path, public_key_path, public_key_spki_sha256 = (
+        _bound_observer_signature_fixture(tmp_path, candidate_root)
+    )
     observer_path = tmp_path / "external-observer-attestation.json"
     observer_path.write_bytes(observer_body)
+    auth_path = tmp_path / "shared-ingress-auth.token"
+    auth_path.write_text(OBSERVER_AUTH_TOKEN + "\n", encoding="utf-8")
     docker_path = tmp_path / "docker"
     docker_path.write_bytes(b"docker")
     docker_config = tmp_path / "docker-config"
@@ -1018,10 +1543,19 @@ def test_config_requires_observer_trust_anchor_outside_candidate_and_rejects_ali
         "YFEISTAI_SHARED_INGRESS_OBSERVER_ID": OBSERVER_ID,
         "YFEISTAI_SHARED_INGRESS_OBSERVER_URL": OBSERVER_URL,
         "YFEISTAI_SHARED_INGRESS_CONTROL_URL": SHARED_CONTROL_URL,
+        "YFEISTAI_SHARED_INGRESS_CANDIDATE_HEALTH_URL": CANDIDATE_HEALTH_URL,
+        "YFEISTAI_SHARED_INGRESS_UPSTREAM_URL": SHARED_UPSTREAM_URL,
+        "YFEISTAI_SHARED_INGRESS_AUTH_EXPIRES_AT": OBSERVER_AUTH_EXPIRES_AT,
         "YFEISTAI_SHARED_INGRESS_OBSERVER_ATTESTATION_PATH": str(observer_path),
         "YFEISTAI_SHARED_INGRESS_OBSERVER_ATTESTATION_SHA256": hashlib.sha256(
             observer_body
         ).hexdigest(),
+        "YFEISTAI_SHARED_INGRESS_OBSERVER_ATTESTATION_SIGNATURE_PATH": str(signature_path),
+        "YFEISTAI_SHARED_INGRESS_OBSERVER_ATTESTATION_PUBLIC_KEY_PATH": str(public_key_path),
+        "YFEISTAI_SHARED_INGRESS_OBSERVER_ATTESTATION_PUBLIC_KEY_SPKI_SHA256": (
+            public_key_spki_sha256
+        ),
+        "YFEISTAI_SHARED_INGRESS_AUTH_TOKEN_FILE": str(auth_path),
         "YFEISTAI_OUTAGE_DOCKER_CONFIG": str(docker_config),
         "YFEISTAI_OUTAGE_DOCKER_HOST": "unix:///var/run/docker.sock",
         "WEB_BASE_URL": BASE_URL,
@@ -1342,7 +1876,7 @@ def test_shared_ingress_observer_requires_an_independent_control_increment(
 
     def observer_handler(request: httpx.Request) -> httpx.Response:
         observer_seen.append((request.method, request.url.path))
-        assert request.headers.get("authorization") is None
+        assert request.headers.get("authorization") == f"Bearer {OBSERVER_AUTH_TOKEN}"
         path = "/v1/observations/run-dedicated-01"
         if request.method == "GET" and request.url.path == path:
             return httpx.Response(
@@ -1362,6 +1896,7 @@ def test_shared_ingress_observer_requires_an_independent_control_increment(
         nonlocal count, last_canary_id
         assert request.method == "POST"
         assert str(request.url) == SHARED_CONTROL_URL
+        assert request.headers.get("authorization") == f"Bearer {OBSERVER_AUTH_TOKEN}"
         payload = json.loads(request.content)
         assert payload == {
             "schemaVersion": 1,
@@ -1411,6 +1946,150 @@ def test_shared_ingress_observer_requires_an_independent_control_increment(
             "kind": "openmaic-shared-ingress-control",
         }
     ]
+
+
+def test_shared_ingress_observer_streams_and_stops_at_response_limit(tmp_path: Path) -> None:
+    module = _module()
+    consumed = 0
+
+    class Stream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            nonlocal consumed
+            for chunk in (b"a" * (64 * 1024), b"b", b"must-not-be-read"):
+                consumed += 1
+                yield chunk
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=Stream())
+
+    async def scenario() -> None:
+        async with module.SharedIngressObserver(
+            _config(module, tmp_path),
+            observer_transport=httpx.MockTransport(handler),
+        ) as observer:
+            with pytest.raises(
+                module.OpenMAICDedicatedOutageProbeError,
+                match="observer_invalid",
+            ):
+                await observer.read()
+
+    asyncio.run(scenario())
+    assert consumed == 2
+
+    observation = json.dumps(
+        {
+            "schemaVersion": 1,
+            "runId": "run-dedicated-01",
+            "environmentId": "environment-dedicated-01",
+            "observationId": "shared-ingress-run-dedicated-01",
+            "requestCount": 0,
+            "lastCanaryId": None,
+        }
+    ).encode()
+
+    def encoded_handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-encoding": "gzip"},
+            content=gzip.compress(observation),
+        )
+
+    async def encoded_scenario() -> None:
+        async with module.SharedIngressObserver(
+            _config(module, tmp_path),
+            observer_transport=httpx.MockTransport(encoded_handler),
+        ) as observer:
+            with pytest.raises(
+                module.OpenMAICDedicatedOutageProbeError,
+                match="observer_invalid",
+            ):
+                await observer.read()
+
+    asyncio.run(encoded_scenario())
+
+
+def test_shared_ingress_observer_authenticates_observer_and_control_requests(
+    tmp_path: Path,
+) -> None:
+    module = _module()
+    config = _config(module, tmp_path)
+    observed_headers: list[str | None] = []
+
+    def observer_handler(request: httpx.Request) -> httpx.Response:
+        observed_headers.append(request.headers.get("authorization"))
+        return httpx.Response(
+            200,
+            json={
+                "schemaVersion": 1,
+                "runId": "run-dedicated-01",
+                "environmentId": "environment-dedicated-01",
+                "observationId": "shared-ingress-run-dedicated-01",
+                "requestCount": 1,
+                "lastCanaryId": None,
+            },
+        )
+
+    def control_handler(request: httpx.Request) -> httpx.Response:
+        observed_headers.append(request.headers.get("authorization"))
+        payload = json.loads(request.content)
+        return httpx.Response(
+            202,
+            json={"accepted": True, "canaryId": payload["canaryId"]},
+        )
+
+    async def scenario() -> None:
+        async with module.SharedIngressObserver(
+            config,
+            observer_transport=httpx.MockTransport(observer_handler),
+            control_transport=httpx.MockTransport(control_handler),
+            canary_id_factory=lambda: "shared-control-canary-01",
+            monotonic=iter((0.0, 21.0)).__next__,
+            sleep=lambda _seconds: asyncio.sleep(0),
+        ) as observer:
+            await observer.read()
+            with pytest.raises(module.OpenMAICDedicatedOutageProbeError):
+                await observer.control()
+
+    asyncio.run(scenario())
+
+    assert observed_headers == [
+        f"Bearer {OBSERVER_AUTH_TOKEN}",
+        f"Bearer {OBSERVER_AUTH_TOKEN}",
+        f"Bearer {OBSERVER_AUTH_TOKEN}",
+        f"Bearer {OBSERVER_AUTH_TOKEN}",
+    ]
+
+
+def test_main_rejects_shared_ingress_auth_secret_in_attestation(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    module = _module()
+    candidate_root, lock = write_schema3_candidate_root(tmp_path)
+    config = SimpleNamespace(
+        candidate_root=candidate_root,
+        candidate=lock["candidate"],
+        admin_token=SecretStr("admin-token-never-serialize"),
+        observer_auth_token=SecretStr(OBSERVER_AUTH_TOKEN),
+    )
+    monkeypatch.setattr(module, "_parse_args", lambda _argv: None)
+    monkeypatch.setattr(module, "_load_config", lambda *_args, **_kwargs: config)
+    probe_called = False
+
+    async def leaked_body(_config) -> bytes:
+        nonlocal probe_called
+        probe_called = True
+        return json.dumps({"nested": {"value": OBSERVER_AUTH_TOKEN}}).encode()
+
+    monkeypatch.setattr(module, "_run_main", leaked_body)
+
+    assert module.main([]) == 1
+    assert probe_called is True
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "openmaic_dedicated_outage_probe_failed\n"
+    assert OBSERVER_AUTH_TOKEN not in captured.err
 
 
 def test_shared_ingress_observer_fails_closed_when_control_is_not_observed(

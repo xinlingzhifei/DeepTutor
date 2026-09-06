@@ -42,5 +42,5 @@ export function I18nProvider({
     };
   }, [language]);
 
-  return children;
+  return <>{children}</>;
 }

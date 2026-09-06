@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import importlib.util
 import json
 from pathlib import Path
@@ -260,7 +262,29 @@ def test_live_spec_declares_exact_tailwind_matrix_and_structural_evidence() -> N
     assert "viewport=${visualCase.viewport.name}" in source
     assert "appearance=${visualCase.appearance}" in source
     assert 'localStorage.setItem("deeptutor-theme", appearance)' in source
-    assert 'new URL(response.url()).pathname === "/api/v1/settings/ui"' in source
+    theme_selection = _compact_typescript(_object_after(source, "function selectLiveVisualTheme("))
+    assert (
+        'page.waitForResponse((response)=>endpointMatches(response,"PUT",'
+        '"/api/v1/settings/ui",expectedOrigin,)' in theme_selection
+    )
+    assert (
+        "constresponse=awaitpersisted;if(!response.ok())"
+        '{thrownewError("livevisualthemepersistencefailed");}' in theme_selection
+    )
+    endpoint_matcher = _compact_typescript(_object_after(source, "function endpointMatches("))
+    assert "if(response.request().method()!==method)returnfalse;" in endpoint_matcher
+    assert (
+        'constresponseUrl=sameOriginHttpsUrl(response.url(),expectedOrigin,"browserresponse",);'
+        "returnresponseUrl.pathname===pathname;" in endpoint_matcher
+    )
+    assert "catch{returnfalse;}" in endpoint_matcher
+    origin_guard = _compact_typescript(
+        _object_after(LIVE_FIXTURE.read_text(encoding="utf-8"), "function sameOriginHttpsUrl(")
+    )
+    assert (
+        'if(parsed.protocol!=="https:"||parsed.username||parsed.password||parsed.origin!==origin)'
+        '{thrownewError("invalid");}' in origin_guard
+    )
     assert 'themeButton.getAttribute("aria-pressed")' in source
     assert 'themeButton).toHaveAttribute("aria-pressed", "true")' in source
     assert 'page.on("console"' in source
@@ -303,6 +327,7 @@ def _probe_environment(tmp_path: Path, report: Path, evidence: str) -> dict[str,
     return {
         "YFEISTAI_EVIDENCE_REPORT": str(report),
         "YFEISTAI_CANDIDATE_ROOT": str(tmp_path),
+        "YFEISTAI_CANDIDATE_SHA256": "a" * 64,
         "YFEISTAI_RELEASE_RUN_ID": "release-run-1",
         "YFEISTAI_ENVIRONMENT_ID": "staging-1",
         "YFEISTAI_EVIDENCE": evidence,
@@ -310,6 +335,40 @@ def _probe_environment(tmp_path: Path, report: Path, evidence: str) -> dict[str,
         "YFEISTAI_LIVE_FIXTURE_TOKEN": "test-fixture-token-placeholder",
         "WEB_BASE_URL": "https://candidate.example.test",
     }
+
+
+def _teacher_fixture_password(environment: dict[str, str]) -> str:
+    material = "\0".join(
+        (
+            "policyVersion=2",
+            f"releaseRun={environment['YFEISTAI_RELEASE_RUN_ID']}",
+            f"environment={environment['YFEISTAI_ENVIRONMENT_ID']}",
+            f"evidence={environment['YFEISTAI_EVIDENCE']}",
+            f"candidateSha256={environment['YFEISTAI_CANDIDATE_SHA256']}",
+            "role=teacher",
+        )
+    ).encode("utf-8")
+    digest = hmac.new(
+        environment["YFEISTAI_LIVE_FIXTURE_TOKEN"].encode("utf-8"),
+        material,
+        hashlib.sha256,
+    ).digest()
+    return f"Yf!2-{base64.urlsafe_b64encode(digest).decode('ascii').rstrip('=')}"
+
+
+def _encoded_secret(secret: str, encoding: str) -> bytes:
+    raw = secret.encode("utf-8")
+    if encoding == "literal":
+        return raw
+    if encoding == "base64":
+        return base64.b64encode(raw)
+    if encoding == "urlsafe":
+        return base64.urlsafe_b64encode(raw).rstrip(b"=")
+    if encoding == "hex":
+        return raw.hex().encode("ascii")
+    if encoding == "json":
+        return json.dumps(secret, ensure_ascii=True)[1:-1].encode("ascii")
+    raise AssertionError(f"unsupported secret encoding: {encoding}")
 
 
 def test_probe_runs_only_the_fixed_teacher_recipe_and_writes_native_stdout(
@@ -399,6 +458,94 @@ def test_probe_refuses_to_persist_playwright_output_containing_fixture_token(
 
     assert "secret" in str(captured.value).lower()
     assert fixture_token not in str(captured.value)
+    assert not report.exists()
+
+
+def test_native_runner_captures_stderr_instead_of_inheriting_it() -> None:
+    module = _load_probe()
+    captured: dict[str, object] = {}
+
+    class OwnedProcess:
+        returncode = 0
+
+        def communicate(self, timeout=None):
+            assert timeout == 3
+            return b"native stdout", b"native stderr"
+
+    def popen(arguments: list[str], **options: object) -> OwnedProcess:
+        captured.update(arguments=arguments, options=options)
+        return OwnedProcess()
+
+    completed = module._run(
+        ["C:/trusted/npm.cmd"],
+        cwd=ROOT,
+        env={},
+        stdout=subprocess.PIPE,
+        check=False,
+        timeout_seconds=3,
+        popen_factory=popen,
+        platform="win32",
+    )
+
+    options = captured["options"]
+    assert isinstance(options, dict)
+    assert options["stderr"] == subprocess.PIPE
+    assert completed.stdout == b"native stdout"
+    assert completed.stderr == b"native stderr"
+
+
+@pytest.mark.parametrize(
+    ("secret_kind", "encoding"),
+    (
+        pytest.param("platform-token", "literal", id="platform-token-literal"),
+        pytest.param("platform-token", "base64", id="platform-token-base64"),
+        pytest.param("platform-token", "urlsafe", id="platform-token-urlsafe"),
+        pytest.param("platform-token", "hex", id="platform-token-hex"),
+        pytest.param("platform-token", "json", id="platform-token-json"),
+        pytest.param("teacher-password", "literal", id="teacher-password-literal"),
+        pytest.param("teacher-password", "base64", id="teacher-password-base64"),
+        pytest.param("teacher-password", "urlsafe", id="teacher-password-urlsafe"),
+        pytest.param("teacher-password", "hex", id="teacher-password-hex"),
+        pytest.param("teacher-password", "json", id="teacher-password-json"),
+    ),
+)
+def test_probe_rejects_encoded_fixture_secrets_from_native_stderr_without_echo(
+    tmp_path: Path,
+    secret_kind: str,
+    encoding: str,
+) -> None:
+    module = _load_probe()
+    npm = _trusted_node_runtime(tmp_path)
+    report = tmp_path / "raw" / "teacher.json"
+    environment = _probe_environment(tmp_path, report, "teacher_flow")
+    fixture_token = "fixture-token-must-never-reach-native-stderr"
+    environment["YFEISTAI_LIVE_FIXTURE_TOKEN"] = fixture_token
+    teacher_password = _teacher_fixture_password(environment)
+    secret = fixture_token if secret_kind == "platform-token" else teacher_password
+    native_stdout = b'{"config":{},"suites":[],"errors":[],"stats":{}}\n'
+    native_stderr = b"untrusted diagnostic: " + _encoded_secret(secret, encoding)
+
+    def run(arguments: list[str], **_options: object) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(
+            arguments,
+            0,
+            stdout=native_stdout,
+            stderr=native_stderr,
+        )
+
+    with pytest.raises(ValueError) as captured:
+        module.main(
+            ["teacher_flow"],
+            environ=environment,
+            runner=run,
+            runtime_resolver=lambda: module.resolve_fixed_node_runtime(
+                platform="win32", trusted_roots=(npm.parent,)
+            ),
+        )
+
+    assert str(captured.value) == "playwright_native_output_contains_live_secret"
+    assert fixture_token not in str(captured.value)
+    assert teacher_password not in str(captured.value)
     assert not report.exists()
 
 
@@ -527,6 +674,56 @@ def test_probe_rejects_missing_or_blank_fixture_token_before_execution(
     assert str(error) == "probe environment is incomplete"
 
 
+def test_probe_rejects_missing_candidate_digest_before_execution(tmp_path: Path) -> None:
+    module = _load_probe()
+    environment = _probe_environment(tmp_path, tmp_path / "probe.json", "teacher_flow")
+    environment.pop("YFEISTAI_CANDIDATE_SHA256")
+    calls: list[str] = []
+
+    def resolve_runtime() -> tuple[str, Path]:
+        calls.append("runtime_resolver")
+        return "C:/trusted/npm.cmd", Path("C:/trusted")
+
+    def run(arguments: list[str], **_options: object) -> subprocess.CompletedProcess[bytes]:
+        calls.append("runner")
+        return subprocess.CompletedProcess(arguments, 0, stdout=b"{}")
+
+    with pytest.raises(ValueError, match="probe environment is incomplete"):
+        module.main(
+            ["teacher_flow"],
+            environ=environment,
+            runner=run,
+            runtime_resolver=resolve_runtime,
+        )
+
+    assert calls == []
+
+
+def test_probe_rejects_plain_http_web_base_url_before_execution(tmp_path: Path) -> None:
+    module = _load_probe()
+    environment = _probe_environment(tmp_path, tmp_path / "probe.json", "teacher_flow")
+    environment["WEB_BASE_URL"] = "http://candidate.example.test/release"
+    calls: list[str] = []
+
+    def resolve_runtime() -> tuple[str, Path]:
+        calls.append("runtime_resolver")
+        return "C:/trusted/npm.cmd", Path("C:/trusted")
+
+    def run(arguments: list[str], **_options: object) -> subprocess.CompletedProcess[bytes]:
+        calls.append("runner")
+        return subprocess.CompletedProcess(arguments, 0, stdout=b"{}")
+
+    with pytest.raises(ValueError, match="probe web base URL must use HTTPS"):
+        module.main(
+            ["teacher_flow"],
+            environ=environment,
+            runner=run,
+            runtime_resolver=resolve_runtime,
+        )
+
+    assert calls == []
+
+
 def test_probe_forwards_only_the_exact_live_fixture_secret(tmp_path: Path) -> None:
     module = _load_probe()
     npm = _trusted_node_runtime(tmp_path)
@@ -557,6 +754,7 @@ def test_probe_forwards_only_the_exact_live_fixture_secret(tmp_path: Path) -> No
     assert isinstance(child_environment, dict)
     assert isinstance(arguments, list)
     assert child_environment["YFEISTAI_LIVE_FIXTURE_TOKEN"] == fixture_token
+    assert child_environment["YFEISTAI_CANDIDATE_SHA256"] == "a" * 64
     assert "YFEISTAI_LIVE_PLATFORM_ADMIN_TOKEN" not in child_environment
     assert "YFEISTAI_LIVE_FIXTURE_TOKEN_BACKUP" not in child_environment
     assert all(fixture_token not in argument for argument in arguments)

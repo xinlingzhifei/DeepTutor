@@ -5,8 +5,14 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import asdict
+import hmac
+import os
+from pathlib import Path
+import re
+import stat
+from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Response
 import httpx
 from prometheus_client import CONTENT_TYPE_LATEST
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -49,6 +55,96 @@ from deeptutor.teaching.storage_credentials import (
 )
 
 router = APIRouter()
+_OBSERVER_CANARY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_OBSERVER_HEALTH_TOKEN = re.compile(r"^[A-Za-z0-9_-]{48,128}$")
+_OBSERVER_HEALTH_TOKEN_FILE = "YFEISTAI_SHARED_INGRESS_CANDIDATE_HEALTH_TOKEN_FILE"
+_CANDIDATE_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_CANDIDATE_SHA256_ENV = "YFEISTAI_CANDIDATE_SHA256"
+
+
+def _observer_candidate_sha256() -> str:
+    value = os.environ.get(_CANDIDATE_SHA256_ENV, "")
+    if _CANDIDATE_SHA256.fullmatch(value) is None or value == "0" * 64:
+        raise HTTPException(status_code=503, detail="observer_candidate_unavailable")
+    return value
+
+
+def _observer_health_token() -> str:
+    raw_path = os.environ.get(_OBSERVER_HEALTH_TOKEN_FILE)
+    if not raw_path:
+        raise HTTPException(status_code=503, detail="observer_credential_unavailable")
+    supplied = Path(raw_path)
+    descriptor: int | None = None
+    try:
+        if not supplied.is_absolute():
+            raise OSError
+        resolved = supplied.resolve(strict=True)
+        if supplied != resolved or any(
+            parent.is_symlink() for parent in (resolved, *resolved.parents)
+        ):
+            raise OSError
+        before = resolved.lstat()
+        if not stat.S_ISREG(before.st_mode):
+            raise OSError
+        if os.name == "posix" and (
+            before.st_uid != os.geteuid() or stat.S_IMODE(before.st_mode) & 0o077
+        ):
+            raise OSError
+        descriptor = os.open(
+            resolved,
+            os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened = os.fstat(descriptor)
+        body = os.read(descriptor, 130)
+        if os.read(descriptor, 1):
+            raise OSError
+        after = os.fstat(descriptor)
+        final = resolved.lstat()
+
+        def identity(details: os.stat_result) -> tuple[int, ...]:
+            return (
+                details.st_dev,
+                details.st_ino,
+                details.st_size,
+                details.st_mtime_ns,
+                details.st_ctime_ns,
+                details.st_mode,
+                details.st_uid,
+            )
+
+        if identity(before) != identity(opened) or identity(opened) != identity(after):
+            raise OSError
+        if identity(opened) != identity(final):
+            raise OSError
+        token = body.decode("ascii").strip()
+        encoded = token.encode("ascii")
+        if _OBSERVER_HEALTH_TOKEN.fullmatch(token) is None or body not in {
+            encoded,
+            encoded + b"\n",
+            encoded + b"\r\n",
+        }:
+            raise OSError
+        return token
+    except (OSError, UnicodeError) as exc:
+        raise HTTPException(status_code=503, detail="observer_credential_unavailable") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+async def require_observer_canary_token(
+    authorization: Annotated[list[str] | None, Header(alias="Authorization")] = None,
+) -> None:
+    if authorization is None or len(authorization) != 1:
+        raise HTTPException(status_code=401, detail="observer_credential_invalid")
+    scheme, separator, supplied = authorization[0].partition(" ")
+    if (
+        separator != " "
+        or scheme.lower() != "bearer"
+        or _OBSERVER_HEALTH_TOKEN.fullmatch(supplied) is None
+        or not hmac.compare_digest(supplied, _observer_health_token())
+    ):
+        raise HTTPException(status_code=401, detail="observer_credential_invalid")
 
 
 class GenerationSchedulerSnapshotRequest(BaseModel):
@@ -147,6 +243,39 @@ async def teaching_health(
 ) -> dict[str, object]:
     active_results = await active_probes.probe()
     return asdict(await service.report_active(runtime_repository, active_results))
+
+
+@router.get(
+    "/api/v1/system/teaching-health/observer-canary",
+    dependencies=[Depends(require_observer_canary_token)],
+)
+async def observer_canary_health(
+    active_probes: ActiveHealthProbeService = Depends(get_active_health_probe_service),
+    observer_canary: Annotated[
+        list[str] | None,
+        Header(alias="X-YFeiSTAI-Observer-Canary"),
+    ] = None,
+) -> dict[str, object]:
+    if (
+        observer_canary is None
+        or len(observer_canary) != 1
+        or _OBSERVER_CANARY.fullmatch(observer_canary[0]) is None
+    ):
+        raise HTTPException(status_code=400, detail="observer_canary_invalid")
+    active_results = await active_probes.probe(openmaic_shared_observer_canary=observer_canary[0])
+    shared = active_results.get("openmaic_shared")
+    if shared is None:
+        raise HTTPException(status_code=503, detail="observer_canary_unavailable")
+    return {
+        "candidateSha256": _observer_candidate_sha256(),
+        "components": {
+            "openmaic_shared": {
+                "status": shared.status,
+                "service": "openmaic",
+                "mode": "shared",
+            }
+        },
+    }
 
 
 def _iso_utc(value) -> str:

@@ -10,6 +10,7 @@ import {
 import {
   pollLiveStudentClassroom,
   loginLiveIdentity,
+  sameOriginHttpsUrl,
   type LiveStudentClassroomMode,
   type LiveStudentClassroomPollState,
   type LiveStudentGenerationJobPollState,
@@ -148,20 +149,29 @@ function endpointMatches(
   response: Response,
   method: string,
   pathname: string,
+  expectedOrigin: string,
 ): boolean {
-  return (
-    response.request().method() === method &&
-    new URL(response.url()).pathname === pathname
-  );
+  if (response.request().method() !== method) return false;
+  try {
+    const responseUrl = sameOriginHttpsUrl(
+      response.url(),
+      expectedOrigin,
+      "browser response",
+    );
+    return responseUrl.pathname === pathname;
+  } catch {
+    return false;
+  }
 }
 
 function waitForEndpoint(
   page: Page,
   method: string,
   pathname: string,
+  expectedOrigin: string,
 ): Promise<Response> {
   return page.waitForResponse(
-    (response) => endpointMatches(response, method, pathname),
+    (response) => endpointMatches(response, method, pathname, expectedOrigin),
     { timeout: ACTION_TIMEOUT_MS },
   );
 }
@@ -170,6 +180,7 @@ function waitForStudentEstimate(
   page: Page,
   courseId: string,
   mode: LiveStudentClassroomMode,
+  expectedOrigin: string,
 ): Promise<Response> {
   return page.waitForResponse(
     (response) => {
@@ -178,6 +189,7 @@ function waitForStudentEstimate(
           response,
           "POST",
           "/api/v1/student-classrooms/estimate",
+          expectedOrigin,
         )
       ) {
         return false;
@@ -231,11 +243,16 @@ async function pollRecord(
   pathname: string,
   label: string,
   ready: (value: JsonRecord) => boolean,
+  expectedOrigin: string,
 ): Promise<JsonRecord> {
   for (let attempt = 0; attempt < SYNC_ATTEMPTS; attempt += 1) {
     let response: APIResponse;
     try {
-      response = await page.request.get(pathname, { timeout: ACTION_TIMEOUT_MS });
+      response = await page.request.get(pathname, {
+        timeout: ACTION_TIMEOUT_MS,
+        maxRedirects: 0,
+      });
+      sameOriginHttpsUrl(response.url(), expectedOrigin, `${label} response`);
     } catch {
       throw new Error(`live ${label} synchronization failed`);
     }
@@ -253,10 +270,15 @@ async function sameSessionGetRecord(
   page: Page,
   pathname: string,
   label: string,
+  expectedOrigin: string,
 ): Promise<JsonRecord> {
   let response: APIResponse;
   try {
-    response = await page.request.get(pathname, { timeout: ACTION_TIMEOUT_MS });
+    response = await page.request.get(pathname, {
+      timeout: ACTION_TIMEOUT_MS,
+      maxRedirects: 0,
+    });
+    sameOriginHttpsUrl(response.url(), expectedOrigin, `${label} response`);
   } catch {
     throw new Error(`live ${label} synchronization failed`);
   }
@@ -271,7 +293,11 @@ function safeOptionValue(value: string): string {
   return value;
 }
 
-async function selectTenant(page: Page, tenantId: string): Promise<void> {
+async function selectTenant(
+  page: Page,
+  tenantId: string,
+  expectedOrigin: string,
+): Promise<void> {
   const safeTenantId = safeOptionValue(tenantId);
   const switcher = page.locator(
     `select:has(option[value="${safeTenantId}"])`,
@@ -282,7 +308,12 @@ async function selectTenant(page: Page, tenantId: string): Promise<void> {
     await switcher.selectOption(tenantId);
     return;
   }
-  const switched = waitForEndpoint(page, "PUT", "/api/v1/tenants/active");
+  const switched = waitForEndpoint(
+    page,
+    "PUT",
+    "/api/v1/tenants/active",
+    expectedOrigin,
+  );
   await switcher.selectOption(tenantId);
   const response = await switched;
   requireStatus(response, 200, "tenant selection");
@@ -306,8 +337,8 @@ async function openActorSession(
   });
   try {
     const page = await context.newPage();
-    await loginLiveIdentity(page, identity);
-    await selectTenant(page, tenantId);
+    await loginLiveIdentity(page, identity, "/home", baseUrl);
+    await selectTenant(page, tenantId, baseUrl);
     return { context, page };
   } catch {
     await context.close();
@@ -347,11 +378,13 @@ function parseStudentClassroomRecord(
 async function readStudentClassroom(
   page: Page,
   assetId: string,
+  expectedOrigin: string,
 ): Promise<StudentClassroomRecord> {
   const value = await sameSessionGetRecord(
     page,
     `/api/v1/student-classrooms/${encodeURIComponent(assetId)}`,
     "student classroom",
+    expectedOrigin,
   );
   const classroom = parseStudentClassroomRecord(value, "student classroom");
   if (classroom.assetId !== assetId) {
@@ -363,11 +396,13 @@ async function readStudentClassroom(
 async function readStudentGenerationJob(
   page: Page,
   jobId: string,
+  expectedOrigin: string,
 ): Promise<LiveStudentGenerationJobPollState> {
   const value = await sameSessionGetRecord(
     page,
     `/api/v1/classroom-jobs/${encodeURIComponent(jobId)}`,
     "student generation job",
+    expectedOrigin,
   );
   const phase = text(value.phase, "student generation job");
   if (phase !== "outline" && phase !== "content") {
@@ -388,11 +423,15 @@ async function readStudentGenerationJob(
   };
 }
 
-async function studentClassroomAssetBaseline(page: Page): Promise<Set<string>> {
+async function studentClassroomAssetBaseline(
+  page: Page,
+  expectedOrigin: string,
+): Promise<Set<string>> {
   const value = await sameSessionGetRecord(
     page,
     "/api/v1/student-classrooms",
     "student classroom list",
+    expectedOrigin,
   );
   return new Set(
     items(value.items, "student classroom list").map((item) =>
@@ -432,12 +471,14 @@ async function pollCreatedStudentClassroom(
     mode: LiveStudentClassroomMode;
     ownerId: string;
   },
+  expectedOrigin: string,
 ): Promise<StudentClassroomRecord & { generationJobId: string }> {
   for (let attempt = 0; attempt < STUDENT_CREATION_ATTEMPTS; attempt += 1) {
     const value = await sameSessionGetRecord(
       page,
       "/api/v1/student-classrooms",
       "student classroom list",
+      expectedOrigin,
     );
     const created = items(value.items, "student classroom list")
       .map((item) =>
@@ -457,7 +498,11 @@ async function pollCreatedStudentClassroom(
         throw new Error("live student classroom creation response is invalid");
       }
       const generationJobId = listed.generationJobId;
-      const classroom = await readStudentClassroom(page, listed.assetId);
+      const classroom = await readStudentClassroom(
+        page,
+        listed.assetId,
+        expectedOrigin,
+      );
       verifyStudentBinding(classroom, expected);
       if (
         classroom.requestId !== listed.requestId ||
@@ -483,6 +528,7 @@ async function submitStudentClassroomPrompt(
   catalog: LiveCatalogRecords,
   mode: LiveStudentClassroomMode,
   prompt: string,
+  expectedOrigin: string,
 ): Promise<void> {
   await page.goto("/home");
   const capability = page.getByRole("button", { name: CHAT_NAME });
@@ -495,7 +541,12 @@ async function submitStudentClassroomPrompt(
   await studentClassroom.click();
   const config = page.getByTestId("student-classroom-config");
   await expect(config).toBeVisible({ timeout: ACTION_TIMEOUT_MS });
-  const estimated = waitForStudentEstimate(page, catalog.course.id, mode);
+  const estimated = waitForStudentEstimate(
+    page,
+    catalog.course.id,
+    mode,
+    expectedOrigin,
+  );
   const course = config.getByLabel(COURSE_NAME);
   await selectValue(course, catalog.course.id);
   const openCreation = config
@@ -542,8 +593,13 @@ async function saveAndConfirmStudentOutline(
   page: Page,
   student: LiveIdentity,
   classroom: LiveStudentClassroomPollState,
+  expectedOrigin: string,
 ): Promise<string> {
-  const before = await readStudentClassroom(page, classroom.assetId);
+  const before = await readStudentClassroom(
+    page,
+    classroom.assetId,
+    expectedOrigin,
+  );
   verifyStudentBinding(before, {
     courseId: classroom.courseId,
     classId: classroom.classId,
@@ -588,6 +644,7 @@ async function saveAndConfirmStudentOutline(
     page,
     "PUT",
     `/api/v1/student-classrooms/${encodedAssetId}/outline`,
+    expectedOrigin,
   );
   const saveOutline = card.getByRole("button", { name: SAVE_OUTLINE_NAME });
   await expect(saveOutline).toBeEnabled({ timeout: ACTION_TIMEOUT_MS });
@@ -623,6 +680,7 @@ async function saveAndConfirmStudentOutline(
     page,
     "POST",
     `/api/v1/student-classrooms/${encodedAssetId}/confirm-outline`,
+    expectedOrigin,
   );
   const confirmOutline = card.getByRole("button", {
     name: CONFIRM_OUTLINE_NAME,
@@ -689,7 +747,7 @@ async function runLiveStudentRecipe(
   );
   try {
     let confirmedOutlineTitle: string | null = null;
-    const baseline = await studentClassroomAssetBaseline(session.page);
+    const baseline = await studentClassroomAssetBaseline(session.page, baseUrl);
     await submitStudentClassroomPrompt(
       session.page,
       catalog,
@@ -697,13 +755,19 @@ async function runLiveStudentRecipe(
       mode === "micro"
         ? `Create a concise micro-classroom about proportional reasoning for ${student.suffix}.`
         : `Create a full classroom about proportional reasoning for ${student.suffix}.`,
+      baseUrl,
     );
-    const created = await pollCreatedStudentClassroom(session.page, baseline, {
-      courseId: catalog.course.id,
-      classId: catalog.teachingClass.id,
-      mode,
-      ownerId,
-    });
+    const created = await pollCreatedStudentClassroom(
+      session.page,
+      baseline,
+      {
+        courseId: catalog.course.id,
+        classId: catalog.teachingClass.id,
+        mode,
+        ownerId,
+      },
+      baseUrl,
+    );
     const card = session.page.getByTestId("student-classroom-job-card");
     await expect(card).toBeVisible({ timeout: ACTION_TIMEOUT_MS });
     await expect(card).toHaveAttribute("data-job-id", created.generationJobId);
@@ -724,6 +788,7 @@ async function runLiveStudentRecipe(
         const classroom = await readStudentClassroom(
           session.page,
           created.assetId,
+          baseUrl,
         );
         if (
           !classroom.generationJobId ||
@@ -737,7 +802,7 @@ async function runLiveStudentRecipe(
         return { ...classroom, generationJobId: classroom.generationJobId };
       },
       readGenerationJob: (jobId) =>
-        readStudentGenerationJob(session.page, jobId),
+        readStudentGenerationJob(session.page, jobId, baseUrl),
       ...(mode === "full"
         ? {
             onAwaitingConfirmation: async (
@@ -756,6 +821,7 @@ async function runLiveStudentRecipe(
                 session.page,
                 student,
                 classroom,
+                baseUrl,
               );
               return undefined;
             },
@@ -769,6 +835,7 @@ async function runLiveStudentRecipe(
       const completed = await readStudentClassroom(
         session.page,
         result.classroom.assetId,
+        baseUrl,
       );
       if (
         completed.classroomVersionId !== result.classroom.classroomVersionId ||
@@ -811,6 +878,7 @@ async function submitTeachingBrief(
   fixture: LiveProvisionedFixture,
   identity: LiveIdentity,
   recipe: "teacher" | "content",
+  expectedOrigin: string,
 ): Promise<{ assetId: string; title: string }> {
   const catalog = catalogFor(fixture);
   const source = catalog.source;
@@ -836,7 +904,12 @@ async function submitTeachingBrief(
     .getByLabel(POINT_DESCRIPTION_NAME)
     .fill("Explain the controlled source with verifiable classroom evidence.");
 
-  const created = waitForEndpoint(page, "POST", "/api/v1/classrooms");
+  const created = waitForEndpoint(
+    page,
+    "POST",
+    "/api/v1/classrooms",
+    expectedOrigin,
+  );
   await form.getByRole("button", { name: GENERATE_NAME }).click();
   const response = await created;
   requireStatus(response, 202, "classroom creation");
@@ -852,7 +925,12 @@ async function submitTeachingBrief(
   return { assetId, title };
 }
 
-async function confirmOutline(page: Page, assetId: string, title: string): Promise<void> {
+async function confirmOutline(
+  page: Page,
+  assetId: string,
+  title: string,
+  expectedOrigin: string,
+): Promise<void> {
   await pollRecord(
     page,
     `/api/v1/classrooms/${encodeURIComponent(assetId)}`,
@@ -864,6 +942,7 @@ async function confirmOutline(page: Page, assetId: string, title: string): Promi
       value.outline !== null &&
       typeof value.outline === "object" &&
       !Array.isArray(value.outline),
+    expectedOrigin,
   );
 
   await page.goto(`/teaching/classrooms/${encodeURIComponent(assetId)}/outline`);
@@ -874,6 +953,7 @@ async function confirmOutline(page: Page, assetId: string, title: string): Promi
     page,
     "POST",
     `/api/v1/classrooms/${encodeURIComponent(assetId)}/confirm-outline`,
+    expectedOrigin,
   );
   await page.getByRole("button", { name: CONFIRM_NAME }).click();
   const response = await confirmed;
@@ -891,6 +971,7 @@ async function confirmOutline(page: Page, assetId: string, title: string): Promi
       !Array.isArray(value.document) &&
       typeof value.classroomVersionId === "string" &&
       value.classroomVersionId.length > 0,
+    expectedOrigin,
   );
 }
 
@@ -899,6 +980,7 @@ async function validateAndSubmit(
   assetId: string,
   title: string,
   scope: SubmissionScope,
+  expectedOrigin: string,
 ): Promise<PendingSubmission> {
   const encodedAssetId = encodeURIComponent(assetId);
   await page.goto(`/teaching/classrooms/${encodedAssetId}/edit`);
@@ -910,6 +992,7 @@ async function validateAndSubmit(
     page,
     "POST",
     `/api/v1/classrooms/${encodedAssetId}/validate`,
+    expectedOrigin,
   );
   await page.getByRole("button", { name: VALIDATE_NAME }).click();
   const validationResponse = await validated;
@@ -934,6 +1017,7 @@ async function validateAndSubmit(
     page,
     "POST",
     `/api/v1/classrooms/${encodedAssetId}/submit`,
+    expectedOrigin,
   );
   await page.getByRole("button", { name: SUBMIT_NAME }).click();
   const submitResponse = await submitted;
@@ -960,10 +1044,28 @@ async function createPendingSubmission(
   identity: LiveIdentity,
   recipe: "teacher" | "content",
   scope: SubmissionScope,
+  expectedOrigin: string,
 ): Promise<PendingSubmission> {
-  const classroom = await submitTeachingBrief(page, fixture, identity, recipe);
-  await confirmOutline(page, classroom.assetId, classroom.title);
-  return validateAndSubmit(page, classroom.assetId, classroom.title, scope);
+  const classroom = await submitTeachingBrief(
+    page,
+    fixture,
+    identity,
+    recipe,
+    expectedOrigin,
+  );
+  await confirmOutline(
+    page,
+    classroom.assetId,
+    classroom.title,
+    expectedOrigin,
+  );
+  return validateAndSubmit(
+    page,
+    classroom.assetId,
+    classroom.title,
+    scope,
+    expectedOrigin,
+  );
 }
 
 export async function runLiveTeacherRecipe(
@@ -979,14 +1081,29 @@ export async function runLiveTeacherRecipe(
     fixture.tenant.tenantId,
   );
   try {
-    await createPendingSubmission(session.page, fixture, teacher, "teacher", "class");
+    await createPendingSubmission(
+      session.page,
+      fixture,
+      teacher,
+      "teacher",
+      "class",
+      baseUrl,
+    );
   } finally {
     await session.context.close();
   }
 }
 
-async function assertAuthorCannotDecide(page: Page): Promise<void> {
-  const listed = waitForEndpoint(page, "GET", "/api/v1/classroom-reviews");
+async function assertAuthorCannotDecide(
+  page: Page,
+  expectedOrigin: string,
+): Promise<void> {
+  const listed = waitForEndpoint(
+    page,
+    "GET",
+    "/api/v1/classroom-reviews",
+    expectedOrigin,
+  );
   await page.goto("/teaching/reviews");
   const response = await listed;
   requireStatus(response, 200, "author review list");
@@ -1011,7 +1128,12 @@ async function approveSubmission(
     fixture.tenant.tenantId,
   );
   try {
-    const listed = waitForEndpoint(session.page, "GET", "/api/v1/classroom-reviews");
+    const listed = waitForEndpoint(
+      session.page,
+      "GET",
+      "/api/v1/classroom-reviews",
+      baseUrl,
+    );
     await session.page.goto("/teaching/reviews");
     requireStatus(await listed, 200, "reviewer review list");
     const reviewChoice = session.page
@@ -1027,6 +1149,7 @@ async function approveSubmission(
       session.page,
       "POST",
       `/api/v1/classroom-reviews/${encodeURIComponent(submission.reviewId)}/approve`,
+      baseUrl,
     );
     await session.page.getByRole("button", { name: APPROVE_NAME }).click();
     const response = await approved;
@@ -1064,6 +1187,7 @@ async function publishSubmission(
       session.page,
       "GET",
       "/api/v1/classroom-publications",
+      baseUrl,
     );
     await session.page.goto("/teaching/library");
     requireStatus(await listed, 200, "publication list");
@@ -1078,6 +1202,7 @@ async function publishSubmission(
       session.page,
       "POST",
       `/api/v1/classrooms/${encodeURIComponent(submission.assetId)}/publish`,
+      baseUrl,
     );
     await candidate.getByRole("button", { name: PUBLISH_NAME }).click();
     const response = await published;
@@ -1138,8 +1263,9 @@ export async function runLiveContentOperationsRecipe(
       author,
       "content",
       "tenant",
+      baseUrl,
     );
-    await assertAuthorCannotDecide(authorSession.page);
+    await assertAuthorCannotDecide(authorSession.page, baseUrl);
   } finally {
     await authorSession.context.close();
   }

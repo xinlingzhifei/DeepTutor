@@ -32,7 +32,9 @@ SCRIPTS_ROOT = Path(__file__).resolve().parent
 if str(SCRIPTS_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_ROOT))
 
-from render_platform_compose import validate_image_lock_bindings  # noqa: E402
+from render_platform_compose import (  # noqa: E402
+    validated_candidate_artifact_lease,
+)
 from tenant_isolation_contract import (  # noqa: E402
     TENANT_ISOLATION_PRODUCER,
     TENANT_ISOLATION_SCHEMA_VERSION,
@@ -160,18 +162,8 @@ CandidateLoader = Callable[[Path], Mapping[str, object]]
 
 
 def _default_candidate_loader(candidate_root: Path) -> dict[str, object]:
-    lock = validate_image_lock_bindings(
-        candidate_root / "deploy" / "image-lock.json",
-        compose_paths=(
-            candidate_root / "docker-compose.platform.yml",
-            candidate_root / "docker-compose.data-plane.yml",
-        ),
-        require_candidate=True,
-    )
-    candidate = lock.get("candidate")
-    if not isinstance(candidate, dict):
-        raise TenantIsolationProbeError("candidate_invalid")
-    return json.loads(json.dumps(candidate))
+    with validated_candidate_artifact_lease(candidate_root) as artifact:
+        return json.loads(json.dumps(artifact.candidate))
 
 
 def _valid_base_url(value: object) -> bool:
@@ -2789,7 +2781,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         _parse_args(argv)
         config = _load_config(os.environ, cwd=Path.cwd())
-        body = asyncio.run(_run_tenant_isolation_probe(config))
+        operation_failed = False
+        try:
+            with validated_candidate_artifact_lease(
+                config.candidate_root,
+                expected_candidate=config.candidate,
+            ):
+                try:
+                    body = asyncio.run(_run_tenant_isolation_probe(config))
+                except BaseException:
+                    operation_failed = True
+                    raise
+        except ValueError as exc:
+            if operation_failed:
+                raise
+            raise TenantIsolationProbeError("candidate_invalid") from exc
         _write_stdout_report(body)
     except TenantIsolationProbeError as exc:
         print(str(exc), file=sys.stderr)

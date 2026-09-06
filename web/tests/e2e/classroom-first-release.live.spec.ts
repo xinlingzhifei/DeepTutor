@@ -1,10 +1,18 @@
-import { expect, test, type Browser, type Page } from "@playwright/test";
+import {
+  expect,
+  test,
+  type Browser,
+  type Page,
+  type Response,
+} from "@playwright/test";
 import {
   ensureLiveCourseGenerationPolicy,
   LiveFixtureContext,
   loginLiveIdentity,
   provisionLiveFixture,
+  sameOriginHttpsUrl,
   type LiveApiRequestContext,
+  type LiveCandidateIdentity,
   type LiveEvidence,
   type LiveProvisionedFixture,
   type LiveTenantRecord,
@@ -59,6 +67,7 @@ const TAILWIND_THEME_LABELS: Record<TailwindAppearance, RegExp> = {
 };
 
 type PublicEnvironmentName =
+  | "YFEISTAI_CANDIDATE_SHA256"
   | "YFEISTAI_RELEASE_RUN_ID"
   | "YFEISTAI_ENVIRONMENT_ID"
   | "YFEISTAI_EVIDENCE"
@@ -71,8 +80,10 @@ function requiredPublicEnvironment(name: PublicEnvironmentName): string {
 }
 
 function requiredFixtureToken(): string {
-  const value = process.env.YFEISTAI_LIVE_FIXTURE_TOKEN?.trim();
-  if (!value) throw new Error("live browser environment is incomplete");
+  const value = process.env.YFEISTAI_LIVE_FIXTURE_TOKEN;
+  if (!value || value !== value.trim()) {
+    throw new Error("live browser environment is incomplete");
+  }
   return value;
 }
 
@@ -81,16 +92,27 @@ function liveBaseUrl(): string {
   try {
     const parsed = new URL(value);
     if (
-      !["http:", "https:"].includes(parsed.protocol) ||
+      parsed.protocol !== "https:" ||
       parsed.username ||
       parsed.password
     ) {
       throw new Error("invalid");
     }
+    return parsed.origin;
   } catch {
     throw new Error("live browser base URL is invalid");
   }
-  return value;
+}
+
+function liveCandidateIdentity(): LiveCandidateIdentity {
+  const candidateSha256 = process.env.YFEISTAI_CANDIDATE_SHA256;
+  if (
+    typeof candidateSha256 !== "string" ||
+    !/^(?!0{64}$)[0-9a-f]{64}$/.test(candidateSha256)
+  ) {
+    throw new Error("live browser candidate identity is invalid");
+  }
+  return { candidateSha256 };
 }
 
 function liveFixtureContext(
@@ -103,9 +125,11 @@ function liveFixtureContext(
   return new LiveFixtureContext({
     request,
     adminToken: requiredFixtureToken(),
+    apiOrigin: liveBaseUrl(),
     releaseRun: requiredPublicEnvironment("YFEISTAI_RELEASE_RUN_ID"),
     environment: requiredPublicEnvironment("YFEISTAI_ENVIRONMENT_ID"),
     evidence,
+    candidate: liveCandidateIdentity(),
   });
 }
 
@@ -116,9 +140,29 @@ function safeTenantOption(value: string): string {
   return value;
 }
 
+function endpointMatches(
+  response: Response,
+  method: string,
+  pathname: string,
+  expectedOrigin: string,
+): boolean {
+  if (response.request().method() !== method) return false;
+  try {
+    const responseUrl = sameOriginHttpsUrl(
+      response.url(),
+      expectedOrigin,
+      "browser response",
+    );
+    return responseUrl.pathname === pathname;
+  } catch {
+    return false;
+  }
+}
+
 async function selectLiveVisualTenant(
   page: Page,
   tenant: LiveTenantRecord,
+  expectedOrigin: string,
 ): Promise<void> {
   const safeTenantId = safeTenantOption(tenant.tenantId);
   const label = page
@@ -150,8 +194,12 @@ async function selectLiveVisualTenant(
 
   const switched = page.waitForResponse(
     (response) =>
-      response.request().method() === "PUT" &&
-      new URL(response.url()).pathname === "/api/v1/tenants/active",
+      endpointMatches(
+        response,
+        "PUT",
+        "/api/v1/tenants/active",
+        expectedOrigin,
+      ),
     { timeout: ACTION_TIMEOUT_MS },
   );
   if ((await action.count()) === 1) {
@@ -193,8 +241,15 @@ async function selectLiveVisualTenant(
 async function assertLiveRouteLandmark(
   page: Page,
   route: (typeof TAILWIND_ROUTES)[number],
+  expectedOrigin: string,
 ): Promise<void> {
-  const pathname = new URL(page.url()).pathname.replace(/\/+$/, "") || "/";
+  const currentUrl = sameOriginHttpsUrl(
+    page.url(),
+    expectedOrigin,
+    "browser route",
+  );
+  expect(currentUrl.origin).toBe(expectedOrigin);
+  const pathname = currentUrl.pathname.replace(/\/+$/, "") || "/";
   expect(pathname).toBe(route);
   if (route === "/login") {
     await expect(page.locator("form")).toBeVisible({
@@ -234,17 +289,21 @@ async function assertLiveRouteLandmark(
 async function navigateToLiveSettingsRoute(
   page: Page,
   route: "/settings/appearance" | "/settings/llm",
+  expectedOrigin: string,
 ): Promise<void> {
   const settingsRead = page.waitForResponse(
     (response) =>
-      response.request().method() === "GET" &&
-      new URL(response.url()).pathname === "/api/v1/settings",
+      endpointMatches(response, "GET", "/api/v1/settings", expectedOrigin),
     { timeout: ACTION_TIMEOUT_MS },
   );
   const statusRead = page.waitForResponse(
     (response) =>
-      response.request().method() === "GET" &&
-      new URL(response.url()).pathname === "/api/v1/system/status",
+      endpointMatches(
+        response,
+        "GET",
+        "/api/v1/system/status",
+        expectedOrigin,
+      ),
     { timeout: ACTION_TIMEOUT_MS },
   );
   await page.goto(route);
@@ -255,14 +314,19 @@ async function navigateToLiveSettingsRoute(
   if (!settingsResponse.ok() || !statusResponse.ok()) {
     throw new Error("live visual settings read failed");
   }
-  await assertLiveRouteLandmark(page, route);
+  await assertLiveRouteLandmark(page, route, expectedOrigin);
 }
 
 async function selectLiveVisualTheme(
   page: Page,
   appearance: TailwindAppearance,
+  expectedOrigin: string,
 ): Promise<void> {
-  await navigateToLiveSettingsRoute(page, "/settings/appearance");
+  await navigateToLiveSettingsRoute(
+    page,
+    "/settings/appearance",
+    expectedOrigin,
+  );
   const themeButton = page.getByRole("button", {
     name: TAILWIND_THEME_LABELS[appearance],
   });
@@ -270,8 +334,12 @@ async function selectLiveVisualTheme(
   if ((await themeButton.getAttribute("aria-pressed")) !== "true") {
     const persisted = page.waitForResponse(
       (response) =>
-        response.request().method() === "PUT" &&
-        new URL(response.url()).pathname === "/api/v1/settings/ui",
+        endpointMatches(
+          response,
+          "PUT",
+          "/api/v1/settings/ui",
+          expectedOrigin,
+        ),
       { timeout: ACTION_TIMEOUT_MS },
     );
     await themeButton.click();
@@ -327,13 +395,13 @@ async function runLiveTailwindCase(
 
     let routeReady = false;
     if (visualCase.route !== "/login") {
-      await loginLiveIdentity(page, identity);
-      await selectLiveVisualTenant(page, fixture.tenant);
+      await loginLiveIdentity(page, identity, "/home", baseUrl);
+      await selectLiveVisualTenant(page, fixture.tenant, baseUrl);
       if (
         visualCase.route === "/settings/appearance" ||
         visualCase.route === "/settings/llm"
       ) {
-        await selectLiveVisualTheme(page, visualCase.appearance);
+        await selectLiveVisualTheme(page, visualCase.appearance, baseUrl);
         routeReady = visualCase.route === "/settings/appearance";
       }
     }
@@ -343,12 +411,12 @@ async function runLiveTailwindCase(
     });
     if (!routeReady) {
       if (visualCase.route === "/settings/llm") {
-        await navigateToLiveSettingsRoute(page, visualCase.route);
+        await navigateToLiveSettingsRoute(page, visualCase.route, baseUrl);
       } else {
         await page.goto(visualCase.route);
       }
     }
-    await assertLiveRouteLandmark(page, visualCase.route);
+    await assertLiveRouteLandmark(page, visualCase.route, baseUrl);
     await page.evaluate(async () => {
       await document.fonts.ready;
       await new Promise<void>((resolve) =>

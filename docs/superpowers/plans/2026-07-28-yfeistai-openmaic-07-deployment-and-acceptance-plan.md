@@ -84,7 +84,7 @@ teaching-reaper
 learning-projector
 ```
 
-`deeptutor` 与以上服务合并到同一内部网络。`gateway` 是唯一具有主机端口的服务；平台覆盖文件使用 Docker Compose v2.24.4+ 的 `!reset []` 清除基础 Compose 中 `deeptutor` 和 `pocketbase` 的端口，测试必须检查两份文件合并后的配置而不是只解析覆盖文件。`tenant-provisioner` 是唯一同时拥有数据库迁移权限、租户 Secret 写目录和 MinIO bootstrap 凭据的内部进程；API 与普通 Worker 没有该权限。OpenMAIC 镜像由 `integrations/openmaic/Dockerfile` 构建为 `ghcr.io/xinlingzhifei/openmaic:0.3.1-0cf2a330`；`openmaic-render` 从同一锁版源码的 `render-service` 构建并发布为 `ghcr.io/xinlingzhifei/openmaic-render:0.3.1-0cf2a330`，只在私网接收 MP4 导出；平台应用镜像发布为 `ghcr.io/xinlingzhifei/deeptutor:first-release`。共享生成 Worker 初始并发 20；MP4 导出使用独立 Worker/槽位；数据库槽位仍是最终并发约束。
+`deeptutor` 与以上服务合并到同一内部网络。`gateway` 是唯一具有主机端口的服务；平台覆盖文件使用 Docker Compose v2.24.4+ 的 `!reset []` 清除基础 Compose 中 `deeptutor` 和 `pocketbase` 的端口，测试必须检查两份文件合并后的配置而不是只解析覆盖文件。`tenant-provisioner` 是唯一同时拥有数据库迁移权限、租户 Secret 写目录和 MinIO bootstrap 凭据的内部进程；API 与普通 Worker 没有该权限。三张自定义镜像均从锁定源码构建，并且每个候选只发布为 `<repository>:<yfeistai-first-release-YYYYMMDD-HEAD8>@<digest>`；`first-release` 与 `0.3.1-0cf2a330` 仅是 checked-in schema-version-1 历史标签，不得创建、移动或用于候选身份。共享生成 Worker 初始并发 20；MP4 导出使用独立 Worker/槽位；数据库槽位仍是最终并发约束。
 
 - [ ] Step 4: 增加独立数据面模板
 
@@ -110,13 +110,22 @@ python scripts/docker_compose.py --data-plane tenant-acme up -d
 
 - [ ] Step 6: 锁定镜像摘要
 
-专用 CI workflow 以固定的 yFeiSTAI 提交和 OpenMAIC 提交构建并推送三张自定义镜像；三张镜像全部推送成功后运行：
+专用 CI workflow 以固定的 yFeiSTAI 提交和 OpenMAIC 提交构建三张 workload
+镜像及独立 observer signer。四张镜像先只推送到
+`staging-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}`；四个 build 输出摘要必须格式有效、
+非零且互不相同，随后显式传给：
 
 ```powershell
 python scripts/render_platform_compose.py --write-image-lock
 ```
 
 `deploy/image-lock.json` 记录 yFeiSTAI、OpenMAIC、OpenMAIC Render、Nginx、PostgreSQL 和 MinIO 的仓库、标签及实际内容摘要。生产渲染只接受带摘要的镜像。
+schema-v3 的 `candidate.imageDigests` 只包含三张 workload 镜像，独立 signer
+记录在唯一的 `supportImages.observer_signer`，并与 observer Compose overlay
+逐字节绑定。锁、基础 Compose 与三份生产 Compose 验证成功后，workflow 才从摘要引用
+执行一次性最终候选标签晋升：构建前及每次晋升前均拒绝任何已存在的最终标签，
+即使摘要相同也不复用。部分发布失败必须保留旧标签，改用新提交和新标签；晋升后必须再次
+按远端原始 manifest 字节核对四个摘要，才能生成 receipts 和上传 artifact。
 远端摘要解析使用 `docker buildx imagetools inspect --raw` 返回的原始 manifest
 字节计算 SHA-256；不得假设 manifest JSON 自带其自身摘要，也不得依赖本地镜像缓存。
 
@@ -146,9 +155,11 @@ git commit -m "feat(deploy): add private teaching platform topology"
 - Create: `scripts/provision_tenant_storage.py`
 - Create: `scripts/migrate_teaching.py`
 - Create: `scripts/platform_preflight.py`
+- Create: `scripts/provision_openmaic_observer_secrets.py`
 - Create: `tests/scripts/test_platform_secrets.py`
 - Create: `tests/scripts/test_tenant_storage_provisioning.py`
 - Create: `tests/scripts/test_platform_preflight.py`
+- Create: `tests/scripts/test_provision_openmaic_observer_secrets.py`
 - Modify: `deeptutor/teaching/processes.py`
 - Modify: `.gitignore`
 
@@ -213,6 +224,14 @@ openmaic_service_secret
 
 TLS 的 `gateway_fullchain_pem` 与 `gateway_private_key_pem` 由部署方或证书自动化系统提供，初始化脚本不得生成自签名证书冒充生产证书。Compose 以只读 Secret 挂载，Preflight 校验证书域名、密钥匹配和剩余有效期至少 14 天。
 
+共享入口 observer 的 auth token、candidate-health token 与 Ed25519 signing key
+按 `releaseRunId` 独立发布。provisioner 先持久化精确 owner marker 与非敏感
+`observer-release-manifest.json`（`uncommitted`），材料和目录全部 fsync 后才原子
+切换为 `committed`；成功 stdout 只允许输出 committed manifest。重复 committed
+批次在生成任何新随机材料前拒绝。恢复只接受本工具 owner marker 完整且仍为
+uncommitted 的三目录批次，并以 no-replace 原子 rename 移入确定性隔离区，保留
+manifest、marker 和 payload 字节，不永久删除或覆盖不明目录。
+
 - [ ] Step 4: 实现租户对象存储凭据初始化
 
 `scripts/provision_tenant_storage.py --tenant-id <id>` 使用 bootstrap 凭据调用 MinIO 管理 API，为 `tenants/{tenant_id}/` 创建只允许该前缀读写、列举和删除的独立策略及服务账号。密钥写入：
@@ -256,6 +275,7 @@ Run:
 
 ```powershell
 python -m pytest tests/scripts/test_platform_secrets.py tests/scripts/test_tenant_storage_provisioning.py tests/scripts/test_platform_preflight.py -q
+python -m pytest tests/scripts/test_provision_openmaic_observer_secrets.py -q
 python scripts/platform_preflight.py --config deploy/platform.example.json --offline-contract-check
 ```
 
@@ -438,6 +458,13 @@ git commit -m "feat(teaching): observe classroom runtime health"
 
 ## Task 5: 建立备份、恢复和独立数据面演练
 
+> 当前状态（2026-09-06）：本地实现及默认符号链接 venv 兼容修复已完成。
+> backup probe 整文件 Linux 66 passed/5 Windows-only skipped，Windows 63 passed/8 POSIX-only
+> skipped，均 native 0；发布验证器 Linux 整文件 210 passed/4 Windows-only skipped，native 0。
+> 以下已勾选步骤记录的是本地实现/测试历史，不表示同候选真实 PostgreSQL/S3 恢复完成。
+> Task 5 的真实恢复和独立数据面演练仍进行中；Task 8 保持 not_ready，live 0/12。
+> 当前详证以 reassessment 的最新状态和 candidate-binding Execution Status 为准。
+
 **Files:**
 
 - Modify: `Dockerfile`
@@ -590,7 +617,8 @@ git commit -m "test(teaching): gate security and first-release capacity"
 
 - Create: `scripts/verify_classroom_release.py`
 - Create: `tests/scripts/test_verify_classroom_release.py`
-- Create: `web/tests/e2e/classroom-first-release.spec.ts`
+- Create: `web/tests/e2e/classroom-first-release.live.spec.ts`
+- Retain: `web/tests/e2e/classroom-first-release.spec.ts`（仅 mocked 快速回归）
 
 - [x] Step 1: 写验证器失败条件
 
@@ -623,20 +651,22 @@ image_digests
 database_revisions
 running_containers
 service_health
-public_routes
+capacity_profile
 teacher_flow
 student_micro_flow
 student_full_flow
 content_operations_flow
-learning_loop
-export_formats
+classroom_exports
 tenant_isolation
-dedicated_data_plane
+learning_event_idempotency
+openmaic_shared_plane
+openmaic_dedicated_plane
+tailwind4_visual_matrix
 backup_restore
-capacity_profile
+gateway_only_public
 ```
 
-- [x] Step 4: 实现统一浏览器验收
+- [x] Step 4: 实现统一浏览器验收 harness（仅静态合同；未执行候选环境验收）
 
 同一套环境依次执行教师、学生微课堂、学生完整课堂、教研批量、审核、发布、播放、课堂 ZIP/PPTX/离线 HTML/MP4 导出、事件回传和报表。切换两个租户证明导航、列表、文件、导出和事件不串租户。
 
@@ -652,17 +682,88 @@ capacity_profile
 
 **`tenant_isolation` 信任与清理边界：** 当前本地 bundle 是未签名证据。规范 JSON、SHA-256、候选绑定和 verifier replay 能拒绝缺失、漂移、不一致或未同步改写的材料，但不能抵抗能够同时重写 report、proof、receipt 与摘要的恶意证据作者；hostile-author 信任仍须由不可变 CI/OIDC、签名或外部只写证据锚补足。验收使用的本地 JSON identity store 仅由进程内 `RLock` 与原子 `os.replace` 保护，只覆盖单 FastAPI 进程；不得外推为 multi-worker/process-safe，PocketBase 多用户管理当前亦 fail closed。清理只回收有正式可逆合同的状态：完成 active learning session、删除 source binding 与 enrollment、删除本轮 memberships/grants 和 identities；course、class、quota grant、published classroom/version、review、assignment、export、event 等无安全正式回滚删除合同的对象保留为 candidate-bound 审计 fixture。不得把该边界报告为“完整 teardown”；任一可逆清理失败仍使 probe 失败，并保留 HMAC 认证、`0600` 原子发布且不含密码/token/session/ticket 的补偿 journal。恢复凭据仅能由同一 platform-admin token、candidate、releaseRun 和随机 attempt-id 重建；token 轮换、绑定漂移、journal 篡改或并发 runner 均须在任何恢复 HTTP 前 fail closed。该 journal 只保证已确认写入状态的续清理，不宣称远端成功响应与本地 journal 更新之间具备跨进程事务原子性。
 
-- [ ] Step 5: 构建并启动候选版本
+- [ ] Step 5: 校验发布制品并启动同一候选版本
 
-Run:
+先完成候选绑定计划 Task 7.5：取得成功的首次 Actions run、独立 API 元数据和原始
+九成员 ZIP，验证全部候选身份。部署只使用该已验证制品，不在部署机重新 build、
+重新生成 image-lock 或混用源码目录中的历史 Compose。以下变量必须来自该候选的
+部署记录：`$candidateRoot` 为已校验制品的绝对目录；`$observerReleaseManifest`
+为正式 provisioning 生成并提交的观察器发布 manifest 绝对路径；平台配置、密钥目录、
+网关域名、release run ID 与 signer digest 都必须与该部署一致，不得填写示例凭据。
+启动器与 host preflight 必须使用同一 manifest；host preflight 的手工 observer 三参数
+不再能替代 committed manifest，也不能与 manifest 参数并传。
+
+**Observer 权威配置与生命周期（2026-09-06 已批准并完成本地双平台复验）：**
+observer manifest schema 2 的 `deploymentEnvironment` 明确记录 `YFEISTAI_ENVIRONMENT_ID`，
+以及 `YFEISTAI_SHARED_INGRESS_` 前缀下的 `OBSERVER_ID`、`OBSERVER_URL`、`CONTROL_URL`、
+`UPSTREAM_URL`、`CANDIDATE_HEALTH_URL`、`AUTH_EXPIRES_AT`。provisioning 必须显式接收
+这七项，启动器和 host preflight 从同一份已提交 manifest 派生全部十五项环境变量，
+清除宿主同名覆盖；旧 schema 1 不得用于新部署，也不原地升级既有 manifest。
+环境/观察器 ID 与四个 HTTPS 地址来自经核验的部署记录；四个 HTTPS authority 和
+内部代理 authority 必须互异，不能用同域名不同路径代替隔离。
+
+在启动/验收窗口临近时生成新批次，显式绝对 UTC 授权期限须剩余 30..7200 秒。
+provisioning、已提交批次 admission 和执行前复核均检查有效期；观察/控制请求到期
+拒绝，重试必须使用新 run/凭据批次，不能覆盖已提交批次、隐式延长或自动续期。
+这不宣称过期即停止已有代理/API 转发，也不提供长期服务的无条件重启策略。
+过期的未提交批次仍可按既有显式恢复合同处理；结构校验与授权新鲜度分离。
+
+provisioning 的七项必填 CLI 参数为 `--environment-id`、`--observer-id`、
+`--observer-url`、`--control-url`、`--upstream-url`、`--candidate-health-url` 和
+`--auth-expires-at`；继续提供候选、secret/trust/attestation 根、run ID 与容器 UID/GID。
+不得用示例值或默认值代填。只通过本地接线测试不能认定真实 DNS/TLS、Compose
+插值、挂载或服务启动已就绪。以下命令仍是待执行的部署步骤，不是成功运行记录。
+
+Run（部署窗口，非本地合同测试）：
 
 ```powershell
-python scripts/docker_compose.py --platform build
-python scripts/docker_compose.py --platform up -d
-python scripts/platform_preflight.py
+python scripts/docker_compose.py --platform --candidate-root $candidateRoot --observer-release-manifest $observerReleaseManifest up -d --no-build
+if ($LASTEXITCODE -ne 0) { throw 'Candidate startup failed' }
+python scripts/platform_preflight.py --candidate-root $candidateRoot --observer-release-manifest $observerReleaseManifest --config $platformConfig --secret-dir $platformSecretDir --hostname $gatewayHostname
+if ($LASTEXITCODE -ne 0) { throw 'Candidate preflight failed' }
 ```
 
-Expected: 所有服务达到健康状态，迁移和 MinIO bootstrap 完成。
+Expected: 所有服务达到健康状态，迁移和 MinIO bootstrap 完成；保留原生 exit 和
+同候选运行证明。容器 Up 或本地 build 成功不能代替上述制品验证或后续完整验收。
+
+**Linux 收据发布身份接线（2026-09-06，本地实现；部署尚未验证）：**
+`classroom_release_evidence.py` 的所有发布子命令现在都要求显式 publisher policy。
+全局 `--receipt-recovery-root`、`--receipt-worker-uid` 必须放在子命令之前；不能由
+worker 可控的环境隐式补值。Python 调用方使用 `receipt_publication(recovery_root=...,
+worker_uid=...)` 包住公开 producer，且每次公开调用拥有独立的原始文件/父目录句柄，
+直到异常补偿全部退出才释放。Windows 继续使用既有原生句柄路径。
+
+部署记录必须提供实际的独立 publisher/worker 身份与 recovery 绝对路径；本轮未创建
+账户或替用户选定部署值。worker UID 必须为非零且不同于 publisher。recovery 目录由
+publisher 拥有、权限 0700、与全部收据输出同文件系统；无链接祖先只能由 root/publisher
+拥有且不可被 group/other 写入，不能放在 `/tmp` 下。publisher 的源码、解释器、依赖和
+子进程必须可信且不可由 worker 改写；worker 不得持有 publisher/root 权限、提权能力或
+宿主 Docker 权限。仅传入 UID 不会切换身份、启动隔离 worker 或证明上述部署边界。
+
+以下为后续部署窗口的显式接线模板，不是已执行记录；变量全部来自同一已验证候选的
+部署记录，不得填示例路径、身份或凭据。先在真实文件系统/身份下完成安全 admission 与
+正常/冲突回滚演练，再执行正式收据命令。保留 recovery journal 和冲突对象的报告路径，
+不要把它们当作临时缓存自动清理；没有实现崩溃后自动恢复/reaper。
+
+```bash
+set -euo pipefail
+receipt_policy=(--receipt-recovery-root "${receipt_recovery_root:?operator recovery root required}" --receipt-worker-uid "${receipt_worker_uid:?operator worker UID required}")
+python scripts/classroom_release_evidence.py "${receipt_policy[@]}" source-head \
+  --output "${bundle_root:?verified bundle root required}/artifacts/source_head.json" \
+  --candidate-root "${candidate_root:?verified candidate required}" \
+  --source-root "${trusted_source_root:?trusted clean source required}" \
+  --run-id "${release_run:?release run required}" \
+  --environment-id "${environment_id:?deployment environment required}" \
+  --observed-at "${observed_at:?observation timestamp required}"
+python scripts/classroom_release_evidence.py "${receipt_policy[@]}" image-digests \
+  --output "$bundle_root/artifacts/image_digests.json" \
+  --candidate-root "$candidate_root" --run-id "$release_run" \
+  --environment-id "$environment_id" --observed-at "$observed_at"
+```
+
+既有 private-image workflow 已为这两个收据步骤传入相同显式 policy，并在输出前执行
+原生 recovery admission；其本地静态合同通过不代表 Actions、GHCR 或实际部署已通过。
+七项 Observer 配置与授权到期/reissue 已由用户独立批准；真实部署证据仍须另行取得。
 
 - [ ] Step 6: 执行完整门禁
 
@@ -674,7 +775,7 @@ npm --prefix web run test:node
 npm --prefix web run i18n:check
 npm --prefix web run lint
 npm --prefix web run build
-npm --prefix web exec playwright -- test tests/e2e/classroom-first-release.spec.ts
+pnpm --dir web exec playwright test --project=first-release-live
 python scripts/verify_classroom_release.py
 python scripts/load_classroom.py --profile first-release
 ```
@@ -688,7 +789,7 @@ Expected: 全部通过。
 - [ ] Step 8: 提交
 
 ```powershell
-git add scripts/verify_classroom_release.py tests/scripts/test_verify_classroom_release.py web/tests/e2e/classroom-first-release.spec.ts
+git add scripts/verify_classroom_release.py tests/scripts/test_verify_classroom_release.py web/tests/e2e/classroom-first-release.live.spec.ts
 git commit -m "test(release): verify all classroom first-release flows"
 ```
 

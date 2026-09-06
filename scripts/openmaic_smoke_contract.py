@@ -2,18 +2,29 @@
 
 from __future__ import annotations
 
+import base64
 from collections.abc import Mapping, Sequence
-from datetime import datetime
+from datetime import datetime, timezone
 import hashlib
 import json
+import os
+from pathlib import Path
 import re
+import stat
 from urllib.parse import urlsplit
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 OPENMAIC_SMOKE_SCHEMA_VERSION = 1
 OPENMAIC_SMOKE_PRODUCER = "openmaic-smoke"
 OPENMAIC_DEDICATED_OUTAGE_PRODUCER = "openmaic-dedicated-outage"
 OPENMAIC_SHARED_INGRESS_OBSERVER_PRODUCER = "openmaic-shared-ingress-observer"
+OPENMAIC_SHARED_INGRESS_OBSERVER_SCHEMA_VERSION = 2
+OPENMAIC_SHARED_INGRESS_OBSERVER_BOUND_SCHEMA_VERSION = 3
 MAX_OPENMAIC_SMOKE_REPORT_BYTES = 64 * 1024
+MAX_OPENMAIC_IMAGE_LOCK_BYTES = 1024 * 1024
 
 _SOURCE_REPOSITORY = "xinlingzhifei/DeepTutor"
 _OPENMAIC_HEAD = "0cf2a330411681190e89f48e20f305345ff99f87"
@@ -21,6 +32,9 @@ _CUSTOM_IMAGE_NAMES = {"deeptutor", "openmaic", "openmaic_render"}
 _RUNTIME_ATTESTATION_ARTIFACT = "runtime/runtime-attestation.json"
 _SHARED_INGRESS_OBSERVER_ATTESTATION_ARTIFACT = (
     "runtime/openmaic-shared-ingress-observer-attestation.json"
+)
+_SHARED_INGRESS_OBSERVER_SIGNATURE_ARTIFACT = (
+    "runtime/openmaic-shared-ingress-observer-attestation.sig"
 )
 _SHARED_BINDING = {
     "routeId": "shared-primary",
@@ -127,9 +141,97 @@ def canonical_openmaic_dedicated_outage_attempt_marker(
 def canonical_openmaic_shared_ingress_observer_attestation(
     report: Mapping[str, object],
 ) -> bytes:
-    """Serialize candidate-independent shared-ingress observer provenance."""
+    """Serialize shared-ingress observer provenance in its only accepted form."""
 
     return canonical_openmaic_smoke_report(report)
+
+
+def openmaic_observer_attestation_challenge(public_key_spki_sha256: str) -> str:
+    """Derive one release-key-scoped, non-secret attestation challenge."""
+
+    if not _valid_sha256(public_key_spki_sha256):
+        raise ValueError("OpenMAIC observer attestation challenge is invalid")
+    return hashlib.sha256(
+        b"yfeistai-openmaic-observer-attestation-v1\0" + bytes.fromhex(public_key_spki_sha256)
+    ).hexdigest()
+
+
+def current_openmaic_observer_candidate_binding(candidate_root: Path) -> dict[str, str]:
+    """Hash the canonical candidate and exact current image-lock bytes."""
+
+    descriptor: int | None = None
+    try:
+        supplied_root = Path(candidate_root)
+        if not supplied_root.is_absolute():
+            raise OSError
+        root = supplied_root.resolve(strict=True)
+        if supplied_root != root or not root.is_dir():
+            raise OSError
+        lock_path = root / "deploy" / "image-lock.json"
+        if any(item.is_symlink() for item in (lock_path, *lock_path.parents)):
+            raise OSError
+        resolved_lock = lock_path.resolve(strict=True)
+        if resolved_lock != lock_path:
+            raise OSError
+        before = resolved_lock.lstat()
+        if not stat.S_ISREG(before.st_mode) or before.st_size > MAX_OPENMAIC_IMAGE_LOCK_BYTES:
+            raise OSError
+        descriptor = os.open(
+            resolved_lock,
+            os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened = os.fstat(descriptor)
+        body = os.read(descriptor, MAX_OPENMAIC_IMAGE_LOCK_BYTES + 1)
+        after = os.fstat(descriptor)
+        final = resolved_lock.lstat()
+
+        def identity(details: os.stat_result) -> tuple[int, ...]:
+            return (
+                details.st_dev,
+                details.st_ino,
+                details.st_size,
+                details.st_mtime_ns,
+                details.st_ctime_ns,
+                details.st_mode,
+                details.st_uid,
+            )
+
+        if (
+            not body
+            or len(body) > MAX_OPENMAIC_IMAGE_LOCK_BYTES
+            or identity(before) != identity(opened)
+            or identity(opened) != identity(after)
+            or identity(opened) != identity(final)
+        ):
+            raise OSError
+        lock = json.loads(body)
+        if (
+            not isinstance(lock, dict)
+            or set(lock) != {"schemaVersion", "candidate", "images", "supportImages"}
+            or lock.get("schemaVersion") != 3
+            or not isinstance(lock.get("images"), dict)
+            or not isinstance(lock.get("supportImages"), dict)
+        ):
+            raise ValueError
+        candidate = lock.get("candidate")
+        _validate_candidate(candidate)
+        assert isinstance(candidate, dict)
+        candidate_body = json.dumps(
+            candidate,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (OSError, TypeError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("OpenMAIC observer candidate binding is invalid") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    return {
+        "candidateSha256": hashlib.sha256(candidate_body).hexdigest(),
+        "imageLockSha256": hashlib.sha256(body).hexdigest(),
+    }
 
 
 def _exact_json_equal(left: object, right: object) -> bool:
@@ -231,7 +333,9 @@ def _canonical_origin(raw: str) -> tuple[str, str, int]:
         port = parsed.port
         if hostname is None:
             raise ValueError
-        canonical_host = hostname.encode("idna").decode("ascii").lower()
+        canonical_host = hostname.encode("idna").decode("ascii").lower().rstrip(".")
+        if not canonical_host:
+            raise ValueError
     except (UnicodeError, ValueError) as exc:
         raise ValueError("OpenMAIC origin is invalid") from exc
     scheme = parsed.scheme.lower()
@@ -248,43 +352,196 @@ def _url_origin(raw: str) -> str:
     return f"{scheme}://{rendered_host}{suffix}"
 
 
+def _canonical_internal_proxy_url(raw: object) -> str:
+    if not isinstance(raw, str):
+        raise ValueError("OpenMAIC internal proxy URL is invalid")
+    try:
+        parsed = urlsplit(raw)
+        explicit_port = parsed.port
+        canonical = _url_origin(raw)
+    except ValueError as exc:
+        raise ValueError("OpenMAIC internal proxy URL is invalid") from exc
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or explicit_port is None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+        or raw != canonical
+    ):
+        raise ValueError("OpenMAIC internal proxy URL is invalid")
+    return canonical
+
+
 def parse_openmaic_shared_ingress_observer_attestation(
     body: bytes,
     *,
     release_run: Mapping[str, str],
+    signature: bytes | None = None,
+    public_key_path: Path | None = None,
+    candidate_root: Path | None = None,
+    expected_public_key_spki_sha256: str | None = None,
 ) -> dict[str, object]:
-    """Parse canonical candidate-independent observer provenance for one run."""
+    """Parse observer provenance, retaining an explicit offline unsigned seam.
+
+    Live evidence must use ``verify_openmaic_shared_ingress_observer_attestation``.
+    The optional signature arguments remain only for offline compatibility and
+    are deliberately all-or-nothing.
+    """
 
     if not isinstance(body, bytes) or not body or len(body) > MAX_OPENMAIC_SMOKE_REPORT_BYTES:
         raise ValueError("OpenMAIC shared-ingress observer attestation size is invalid")
+    signature_inputs = (
+        signature,
+        public_key_path,
+        candidate_root,
+        expected_public_key_spki_sha256,
+    )
+    if any(value is not None for value in signature_inputs):
+        if any(value is None for value in signature_inputs):
+            raise ValueError("OpenMAIC shared-ingress observer signature inputs are incomplete")
+        assert signature is not None
+        assert public_key_path is not None
+        assert candidate_root is not None
+        assert expected_public_key_spki_sha256 is not None
+        descriptor: int | None = None
+        try:
+            supplied_root = Path(candidate_root)
+            if not supplied_root.is_absolute():
+                raise OSError
+            root = supplied_root.resolve(strict=True)
+            if supplied_root != root or not root.is_dir():
+                raise OSError
+            anchor = Path(public_key_path)
+            if not anchor.is_absolute():
+                raise OSError
+            resolved_anchor = anchor.resolve(strict=True)
+            if anchor != resolved_anchor or any(
+                parent.is_symlink() for parent in (resolved_anchor, *resolved_anchor.parents)
+            ):
+                raise OSError
+            try:
+                resolved_anchor.relative_to(root)
+            except ValueError:
+                pass
+            else:
+                raise OSError
+            before = resolved_anchor.lstat()
+            if not stat.S_ISREG(before.st_mode) or before.st_size > 16 * 1024:
+                raise OSError
+            descriptor = os.open(
+                resolved_anchor,
+                os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            )
+            opened = os.fstat(descriptor)
+            public_key_body = os.read(descriptor, 16 * 1024 + 1)
+            after = os.fstat(descriptor)
+            final = resolved_anchor.lstat()
+
+            def identity(details: os.stat_result) -> tuple[int, ...]:
+                return (
+                    details.st_dev,
+                    details.st_ino,
+                    details.st_size,
+                    details.st_mtime_ns,
+                    details.st_ctime_ns,
+                    details.st_mode,
+                    details.st_uid,
+                )
+
+            if (
+                len(public_key_body) > 16 * 1024
+                or identity(before) != identity(opened)
+                or identity(opened) != identity(after)
+                or identity(opened) != identity(final)
+            ):
+                raise OSError
+            public_key = serialization.load_pem_public_key(public_key_body)
+            if not isinstance(public_key, Ed25519PublicKey):
+                raise ValueError
+            public_key_spki = public_key.public_bytes(
+                serialization.Encoding.DER,
+                serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+            if (
+                _SHA256.fullmatch(expected_public_key_spki_sha256) is None
+                or expected_public_key_spki_sha256 == "0" * 64
+                or hashlib.sha256(public_key_spki).hexdigest() != expected_public_key_spki_sha256
+            ):
+                raise ValueError
+            encoded_signature = signature.decode("ascii").strip()
+            signature_bytes = base64.b64decode(encoded_signature, validate=True)
+            if len(signature_bytes) != 64 or signature not in {
+                encoded_signature.encode("ascii"),
+                encoded_signature.encode("ascii") + b"\n",
+                encoded_signature.encode("ascii") + b"\r\n",
+            }:
+                raise ValueError
+            public_key.verify(signature_bytes, body)
+        except (InvalidSignature, OSError, TypeError, UnicodeError, ValueError) as exc:
+            raise ValueError("OpenMAIC shared-ingress observer signature is invalid") from exc
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
     try:
         report = json.loads(body)
     except (UnicodeError, json.JSONDecodeError) as exc:
         raise ValueError("OpenMAIC shared-ingress observer attestation is invalid") from exc
-    if not isinstance(report, dict) or set(report) != {
+    if not isinstance(report, dict):
+        raise ValueError("OpenMAIC shared-ingress observer attestation schema is invalid")
+    schema_version = report.get("schemaVersion")
+    expected_report_fields = {
         "schemaVersion",
         "producer",
         "releaseRun",
         "observedAt",
         "observer",
-    }:
+    }
+    if schema_version == OPENMAIC_SHARED_INGRESS_OBSERVER_BOUND_SCHEMA_VERSION:
+        expected_report_fields.update(("candidateBinding", "attestationChallenge"))
+    if set(report) != expected_report_fields:
         raise ValueError("OpenMAIC shared-ingress observer attestation schema is invalid")
     if canonical_openmaic_shared_ingress_observer_attestation(report) != body:
         raise ValueError("OpenMAIC shared-ingress observer attestation is invalid")
     expected_run = dict(release_run)
     _validate_release_run(expected_run)
     observer = report.get("observer")
-    if not isinstance(observer, dict) or set(observer) != {
+    legacy_fields = {
         "observerId",
         "observerUrl",
         "sharedIngressControlUrl",
-    }:
+    }
+    proxy_fields = {
+        *legacy_fields,
+        "candidateHealthUrl",
+        "sharedIngressUpstreamUrl",
+        "internalProxyUrl",
+        "authExpiresAt",
+    }
+    expected_fields = (
+        legacy_fields
+        if schema_version == OPENMAIC_SMOKE_SCHEMA_VERSION
+        else proxy_fields
+        if schema_version
+        in {
+            OPENMAIC_SHARED_INGRESS_OBSERVER_SCHEMA_VERSION,
+            OPENMAIC_SHARED_INGRESS_OBSERVER_BOUND_SCHEMA_VERSION,
+        }
+        else None
+    )
+    if (
+        not isinstance(observer, dict)
+        or expected_fields is None
+        or set(observer) != expected_fields
+    ):
         raise ValueError("OpenMAIC shared-ingress observer identity is invalid")
     observer_url = observer.get("observerUrl")
     control_url = observer.get("sharedIngressControlUrl")
     if (
-        report.get("schemaVersion") != OPENMAIC_SMOKE_SCHEMA_VERSION
-        or report.get("producer") != OPENMAIC_SHARED_INGRESS_OBSERVER_PRODUCER
+        report.get("producer") != OPENMAIC_SHARED_INGRESS_OBSERVER_PRODUCER
         or not _exact_json_equal(report.get("releaseRun"), expected_run)
         or not _valid_observed_at(report.get("observedAt"))
         or not _valid_public_id(observer.get("observerId"))
@@ -294,7 +551,179 @@ def parse_openmaic_shared_ingress_observer_attestation(
         or _contains_sensitive_field(report)
     ):
         raise ValueError("OpenMAIC shared-ingress observer binding is invalid")
+    if schema_version in {
+        OPENMAIC_SHARED_INGRESS_OBSERVER_SCHEMA_VERSION,
+        OPENMAIC_SHARED_INGRESS_OBSERVER_BOUND_SCHEMA_VERSION,
+    }:
+        candidate_health_url = observer.get("candidateHealthUrl")
+        upstream_url = observer.get("sharedIngressUpstreamUrl")
+        internal_proxy_url = observer.get("internalProxyUrl")
+        expires_at = observer.get("authExpiresAt")
+        observed_at = report.get("observedAt")
+        try:
+            normalized_internal_proxy_url = _canonical_internal_proxy_url(internal_proxy_url)
+        except ValueError as exc:
+            raise ValueError("OpenMAIC shared-ingress observer binding is invalid") from exc
+        if (
+            not isinstance(control_url, str)
+            or urlsplit(control_url).path != "/v1/control-canaries"
+            or bool(urlsplit(control_url).query or urlsplit(control_url).fragment)
+            or not _valid_absolute_url(candidate_health_url)
+            or not isinstance(candidate_health_url, str)
+            or urlsplit(candidate_health_url).path
+            != "/api/v1/system/teaching-health/observer-canary"
+            or not _valid_base_url(upstream_url)
+            or not isinstance(upstream_url, str)
+            or internal_proxy_url != normalized_internal_proxy_url
+            or not _valid_observed_at(expires_at)
+            or not isinstance(expires_at, str)
+            or not isinstance(observed_at, str)
+            or datetime.fromisoformat(expires_at.removesuffix("Z") + "+00:00")
+            <= datetime.fromisoformat(observed_at.removesuffix("Z") + "+00:00")
+            or (
+                datetime.fromisoformat(expires_at.removesuffix("Z") + "+00:00")
+                - datetime.fromisoformat(observed_at.removesuffix("Z") + "+00:00")
+            ).total_seconds()
+            > 7_200
+            or len(
+                {
+                    _canonical_origin(observer_url),
+                    _canonical_origin(control_url),
+                    _canonical_origin(candidate_health_url),
+                    _canonical_origin(upstream_url),
+                    _canonical_origin(normalized_internal_proxy_url),
+                }
+            )
+            != 5
+            or len(
+                {
+                    _canonical_origin(observer_url)[1:],
+                    _canonical_origin(control_url)[1:],
+                    _canonical_origin(candidate_health_url)[1:],
+                    _canonical_origin(upstream_url)[1:],
+                    _canonical_origin(normalized_internal_proxy_url)[1:],
+                }
+            )
+            != 5
+        ):
+            raise ValueError("OpenMAIC shared-ingress observer binding is invalid")
+    if schema_version == OPENMAIC_SHARED_INGRESS_OBSERVER_BOUND_SCHEMA_VERSION:
+        candidate_binding = report.get("candidateBinding")
+        challenge = report.get("attestationChallenge")
+        if (
+            not isinstance(candidate_binding, dict)
+            or set(candidate_binding) != {"candidateSha256", "imageLockSha256"}
+            or not _valid_sha256(candidate_binding.get("candidateSha256"))
+            or not _valid_sha256(candidate_binding.get("imageLockSha256"))
+            or not _valid_sha256(challenge)
+        ):
+            raise ValueError("OpenMAIC shared-ingress observer candidate binding is invalid")
     return report
+
+
+def validate_openmaic_shared_ingress_observer_bound_context(
+    report: Mapping[str, object],
+    *,
+    expected_candidate_binding: Mapping[str, str],
+    expected_public_key_spki_sha256: str,
+    trusted_now: datetime | None = None,
+) -> dict[str, object]:
+    """Bind one signed observer report to the current candidate and trust clock."""
+
+    expected_binding = dict(expected_candidate_binding)
+    try:
+        expected_challenge = openmaic_observer_attestation_challenge(
+            expected_public_key_spki_sha256
+        )
+    except ValueError as exc:
+        raise ValueError("OpenMAIC shared-ingress observer candidate binding is invalid") from exc
+    if (
+        report.get("schemaVersion") != OPENMAIC_SHARED_INGRESS_OBSERVER_BOUND_SCHEMA_VERSION
+        or set(expected_binding) != {"candidateSha256", "imageLockSha256"}
+        or not all(_valid_sha256(value) for value in expected_binding.values())
+        or not _exact_json_equal(report.get("candidateBinding"), expected_binding)
+        or report.get("attestationChallenge") != expected_challenge
+    ):
+        raise ValueError("OpenMAIC shared-ingress observer candidate binding is invalid")
+    if trusted_now is not None:
+        observer = report.get("observer")
+        observed_at = report.get("observedAt")
+        expires_at = observer.get("authExpiresAt") if isinstance(observer, dict) else None
+        if (
+            trusted_now.tzinfo is None
+            or trusted_now.utcoffset() != timezone.utc.utcoffset(trusted_now)
+            or not isinstance(observed_at, str)
+            or not isinstance(expires_at, str)
+        ):
+            raise ValueError("OpenMAIC shared-ingress observer auth window is invalid")
+        observed = datetime.fromisoformat(observed_at.removesuffix("Z") + "+00:00")
+        expires = datetime.fromisoformat(expires_at.removesuffix("Z") + "+00:00")
+        current = trusted_now.astimezone(timezone.utc)
+        if current < observed or current >= expires:
+            raise ValueError("OpenMAIC shared-ingress observer auth window is invalid")
+    return dict(report)
+
+
+def verify_openmaic_shared_ingress_observer_attestation(
+    body: bytes,
+    *,
+    release_run: Mapping[str, str],
+    signature: bytes,
+    public_key_path: Path,
+    candidate_root: Path,
+    expected_public_key_spki_sha256: str,
+    trusted_now: datetime,
+) -> dict[str, object]:
+    """Verify the detached Ed25519 signature before accepting live evidence."""
+
+    report = parse_openmaic_shared_ingress_observer_attestation(
+        body,
+        release_run=release_run,
+        signature=signature,
+        public_key_path=public_key_path,
+        candidate_root=candidate_root,
+        expected_public_key_spki_sha256=expected_public_key_spki_sha256,
+    )
+    return validate_openmaic_shared_ingress_observer_bound_context(
+        report,
+        expected_candidate_binding=current_openmaic_observer_candidate_binding(candidate_root),
+        expected_public_key_spki_sha256=expected_public_key_spki_sha256,
+        trusted_now=trusted_now,
+    )
+
+
+def verify_archived_openmaic_shared_ingress_observer_attestation(
+    body: bytes,
+    *,
+    release_run: Mapping[str, str],
+    signature: bytes,
+    public_key_path: Path,
+    candidate_root: Path,
+    expected_public_key_spki_sha256: str,
+) -> dict[str, object]:
+    """Replay a signed observer report at its signed observation time."""
+
+    report = parse_openmaic_shared_ingress_observer_attestation(
+        body,
+        release_run=release_run,
+        signature=signature,
+        public_key_path=public_key_path,
+        candidate_root=candidate_root,
+        expected_public_key_spki_sha256=expected_public_key_spki_sha256,
+    )
+    observed_at = report.get("observedAt")
+    if not isinstance(observed_at, str):
+        raise ValueError("OpenMAIC shared-ingress observer auth window is invalid")
+    try:
+        signed_observation_time = datetime.fromisoformat(observed_at.removesuffix("Z") + "+00:00")
+    except ValueError as exc:
+        raise ValueError("OpenMAIC shared-ingress observer auth window is invalid") from exc
+    return validate_openmaic_shared_ingress_observer_bound_context(
+        report,
+        expected_candidate_binding=current_openmaic_observer_candidate_binding(candidate_root),
+        expected_public_key_spki_sha256=expected_public_key_spki_sha256,
+        trusted_now=signed_observation_time,
+    )
 
 
 def _validate_candidate(raw: object) -> None:
@@ -609,13 +1038,17 @@ def _validate_observer_trust_anchor(
     expected_observer_id: str,
     expected_observer_origin: str,
     expected_control_origin: str,
+    expected_public_key_spki_sha256: str | None = None,
 ) -> None:
-    if not isinstance(raw, dict) or set(raw) != {
+    expected_fields = {
         "sha256",
         "observerId",
         "observerOrigin",
         "sharedIngressControlOrigin",
-    }:
+    }
+    if expected_public_key_spki_sha256 is not None:
+        expected_fields.update(("signatureArtifact", "publicKeySpkiSha256"))
+    if not isinstance(raw, dict) or set(raw) != expected_fields:
         raise ValueError("OpenMAIC shared-ingress observer trust anchor is invalid")
     try:
         observer_identity = _canonical_origin(expected_observer_origin)
@@ -634,6 +1067,14 @@ def _validate_observer_trust_anchor(
         or raw.get("sharedIngressControlOrigin") != expected_control_origin
         or _url_origin(expected_control_origin) != expected_control_origin
         or observer_identity == control_identity
+        or (
+            expected_public_key_spki_sha256 is not None
+            and (
+                not _valid_sha256(expected_public_key_spki_sha256)
+                or raw.get("signatureArtifact") != _SHARED_INGRESS_OBSERVER_SIGNATURE_ARTIFACT
+                or raw.get("publicKeySpkiSha256") != expected_public_key_spki_sha256
+            )
+        )
     ):
         raise ValueError("OpenMAIC shared-ingress observer trust anchor is invalid")
 
@@ -644,6 +1085,7 @@ def validate_openmaic_shared_ingress_observer_trust_anchor(
     expected_observer_id: object,
     expected_observer_origin: object,
     expected_shared_ingress_control_origin: object,
+    expected_public_key_spki_sha256: object | None = None,
 ) -> dict[str, str]:
     """Validate caller-supplied observer identity without consulting an evidence bundle."""
 
@@ -663,6 +1105,15 @@ def validate_openmaic_shared_ingress_observer_trust_anchor(
         "observerOrigin": expected_observer_origin,
         "sharedIngressControlOrigin": expected_shared_ingress_control_origin,
     }
+    if expected_public_key_spki_sha256 is not None:
+        if not isinstance(expected_public_key_spki_sha256, str):
+            raise ValueError("OpenMAIC external observer trust anchor is unavailable or invalid")
+        anchor.update(
+            {
+                "signatureArtifact": _SHARED_INGRESS_OBSERVER_SIGNATURE_ARTIFACT,
+                "publicKeySpkiSha256": expected_public_key_spki_sha256,
+            }
+        )
     try:
         _validate_observer_trust_anchor(
             anchor,
@@ -670,6 +1121,7 @@ def validate_openmaic_shared_ingress_observer_trust_anchor(
             expected_observer_id=expected_observer_id,
             expected_observer_origin=expected_observer_origin,
             expected_control_origin=expected_shared_ingress_control_origin,
+            expected_public_key_spki_sha256=(expected_public_key_spki_sha256),
         )
     except ValueError as exc:
         raise ValueError(
@@ -689,6 +1141,7 @@ def parse_openmaic_dedicated_outage_attempt_marker(
     expected_shared_ingress_control_origin: str,
     expected_tenant_id: str,
     expected_route_id: str,
+    expected_observer_public_key_spki_sha256: str | None = None,
 ) -> dict[str, object]:
     """Parse the durable pre-mutation marker against external trusted bindings."""
 
@@ -728,6 +1181,7 @@ def parse_openmaic_dedicated_outage_attempt_marker(
         expected_observer_id=expected_observer_id,
         expected_observer_origin=expected_observer_origin,
         expected_control_origin=expected_shared_ingress_control_origin,
+        expected_public_key_spki_sha256=(expected_observer_public_key_spki_sha256),
     )
     plan = marker.get("fixturePlan")
     if (
@@ -789,14 +1243,18 @@ def _validate_observer_attestation_reference(
     expected_observer_origin: str,
     expected_control_origin: str,
     candidate_origin: str,
+    expected_public_key_spki_sha256: str | None = None,
 ) -> None:
-    if not isinstance(raw, dict) or set(raw) != {
+    expected_fields = {
         "artifact",
         "sha256",
         "observerId",
         "observerOrigin",
         "sharedIngressControlOrigin",
-    }:
+    }
+    if expected_public_key_spki_sha256 is not None:
+        expected_fields.update(("signatureArtifact", "publicKeySpkiSha256"))
+    if not isinstance(raw, dict) or set(raw) != expected_fields:
         raise ValueError("OpenMAIC shared-ingress observer reference is invalid")
     try:
         observer_identity = _canonical_origin(expected_observer_origin)
@@ -817,6 +1275,14 @@ def _validate_observer_attestation_reference(
         or raw.get("sharedIngressControlOrigin") != expected_control_origin
         or _url_origin(expected_control_origin) != expected_control_origin
         or observer_identity in {candidate_identity, control_identity}
+        or (
+            expected_public_key_spki_sha256 is not None
+            and (
+                not _valid_sha256(expected_public_key_spki_sha256)
+                or raw.get("signatureArtifact") != _SHARED_INGRESS_OBSERVER_SIGNATURE_ARTIFACT
+                or raw.get("publicKeySpkiSha256") != expected_public_key_spki_sha256
+            )
+        )
     ):
         raise ValueError("OpenMAIC shared-ingress observer reference is invalid")
 
@@ -835,6 +1301,7 @@ def parse_openmaic_dedicated_outage_attestation(
     expected_tenant_id: str,
     attempt_marker_body: bytes,
     expected_docker_host_identity_sha256: str,
+    expected_observer_public_key_spki_sha256: str | None = None,
 ) -> dict[str, object]:
     """Parse a candidate-bound outage/zero-shared-ingress/restore attestation."""
 
@@ -893,6 +1360,7 @@ def parse_openmaic_dedicated_outage_attestation(
         expected_observer_origin=expected_observer_origin,
         expected_control_origin=expected_shared_ingress_control_origin,
         candidate_origin=_url_origin(expected_base_url),
+        expected_public_key_spki_sha256=(expected_observer_public_key_spki_sha256),
     )
     _validate_dedicated_outage_facts(report)
     fixture = report["fixture"]
@@ -920,6 +1388,7 @@ def parse_openmaic_dedicated_outage_attestation(
         expected_observer_id=expected_observer_id,
         expected_observer_origin=expected_observer_origin,
         expected_control_origin=expected_shared_ingress_control_origin,
+        expected_public_key_spki_sha256=(expected_observer_public_key_spki_sha256),
     )
     _validate_docker_boundary(
         provenance.get("dockerBoundary"),
@@ -935,6 +1404,7 @@ def parse_openmaic_dedicated_outage_attestation(
         expected_shared_ingress_control_origin=expected_shared_ingress_control_origin,
         expected_tenant_id=expected_tenant_id,
         expected_route_id=str(outage["routeId"]),
+        expected_observer_public_key_spki_sha256=(expected_observer_public_key_spki_sha256),
     )
     execution = report.get("execution")
     if (
@@ -1111,20 +1581,26 @@ __all__ = [
     "MAX_OPENMAIC_SMOKE_REPORT_BYTES",
     "OPENMAIC_DEDICATED_OUTAGE_PRODUCER",
     "OPENMAIC_SHARED_INGRESS_OBSERVER_PRODUCER",
+    "OPENMAIC_SHARED_INGRESS_OBSERVER_BOUND_SCHEMA_VERSION",
+    "OPENMAIC_SHARED_INGRESS_OBSERVER_SCHEMA_VERSION",
     "OPENMAIC_SMOKE_PRODUCER",
     "OPENMAIC_SMOKE_SCHEMA_VERSION",
     "canonical_openmaic_smoke_report",
     "canonical_openmaic_dedicated_outage_attestation",
     "canonical_openmaic_dedicated_outage_attempt_marker",
     "canonical_openmaic_shared_ingress_observer_attestation",
+    "current_openmaic_observer_candidate_binding",
     "derive_openmaic_dedicated_outage_checks",
     "derive_openmaic_dedicated_plane_checks",
     "derive_openmaic_shared_plane_checks",
     "openmaic_dedicated_plane_command_record",
     "openmaic_dedicated_outage_command_record",
     "openmaic_shared_plane_command_record",
+    "openmaic_observer_attestation_challenge",
     "parse_openmaic_smoke_report",
     "parse_openmaic_dedicated_outage_attestation",
     "parse_openmaic_dedicated_outage_attempt_marker",
     "parse_openmaic_shared_ingress_observer_attestation",
+    "validate_openmaic_shared_ingress_observer_bound_context",
+    "verify_openmaic_shared_ingress_observer_attestation",
 ]

@@ -53,6 +53,53 @@ def _load_module():
         sys.modules.pop(spec.name, None)
 
 
+def test_gateway_candidate_networks_merge_trusted_overlay_and_allow_network_none() -> None:
+    module = _load_module()
+    base = b"""services:
+  deeptutor:
+    networks:
+      - platform-internal
+      - platform-service-egress
+  shared-data-plane-bootstrap:
+    networks:
+      - platform-internal
+networks:
+  platform-internal:
+    internal: true
+  platform-service-egress: {}
+"""
+    overlay = b"""services:
+  deeptutor:
+    environment:
+      OBSERVER_ENABLED: \"1\"
+  openmaic-shared-ingress-observer:
+    networks:
+      - platform-internal
+  openmaic-observer-attestation-signer:
+    network_mode: none
+"""
+
+    assert module.parse_gateway_candidate_networks(
+        base,
+        docker_project="yfeistai-platform",
+        expected_services=(
+            "deeptutor",
+            "shared-data-plane-bootstrap",
+            "openmaic-shared-ingress-observer",
+            "openmaic-observer-attestation-signer",
+        ),
+        overlay_bodies=(overlay,),
+    ) == {
+        "deeptutor": (
+            "yfeistai-platform_platform-internal",
+            "yfeistai-platform_platform-service-egress",
+        ),
+        "openmaic-observer-attestation-signer": (),
+        "openmaic-shared-ingress-observer": ("yfeistai-platform_platform-internal",),
+        "shared-data-plane-bootstrap": ("yfeistai-platform_platform-internal",),
+    }
+
+
 def _canonical(module, document: dict[str, object]) -> bytes:
     return module.canonical_gateway_public_document(document)
 

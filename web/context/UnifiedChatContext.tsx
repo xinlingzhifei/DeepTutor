@@ -1296,7 +1296,7 @@ export function UnifiedChatProvider({
         if (!existing.client.connected) existing.client.connect();
         return existing;
       }
-      const record = {
+      const record: { key: string; client: UnifiedWSClient } = {
         key,
         client: new UnifiedWSClient(
           (event) => handleRunnerEvent(record.key, event),
@@ -1403,6 +1403,9 @@ export function UnifiedChatProvider({
         if (!local || local.isStreaming || local.status === "running") return;
       }
       const messages = hydrateMessages(session.messages ?? []);
+      const preferences = session.preferences;
+      const tools = preferences?.tools;
+      const knowledgeBases = preferences?.knowledge_bases;
       dispatch({
         type: options?.revalidate ? "REVALIDATE_SESSION" : "LOAD_SESSION",
         key,
@@ -1413,28 +1416,24 @@ export function UnifiedChatProvider({
         status:
           (session.status as SessionRuntimeStatus | undefined) ||
           (activeTurn ? "running" : "idle"),
-        tools: Array.isArray(session.preferences?.tools)
-          ? session.preferences.tools
-          : [],
-        capability: session.preferences?.capability || null,
-        knowledgeBases: Array.isArray(session.preferences?.knowledge_bases)
-          ? session.preferences.knowledge_bases
-          : [],
-        llmSelection: asLLMSelection(session.preferences?.llm_selection),
+        tools: Array.isArray(tools) ? tools : [],
+        capability: preferences?.capability || null,
+        knowledgeBases: Array.isArray(knowledgeBases) ? knowledgeBases : [],
+        llmSelection: asLLMSelection(preferences?.llm_selection),
         masteryPathId:
-          typeof session.preferences?.mastery_path_id === "string"
-            ? session.preferences.mastery_path_id
+          typeof preferences?.mastery_path_id === "string"
+            ? preferences.mastery_path_id
             : null,
         personaSelection:
-          typeof session.preferences?.persona === "string"
-            ? session.preferences.persona
+          typeof preferences?.persona === "string"
+            ? preferences.persona
             : "",
         // Model output language is account-level state. Historical sessions
         // may have stale persisted preferences, so new turns follow the
         // current response-language setting rather than their original value.
         language: readStoredResponseLanguage(),
         selectedBranches: normalizeSelectedBranches(
-          session.preferences?.selected_branches,
+          preferences?.selected_branches,
         ),
       });
       if (activeTurn?.turn_id || activeTurn?.id) {

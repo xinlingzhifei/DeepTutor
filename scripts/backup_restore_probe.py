@@ -307,6 +307,23 @@ def _terminate_process_tree(process: subprocess.Popen[bytes]) -> None:
         raise subprocess.SubprocessError("taskkill did not terminate the process tree")
 
 
+def _validate_python_executable(path: Path) -> Path:
+    # The interpreter/venv is operator-managed runtime, not an untrusted artifact.
+    # Keep its lexical entrypoint: resolving a venv symlink loses its prefix and
+    # installed dependencies. This is an availability check, not race-free exec.
+    try:
+        executable = Path(path).absolute()
+        executable_stat = executable.stat()
+        available = stat.S_ISREG(executable_stat.st_mode) and (
+            os.name == "nt" or os.access(executable, os.X_OK)
+        )
+    except OSError:
+        raise ValueError("backup restore Python executable is unavailable") from None
+    if not available:
+        raise ValueError("backup restore Python executable is unavailable")
+    return executable
+
+
 def _resolve_existing_file(path: Path, field_name: str) -> Path:
     source = Path(path)
     try:
@@ -1560,7 +1577,7 @@ def run_backup_restore_probe(
         database_disposition=config.database_ownership,
         object_store_disposition=config.object_namespace_ownership,
     )
-    python_executable = _resolve_existing_file(config.python_executable, "Python executable")
+    python_executable = _validate_python_executable(config.python_executable)
     pg_restore_executable = _resolve_existing_file(
         config.pg_restore_executable,
         "pg_restore executable",

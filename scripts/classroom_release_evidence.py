@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import errno
+from functools import wraps
 import hashlib
 import json
 import math
@@ -50,6 +52,7 @@ from classroom_export_contract import (  # noqa: E402
 from classroom_release_probe_contract import probe_command_record  # noqa: E402
 from classroom_runtime_attestation import (  # noqa: E402
     _assert_no_link_ancestors,
+    _CandidateContractLease,
     _close_windows_handle,
     _create_windows_directory_relative,
     _create_windows_staging_file,
@@ -79,8 +82,8 @@ from openmaic_smoke_contract import (  # noqa: E402
     openmaic_dedicated_plane_command_record,
     openmaic_shared_plane_command_record,
     parse_openmaic_dedicated_outage_attestation,
-    parse_openmaic_shared_ingress_observer_attestation,
     parse_openmaic_smoke_report,
+    verify_openmaic_shared_ingress_observer_attestation,
 )
 from platform_preflight_contract import (  # noqa: E402
     MAX_CANDIDATE_NETWORK_REPORT_BYTES,
@@ -93,7 +96,15 @@ from platform_preflight_contract import (
 from platform_preflight_contract import (
     PHASES as PREFLIGHT_PHASES,
 )
-from render_platform_compose import validate_image_lock_bindings  # noqa: E402
+from receipt_recovery import PosixReceiptRecovery  # noqa: E402
+from render_platform_compose import (  # noqa: E402
+    ValidatedCandidateArtifact,
+    _reject_in_progress_publish_journal,
+    _validate_image_lock_binding_bytes,
+    load_image_lock_bytes,
+    validate_image_lock_bindings,
+    validated_candidate_artifact_lease,
+)
 from tenant_isolation_contract import (  # noqa: E402
     MAX_TENANT_ISOLATION_REPORT_BYTES,
     derive_tenant_isolation_checks,
@@ -118,7 +129,10 @@ from verify_classroom_release import (  # noqa: E402
     read_backup_restore_report_artifact,
     read_capacity_profile_attestation_artifact,
     read_runtime_attestation_artifact,
-    validate_runtime_attestation,
+    verify_release_supervisor_signature,
+)
+from verify_classroom_release import (  # noqa: E402
+    validate_runtime_attestation as _validate_runtime_attestation,
 )
 
 _RELEASE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -128,6 +142,25 @@ _GITHUB_REMOTE = re.compile(
     r"^(?:https://github\.com/|ssh://git@github\.com/|git@github\.com:)"
     r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?$"
 )
+
+
+def _operator_observer_signer_image() -> str:
+    observer_signer_image = os.environ.get("YFEISTAI_OBSERVER_SIGNER_IMAGE")
+    if not isinstance(observer_signer_image, str) or not observer_signer_image.strip():
+        raise ValueError("observer signer image reference is unavailable")
+    return observer_signer_image
+
+
+def validate_runtime_attestation(*args: object, **kwargs: object) -> dict[str, object]:
+    """Replay runtime evidence against the operator-owned signer image binding."""
+
+    if "observer_signer_image" in kwargs:
+        raise ValueError("observer signer image must come from the operator environment")
+    return _validate_runtime_attestation(
+        *args,
+        **kwargs,
+        observer_signer_image=_operator_observer_signer_image(),
+    )
 
 
 class GitRunner(Protocol):
@@ -152,6 +185,17 @@ class CommandRunner(Protocol):
 
 _DIRECT_RECEIPT_EVIDENCE = frozenset(("source_head", "image_digests"))
 _PROBE_CLEANUP_MARGIN_SECONDS = 30
+_PROBE_SYSTEM_ENVIRONMENT = (
+    "SYSTEMROOT",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "LANG",
+    "LC_ALL",
+)
 _CAPACITY_STDERR_LIMIT_BYTES = 64 * 1024
 _CLASSROOM_EXPORT_STDERR_LIMIT_BYTES = 64 * 1024
 _TENANT_ISOLATION_STDERR_LIMIT_BYTES = 64 * 1024
@@ -199,6 +243,7 @@ def _candidate(candidate_root: Path) -> dict[str, Any]:
         compose_paths=(
             root / "docker-compose.platform.yml",
             root / "docker-compose.data-plane.yml",
+            root / "deploy" / "docker-compose.openmaic-shared-ingress-observer.yml",
         ),
         require_candidate=True,
     )
@@ -206,6 +251,16 @@ def _candidate(candidate_root: Path) -> dict[str, Any]:
     if not isinstance(candidate, dict):
         raise ValueError("candidate image lock is invalid")
     return json.loads(json.dumps(candidate))
+
+
+def _candidate_sha256(candidate: Mapping[str, object]) -> str:
+    canonical = json.dumps(
+        candidate,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def _release_run(raw: Mapping[str, object]) -> dict[str, str]:
@@ -249,6 +304,223 @@ def _validate_pass_result(
     return producer, {name: True for name in required_checks}
 
 
+@dataclass(frozen=True, slots=True)
+class _ReceiptOriginal:
+    descriptor: int
+    parent_descriptor: int
+    identity: tuple[int, int]
+
+
+class _ReceiptPublicationAttempt:
+    """Own original file and parent capabilities until all compensation exits."""
+
+    def __init__(self, recovery: PosixReceiptRecovery) -> None:
+        self.recovery = recovery
+        self.originals: dict[Path, _ReceiptOriginal] = {}
+
+    def check_parent(self, descriptor: int) -> None:
+        recovery_fd = self.recovery._assert_open()
+        details = os.fstat(descriptor)
+        if not stat.S_ISDIR(details.st_mode) or details.st_dev != os.fstat(recovery_fd).st_dev:
+            raise ValueError("receipt publication recovery must share the destination filesystem")
+
+    def admit(self, path: Path) -> None:
+        parent = Path(os.path.abspath(path)).parent
+        while not os.path.lexists(parent):
+            parent = parent.parent
+        descriptor, _identity = _open_posix_directory_path_no_follow(parent)
+        try:
+            self.check_parent(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def pin(
+        self, path: Path, descriptor: int, *, parent_fd: int | None = None, published: bool = False
+    ) -> None:
+        path = Path(os.path.abspath(path))
+        details = os.fstat(descriptor)
+        if not stat.S_ISREG(details.st_mode):
+            raise ValueError("receipt original pin must be a regular file")
+        identity = _file_identity(details)
+        if parent_fd is None:
+            parent, _identity = _open_posix_directory_path_no_follow(path.parent)
+        else:
+            parent = os.dup(parent_fd)
+        try:
+            self.check_parent(parent)
+            if details.st_dev != os.fstat(parent).st_dev:
+                raise ValueError("receipt original pin is on a different filesystem")
+            existing = self.originals.get(path)
+            if existing is not None:
+                if _file_identity(os.fstat(parent)) != _file_identity(
+                    os.fstat(existing.parent_descriptor)
+                ):
+                    raise ValueError("receipt original parent pin changed")
+                if existing.identity != identity:
+                    raise ValueError("receipt original pin association changed")
+            elif not published:
+                named = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+                if not stat.S_ISREG(named.st_mode) or _file_identity(named) != identity:
+                    raise ValueError("receipt original parent/name binding changed")
+            if existing is None:
+                duplicate = os.dup(descriptor)
+        except BaseException as original_error:
+            try:
+                os.close(parent)
+            except OSError as close_error:
+                original_error.add_note(f"receipt parent pin close failed: {close_error}")
+            raise
+        if existing is not None:
+            os.close(parent)
+            return
+        self.originals[path] = _ReceiptOriginal(duplicate, parent, identity)
+
+    def bind(self, target: Path, descriptor: int, *, parent_fd: int) -> None:
+        identity = _file_identity(os.fstat(descriptor))
+        for original in self.originals.values():
+            if _file_identity(os.fstat(original.descriptor)) == identity == original.identity:
+                self.pin(target, original.descriptor, parent_fd=parent_fd, published=True)
+                return
+        raise ValueError("receipt publication requires an original file pin")
+
+    def original(self, path: Path) -> _ReceiptOriginal:
+        original = self.originals.get(Path(os.path.abspath(path)))
+        if original is None:
+            raise ValueError("receipt original file pin is unavailable")
+        if _file_identity(os.fstat(original.descriptor)) != original.identity:
+            raise ValueError("receipt original file pin changed")
+        return original
+
+    def remove(self, path: Path, expected_identity: tuple[int, int] | None) -> None:
+        original = self.original(path)
+        if expected_identity is not None and original.identity != expected_identity:
+            raise ValueError("receipt original file pin identity changed")
+        self.recovery.remove_owned(
+            original.parent_descriptor,
+            Path(path).name,
+            expected_fd=original.descriptor,
+            source_path=Path(os.path.abspath(path)),
+        )
+
+    def close(self) -> None:
+        errors = []
+        while self.originals:
+            _path, original = self.originals.popitem()
+            for descriptor in (original.descriptor, original.parent_descriptor):
+                try:
+                    os.close(descriptor)
+                except OSError as exc:
+                    errors.append(exc)
+        if errors:
+            raise errors[0]
+
+
+_RECEIPT_ATTEMPT: ContextVar[_ReceiptPublicationAttempt | None] = ContextVar(
+    "receipt_publication_attempt", default=None
+)
+
+
+def _require_receipt_attempt() -> _ReceiptPublicationAttempt:
+    attempt = _RECEIPT_ATTEMPT.get()
+    if attempt is None:
+        raise ValueError("explicit receipt publication policy is required on POSIX")
+    attempt.recovery._assert_open()
+    return attempt
+
+
+@contextmanager
+def _receipt_attempt_scope(recovery: PosixReceiptRecovery) -> Iterator[_ReceiptPublicationAttempt]:
+    attempt = _ReceiptPublicationAttempt(recovery)
+    token = _RECEIPT_ATTEMPT.set(attempt)
+    try:
+        yield attempt
+    finally:
+        active_error = sys.exception()
+        _RECEIPT_ATTEMPT.reset(token)
+        try:
+            attempt.close()
+        except OSError as close_error:
+            if active_error is None:
+                raise
+            active_error.add_note(f"receipt original pin close failed: {close_error}")
+
+
+@contextmanager
+def receipt_publication(
+    *, recovery_root: Path | None = None, worker_uid: int | None = None
+) -> Iterator[_ReceiptPublicationAttempt | None]:
+    """Operator-supplied trusted publisher scope; does not change process UIDs.
+
+    Publisher code, dependencies and probe children must already be trusted.
+    External workers must lack publisher credentials/capabilities. Policy is
+    explicit, never inherited from worker-controlled environment variables.
+    """
+    if os.name == "nt":
+        yield None
+        return
+    if recovery_root is None or worker_uid is None:
+        raise ValueError("explicit receipt publication policy is required on POSIX")
+    if _RECEIPT_ATTEMPT.get() is not None:
+        raise ValueError("receipt publication scopes must not be nested")
+    with PosixReceiptRecovery.open(recovery_root, worker_uid=worker_uid) as recovery:
+        with _receipt_attempt_scope(recovery) as attempt:
+            yield attempt
+
+
+def _receipt_producer(function):
+    @wraps(function)
+    def publish(*args, **kwargs):
+        if os.name != "nt":
+            attempt = _require_receipt_attempt()
+            output = args[0] if args else kwargs.get("output_path")
+            if output is not None:
+                attempt.admit(Path(output))
+            bundle = kwargs.get("bundle_root")
+            if bundle is not None:
+                for relative in (
+                    "runtime",
+                    "artifacts",
+                    "raw",
+                    "staging",
+                    "executions",
+                    "runtime/probe-commits",
+                    "raw/classroom-exports",
+                ):
+                    attempt.admit(Path(bundle) / relative / ".publication-parent")
+            for name in ("raw_report_path", "execution_record_path"):
+                if kwargs.get(name) is not None:
+                    attempt.admit(Path(kwargs[name]))
+            # Keep original capabilities through the producer's complete unwind,
+            # but never reuse a previous invocation's inode associations on retry.
+            with _receipt_attempt_scope(attempt.recovery):
+                return function(*args, **kwargs)
+        return function(*args, **kwargs)
+
+    return publish
+
+
+def _pin_receipt(path: Path, descriptor: int, *, parent_fd: int | None = None) -> None:
+    if os.name != "nt":
+        _require_receipt_attempt().pin(path, descriptor, parent_fd=parent_fd)
+
+
+def _remove_receipt_path(path: Path, expected_identity: tuple[int, int] | None = None) -> None:
+    if os.name == "nt":
+        path.unlink(missing_ok=True)
+    else:
+        _require_receipt_attempt().remove(path, expected_identity)
+
+
+def _finish_receipt_staging(path: Path) -> None:
+    active_error = sys.exception()
+    try:
+        _remove_receipt_path(path)
+    except Exception as cleanup_error:
+        if active_error is None:
+            raise
+        active_error.add_note(f"receipt staging recovery failed: {cleanup_error}")
+
+
 def _json_bytes(document: Mapping[str, object]) -> bytes:
     return (json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode(
         "utf-8"
@@ -268,6 +540,7 @@ def _atomic_write_json(path: Path, document: Mapping[str, object]) -> None:
             delete=False,
         ) as handle:
             staged = Path(handle.name)
+            _pin_receipt(staged, handle.fileno())
             handle.write(_json_bytes(document))
             handle.flush()
             os.fsync(handle.fileno())
@@ -275,7 +548,72 @@ def _atomic_write_json(path: Path, document: Mapping[str, object]) -> None:
         staged = None
     finally:
         if staged is not None:
-            staged.unlink(missing_ok=True)
+            _finish_receipt_staging(staged)
+
+
+def _publish_staged_file_no_replace(
+    source: Path,
+    target: Path,
+    *,
+    owned_publications: dict[Path, tuple[int, int]],
+) -> None:
+    source_details = (
+        source.stat(follow_symlinks=False)
+        if os.name == "nt"
+        else os.fstat(_require_receipt_attempt().original(source).descriptor)
+    )
+    if not stat.S_ISREG(source_details.st_mode):
+        raise ValueError("probe proof staging is not a regular file")
+    source_identity = _file_identity(source_details)
+    owned_publications[target] = source_identity
+    _publish_no_replace(source, target)
+    target_details = target.stat(follow_symlinks=False)
+    if (
+        not stat.S_ISREG(target_details.st_mode)
+        or _file_identity(target_details) != source_identity
+    ):
+        raise ValueError("probe proof publication ownership changed")
+    owned_publications[target] = source_identity
+    try:
+        _remove_receipt_path(source, source_identity)
+        _fsync_directory(target.parent)
+    except BaseException as exc:
+        if hasattr(exc, "add_note"):
+            exc.add_note("probe proof publication committed but durability verification failed")
+        raise
+
+
+def _atomic_write_json_no_replace(
+    path: Path,
+    document: Mapping[str, object],
+    *,
+    owned_publications: dict[Path, tuple[int, int]],
+) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    staged: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            dir=target.parent,
+            delete=False,
+        ) as handle:
+            staged = Path(handle.name)
+            _pin_receipt(staged, handle.fileno())
+            handle.write(_json_bytes(document))
+            handle.flush()
+            os.fsync(handle.fileno())
+        _publish_staged_file_no_replace(
+            staged,
+            target,
+            owned_publications=owned_publications,
+        )
+        staged = None
+    finally:
+        if staged is not None:
+            _finish_receipt_staging(staged)
 
 
 @dataclass(frozen=True, slots=True)
@@ -316,7 +654,17 @@ def _publish_no_replace(source: Path, target: Path) -> None:
             source_handle=source_handle,
         )
         return
-    os.link(source, target, follow_symlinks=False)
+    if os.name == "nt":
+        os.link(source, target, follow_symlinks=False)
+    else:
+        attempt = _require_receipt_attempt()
+        original = attempt.original(source)
+        parent, _identity = _open_posix_directory_path_no_follow(target.parent)
+        try:
+            attempt.bind(target, original.descriptor, parent_fd=parent)
+            _link_posix_file_descriptor(original.descriptor, parent, target.name)
+        finally:
+            os.close(parent)
 
 
 def _fsync_directory(path: Path) -> None:
@@ -604,7 +952,7 @@ def _gateway_published_ports(value: object) -> list[dict[str, object]]:
 
 
 def _gateway_attached_networks(value: object) -> list[str]:
-    if not isinstance(value, dict) or not value:
+    if not isinstance(value, dict):
         raise ValueError("gateway Docker network set is invalid")
     if any(
         not isinstance(name, str)
@@ -726,7 +1074,10 @@ def _gateway_observation_round(
         ):
             raise ValueError("gateway candidate Compose network set is invalid")
         network_mode = row.get("networkMode")
-        if not isinstance(network_mode, str) or network_mode not in expected_networks:
+        if not isinstance(network_mode, str) or (
+            (expected_networks and network_mode not in expected_networks)
+            or (not expected_networks and network_mode != "none")
+        ):
             raise ValueError("gateway Docker network mode is invalid")
         networks = _gateway_attached_networks(row.get("networks"))
         if networks != sorted(expected_networks):
@@ -792,9 +1143,12 @@ def _stage_gateway_json(
             handle.close()
             handle = None
             return staged, body, identity
-        except BaseException:
+        except BaseException as original_error:
             if handle is not None:
-                handle.close()
+                try:
+                    handle.close()
+                except Exception as cleanup_error:
+                    original_error.add_note(f"gateway staging cleanup failed: {cleanup_error}")
             try:
                 _remove_classroom_entries(
                     gateway_boundary,
@@ -802,9 +1156,7 @@ def _stage_gateway_json(
                     label="gateway staging evidence",
                 )
             except Exception as cleanup_error:
-                active_error = sys.exception()
-                if active_error is not None:
-                    active_error.add_note(f"gateway staging cleanup failed: {cleanup_error}")
+                original_error.add_note(f"gateway staging cleanup failed: {cleanup_error}")
             raise
 
     body = _json_bytes(document)
@@ -818,6 +1170,7 @@ def _stage_gateway_json(
             delete=False,
         ) as handle:
             staged = Path(handle.name)
+            _pin_receipt(staged, handle.fileno())
             handle.write(body)
             handle.flush()
             os.fsync(handle.fileno())
@@ -825,7 +1178,7 @@ def _stage_gateway_json(
         return staged, body, identity
     except BaseException:
         if staged is not None:
-            staged.unlink(missing_ok=True)
+            _finish_receipt_staging(staged)
         raise
 
 
@@ -877,6 +1230,7 @@ def _open_gateway_staged_input(
         raise
 
 
+@_receipt_producer
 def write_pass_receipt(
     output_path: Path,
     *,
@@ -888,6 +1242,8 @@ def write_pass_receipt(
     checks: Mapping[str, object],
 ) -> dict[str, object]:
     """Write one derived receipt; executable evidence must use a fresh probe."""
+    if evidence == "source_head":
+        raise ValueError("source_head evidence must use write_source_head_receipt")
     if evidence not in _DIRECT_RECEIPT_EVIDENCE:
         raise ValueError("probe-backed evidence must be derived from an executed probe")
     return _write_pass_receipt_from_candidate(
@@ -922,6 +1278,35 @@ def _write_pass_receipt_from_candidate(
         provenance=provenance,
     )
     _atomic_write_json(Path(output_path), document)
+    return document
+
+
+def _write_pass_receipt_no_replace_from_candidate(
+    output_path: Path,
+    *,
+    candidate: Mapping[str, object],
+    release_run: Mapping[str, object],
+    evidence: str,
+    observed_at: str,
+    native_exit: int,
+    checks: Mapping[str, object],
+    provenance: Mapping[str, object] | None = None,
+    owned_publications: dict[Path, tuple[int, int]],
+) -> dict[str, object]:
+    document = _pass_receipt_from_candidate(
+        candidate=candidate,
+        release_run=release_run,
+        evidence=evidence,
+        observed_at=observed_at,
+        native_exit=native_exit,
+        checks=checks,
+        provenance=provenance,
+    )
+    _atomic_write_json_no_replace(
+        Path(output_path),
+        document,
+        owned_publications=owned_publications,
+    )
     return document
 
 
@@ -1223,6 +1608,8 @@ def _classroom_artifact_contains_secret(
 def _open_classroom_artifact_relative(
     parent: _ClassroomDirectoryLease,
     name: str,
+    *,
+    deletable: bool = True,
 ) -> BinaryIO:
     if Path(name).name != name or not name:
         raise ValueError("classroom export staged artifact name is invalid")
@@ -1233,7 +1620,7 @@ def _open_classroom_artifact_relative(
             parent.handle,
             name,
             share_access=0x00000001 | 0x00000002 | 0x00000004,
-            deletable=True,
+            deletable=deletable,
         )
         descriptor: int | None = None
         try:
@@ -1277,6 +1664,7 @@ def _open_classroom_artifact_leases(
         raise ValueError("classroom export staging must contain exactly four artifacts")
     leases: dict[str, _ClassroomArtifactLease] = {}
     total_size = 0
+    handle: BinaryIO | None = None
     try:
         for kind, name in CLASSROOM_EXPORT_PATHS.items():
             path = staging / name
@@ -1289,6 +1677,11 @@ def _open_classroom_artifact_leases(
             if not stat.S_ISREG(opened.st_mode):
                 handle.close()
                 raise ValueError("classroom export staged artifact must be a regular file")
+            _pin_receipt(
+                path,
+                handle.fileno(),
+                parent_fd=int(staging_parent.handle) if os.name != "nt" else None,
+            )
             if opened.st_size <= 0 or opened.st_size > MAX_EXPORT_BYTES[kind]:
                 handle.close()
                 raise ValueError("classroom export staged artifact size is invalid")
@@ -1310,12 +1703,23 @@ def _open_classroom_artifact_leases(
                 sha256=sha256,
             )
             leases[kind] = lease
+            handle = None
             _assert_classroom_artifact_lease(lease)
         boundary.assert_unchanged()
         return leases
-    except BaseException:
+    except BaseException as original_error:
+        if handle is not None:
+            try:
+                handle.close()
+            except BaseException as close_error:
+                original_error.add_note(
+                    f"unaccepted classroom artifact close failed: {close_error}"
+                )
         for lease in leases.values():
-            lease.handle.close()
+            try:
+                lease.handle.close()
+            except BaseException as close_error:
+                original_error.add_note(f"classroom artifact close failed: {close_error}")
         raise
 
 
@@ -1919,7 +2323,7 @@ class _TenantPublicationBoundary(_ClassroomPublicationBoundary):
 
 
 def _create_classroom_json_staging(
-    boundary: _ClassroomPublicationBoundary,
+    boundary: _ClassroomPublicationBoundary | _ManifestPublicationBoundary,
     *,
     parent_key: str,
     path: Path,
@@ -1929,49 +2333,68 @@ def _create_classroom_json_staging(
     if path.parent != parent.path or Path(path.name).name != path.name or not path.name:
         raise ValueError("classroom export staging path is invalid")
     body = _json_bytes(document)
-    if os.name == "nt":
-        import msvcrt
+    native_handle: object | None = None
+    descriptor: int | None = None
+    handle: BinaryIO | None = None
+    identity: tuple[int, int] | None = None
+    try:
+        if os.name == "nt":
+            import msvcrt
 
-        native_handle, _native_identity = _create_windows_staging_file(
-            parent.handle,
-            path.name,
-            body,
-        )
-        descriptor: int | None = None
-        try:
+            native_handle, _native_identity = _create_windows_staging_file(
+                parent.handle,
+                path.name,
+                body,
+            )
             handle_value = getattr(native_handle, "value", native_handle)
             descriptor = msvcrt.open_osfhandle(
                 int(handle_value),
                 os.O_RDONLY | os.O_BINARY,
             )
-            handle = os.fdopen(descriptor, "rb")
-        except BaseException:
-            if descriptor is None:
-                _close_windows_handle(native_handle)
-            else:
-                os.close(descriptor)
-            raise
-    else:
-        flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
-        descriptor = os.open(path.name, flags, 0o600, dir_fd=int(parent.handle))
-        try:
+        else:
+            _require_receipt_attempt().check_parent(int(parent.handle))
+            flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+            descriptor = os.open(path.name, flags, 0o600, dir_fd=int(parent.handle))
+        details = os.fstat(descriptor)
+        if not stat.S_ISREG(details.st_mode):
+            raise ValueError("classroom export staging file is invalid")
+        identity = _file_identity(details)
+        _pin_receipt(path, descriptor, parent_fd=int(parent.handle) if os.name != "nt" else None)
+        if os.name != "nt":
             offset = 0
             while offset < len(body):
                 offset += os.write(descriptor, body[offset:])
             os.fsync(descriptor)
             os.lseek(descriptor, 0, os.SEEK_SET)
-            handle = os.fdopen(descriptor, "rb")
-        except BaseException:
-            os.close(descriptor)
-            raise
-    try:
-        details = os.fstat(handle.fileno())
-        if not stat.S_ISREG(details.st_mode):
-            raise ValueError("classroom export staging file is invalid")
-        identity = _file_identity(details)
+        handle = os.fdopen(descriptor, "rb")
         handle.seek(0)
-    except BaseException:
-        handle.close()
+    except BaseException as original_error:
+        if native_handle is not None and identity is None:
+            try:
+                _delete_windows_file_on_close(native_handle)
+            except Exception as cleanup_error:
+                original_error.add_note(f"classroom staging cleanup failed: {cleanup_error}")
+        try:
+            if handle is not None:
+                handle.close()
+            elif descriptor is not None:
+                os.close(descriptor)
+            elif native_handle is not None:
+                _close_windows_handle(native_handle)
+        except Exception as cleanup_error:
+            original_error.add_note(f"classroom staging cleanup failed: {cleanup_error}")
+        if identity is not None:
+            try:
+                if parent_key == "bundle":
+                    _remove_manifest_staging(boundary, path, expected_identity=identity)
+                else:
+                    _remove_classroom_entries(
+                        boundary,
+                        {path: identity},
+                        label="classroom staging evidence",
+                    )
+            except Exception as cleanup_error:
+                original_error.add_note(f"classroom staging cleanup failed: {cleanup_error}")
         raise
     return handle, identity, body
 
@@ -2099,6 +2522,9 @@ def _publish_classroom_no_replace(
         )
     else:
         del source_parent
+        _require_receipt_attempt().bind(
+            target, source_handle.fileno(), parent_fd=int(target_parent.handle)
+        )
         _link_posix_file_descriptor(
             source_handle.fileno(),
             int(target_parent.handle),
@@ -2191,6 +2617,23 @@ def _remove_classroom_entries(
     *,
     label: str,
 ) -> None:
+    if os.name != "nt":
+        attempt = _require_receipt_attempt()
+        failures = []
+        for path, expected_identity in entries.items():
+            try:
+                if expected_identity is None and path not in attempt.originals:
+                    if not os.path.lexists(path):
+                        continue
+                attempt.remove(path, expected_identity)
+            except (OSError, ValueError, RuntimeError) as exc:
+                failures.append(exc)
+        if failures:
+            error = RuntimeError(f"{label} could not be removed: " + "; ".join(map(str, failures)))
+            for failure in failures:
+                error.add_note(str(failure))
+            raise error from failures[0]
+        return
     parent_leases = {
         boundary.root / "runtime": boundary.leases["runtime"],
         boundary.root / "artifacts": boundary.leases["artifacts"],
@@ -2227,7 +2670,7 @@ def _remove_classroom_entries(
                         os.O_RDONLY | os.O_BINARY,
                     )
                     identity = _file_identity(os.fstat(descriptor))
-                    if expected_identity is not None and identity != expected_identity:
+                    if identity != expected_identity:
                         raise ValueError(f"{label} identity changed")
                     _delete_windows_file_on_close(msvcrt.get_osfhandle(descriptor))
                 finally:
@@ -2235,21 +2678,6 @@ def _remove_classroom_entries(
                         _close_windows_handle(handle)
                     else:
                         os.close(descriptor)
-            else:
-                try:
-                    details = os.stat(
-                        path.name,
-                        dir_fd=int(parent.handle),
-                        follow_symlinks=False,
-                    )
-                    identity = _file_identity(details)
-                    if not stat.S_ISREG(details.st_mode) or (
-                        expected_identity is not None and identity != expected_identity
-                    ):
-                        raise ValueError(f"{label} identity changed")
-                    os.unlink(path.name, dir_fd=int(parent.handle))
-                except FileNotFoundError:
-                    continue
         except (OSError, ValueError) as exc:
             failures.append(exc)
     remaining: list[Path] = []
@@ -2279,13 +2707,6 @@ def _remove_classroom_entries(
                         _close_windows_handle(handle)
                     else:
                         os.close(descriptor)
-            else:
-                details = os.stat(
-                    path.name,
-                    dir_fd=int(parent.handle),
-                    follow_symlinks=False,
-                )
-                identity = _file_identity(details)
         except FileNotFoundError:
             continue
         except (OSError, ValueError) as exc:
@@ -2312,6 +2733,10 @@ def _retract_classroom_formal_entries(
 
 def _current_observed_at() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _current_trusted_now() -> datetime:
+    return datetime.now(UTC)
 
 
 def _bundle_artifact(path: Path, *, bundle_root: Path, label: str) -> tuple[Path, str]:
@@ -2357,6 +2782,288 @@ def _probe_command(evidence: str, recipe: str) -> list[str]:
         str(SCRIPTS_ROOT / "classroom_release_probe.py"),
         evidence,
     ]
+
+
+def _live_fixture_token() -> str:
+    fixture_token = os.environ.get("YFEISTAI_LIVE_FIXTURE_TOKEN", "")
+    if not fixture_token:
+        raise ValueError("live fixture token is unavailable")
+    if fixture_token != fixture_token.strip():
+        raise ValueError("live fixture token is not canonical")
+    return fixture_token
+
+
+def _probe_child_environment(
+    explicit: Mapping[str, str],
+    *,
+    fixture_token: str,
+) -> dict[str, str]:
+    host = {name.upper(): value for name, value in os.environ.items()}
+    environment = {
+        name: host[name] for name in _PROBE_SYSTEM_ENVIRONMENT if name in host and host[name]
+    }
+    environment.update(explicit)
+    environment["YFEISTAI_LIVE_FIXTURE_TOKEN"] = fixture_token
+    return environment
+
+
+def _probe_claim_digest(
+    *,
+    candidate: Mapping[str, object],
+    release_run: Mapping[str, str],
+    evidence: str,
+) -> str:
+    identity = {
+        "candidate": candidate,
+        "evidence": evidence,
+        "releaseRun": release_run,
+    }
+    canonical = json.dumps(
+        identity,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _probe_process_time(value: float) -> str:
+    return f"{value:.6f}"
+
+
+def _current_probe_claim_owner() -> dict[str, object]:
+    try:
+        import psutil
+
+        process = psutil.Process(os.getpid())
+        boot_id = _probe_process_time(psutil.boot_time())
+        process_start = _probe_process_time(process.create_time())
+    except Exception as exc:
+        raise ValueError("probe claim owner identity is unavailable") from exc
+    return {
+        "pid": os.getpid(),
+        "bootId": boot_id,
+        "processStart": process_start,
+        "nonce": uuid.uuid4().hex,
+    }
+
+
+def _probe_claim_owner_status(owner: Mapping[str, object]) -> str:
+    if (
+        set(owner) != {"pid", "bootId", "processStart", "nonce"}
+        or type(owner.get("pid")) is not int
+        or int(owner["pid"]) <= 0
+        or any(
+            not isinstance(owner.get(name), str)
+            or not str(owner[name])
+            or str(owner[name]) != str(owner[name]).strip()
+            for name in ("bootId", "processStart", "nonce")
+        )
+    ):
+        return "unknown"
+    try:
+        import psutil
+
+        current_boot = _probe_process_time(psutil.boot_time())
+    except Exception:
+        return "unknown"
+    if owner["bootId"] != current_boot:
+        return "dead"
+    try:
+        observed_start = _probe_process_time(psutil.Process(int(owner["pid"])).create_time())
+    except psutil.NoSuchProcess:
+        return "dead"
+    except Exception:
+        return "unknown"
+    return "alive" if observed_start == owner["processStart"] else "dead"
+
+
+def _lock_probe_claim(descriptor: int) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        os.lseek(descriptor, 16 * 1024, os.SEEK_SET)
+        msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+        return
+    import fcntl
+
+    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock_probe_claim(descriptor: int) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        os.lseek(descriptor, 16 * 1024, os.SEEK_SET)
+        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+        return
+    import fcntl
+
+    fcntl.flock(descriptor, fcntl.LOCK_UN)
+
+
+def _read_probe_claim_body(descriptor: int) -> bytes | None:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    size = 0
+    while True:
+        chunk = os.read(descriptor, 4096)
+        if not chunk:
+            break
+        size += len(chunk)
+        if size > 16 * 1024:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _probe_claim_owner_from_body(body: bytes | None) -> dict[str, object] | None:
+    if body is None:
+        return None
+    try:
+        document = json.loads(body)
+    except (UnicodeError, json.JSONDecodeError):
+        return None
+    owner = document.get("owner") if isinstance(document, dict) else None
+    if (
+        not isinstance(document, dict)
+        or set(document) != {"schemaVersion", "owner"}
+        or document.get("schemaVersion") != 1
+        or not isinstance(owner, dict)
+    ):
+        return None
+    return owner
+
+
+def _read_probe_claim_owner(descriptor: int) -> dict[str, object] | None:
+    return _probe_claim_owner_from_body(_read_probe_claim_body(descriptor))
+
+
+def _release_dead_probe_claim(path: Path, *, runtime: Path) -> bool:
+    flags = (
+        os.O_RDWR
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return True
+    locked = False
+    expected_identity: tuple[int, int] | None = None
+    expected_body: bytes | None = None
+    try:
+        try:
+            _lock_probe_claim(descriptor)
+        except OSError:
+            return False
+        locked = True
+        details = os.fstat(descriptor)
+        if not stat.S_ISREG(details.st_mode):
+            return False
+        expected_body = _read_probe_claim_body(descriptor)
+        owner = _probe_claim_owner_from_body(expected_body)
+        if owner is None or _probe_claim_owner_status(owner) != "dead":
+            return False
+        expected_identity = _file_identity(details)
+    finally:
+        if locked:
+            _unlock_probe_claim(descriptor)
+        os.close(descriptor)
+    if expected_identity is None or expected_body is None:
+        return False
+    try:
+        current = path.stat(follow_symlinks=False)
+        if _file_identity(current) != expected_identity or path.read_bytes() != expected_body:
+            return False
+        path.unlink()
+    except FileNotFoundError:
+        return True
+    _fsync_directory(runtime)
+    return True
+
+
+@contextmanager
+def _exclusive_probe_claim(
+    *,
+    bundle_root: Path,
+    candidate: Mapping[str, object],
+    release_run: Mapping[str, str],
+    evidence: str,
+) -> Iterator[None]:
+    root = Path(bundle_root).resolve()
+    runtime = root / "runtime"
+    if not root.is_dir() or not runtime.is_dir():
+        raise ValueError("probe claim boundary is invalid")
+    _assert_no_link_ancestors(runtime)
+    digest = _probe_claim_digest(
+        candidate=candidate,
+        release_run=release_run,
+        evidence=evidence,
+    )
+    path = runtime / f".probe-claim-{digest}.lock"
+    owner = _current_probe_claim_owner()
+    owner_body = _json_bytes({"schemaVersion": 1, "owner": owner})
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
+    descriptor: int | None = None
+    for _attempt in range(2):
+        try:
+            descriptor = os.open(path, flags, 0o600)
+            break
+        except FileExistsError:
+            if not _release_dead_probe_claim(path, runtime=runtime):
+                raise ValueError("probe claim already held") from None
+    if descriptor is None:
+        raise ValueError("probe claim already held")
+    identity: tuple[int, int] | None = None
+    remove_claim = False
+    claim_locked = False
+    try:
+        offset = 0
+        while offset < len(owner_body):
+            written = os.write(descriptor, owner_body[offset:])
+            if written <= 0:
+                raise OSError("probe claim owner write was incomplete")
+            offset += written
+        os.fsync(descriptor)
+        _lock_probe_claim(descriptor)
+        claim_locked = True
+        identity = _file_identity(os.fstat(descriptor))
+        _fsync_directory(runtime)
+        yield
+    finally:
+        try:
+            current = path.stat(follow_symlinks=False)
+            if (
+                identity is not None
+                and _file_identity(current) == identity
+                and _read_probe_claim_owner(descriptor) == owner
+            ):
+                remove_claim = True
+        except FileNotFoundError:
+            pass
+        if claim_locked:
+            _unlock_probe_claim(descriptor)
+        os.close(descriptor)
+        if remove_claim:
+            try:
+                current = path.stat(follow_symlinks=False)
+                if (
+                    identity is not None
+                    and _file_identity(current) == identity
+                    and _probe_claim_owner_from_body(path.read_bytes()) == owner
+                ):
+                    path.unlink()
+                    _fsync_directory(runtime)
+            except FileNotFoundError:
+                pass
 
 
 def _failure_archive_document(
@@ -2423,43 +3130,7 @@ def _relocate_windows_bundle_file(
     bundle_handle: object,
     target_handle: object,
     target_name: str,
-) -> bool:
-    relative = _bundle_relative_file(source, bundle_root=bundle_root)
-    directory_handles: list[object] = []
-    current = bundle_handle
-    source_handle: object | None = None
-    try:
-        try:
-            for component in relative.parts[:-1]:
-                current, _identity = _open_windows_directory_relative(current, component)
-                directory_handles.append(current)
-            source_handle, _identity = _open_windows_regular_file_relative(
-                current,
-                relative.name,
-                share_access=0x00000001 | 0x00000002 | 0x00000004,
-                deletable=True,
-            )
-        except FileNotFoundError:
-            return False
-        _rename_windows_file_relative(
-            source_handle,
-            target_handle,
-            target_name,
-            replace_existing=False,
-        )
-        return True
-    finally:
-        if source_handle is not None:
-            _close_windows_handle(source_handle)
-        for handle in reversed(directory_handles):
-            _close_windows_handle(handle)
-
-
-def _discard_windows_bundle_file(
-    source: Path,
-    *,
-    bundle_root: Path,
-    bundle_handle: object,
+    expected_identity: tuple[int, int] | None = None,
 ) -> bool:
     import msvcrt
 
@@ -2473,7 +3144,58 @@ def _discard_windows_bundle_file(
             for component in relative.parts[:-1]:
                 current, _identity = _open_windows_directory_relative(current, component)
                 directory_handles.append(current)
-            source_handle, _identity = _open_windows_regular_file_relative(
+            source_handle, _native_identity = _open_windows_regular_file_relative(
+                current,
+                relative.name,
+                share_access=0x00000001 | 0x00000002 | 0x00000004,
+                deletable=True,
+            )
+        except FileNotFoundError:
+            return False
+        handle_value = getattr(source_handle, "value", source_handle)
+        descriptor = msvcrt.open_osfhandle(int(handle_value), os.O_RDONLY | os.O_BINARY)
+        source_handle = None
+        details = os.fstat(descriptor)
+        if not stat.S_ISREG(details.st_mode):
+            raise ValueError("failure archive source is not a regular file")
+        if expected_identity is not None and _file_identity(details) != expected_identity:
+            return False
+        _rename_windows_file_relative(
+            msvcrt.get_osfhandle(descriptor),
+            target_handle,
+            target_name,
+            replace_existing=False,
+        )
+        return True
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if source_handle is not None:
+            _close_windows_handle(source_handle)
+        for handle in reversed(directory_handles):
+            _close_windows_handle(handle)
+
+
+def _discard_windows_bundle_file(
+    source: Path,
+    *,
+    bundle_root: Path,
+    bundle_handle: object,
+    expected_identity: tuple[int, int] | None = None,
+) -> bool:
+    import msvcrt
+
+    relative = _bundle_relative_file(source, bundle_root=bundle_root)
+    directory_handles: list[object] = []
+    current = bundle_handle
+    source_handle: object | None = None
+    descriptor: int | None = None
+    try:
+        try:
+            for component in relative.parts[:-1]:
+                current, _identity = _open_windows_directory_relative(current, component)
+                directory_handles.append(current)
+            source_handle, _native_identity = _open_windows_regular_file_relative(
                 current,
                 relative.name,
                 share_access=0x00000001 | 0x00000002 | 0x00000004,
@@ -2487,8 +3209,11 @@ def _discard_windows_bundle_file(
             os.O_RDONLY | os.O_BINARY,
         )
         source_handle = None
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+        details = os.fstat(descriptor)
+        if not stat.S_ISREG(details.st_mode):
             raise ValueError("sensitive probe artifact is not a regular file")
+        if expected_identity is not None and _file_identity(details) != expected_identity:
+            return False
         _delete_windows_file_on_close(msvcrt.get_osfhandle(descriptor))
         os.close(descriptor)
         descriptor = None
@@ -2519,7 +3244,7 @@ def _record_probe_failure_windows(
     attempt_id: str,
     reason: str,
     native_exit: int | None,
-    artifacts: Mapping[str, Path],
+    artifacts: Mapping[str, Path | tuple[Path, tuple[int, int]]],
 ) -> None:
     handles: list[object] = []
     try:
@@ -2541,7 +3266,10 @@ def _record_probe_failure_windows(
         )
         handles.append(failure_handle)
         moved: dict[str, str] = {}
-        for name, source in artifacts.items():
+        for name, artifact in artifacts.items():
+            source, expected_identity = (
+                artifact if isinstance(artifact, tuple) else (artifact, None)
+            )
             target_name = f"{name}.json"
             if _relocate_windows_bundle_file(
                 Path(source),
@@ -2549,6 +3277,7 @@ def _record_probe_failure_windows(
                 bundle_handle=bundle_handle,
                 target_handle=failure_handle,
                 target_name=target_name,
+                expected_identity=expected_identity,
             ):
                 moved[name] = f"failures/{evidence}/{attempt_id}/{target_name}"
         failure_file, _identity = _create_windows_staging_file(
@@ -2593,48 +3322,6 @@ def _open_or_create_posix_directory(
     return file_descriptor
 
 
-def _rename_posix_between_no_replace(
-    source_fd: int,
-    source: str,
-    target_fd: int,
-    target: str,
-) -> None:
-    if any(Path(name).name != name or not name for name in (source, target)):
-        raise ValueError("failure archive entry name is invalid")
-    if sys.platform.startswith("linux"):
-        import ctypes
-
-        libc = ctypes.CDLL(None, use_errno=True)
-        renameat2 = getattr(libc, "renameat2", None)
-        if renameat2 is None:
-            raise OSError(errno.ENOSYS, "renameat2 is required for safe failure archival")
-        renameat2.argtypes = (
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_int,
-            ctypes.c_char_p,
-            ctypes.c_uint,
-        )
-        renameat2.restype = ctypes.c_int
-        if (
-            renameat2(
-                source_fd,
-                os.fsencode(source),
-                target_fd,
-                os.fsencode(target),
-                1,
-            )
-            != 0
-        ):
-            error = ctypes.get_errno()
-            raise OSError(error, f"cannot safely archive failure entry: {target}")
-        return
-    raise OSError(
-        errno.ENOSYS,
-        "atomic no-replace failure archival is unavailable on this POSIX platform",
-    )
-
-
 def _relocate_posix_bundle_file(
     source: Path,
     *,
@@ -2642,85 +3329,44 @@ def _relocate_posix_bundle_file(
     bundle_fd: int,
     target_fd: int,
     target_name: str,
+    expected_identity: tuple[int, int] | None = None,
 ) -> bool:
-    relative = _bundle_relative_file(source, bundle_root=bundle_root)
-    directory_fds: list[int] = []
-    current = bundle_fd
-    source_file: int | None = None
-    try:
-        try:
-            directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-            for component in relative.parts[:-1]:
-                current = os.open(component, directory_flags, dir_fd=current)
-                directory_fds.append(current)
-            source_file = os.open(
-                relative.name,
-                os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
-                dir_fd=current,
-            )
-        except FileNotFoundError:
-            return False
-        source_details = os.fstat(source_file)
-        if not stat.S_ISREG(source_details.st_mode):
-            raise ValueError("failure archive source is not a regular file")
-        source_identity = _file_identity(source_details)
-        _rename_posix_between_no_replace(current, relative.name, target_fd, target_name)
-        target_details = os.stat(target_name, dir_fd=target_fd, follow_symlinks=False)
-        if _file_identity(target_details) != source_identity or not stat.S_ISREG(
-            target_details.st_mode
-        ):
-            raise ValueError("failure archive target identity changed")
-        os.fsync(current)
-        os.fsync(target_fd)
-        return True
-    finally:
-        if source_file is not None:
-            os.close(source_file)
-        for file_descriptor in reversed(directory_fds):
-            os.close(file_descriptor)
+    _bundle_relative_file(source, bundle_root=bundle_root)
+    attempt = _require_receipt_attempt()
+    if source not in attempt.originals and not os.path.lexists(source):
+        return False
+    original = attempt.original(source)
+    if expected_identity is not None and original.identity != expected_identity:
+        raise ValueError("failure archive original file pin identity changed")
+    attempt.check_parent(target_fd)
+    _link_posix_file_descriptor(original.descriptor, target_fd, target_name)
+    os.fsync(target_fd)
+    attempt.remove(source, original.identity)
+    return True
 
 
 def _discard_posix_bundle_file(
     source: Path,
     *,
     bundle_root: Path,
-    bundle_fd: int,
+    bundle_fd: int | None = None,
+    expected_identity: tuple[int, int] | None = None,
 ) -> bool:
-    relative = _bundle_relative_file(source, bundle_root=bundle_root)
-    directory_fds: list[int] = []
-    current = bundle_fd
-    source_file: int | None = None
-    try:
-        try:
-            directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-            for component in relative.parts[:-1]:
-                current = os.open(component, directory_flags, dir_fd=current)
-                directory_fds.append(current)
-            source_file = os.open(
-                relative.name,
-                os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
-                dir_fd=current,
-            )
-        except FileNotFoundError:
-            return False
-        if not stat.S_ISREG(os.fstat(source_file).st_mode):
-            raise ValueError("sensitive probe artifact is not a regular file")
-        os.unlink(relative.name, dir_fd=current)
-        os.fsync(current)
-        try:
-            os.stat(relative.name, dir_fd=current, follow_symlinks=False)
-        except FileNotFoundError:
-            return True
-        raise ValueError("sensitive probe artifact reappeared during cleanup")
-    finally:
-        if source_file is not None:
-            os.close(source_file)
-        for file_descriptor in reversed(directory_fds):
-            os.close(file_descriptor)
+    _bundle_relative_file(source, bundle_root=bundle_root)
+    attempt = _require_receipt_attempt()
+    if source not in attempt.originals and not os.path.lexists(source):
+        return False
+    attempt.remove(source, expected_identity)
+    return True
 
 
-def _discard_sensitive_probe_artifact(path: Path, *, bundle_root: Path) -> None:
-    root = Path(bundle_root).resolve()
+def _discard_sensitive_probe_artifact(
+    path: Path,
+    *,
+    bundle_root: Path,
+    expected_identity: tuple[int, int] | None = None,
+) -> None:
+    root = Path(os.path.abspath(bundle_root))
     if os.name == "nt":
         bundle_handle, _identity = _open_windows_directory_handle(root, deletable=True)
         try:
@@ -2728,19 +3374,12 @@ def _discard_sensitive_probe_artifact(path: Path, *, bundle_root: Path) -> None:
                 Path(path),
                 bundle_root=root,
                 bundle_handle=bundle_handle,
+                expected_identity=expected_identity,
             )
         finally:
             _close_windows_handle(bundle_handle)
         return
-    bundle_fd, _identity = _open_posix_directory_path_no_follow(root)
-    try:
-        _discard_posix_bundle_file(
-            Path(path),
-            bundle_root=root,
-            bundle_fd=bundle_fd,
-        )
-    finally:
-        os.close(bundle_fd)
+    _discard_posix_bundle_file(Path(path), bundle_root=root, expected_identity=expected_identity)
 
 
 def _write_posix_new_file(directory_fd: int, name: str, body: bytes) -> None:
@@ -2767,7 +3406,7 @@ def _record_probe_failure_posix(
     attempt_id: str,
     reason: str,
     native_exit: int | None,
-    artifacts: Mapping[str, Path],
+    artifacts: Mapping[str, Path | tuple[Path, tuple[int, int]]],
 ) -> None:
     handles: list[int] = []
     try:
@@ -2792,7 +3431,10 @@ def _record_probe_failure_posix(
         )
         handles.append(failure_fd)
         moved: dict[str, str] = {}
-        for name, source in artifacts.items():
+        for name, artifact in artifacts.items():
+            source, expected_identity = (
+                artifact if isinstance(artifact, tuple) else (artifact, None)
+            )
             target_name = f"{name}.json"
             if _relocate_posix_bundle_file(
                 Path(source),
@@ -2800,6 +3442,7 @@ def _record_probe_failure_posix(
                 bundle_fd=bundle_fd,
                 target_fd=failure_fd,
                 target_name=target_name,
+                expected_identity=expected_identity,
             ):
                 moved[name] = f"failures/{evidence}/{attempt_id}/{target_name}"
         _write_posix_new_file(
@@ -2828,7 +3471,7 @@ def _record_probe_failure(
     attempt_id: str,
     reason: str,
     native_exit: int | None,
-    artifacts: Mapping[str, Path],
+    artifacts: Mapping[str, Path | tuple[Path, tuple[int, int]]],
 ) -> Path:
     components = (evidence, attempt_id, *artifacts)
     if any(
@@ -2839,7 +3482,7 @@ def _record_probe_failure(
         for component in components
     ):
         raise ValueError("failure archive boundary is invalid")
-    root = Path(bundle_root).resolve()
+    root = Path(os.path.abspath(bundle_root))
     arguments = {
         "root": root,
         "evidence": evidence,
@@ -2849,15 +3492,50 @@ def _record_probe_failure(
         "native_exit": native_exit,
         "artifacts": artifacts,
     }
+    archive_error: BaseException | None = None
+    cleanup_errors: list[BaseException] = []
     try:
         if os.name == "nt":
             _record_probe_failure_windows(**arguments)
         else:
             _record_probe_failure_posix(**arguments)
-    except ValueError as exc:
-        if str(exc).startswith("failure archive"):
-            raise
-        raise ValueError("failure archive boundary is invalid") from exc
+    except BaseException as exc:
+        archive_error = exc
+    finally:
+        if os.name != "nt":
+            # Archival is diagnostic, not a prerequisite for compensating the
+            # attempted publications. Each original capability is independent.
+            for artifact in artifacts.values():
+                if not isinstance(artifact, tuple):
+                    # A plain source requests archival, not deletion when the
+                    # archive boundary could not be established.
+                    continue
+                path, identity = artifact
+                try:
+                    _discard_posix_bundle_file(
+                        Path(path), bundle_root=root, expected_identity=identity
+                    )
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
+    if archive_error is not None:
+        for error in cleanup_errors:
+            _add_receipt_cleanup_note(
+                archive_error, error, label="failure archive source recovery failed"
+            )
+        if isinstance(archive_error, (ValueError, NotADirectoryError)) and not str(
+            archive_error
+        ).startswith("failure archive"):
+            wrapped = ValueError("failure archive boundary is invalid")
+            _add_receipt_cleanup_note(wrapped, archive_error, label="failure archive error")
+            raise wrapped from archive_error
+        raise archive_error
+    if cleanup_errors:
+        primary = cleanup_errors[0]
+        for error in cleanup_errors[1:]:
+            _add_receipt_cleanup_note(
+                primary, error, label="failure archive source recovery failed"
+            )
+        raise primary
     return root / "failures" / evidence / attempt_id
 
 
@@ -2869,21 +3547,83 @@ def _record_playwright_probe_failure(
     attempt_id: str,
     reason: str,
     native_exit: int | None,
-    raw_report: Path,
-    artifacts: Mapping[str, Path] | None = None,
+    raw_report: Path | tuple[Path, tuple[int, int]],
+    artifacts: Mapping[str, Path | tuple[Path, tuple[int, int]]] | None = None,
+    raw_aliases: Sequence[Path] = (),
 ) -> Path:
-    _discard_sensitive_probe_artifact(raw_report, bundle_root=bundle_root)
-    return _record_probe_failure(
-        bundle_root=bundle_root,
-        evidence=evidence,
-        recipe=recipe,
-        attempt_id=attempt_id,
-        reason=reason,
-        native_exit=native_exit,
-        artifacts={} if artifacts is None else artifacts,
-    )
+    active_error = sys.exception()
+    errors: list[BaseException] = []
+    discarded: set[Path] = set()
+    for raw in (raw_report, *raw_aliases):
+        raw_path, expected_identity = raw if isinstance(raw, tuple) else (raw, None)
+        if raw_path in discarded:
+            continue
+        discarded.add(raw_path)
+        try:
+            _discard_sensitive_probe_artifact(
+                raw_path, bundle_root=bundle_root, expected_identity=expected_identity
+            )
+        except BaseException as error:
+            errors.append(error)
+    failure_path = Path(bundle_root) / "failures" / evidence / attempt_id
+    try:
+        failure_path = _record_probe_failure(
+            bundle_root=bundle_root,
+            evidence=evidence,
+            recipe=recipe,
+            attempt_id=attempt_id,
+            reason=reason,
+            native_exit=native_exit,
+            artifacts={} if artifacts is None else artifacts,
+        )
+    except BaseException as error:
+        errors.append(error)
+    if errors:
+        primary = active_error if active_error is not None else errors[0]
+        for error in errors:
+            if error is not primary:
+                _add_receipt_cleanup_note(primary, error, label="probe failure recovery failed")
+        if active_error is None:
+            raise primary
+    return failure_path
 
 
+def _owned_probe_publication(
+    path: Path,
+    *,
+    owned_publications: Mapping[Path, tuple[int, int]],
+    active_error: BaseException,
+    label: str,
+) -> tuple[Path, tuple[int, int]] | None:
+    expected_identity = owned_publications.get(path)
+    if expected_identity is None:
+        return None
+    if os.name != "nt":
+        try:
+            original = _require_receipt_attempt().original(path)
+        except ValueError as exc:
+            active_error.add_note(f"probe published {label} has no original pin: {exc}")
+            return None
+        if original.identity != expected_identity:
+            active_error.add_note(f"probe published {label} original pin changed; cleanup skipped")
+            return None
+        return path, expected_identity
+    try:
+        details = path.stat(follow_symlinks=False)
+    except OSError:
+        details = None
+    if (
+        details is None
+        or not stat.S_ISREG(details.st_mode)
+        or _file_identity(details) != expected_identity
+    ):
+        if hasattr(active_error, "add_note"):
+            active_error.add_note(f"probe published {label} ownership changed; cleanup skipped")
+        return None
+    return path, expected_identity
+
+
+@_receipt_producer
 def run_probe_receipt(
     output_path: Path,
     *,
@@ -2903,8 +3643,64 @@ def run_probe_receipt(
     """Execute one probe and publish its receipt only from a fresh bound report."""
     if evidence in _DIRECT_RECEIPT_EVIDENCE or evidence not in RECEIPT_CONTRACTS:
         raise ValueError("probe evidence layer is invalid")
-    candidate = _candidate(candidate_root)
-    bound_run = _release_run(release_run)
+    fixture_token = _live_fixture_token()
+    candidate_path = Path(os.path.abspath(candidate_root))
+    with ExitStack() as candidate_stack:
+        candidate_artifact = candidate_stack.enter_context(
+            validated_candidate_artifact_lease(candidate_path)
+        )
+        candidate = candidate_artifact.candidate_copy()
+        candidate_sha256 = _candidate_sha256(candidate)
+        bound_run = _release_run(release_run)
+        with _exclusive_probe_claim(
+            bundle_root=bundle_root,
+            candidate=candidate,
+            release_run=bound_run,
+            evidence=evidence,
+        ):
+            return _run_claimed_probe_receipt(
+                output_path,
+                candidate_root=candidate_path,
+                candidate_artifact=candidate_artifact,
+                candidate_stack=candidate_stack,
+                bundle_root=bundle_root,
+                candidate=candidate,
+                candidate_sha256=candidate_sha256,
+                bound_run=bound_run,
+                evidence=evidence,
+                observed_at=observed_at,
+                base_url=base_url,
+                raw_report_path=raw_report_path,
+                execution_record_path=execution_record_path,
+                recipe=recipe,
+                working_directory=working_directory,
+                timeout_seconds=timeout_seconds,
+                fixture_token=fixture_token,
+                runner=runner,
+            )
+
+
+def _run_claimed_probe_receipt(
+    output_path: Path,
+    *,
+    candidate_root: Path,
+    candidate_artifact: ValidatedCandidateArtifact,
+    candidate_stack: ExitStack,
+    bundle_root: Path,
+    candidate: Mapping[str, object],
+    candidate_sha256: str,
+    bound_run: Mapping[str, str],
+    evidence: str,
+    observed_at: str,
+    base_url: str,
+    raw_report_path: Path,
+    execution_record_path: Path,
+    recipe: str,
+    working_directory: Path,
+    timeout_seconds: int,
+    fixture_token: str,
+    runner: CommandRunner,
+) -> dict[str, object]:
     if not _valid_observed_at(observed_at):
         raise ValueError("receipt observedAt is invalid")
     resolved_output, _output_artifact = _bundle_artifact(
@@ -2954,68 +3750,100 @@ def run_probe_receipt(
         "sha256": attestation_sha256,
     }
     arguments = _probe_command(evidence, recipe)
-    cwd = Path(working_directory).resolve()
-    if not cwd.is_dir():
-        raise ValueError("probe working directory is invalid")
+    try:
+        cwd = Path(working_directory).resolve(strict=True)
+        trusted_cwd = PROJECT_ROOT.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("probe working directory is not the trusted harness") from exc
+    if cwd != trusted_cwd or not cwd.is_dir():
+        raise ValueError("probe working directory is not the trusted harness")
     resolved_report.parent.mkdir(parents=True, exist_ok=True)
     attempt_id = uuid.uuid4().hex
     staged_report = resolved_report.parent / f".{resolved_report.name}.{attempt_id}.staging"
-    environment = os.environ.copy()
-    environment.update(
+    environment = _probe_child_environment(
         {
             "YFEISTAI_EVIDENCE_REPORT": str(staged_report),
             "YFEISTAI_CANDIDATE_ROOT": str(Path(candidate_root).resolve()),
+            "YFEISTAI_CANDIDATE_SHA256": candidate_sha256,
             "YFEISTAI_RELEASE_RUN_ID": bound_run["runId"],
             "YFEISTAI_ENVIRONMENT_ID": bound_run["environmentId"],
             "YFEISTAI_EVIDENCE": evidence,
             "YFEISTAI_PROBE_TIMEOUT_SECONDS": str(timeout_seconds - _PROBE_CLEANUP_MARGIN_SECONDS),
             "WEB_BASE_URL": base_url,
-        }
+        },
+        fixture_token=fixture_token,
     )
+    report_accept_error: OSError | ValueError | None = None
     try:
-        completed = runner(
-            arguments,
-            cwd=cwd,
-            env=environment,
-            timeout=timeout_seconds,
-        )
-    except subprocess.TimeoutExpired:
+        try:
+            candidate_artifact.check_unchanged()
+            completed = runner(
+                arguments,
+                cwd=cwd,
+                env=environment,
+                timeout=timeout_seconds,
+            )
+        finally:
+            if os.name != "nt":
+                # Accept the trusted runner's completed artifact before result
+                # classification. Cleanup never acquires ownership by reopening.
+                try:
+                    descriptor = os.open(
+                        staged_report, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
+                    )
+                    try:
+                        _pin_receipt(staged_report, descriptor)
+                    finally:
+                        os.close(descriptor)
+                except (OSError, ValueError) as exc:
+                    report_accept_error = exc
+    except BaseException as error:
         _record_playwright_probe_failure(
             bundle_root=bundle_root,
             evidence=evidence,
             recipe=recipe,
             attempt_id=attempt_id,
-            reason="outer probe deadline expired",
+            reason=(
+                "outer probe deadline expired"
+                if isinstance(error, subprocess.TimeoutExpired)
+                else "probe execution interrupted"
+            ),
             native_exit=None,
             raw_report=staged_report,
         )
         raise
     native_exit = completed.returncode
-    if not isinstance(native_exit, int) or isinstance(native_exit, bool):
-        _record_playwright_probe_failure(
-            bundle_root=bundle_root,
-            evidence=evidence,
-            recipe=recipe,
-            attempt_id=attempt_id,
-            reason="probe native exit is invalid",
-            native_exit=None,
-            raw_report=staged_report,
-        )
-        raise ValueError("probe native exit is invalid")
-    if native_exit != 0:
-        _record_playwright_probe_failure(
-            bundle_root=bundle_root,
-            evidence=evidence,
-            recipe=recipe,
-            attempt_id=attempt_id,
-            reason="probe native exit does not prove passing evidence",
-            native_exit=native_exit,
-            raw_report=staged_report,
-        )
-        raise ValueError(f"probe native exit {native_exit} does not prove passing evidence")
+    valid_exit = isinstance(native_exit, int) and not isinstance(native_exit, bool)
     try:
-        raw_body = staged_report.read_bytes()
-    except OSError as exc:
+        if not valid_exit:
+            raise ValueError("probe native exit is invalid")
+        if native_exit != 0:
+            raise ValueError(f"probe native exit {native_exit} does not prove passing evidence")
+    except ValueError:
+        _record_playwright_probe_failure(
+            bundle_root=bundle_root,
+            evidence=evidence,
+            recipe=recipe,
+            attempt_id=attempt_id,
+            reason=(
+                "probe native exit does not prove passing evidence"
+                if valid_exit
+                else "probe native exit is invalid"
+            ),
+            native_exit=native_exit if valid_exit else None,
+            raw_report=staged_report,
+        )
+        raise
+    try:
+        if os.name == "nt":
+            raw_body = staged_report.read_bytes()
+        else:
+            if report_accept_error is not None:
+                raise report_accept_error
+            descriptor = os.dup(_require_receipt_attempt().original(staged_report).descriptor)
+            with os.fdopen(descriptor, "rb") as report_handle:
+                raw_body = report_handle.read()
+    except (OSError, ValueError) as exc:
         _record_playwright_probe_failure(
             bundle_root=bundle_root,
             evidence=evidence,
@@ -3033,9 +3861,7 @@ def run_probe_receipt(
             release_run=bound_run,
             evidence=evidence,
         )
-        candidate_after = _candidate(candidate_root)
-        if candidate_after != candidate:
-            raise ValueError("candidate changed while the probe was running")
+        candidate_artifact.check_unchanged()
         try:
             attestation_after, attestation_after_sha256 = read_runtime_attestation_artifact(
                 resolved_attestation,
@@ -3082,11 +3908,23 @@ def run_probe_receipt(
         "rawReportSha256": raw_sha256,
         "runtimeAttestation": attestation_proof,
     }
+    owned_publications: dict[Path, tuple[int, int]] = {}
     try:
-        os.replace(staged_report, resolved_report)
-        _atomic_write_json(resolved_execution, execution)
+        candidate_artifact.check_unchanged()
+        _publish_staged_file_no_replace(
+            staged_report,
+            resolved_report,
+            owned_publications=owned_publications,
+        )
+        candidate_artifact.check_unchanged()
+        _atomic_write_json_no_replace(
+            resolved_execution,
+            execution,
+            owned_publications=owned_publications,
+        )
+        candidate_artifact.check_unchanged()
         execution_sha256 = hashlib.sha256(resolved_execution.read_bytes()).hexdigest()
-        return _write_pass_receipt_from_candidate(
+        receipt = _write_pass_receipt_no_replace_from_candidate(
             resolved_output,
             candidate=candidate,
             release_run=bound_run,
@@ -3097,6 +3935,10 @@ def run_probe_receipt(
             provenance={
                 "recipe": recipe,
                 "command": command_record,
+                "finalCommit": {
+                    "artifact": f"runtime/probe-commits/{evidence}.json",
+                    "authority": "external-supervisor-ed25519",
+                },
                 "rawReport": {
                     "artifact": report_artifact,
                     "sha256": raw_sha256,
@@ -3107,21 +3949,49 @@ def run_probe_receipt(
                 },
                 "runtimeAttestation": attestation_proof,
             },
+            owned_publications=owned_publications,
         )
-    except Exception:
-        _record_playwright_probe_failure(
-            bundle_root=bundle_root,
-            evidence=evidence,
-            recipe=recipe,
-            attempt_id=attempt_id,
-            reason="probe proof publication failed",
-            native_exit=native_exit,
-            raw_report=resolved_report if resolved_report.exists() else staged_report,
-            artifacts={
-                "execution": resolved_execution,
-                "receipt": resolved_output,
-            },
+        candidate_artifact.check_unchanged()
+        # Exit validation and close failures must still retract the owned trio.
+        candidate_stack.close()
+        return receipt
+    except BaseException as error:
+        owned_report = _owned_probe_publication(
+            resolved_report,
+            owned_publications=owned_publications,
+            active_error=error,
+            label="raw report",
         )
+        owned_execution = _owned_probe_publication(
+            resolved_execution,
+            owned_publications=owned_publications,
+            active_error=error,
+            label="execution record",
+        )
+        owned_receipt = _owned_probe_publication(
+            resolved_output,
+            owned_publications=owned_publications,
+            active_error=error,
+            label="receipt",
+        )
+        try:
+            _record_playwright_probe_failure(
+                bundle_root=bundle_root,
+                evidence=evidence,
+                recipe=recipe,
+                attempt_id=attempt_id,
+                reason="probe proof publication failed",
+                native_exit=native_exit,
+                raw_report=owned_report or staged_report,
+                raw_aliases=(staged_report,),
+                artifacts={
+                    **({"execution": owned_execution} if owned_execution is not None else {}),
+                    **({"receipt": owned_receipt} if owned_receipt is not None else {}),
+                },
+            )
+        except BaseException as cleanup_error:
+            if hasattr(error, "add_note"):
+                error.add_note(f"probe proof cleanup failed: {cleanup_error}")
         raise
 
 
@@ -3185,6 +4055,7 @@ def _github_repository(remote: str) -> str | None:
     return match.group(1) if match is not None else None
 
 
+@_receipt_producer
 def write_source_head_receipt(
     output_path: Path,
     *,
@@ -3195,43 +4066,49 @@ def write_source_head_receipt(
     git_runner: GitRunner = _run_git,
 ) -> dict[str, object]:
     """Probe one trusted, clean Git checkout and bind it to the candidate."""
-    candidate = _candidate(candidate_root)
-    root = Path(source_root).resolve()
-    if not root.is_dir():
-        raise ValueError("Git source root is unavailable")
-    head = _git_stdout(git_runner, ["rev-parse", "HEAD"], cwd=root)
-    status = _git_stdout(
-        git_runner,
-        ["status", "--porcelain=v1", "--untracked-files=all"],
-        cwd=root,
-    )
-    origin = _git_stdout(git_runner, ["remote", "get-url", "origin"], cwd=root)
-    final_head = _git_stdout(git_runner, ["rev-parse", "HEAD"], cwd=root)
-    try:
-        final_candidate = _candidate(candidate_root)
-    except ValueError as exc:
-        raise ValueError("release candidate changed during Git probe") from exc
-    if final_candidate != candidate:
-        raise ValueError("release candidate changed during Git probe")
-    if head != candidate["sourceHead"]:
-        raise ValueError("Git HEAD does not match the release candidate")
-    if final_head != head:
-        raise ValueError("Git HEAD changed during release probe")
-    if status:
-        raise ValueError("Git worktree is not clean")
-    if _github_repository(origin) != candidate["sourceRepository"]:
-        raise ValueError("Git origin does not match the release candidate")
-    return _write_pass_receipt_from_candidate(
-        output_path,
-        candidate=candidate,
-        release_run=release_run,
-        evidence="source_head",
-        observed_at=observed_at,
-        native_exit=0,
-        checks={"headMatches": True, "worktreeClean": True},
+
+    def prepare(artifact: ValidatedCandidateArtifact, inputs: ExitStack):
+        candidate = artifact.candidate_copy()
+        root = Path(os.path.abspath(source_root))
+        if not root.is_dir():
+            raise ValueError("Git source root is unavailable")
+        source_boundary = _ManifestPublicationBoundary.open(root)
+        inputs.callback(_close_receipt_input_directory, source_boundary)
+
+        def check_source() -> None:
+            source_boundary.assert_unchanged()
+            head = _git_stdout(git_runner, ["rev-parse", "HEAD"], cwd=root)
+            status = _git_stdout(
+                git_runner, ["status", "--porcelain=v1", "--untracked-files=all"], cwd=root
+            )
+            origin = _git_stdout(git_runner, ["remote", "get-url", "origin"], cwd=root)
+            final_head = _git_stdout(git_runner, ["rev-parse", "HEAD"], cwd=root)
+            source_boundary.assert_unchanged()
+            if head != candidate["sourceHead"]:
+                raise ValueError("Git HEAD does not match the release candidate")
+            if final_head != head:
+                raise ValueError("Git HEAD changed during release probe")
+            if status:
+                raise ValueError("Git worktree is not clean")
+            if _github_repository(origin) != candidate["sourceRepository"]:
+                raise ValueError("Git origin does not match the release candidate")
+
+        check_source()
+        return _pass_receipt_from_candidate(
+            candidate=candidate,
+            release_run=release_run,
+            evidence="source_head",
+            observed_at=observed_at,
+            native_exit=0,
+            checks={"headMatches": True, "worktreeClean": True},
+        ), check_source
+
+    return _publish_candidate_bound_receipt(
+        output_path, candidate_root=candidate_root, prepare=prepare
     )
 
 
+@_receipt_producer
 def write_image_digest_receipt(
     output_path: Path,
     *,
@@ -3239,19 +4116,255 @@ def write_image_digest_receipt(
     release_run: Mapping[str, object],
     observed_at: str,
 ) -> dict[str, object]:
-    """Revalidate the candidate lock and both Compose files before receipt."""
-    candidate = _candidate(candidate_root)
-    return _write_pass_receipt_from_candidate(
-        output_path,
-        candidate=candidate,
-        release_run=release_run,
-        evidence="image_digests",
-        observed_at=observed_at,
-        native_exit=0,
-        checks={"lockMatches": True, "composeMatches": True},
+    """Hold the five-file candidate through fresh, no-replace receipt publication."""
+
+    def prepare(artifact: ValidatedCandidateArtifact, _inputs: ExitStack):
+        return _pass_receipt_from_candidate(
+            candidate=artifact.candidate_copy(),
+            release_run=release_run,
+            evidence="image_digests",
+            observed_at=observed_at,
+            native_exit=0,
+            checks={"lockMatches": True, "composeMatches": True},
+        ), lambda: None
+
+    return _publish_candidate_bound_receipt(
+        output_path, candidate_root=candidate_root, prepare=prepare
     )
 
 
+def _publish_candidate_bound_receipt(
+    output_path: Path,
+    *,
+    candidate_root: Path,
+    prepare: Callable[
+        [ValidatedCandidateArtifact, ExitStack], tuple[dict[str, object], Callable[[], None]]
+    ],
+) -> dict[str, object]:
+    """Keep producer inputs and the candidate bound until the new receipt commits."""
+    target = Path(os.path.abspath(output_path))
+    boundary: _ManifestPublicationBoundary | None = None
+    directory_identity: tuple[int, int] | None = None
+    staged_handle: BinaryIO | None = None
+    owned: dict[Path, tuple[int, int]] = {}
+    inputs = ExitStack()
+    try:
+        with ExitStack() as candidate_stack:
+            artifact = candidate_stack.enter_context(
+                validated_candidate_artifact_lease(candidate_root)
+            )
+            document, check_inputs = prepare(artifact, inputs)
+            artifact.check_unchanged()
+            _assert_no_link_ancestors(target.parent)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            boundary = _ManifestPublicationBoundary.open(target.parent)
+            directory_identity = boundary.leases["bundle"].identity
+            if os.path.lexists(target):
+                raise FileExistsError("candidate receipt already exists")
+            staged = target.parent / f".{target.name}.{uuid.uuid4().hex}.tmp"
+            staged_handle, identity, body = _create_classroom_json_staging(
+                boundary, parent_key="bundle", path=staged, document=document
+            )
+            owned[staged] = identity
+            boundary.assert_unchanged()
+            check_inputs()
+            artifact.check_unchanged()
+            # The native link can succeed before an exception reaches its caller.
+            # Only the original staging identity authorizes any compensation.
+            owned[target] = identity
+            _publish_manifest_no_replace(boundary, target, source_handle=staged_handle)
+            _assert_manifest_published(
+                boundary, target, expected_body=body, expected_identity=identity
+            )
+            check_inputs()
+            artifact.check_unchanged()
+            boundary.assert_unchanged()
+            staged_handle.close()
+            staged_handle = None
+            _remove_manifest_staging(boundary, staged, expected_identity=identity)
+            owned.pop(staged)
+            _assert_manifest_published(
+                boundary, target, expected_body=body, expected_identity=identity
+            )
+            if os.name != "nt":
+                os.fsync(int(boundary.leases["bundle"].handle))
+            boundary.assert_unchanged()
+            artifact.check_unchanged()
+            # Lease exit is part of publication. Retain the output boundary for
+            # a final identity/body check even if exit itself replaces that path.
+            candidate_stack.close()
+            check_inputs()
+            inputs.close()
+            _assert_manifest_published(
+                boundary, target, expected_body=body, expected_identity=identity
+            )
+            boundary.assert_unchanged()
+            _close_image_receipt_boundary(boundary)
+    except BaseException as original_error:
+        if staged_handle is not None:
+            try:
+                staged_handle.close()
+            except BaseException as cleanup_error:
+                original_error.add_note(f"image receipt staging close failed: {cleanup_error}")
+        if owned and boundary is not None:
+            recovery: _ManifestPublicationBoundary | None = None
+            try:
+                if os.name == "nt" and "bundle" not in boundary.leases:
+                    recovery = _ManifestPublicationBoundary.open(target.parent)
+                    if recovery.leases["bundle"].identity != directory_identity:
+                        raise ValueError("image receipt publication directory changed")
+                cleanup_boundary = recovery if recovery is not None else boundary
+                for path, identity in reversed(tuple(owned.items())):
+                    try:
+                        _remove_manifest_staging(cleanup_boundary, path, expected_identity=identity)
+                    except FileNotFoundError:
+                        pass
+                    except BaseException as cleanup_error:
+                        original_error.add_note(f"image receipt cleanup failed: {cleanup_error}")
+            except BaseException as cleanup_error:
+                original_error.add_note(f"image receipt recovery failed: {cleanup_error}")
+            finally:
+                if recovery is not None:
+                    try:
+                        _close_image_receipt_boundary(recovery)
+                    except BaseException as cleanup_error:
+                        original_error.add_note(
+                            f"image receipt recovery close failed: {cleanup_error}"
+                        )
+        raise
+    finally:
+        active_error = sys.exception()
+        try:
+            inputs.close()
+        except BaseException as cleanup_error:
+            if active_error is None:
+                raise
+            active_error.add_note(f"receipt input cleanup failed: {cleanup_error}")
+        if boundary is not None and boundary.leases:
+            active_error = sys.exception()
+            try:
+                _close_image_receipt_boundary(boundary)
+            except BaseException as cleanup_error:
+                if active_error is None:
+                    raise
+                active_error.add_note(f"image receipt boundary close failed: {cleanup_error}")
+    return document
+
+
+def _close_receipt_input_directory(boundary: _ManifestPublicationBoundary) -> None:
+    try:
+        _close_image_receipt_boundary(boundary)
+    except OSError as original_error:
+        # A native Windows close failure retains ownership; ExitStack callbacks
+        # are consumed on invocation, so finish that owned close before propagating.
+        if boundary.leases:
+            try:
+                _close_image_receipt_boundary(boundary)
+            except BaseException as cleanup_error:
+                original_error.add_note(f"receipt input directory close failed: {cleanup_error}")
+        raise
+
+
+def _close_image_receipt_boundary(boundary: _ManifestPublicationBoundary) -> None:
+    lease = boundary.leases.pop("bundle", None)
+    if lease is None:
+        return
+    if os.name == "nt":
+        try:
+            _close_windows_handle(lease.handle)
+        except OSError:
+            # Only a failed native CloseHandle leaves this lease owned. Never
+            # reclaim an old number following a successful higher-level close.
+            boundary.leases["bundle"] = lease
+            raise
+    else:
+        # POSIX close errors may already have released the descriptor; no retry
+        # or object-identity check can establish ownership of a reused number.
+        os.close(int(lease.handle))
+
+
+def _add_receipt_cleanup_note(
+    original_error: BaseException, cleanup_error: BaseException, *, label: str
+) -> None:
+    notes = tuple(getattr(cleanup_error, "__notes__", ()))
+    original_error.add_note(f"{label}: {cleanup_error}")
+    for note in notes:
+        original_error.add_note(note)
+
+
+def _lease_runtime_attestation_input(
+    resolved_attestation: Path,
+    *,
+    bundle_root: Path,
+    inputs: ExitStack,
+) -> tuple[bytes, str, Callable[[], None]]:
+    runtime_boundary = _ManifestPublicationBoundary.open(resolved_attestation.parent)
+    handle: BinaryIO | None = None
+
+    def close_attestation_inputs() -> None:
+        close_error = None
+        if handle is not None:
+            try:
+                handle.close()
+            except BaseException as error:
+                close_error = error
+        try:
+            _close_receipt_input_directory(runtime_boundary)
+        except BaseException as error:
+            if close_error is None:
+                close_error = error
+            else:
+                _add_receipt_cleanup_note(
+                    close_error, error, label="runtime attestation input cleanup failed"
+                )
+        if close_error is not None:
+            raise close_error
+
+    inputs.callback(close_attestation_inputs)
+    handle = _open_classroom_artifact_relative(
+        runtime_boundary.leases["bundle"], resolved_attestation.name, deletable=False
+    )
+    details = os.fstat(handle.fileno())
+    attestation_body, attestation_sha256 = read_runtime_attestation_artifact(
+        resolved_attestation, bundle_root=bundle_root
+    )
+    if (
+        not stat.S_ISREG(details.st_mode)
+        or details.st_size != len(attestation_body)
+        or handle.read(len(attestation_body) + 1) != attestation_body
+    ):
+        raise ValueError("runtime attestation changed while opening its input lease")
+    input_lease = _ClassroomArtifactLease(
+        kind="runtime-attestation",
+        name=resolved_attestation.name,
+        path=resolved_attestation,
+        handle=handle,
+        identity=_file_identity(details),
+        size=details.st_size,
+        sha256=attestation_sha256,
+    )
+
+    def check_attestation() -> None:
+        try:
+            runtime_boundary.assert_unchanged()
+            if os.fstat(handle.fileno()).st_size != input_lease.size:
+                raise ValueError("runtime attestation size changed")
+            _assert_classroom_artifact_lease(input_lease)
+            body, sha256 = read_runtime_attestation_artifact(
+                resolved_attestation, bundle_root=bundle_root
+            )
+            if body != attestation_body or sha256 != attestation_sha256:
+                raise ValueError("runtime attestation content changed")
+            runtime_boundary.assert_unchanged()
+            _assert_classroom_artifact_lease(input_lease)
+        except (OSError, ValueError) as exc:
+            raise ValueError("runtime attestation changed while evidence was derived") from exc
+
+    check_attestation()
+    return attestation_body, attestation_sha256, check_attestation
+
+
+@_receipt_producer
 def write_running_containers_receipt(
     output_path: Path,
     *,
@@ -3268,63 +4381,47 @@ def write_running_containers_receipt(
     canonical_output = Path(bundle_root).resolve() / "artifacts" / "running_containers.json"
     if resolved_output != canonical_output:
         raise ValueError("running containers receipt must use its canonical output path")
-    candidate = _candidate(candidate_root)
-    bound_run = _release_run(release_run)
     resolved_attestation = Path(bundle_root).resolve() / "runtime" / "runtime-attestation.json"
-    attestation_body, attestation_sha256 = read_runtime_attestation_artifact(
-        resolved_attestation,
-        bundle_root=bundle_root,
-    )
-    attestation = validate_runtime_attestation(
-        resolved_attestation,
-        bundle_root=bundle_root,
-        candidate_root=candidate_root,
-        candidate=candidate,
-        release_run=bound_run,
-        expected_sha256=attestation_sha256,
-    )
-    observed_at = attestation["observedAt"]
-    assert isinstance(observed_at, str)
-    try:
-        candidate_after = _candidate(candidate_root)
-    except ValueError as exc:
-        raise ValueError("candidate changed while container evidence was derived") from exc
-    if candidate_after != candidate:
-        raise ValueError("candidate changed while container evidence was derived")
-    try:
-        attestation_after, attestation_after_sha256 = read_runtime_attestation_artifact(
+
+    def prepare(artifact: ValidatedCandidateArtifact, inputs: ExitStack):
+        candidate = artifact.candidate_copy()
+        bound_run = _release_run(release_run)
+        _body, attestation_sha256, check_attestation = _lease_runtime_attestation_input(
+            resolved_attestation, bundle_root=bundle_root, inputs=inputs
+        )
+        attestation = validate_runtime_attestation(
             resolved_attestation,
             bundle_root=bundle_root,
+            candidate_root=candidate_root,
+            candidate=candidate,
+            release_run=bound_run,
+            expected_sha256=attestation_sha256,
         )
-    except ValueError as exc:
-        raise ValueError("runtime attestation changed while evidence was derived") from exc
-    if attestation_after != attestation_body or attestation_after_sha256 != attestation_sha256:
-        raise ValueError("runtime attestation changed while evidence was derived")
-    validate_runtime_attestation(
-        resolved_attestation,
-        bundle_root=bundle_root,
-        candidate_root=candidate_root,
-        candidate=candidate,
-        release_run=bound_run,
-        expected_sha256=attestation_sha256,
-    )
-    return _write_pass_receipt_from_candidate(
-        resolved_output,
-        candidate=candidate,
-        release_run=bound_run,
-        evidence="running_containers",
-        observed_at=observed_at,
-        native_exit=0,
-        checks={"stableContainerSet": True},
-        provenance={
-            "runtimeAttestation": {
-                "artifact": "runtime/runtime-attestation.json",
-                "sha256": attestation_sha256,
-            }
-        },
+        check_attestation()
+        artifact.check_unchanged()
+        observed_at = attestation["observedAt"]
+        assert isinstance(observed_at, str)
+        return _pass_receipt_from_candidate(
+            candidate=candidate,
+            release_run=bound_run,
+            evidence="running_containers",
+            observed_at=observed_at,
+            native_exit=0,
+            checks={"stableContainerSet": True},
+            provenance={
+                "runtimeAttestation": {
+                    "artifact": "runtime/runtime-attestation.json",
+                    "sha256": attestation_sha256,
+                }
+            },
+        ), check_attestation
+
+    return _publish_candidate_bound_receipt(
+        resolved_output, candidate_root=candidate_root, prepare=prepare
     )
 
 
+@_receipt_producer
 def write_platform_preflight_receipts(
     *,
     candidate_root: Path,
@@ -3342,6 +4439,67 @@ def write_platform_preflight_receipts(
         or timeout_seconds <= 0
     ):
         raise ValueError("platform preflight timeout is invalid")
+    candidate_stack = ExitStack()
+    inputs = ExitStack()
+    try:
+        artifact = candidate_stack.enter_context(validated_candidate_artifact_lease(candidate_root))
+        root = Path(bundle_root).resolve()
+        runtime_path = root / "runtime" / "runtime-attestation.json"
+        _body, runtime_sha256, check_runtime = _lease_runtime_attestation_input(
+            runtime_path, bundle_root=root, inputs=inputs
+        )
+
+        def check_inputs() -> None:
+            artifact.check_unchanged()
+            check_runtime()
+
+        def close_inputs() -> None:
+            candidate_stack.close()
+            check_runtime()
+            inputs.close()
+
+        return _write_platform_preflight_receipts(
+            candidate_root=candidate_root,
+            bundle_root=root,
+            candidate=artifact.candidate_copy(),
+            runtime_sha256=runtime_sha256,
+            check_inputs=check_inputs,
+            close_inputs=close_inputs,
+            release_run=release_run,
+            timeout_seconds=timeout_seconds,
+            runner=runner,
+            docker_resolver=docker_resolver,
+        )
+    finally:
+        active_error = sys.exception()
+        close_error = None
+        for stack in (candidate_stack, inputs):
+            try:
+                stack.close()
+            except BaseException as error:
+                if active_error is not None:
+                    active_error.add_note(f"preflight input cleanup failed: {error}")
+                elif close_error is None:
+                    close_error = error
+                else:
+                    close_error.add_note(f"preflight input cleanup failed: {error}")
+        if close_error is not None:
+            raise close_error
+
+
+def _write_platform_preflight_receipts(
+    *,
+    candidate_root: Path,
+    bundle_root: Path,
+    candidate: Mapping[str, object],
+    runtime_sha256: str,
+    check_inputs: Callable[[], None],
+    close_inputs: Callable[[], None],
+    release_run: Mapping[str, object],
+    timeout_seconds: int,
+    runner: CommandRunner,
+    docker_resolver: Callable[[], Path],
+) -> dict[str, dict[str, object]]:
     root = Path(bundle_root).resolve()
     candidate_path = Path(candidate_root).resolve()
     proof_path = root / "runtime" / "platform-preflight-attestation.json"
@@ -3350,16 +4508,12 @@ def write_platform_preflight_receipts(
         for evidence in ("database_revisions", "service_health")
     }
     targets = (proof_path, *receipt_paths.values())
-    if any(path.exists() for path in targets):
+    if any(os.path.lexists(path) for path in targets):
         raise ValueError("platform preflight evidence already exists")
 
-    candidate = _candidate(candidate_path)
     bound_run = _release_run(release_run)
     runtime_path = root / "runtime" / "runtime-attestation.json"
-    runtime_body, runtime_sha256 = read_runtime_attestation_artifact(
-        runtime_path,
-        bundle_root=root,
-    )
+    check_inputs()
     runtime = validate_runtime_attestation(
         runtime_path,
         bundle_root=root,
@@ -3368,6 +4522,7 @@ def write_platform_preflight_receipts(
         release_run=bound_run,
         expected_sha256=runtime_sha256,
     )
+    check_inputs()
     containers = runtime.get("containers")
     if not isinstance(containers, list):
         raise ValueError("platform preflight runtime containers are invalid")
@@ -3402,6 +4557,7 @@ def write_platform_preflight_receipts(
     docker = Path(docker_resolver())
     with tempfile.TemporaryDirectory(prefix="yfeistai-preflight-docker-") as config_dir:
         for phase in PREFLIGHT_PHASES:
+            check_inputs()
             service = PREFLIGHT_PHASE_SERVICES[phase]
             container_id = container_ids.get(service)
             if not isinstance(container_id, str):
@@ -3421,6 +4577,7 @@ def write_platform_preflight_receipts(
                 )
             except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
                 raise ValueError("platform preflight phase could not run") from exc
+            check_inputs()
             if (
                 not isinstance(completed.returncode, int)
                 or isinstance(completed.returncode, bool)
@@ -3454,20 +4611,7 @@ def write_platform_preflight_receipts(
         if any(Path(config_dir).iterdir()):
             raise ValueError("platform preflight isolated Docker config was modified")
 
-    try:
-        candidate_after = _candidate(candidate_path)
-        runtime_after, runtime_after_sha256 = read_runtime_attestation_artifact(
-            runtime_path,
-            bundle_root=root,
-        )
-    except ValueError as exc:
-        raise ValueError("platform preflight release binding changed") from exc
-    if (
-        candidate_after != candidate
-        or runtime_after != runtime_body
-        or runtime_after_sha256 != runtime_sha256
-    ):
-        raise ValueError("platform preflight release binding changed")
+    check_inputs()
     validate_runtime_attestation(
         runtime_path,
         bundle_root=root,
@@ -3477,6 +4621,7 @@ def write_platform_preflight_receipts(
         expected_base_url=base_url,
         expected_sha256=runtime_sha256,
     )
+    check_inputs()
 
     observed_at = _current_observed_at()
     if not _valid_observed_at(observed_at):
@@ -3499,14 +4644,40 @@ def write_platform_preflight_receipts(
         evidence: path.with_name(f".{path.name}.{attempt_id}.staging")
         for evidence, path in receipt_paths.items()
     }
-    staged_paths = {
-        "proof": staged_proof,
-        **staged_receipts,
-    }
-    published_paths: dict[str, Path] = {}
+    owned_paths: dict[str, tuple[Path, tuple[int, int]]] = {}
+    staged_handles: dict[str, BinaryIO] = {}
+    staged_bodies: dict[str, bytes] = {}
+    boundaries: dict[Path, _ManifestPublicationBoundary] = {}
+    boundary_stack = ExitStack()
+
+    def stage(name: str, path: Path, document: Mapping[str, object]) -> bytes:
+        handle, identity, body = _create_classroom_json_staging(
+            boundaries[path.parent], parent_key="bundle", path=path, document=document
+        )
+        owned_paths[name] = path, identity
+        staged_handles[name] = handle
+        staged_bodies[name] = body
+        return body
+
+    def check_published() -> None:
+        for name, _staged, target in publication_order:
+            identity = owned_paths[f"published-{name.replace('_', '-')}"][1]
+            _assert_manifest_published(
+                boundaries[target.parent],
+                target,
+                expected_body=staged_bodies[name],
+                expected_identity=identity,
+            )
+
     try:
-        _atomic_write_json(staged_proof, proof)
-        proof_body = staged_proof.read_bytes()
+        for parent in (proof_path.parent, receipt_paths["database_revisions"].parent):
+            _assert_no_link_ancestors(parent)
+            parent.mkdir(parents=True, exist_ok=True)
+            boundary = _ManifestPublicationBoundary.open(parent)
+            boundaries[parent] = boundary
+            boundary_stack.callback(_close_receipt_input_directory, boundary)
+        check_inputs()
+        proof_body = stage("proof", staged_proof, proof)
         proof_sha256 = hashlib.sha256(proof_body).hexdigest()
         derived_checks, replayed_observed_at = derive_platform_preflight_receipt_checks(
             proof_body,
@@ -3514,6 +4685,7 @@ def write_platform_preflight_receipts(
             candidate_root=candidate_path,
             candidate=candidate,
             release_run=bound_run,
+            observer_signer_image=_operator_observer_signer_image(),
         )
         if replayed_observed_at != observed_at:
             raise ValueError("platform preflight replay timestamp changed")
@@ -3524,8 +4696,7 @@ def write_platform_preflight_receipts(
             }
         }
         documents = {
-            "database_revisions": _write_pass_receipt_from_candidate(
-                staged_receipts["database_revisions"],
+            "database_revisions": _pass_receipt_from_candidate(
                 candidate=candidate,
                 release_run=bound_run,
                 evidence="database_revisions",
@@ -3534,8 +4705,7 @@ def write_platform_preflight_receipts(
                 checks=derived_checks["database_revisions"],
                 provenance=provenance,
             ),
-            "service_health": _write_pass_receipt_from_candidate(
-                staged_receipts["service_health"],
+            "service_health": _pass_receipt_from_candidate(
                 candidate=candidate,
                 release_run=bound_run,
                 evidence="service_health",
@@ -3545,20 +4715,11 @@ def write_platform_preflight_receipts(
                 provenance=provenance,
             ),
         }
-        candidate_before_publish = _candidate(candidate_path)
-        runtime_before_publish, sha_before_publish = read_runtime_attestation_artifact(
-            runtime_path,
-            bundle_root=root,
-        )
-        if (
-            candidate_before_publish != candidate
-            or runtime_before_publish != runtime_body
-            or sha_before_publish != runtime_sha256
-            or any(path.exists() for path in targets)
-        ):
+        for name, document in documents.items():
+            stage(name, staged_receipts[name], document)
+        check_inputs()
+        if any(os.path.lexists(path) for path in targets):
             raise ValueError("platform preflight release binding changed before publication")
-        proof_path.parent.mkdir(parents=True, exist_ok=True)
-        receipt_paths["database_revisions"].parent.mkdir(parents=True, exist_ok=True)
         publication_order = (
             (
                 "database_revisions",
@@ -3573,28 +4734,63 @@ def write_platform_preflight_receipts(
             ("proof", staged_proof, proof_path),
         )
         for name, staged, target in publication_order:
-            _publish_no_replace(staged, target)
-            published_paths[f"published-{name.replace('_', '-')}"] = target
-            if target.read_bytes() != staged.read_bytes():
-                raise ValueError("platform preflight published evidence changed")
-            staged.unlink()
+            boundary = boundaries[target.parent]
+            boundary.assert_unchanged()
+            check_inputs()
+            identity = owned_paths[name][1]
+            owned_paths[f"published-{name.replace('_', '-')}"] = target, identity
+            token = _MANIFEST_PUBLICATION_CONTEXT.set(
+                _ManifestPublicationContext(boundary, staged, staged_handles[name])
+            )
+            try:
+                _publish_no_replace(staged, target)
+            finally:
+                _MANIFEST_PUBLICATION_CONTEXT.reset(token)
+            _assert_manifest_published(
+                boundary, target, expected_body=staged_bodies[name], expected_identity=identity
+            )
+            check_inputs()
+            staged_handles[name].close()
+            staged_handles.pop(name)
+            _remove_manifest_staging(boundary, staged, expected_identity=identity)
+            owned_paths.pop(name)
+            boundary.assert_unchanged()
+        check_published()
+        check_inputs()
+        close_inputs()
+        check_published()
+        boundary_stack.close()
         return documents
-    except Exception:
-        _record_probe_failure(
-            bundle_root=root,
-            evidence="platform-preflight",
-            recipe="candidate-network-phases",
-            attempt_id=attempt_id,
-            reason="platform preflight proof publication failed",
-            native_exit=0,
-            artifacts={
-                **staged_paths,
-                **published_paths,
-            },
-        )
+    except BaseException as original_error:
+        for handle in staged_handles.values():
+            try:
+                handle.close()
+            except BaseException as cleanup_error:
+                original_error.add_note(f"preflight staging close failed: {cleanup_error}")
+        try:
+            _record_probe_failure(
+                bundle_root=root,
+                evidence="platform-preflight",
+                recipe="candidate-network-phases",
+                attempt_id=attempt_id,
+                reason="platform preflight proof publication failed",
+                native_exit=0,
+                artifacts=owned_paths,
+            )
+        except BaseException as cleanup_error:
+            original_error.add_note(f"preflight failure archive failed: {cleanup_error}")
         raise
+    finally:
+        active_error = sys.exception()
+        try:
+            boundary_stack.close()
+        except BaseException as cleanup_error:
+            if active_error is None:
+                raise
+            active_error.add_note(f"preflight boundary close failed: {cleanup_error}")
 
 
+@_receipt_producer
 def write_capacity_profile_receipt(
     *,
     candidate_root: Path,
@@ -3614,6 +4810,74 @@ def write_capacity_profile_receipt(
     token = os.environ.get("YFEISTAI_LIVE_FIXTURE_TOKEN")
     if not isinstance(token, str) or not token.strip():
         raise ValueError("capacity profile live fixture token is unavailable")
+    candidate_stack = ExitStack()
+    inputs = ExitStack()
+    try:
+        artifact = candidate_stack.enter_context(validated_candidate_artifact_lease(candidate_root))
+        root = Path(bundle_root).resolve()
+        runtime_path = root / "runtime" / "runtime-attestation.json"
+        _body, runtime_sha256, check_runtime = _lease_runtime_attestation_input(
+            runtime_path, bundle_root=root, inputs=inputs
+        )
+
+        def check_inputs() -> None:
+            try:
+                artifact.check_unchanged()
+                check_runtime()
+            except (OSError, ValueError) as exc:
+                raise ValueError("capacity profile release binding changed") from exc
+
+        def close_inputs() -> None:
+            candidate_stack.close()
+            check_runtime()
+            inputs.close()
+
+        return _write_capacity_profile_receipt(
+            candidate_root=candidate_root,
+            bundle_root=root,
+            candidate=artifact.candidate_copy(),
+            runtime_sha256=runtime_sha256,
+            check_inputs=check_inputs,
+            close_inputs=close_inputs,
+            release_run=release_run,
+            timeout_seconds=timeout_seconds,
+            runner=runner,
+            token=token,
+        )
+    finally:
+        active_error = sys.exception()
+        close_error = None
+        for stack in (candidate_stack, inputs):
+            try:
+                stack.close()
+            except BaseException as error:
+                if active_error is not None:
+                    _add_receipt_cleanup_note(
+                        active_error, error, label="capacity input cleanup failed"
+                    )
+                elif close_error is None:
+                    close_error = error
+                else:
+                    _add_receipt_cleanup_note(
+                        close_error, error, label="capacity input cleanup failed"
+                    )
+        if close_error is not None:
+            raise close_error
+
+
+def _write_capacity_profile_receipt(
+    *,
+    candidate_root: Path,
+    bundle_root: Path,
+    candidate: Mapping[str, object],
+    runtime_sha256: str,
+    check_inputs: Callable[[], None],
+    close_inputs: Callable[[], None],
+    release_run: Mapping[str, object],
+    timeout_seconds: int,
+    runner: CommandRunner,
+    token: str,
+) -> dict[str, object]:
     root = Path(bundle_root).resolve()
     candidate_path = Path(candidate_root).resolve()
     proof_path = root / "runtime" / "capacity-profile-attestation.json"
@@ -3622,13 +4886,9 @@ def write_capacity_profile_receipt(
     if any(os.path.lexists(path) for path in (proof_path, receipt_path, idempotency_path)):
         raise ValueError("capacity profile evidence already exists")
 
-    candidate = _candidate(candidate_path)
     bound_run = _release_run(release_run)
     runtime_path = root / "runtime" / "runtime-attestation.json"
-    runtime_body, runtime_sha256 = read_runtime_attestation_artifact(
-        runtime_path,
-        bundle_root=root,
-    )
+    check_inputs()
     runtime = validate_runtime_attestation(
         runtime_path,
         bundle_root=root,
@@ -3637,6 +4897,7 @@ def write_capacity_profile_receipt(
         release_run=bound_run,
         expected_sha256=runtime_sha256,
     )
+    check_inputs()
     base_url = runtime.get("baseUrl")
     if not isinstance(base_url, str):
         raise ValueError("capacity profile runtime URL is invalid")
@@ -3689,6 +4950,7 @@ def write_capacity_profile_receipt(
         )
     except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
         raise ValueError("capacity profile probe could not run") from exc
+    check_inputs()
     if (
         not isinstance(completed.returncode, int)
         or isinstance(completed.returncode, bool)
@@ -3725,20 +4987,7 @@ def write_capacity_profile_receipt(
     if not isinstance(observed_at, str) or not _valid_observed_at(observed_at):
         raise ValueError("capacity profile observedAt is invalid")
 
-    try:
-        candidate_after = _candidate(candidate_path)
-        runtime_after, runtime_after_sha256 = read_runtime_attestation_artifact(
-            runtime_path,
-            bundle_root=root,
-        )
-    except ValueError as exc:
-        raise ValueError("capacity profile release binding changed") from exc
-    if (
-        candidate_after != candidate
-        or runtime_after != runtime_body
-        or runtime_after_sha256 != runtime_sha256
-    ):
-        raise ValueError("capacity profile release binding changed")
+    check_inputs()
     validate_runtime_attestation(
         runtime_path,
         bundle_root=root,
@@ -3748,6 +4997,7 @@ def write_capacity_profile_receipt(
         expected_base_url=base_url,
         expected_sha256=runtime_sha256,
     )
+    check_inputs()
 
     proof = {
         "schemaVersion": 1,
@@ -3774,10 +5024,60 @@ def write_capacity_profile_receipt(
     staged_idempotency = idempotency_path.with_name(
         f".{idempotency_path.name}.{attempt_id}.staging"
     )
-    published: dict[str, Path] = {}
+    owned_paths: dict[str, tuple[Path, tuple[int, int]]] = {}
+    staged_handles: dict[str, BinaryIO] = {}
+    staged_bodies: dict[str, bytes] = {}
+    boundaries: dict[Path, _ManifestPublicationBoundary] = {}
+    boundary_stack = ExitStack()
+    publication_order = (
+        ("capacity-receipt", staged_receipt, receipt_path),
+        ("idempotency-receipt", staged_idempotency, idempotency_path),
+        ("proof", staged_proof, proof_path),
+    )
+
+    def close_boundaries() -> None:
+        close_error = None
+        for boundary in reversed(tuple(boundaries.values())):
+            try:
+                _close_receipt_input_directory(boundary)
+            except BaseException as error:
+                if close_error is None:
+                    close_error = error
+                else:
+                    _add_receipt_cleanup_note(
+                        close_error, error, label="capacity boundary close failed"
+                    )
+        if close_error is not None:
+            raise close_error
+
+    boundary_stack.callback(close_boundaries)
+
+    def stage(name: str, path: Path, document: Mapping[str, object]) -> bytes:
+        handle, identity, body = _create_classroom_json_staging(
+            boundaries[path.parent], parent_key="bundle", path=path, document=document
+        )
+        owned_paths[name] = path, identity
+        staged_handles[name] = handle
+        staged_bodies[name] = body
+        return body
+
+    def check_published() -> None:
+        for name, _staged, target in publication_order:
+            _assert_manifest_published(
+                boundaries[target.parent],
+                target,
+                expected_body=staged_bodies[name],
+                expected_identity=owned_paths[f"published-{name}"][1],
+            )
+
     try:
-        _atomic_write_json(staged_proof, proof)
-        proof_body = staged_proof.read_bytes()
+        for parent in (proof_path.parent, receipt_path.parent):
+            _assert_no_link_ancestors(parent)
+            parent.mkdir(parents=True, exist_ok=True)
+            boundary = _ManifestPublicationBoundary.open(parent)
+            boundaries[parent] = boundary
+        check_inputs()
+        proof_body = stage("proof", staged_proof, proof)
         proof_sha256 = hashlib.sha256(proof_body).hexdigest()
         derived_checks, replayed_observed_at = derive_capacity_profile_receipt_checks(
             proof_body,
@@ -3785,11 +5085,11 @@ def write_capacity_profile_receipt(
             candidate_root=candidate_path,
             candidate=candidate,
             release_run=bound_run,
+            observer_signer_image=_operator_observer_signer_image(),
         )
         if replayed_observed_at != observed_at or derived_checks != checks:
             raise ValueError("capacity profile replay changed")
-        receipt = _write_pass_receipt_from_candidate(
-            staged_receipt,
+        receipt = _pass_receipt_from_candidate(
             candidate=candidate,
             release_run=bound_run,
             evidence="capacity_profile",
@@ -3803,8 +5103,7 @@ def write_capacity_profile_receipt(
                 }
             },
         )
-        _write_pass_receipt_from_candidate(
-            staged_idempotency,
+        idempotency_receipt = _pass_receipt_from_candidate(
             candidate=candidate,
             release_run=bound_run,
             evidence="learning_event_idempotency",
@@ -3818,47 +5117,72 @@ def write_capacity_profile_receipt(
                 }
             },
         )
-        candidate_before_publish = _candidate(candidate_path)
-        runtime_before_publish, runtime_before_sha256 = read_runtime_attestation_artifact(
-            runtime_path,
-            bundle_root=root,
-        )
-        if (
-            candidate_before_publish != candidate
-            or runtime_before_publish != runtime_body
-            or runtime_before_sha256 != runtime_sha256
-            or any(os.path.lexists(path) for path in (proof_path, receipt_path, idempotency_path))
-        ):
+        stage("capacity-receipt", staged_receipt, receipt)
+        stage("idempotency-receipt", staged_idempotency, idempotency_receipt)
+        check_inputs()
+        if any(os.path.lexists(path) for path in (proof_path, receipt_path, idempotency_path)):
             raise ValueError("capacity profile release binding changed before publication")
-        proof_path.parent.mkdir(parents=True, exist_ok=True)
-        receipt_path.parent.mkdir(parents=True, exist_ok=True)
-        for name, staged, target in (
-            ("capacity-receipt", staged_receipt, receipt_path),
-            ("idempotency-receipt", staged_idempotency, idempotency_path),
-            ("proof", staged_proof, proof_path),
-        ):
-            _publish_no_replace(staged, target)
-            published[f"published-{name}"] = target
-            if target.read_bytes() != staged.read_bytes():
-                raise ValueError("capacity profile published evidence changed")
-            staged.unlink()
+        for name, staged, target in publication_order:
+            boundary = boundaries[target.parent]
+            boundary.assert_unchanged()
+            check_inputs()
+            identity = owned_paths[name][1]
+            owned_paths[f"published-{name}"] = target, identity
+            publication_token = _MANIFEST_PUBLICATION_CONTEXT.set(
+                _ManifestPublicationContext(boundary, staged, staged_handles[name])
+            )
+            try:
+                _publish_no_replace(staged, target)
+            finally:
+                _MANIFEST_PUBLICATION_CONTEXT.reset(publication_token)
+            _assert_manifest_published(
+                boundary, target, expected_body=staged_bodies[name], expected_identity=identity
+            )
+            check_inputs()
+            staged_handles[name].close()
+            staged_handles.pop(name)
+            _remove_manifest_staging(boundary, staged, expected_identity=identity)
+            owned_paths.pop(name)
+            boundary.assert_unchanged()
+        check_published()
+        check_inputs()
+        close_inputs()
+        check_published()
+        boundary_stack.close()
         return receipt
-    except Exception:
-        _record_probe_failure(
-            bundle_root=root,
-            evidence="capacity-profile",
-            recipe="live-first-release",
-            attempt_id=attempt_id,
-            reason="capacity profile proof publication failed",
-            native_exit=0,
-            artifacts={
-                "proof": staged_proof,
-                "capacity-receipt": staged_receipt,
-                "idempotency-receipt": staged_idempotency,
-                **published,
-            },
-        )
+    except BaseException as original_error:
+        for handle in staged_handles.values():
+            try:
+                handle.close()
+            except BaseException as cleanup_error:
+                _add_receipt_cleanup_note(
+                    original_error, cleanup_error, label="capacity staging close failed"
+                )
+        try:
+            _record_probe_failure(
+                bundle_root=root,
+                evidence="capacity-profile",
+                recipe="live-first-release",
+                attempt_id=attempt_id,
+                reason="capacity profile proof publication failed",
+                native_exit=0,
+                artifacts=owned_paths,
+            )
+        except BaseException as cleanup_error:
+            _add_receipt_cleanup_note(
+                original_error, cleanup_error, label="capacity failure archive failed"
+            )
         raise
+    finally:
+        active_error = sys.exception()
+        try:
+            boundary_stack.close()
+        except BaseException as cleanup_error:
+            if active_error is None:
+                raise
+            _add_receipt_cleanup_note(
+                active_error, cleanup_error, label="capacity boundary close failed"
+            )
 
 
 def _parse_bound_openmaic_dedicated_outage_attestation(
@@ -3875,6 +5199,7 @@ def _parse_bound_openmaic_dedicated_outage_attestation(
     expected_shared_ingress_control_origin: str,
     expected_tenant_id: str,
     expected_docker_host_identity_sha256: str,
+    expected_observer_public_key_spki_sha256: str,
 ) -> dict[str, object]:
     """Replay the archived marker, then validate its bound outage receipt."""
 
@@ -3906,6 +5231,7 @@ def _parse_bound_openmaic_dedicated_outage_attestation(
         expected_shared_ingress_control_origin=expected_shared_ingress_control_origin,
         expected_tenant_id=expected_tenant_id,
         expected_route_id=route_id,
+        expected_observer_public_key_spki_sha256=(expected_observer_public_key_spki_sha256),
         return_body=True,
     )
     if not isinstance(replayed, tuple):
@@ -3924,7 +5250,49 @@ def _parse_bound_openmaic_dedicated_outage_attestation(
         expected_tenant_id=expected_tenant_id,
         attempt_marker_body=marker_body,
         expected_docker_host_identity_sha256=(expected_docker_host_identity_sha256),
+        expected_observer_public_key_spki_sha256=(expected_observer_public_key_spki_sha256),
     )
+
+
+def _read_openmaic_observer_artifact(
+    path: Path,
+    *,
+    bundle_root: Path,
+    maximum_bytes: int,
+) -> bytes:
+    root = Path(bundle_root).resolve()
+    target = Path(path)
+    try:
+        target.relative_to(root)
+        _assert_no_link_ancestors(target)
+        before = target.stat(follow_symlinks=False)
+        body = target.read_bytes()
+        after = target.stat(follow_symlinks=False)
+        replayed = target.read_bytes()
+    except (OSError, ValueError) as exc:
+        raise ValueError("OpenMAIC observer artifact boundary is invalid") from exc
+
+    def identity(details: os.stat_result) -> tuple[int, ...]:
+        return (
+            details.st_dev,
+            details.st_ino,
+            details.st_size,
+            details.st_mtime_ns,
+            details.st_ctime_ns,
+            details.st_mode,
+            details.st_uid,
+        )
+
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_size <= 0
+        or before.st_size > maximum_bytes
+        or len(body) != before.st_size
+        or identity(before) != identity(after)
+        or replayed != body
+    ):
+        raise ValueError("OpenMAIC observer artifact boundary is invalid")
+    return body
 
 
 def _write_openmaic_plane_receipt(
@@ -3936,9 +5304,50 @@ def _write_openmaic_plane_receipt(
     timeout_seconds: int,
     runner: CommandRunner = _run_openmaic_smoke,
     expected_outage_docker_host_identity_sha256: str | None = None,
+    observer_attestation_public_key_path: Path | None = None,
+    expected_observer_attestation_public_key_spki_sha256: str | None = None,
 ) -> dict[str, object]:
     """Run one fixed OpenMAIC plane smoke and publish its proof marker last."""
 
+    candidate_path = Path(os.path.abspath(candidate_root))
+    with ExitStack() as candidate_stack:
+        candidate_artifact = candidate_stack.enter_context(
+            validated_candidate_artifact_lease(candidate_path)
+        )
+        return _write_openmaic_plane_receipt_bound(
+            plane=plane,
+            candidate_path=candidate_path,
+            candidate_artifact=candidate_artifact,
+            candidate_stack=candidate_stack,
+            bundle_root=bundle_root,
+            release_run=release_run,
+            timeout_seconds=timeout_seconds,
+            runner=runner,
+            expected_outage_docker_host_identity_sha256=(
+                expected_outage_docker_host_identity_sha256
+            ),
+            observer_attestation_public_key_path=observer_attestation_public_key_path,
+            expected_observer_attestation_public_key_spki_sha256=(
+                expected_observer_attestation_public_key_spki_sha256
+            ),
+        )
+
+
+def _write_openmaic_plane_receipt_bound(
+    *,
+    plane: str,
+    candidate_path: Path,
+    candidate_artifact: ValidatedCandidateArtifact,
+    candidate_stack: ExitStack,
+    bundle_root: Path,
+    release_run: Mapping[str, object],
+    timeout_seconds: int,
+    runner: CommandRunner,
+    expected_outage_docker_host_identity_sha256: str | None,
+    observer_attestation_public_key_path: Path | None,
+    expected_observer_attestation_public_key_spki_sha256: str | None,
+) -> dict[str, object]:
+    candidate_artifact.check_unchanged()
     if plane == "shared":
         evidence = "openmaic_shared_plane"
         proof_name = "openmaic-shared-plane-attestation.json"
@@ -3987,13 +5396,12 @@ def _write_openmaic_plane_receipt(
         value.encode("utf-8", errors="strict") for value in {token, token.strip()} if value
     )
     root = Path(os.path.abspath(bundle_root))
-    candidate_path = Path(candidate_root).resolve()
     proof_path = root / "runtime" / proof_name
     receipt_path = root / "artifacts" / receipt_name
     if any(os.path.lexists(path) for path in (proof_path, receipt_path)):
         raise ValueError(f"{label} evidence already exists")
 
-    candidate = _candidate(candidate_path)
+    candidate = candidate_artifact.candidate_copy()
     bound_run = _release_run(release_run)
     runtime_path = root / "runtime" / "runtime-attestation.json"
     runtime_body, runtime_sha256 = read_runtime_attestation_artifact(
@@ -4019,6 +5427,9 @@ def _write_openmaic_plane_receipt(
     observer_path: Path | None = None
     observer_body: bytes | None = None
     observer_sha256: str | None = None
+    observer_signature_path: Path | None = None
+    observer_signature_body: bytes | None = None
+    observer_signature_sha256: str | None = None
     observer_id: str | None = None
     observer_origin: str | None = None
     control_origin: str | None = None
@@ -4032,15 +5443,44 @@ def _write_openmaic_plane_receipt(
                 "OpenMAIC dedicated outage Docker host identity is unavailable or invalid"
             )
         observer_path = root / "runtime" / "openmaic-shared-ingress-observer-attestation.json"
+        observer_signature_path = (
+            root / "runtime" / "openmaic-shared-ingress-observer-attestation.sig"
+        )
+        if (
+            observer_attestation_public_key_path is None
+            or not isinstance(expected_observer_attestation_public_key_spki_sha256, str)
+            or _SHA256.fullmatch(expected_observer_attestation_public_key_spki_sha256) is None
+            or expected_observer_attestation_public_key_spki_sha256 == "0" * 64
+        ):
+            raise ValueError(
+                "OpenMAIC shared-ingress observer public-key anchor is unavailable or invalid"
+            )
         try:
-            observer_body = observer_path.read_bytes()
-            observer = parse_openmaic_shared_ingress_observer_attestation(
+            observer_body = _read_openmaic_observer_artifact(
+                observer_path,
+                bundle_root=root,
+                maximum_bytes=MAX_OPENMAIC_SMOKE_REPORT_BYTES,
+            )
+            observer_signature_body = _read_openmaic_observer_artifact(
+                observer_signature_path,
+                bundle_root=root,
+                maximum_bytes=1024,
+            )
+            observer = verify_openmaic_shared_ingress_observer_attestation(
                 observer_body,
                 release_run=bound_run,
+                signature=observer_signature_body,
+                public_key_path=observer_attestation_public_key_path,
+                candidate_root=candidate_path,
+                expected_public_key_spki_sha256=(
+                    expected_observer_attestation_public_key_spki_sha256
+                ),
+                trusted_now=_current_trusted_now(),
             )
         except (OSError, ValueError) as exc:
             raise ValueError("OpenMAIC shared-ingress observer attestation is invalid") from exc
         observer_sha256 = hashlib.sha256(observer_body).hexdigest()
+        observer_signature_sha256 = hashlib.sha256(observer_signature_body).hexdigest()
         observer_details = observer.get("observer")
         if not isinstance(observer_details, dict):
             raise ValueError("OpenMAIC shared-ingress observer attestation is invalid")
@@ -4072,6 +5512,9 @@ def _write_openmaic_plane_receipt(
                 expected_shared_ingress_control_origin=control_origin,
                 expected_tenant_id=dedicated_tenant_id,
                 expected_docker_host_identity_sha256=(expected_outage_docker_host_identity_sha256),
+                expected_observer_public_key_spki_sha256=(
+                    expected_observer_attestation_public_key_spki_sha256
+                ),
             )
         except ValueError as exc:
             raise ValueError("OpenMAIC dedicated outage attestation is invalid") from exc
@@ -4123,6 +5566,7 @@ def _write_openmaic_plane_receipt(
     )
     if dedicated_tenant_id is not None:
         environment["YFEISTAI_DEDICATED_TENANT_ID"] = dedicated_tenant_id
+    candidate_artifact.check_unchanged()
     try:
         completed = runner(
             arguments,
@@ -4132,6 +5576,7 @@ def _write_openmaic_plane_receipt(
         )
     except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
         raise ValueError(f"{label} probe could not run") from exc
+    candidate_artifact.check_unchanged()
     if (
         not isinstance(completed.returncode, int)
         or isinstance(completed.returncode, bool)
@@ -4180,19 +5625,15 @@ def _write_openmaic_plane_receipt(
         )
 
     def assert_release_binding() -> None:
+        candidate_artifact.check_unchanged()
         try:
-            candidate_after = _candidate(candidate_path)
             runtime_after, runtime_after_sha256 = read_runtime_attestation_artifact(
                 runtime_path,
                 bundle_root=root,
             )
         except ValueError as exc:
             raise ValueError(f"{label} release binding changed") from exc
-        if (
-            candidate_after != candidate
-            or runtime_after != runtime_body
-            or runtime_after_sha256 != runtime_sha256
-        ):
+        if runtime_after != runtime_body or runtime_after_sha256 != runtime_sha256:
             raise ValueError(f"{label} release binding changed")
         validate_runtime_attestation(
             runtime_path,
@@ -4208,20 +5649,45 @@ def _write_openmaic_plane_receipt(
             assert observer_path is not None
             assert observer_body is not None
             assert observer_sha256 is not None
+            assert observer_signature_path is not None
+            assert observer_signature_body is not None
+            assert observer_signature_sha256 is not None
+            assert observer_attestation_public_key_path is not None
+            assert expected_observer_attestation_public_key_spki_sha256 is not None
             assert observer_id is not None
             assert observer_origin is not None
             assert control_origin is not None
             try:
                 outage_after = outage_path.read_bytes()
-                observer_after = observer_path.read_bytes()
+                observer_after = _read_openmaic_observer_artifact(
+                    observer_path,
+                    bundle_root=root,
+                    maximum_bytes=MAX_OPENMAIC_SMOKE_REPORT_BYTES,
+                )
+                observer_signature_after = _read_openmaic_observer_artifact(
+                    observer_signature_path,
+                    bundle_root=root,
+                    maximum_bytes=1024,
+                )
             except OSError as exc:
                 raise ValueError("OpenMAIC dedicated outage release binding changed") from exc
-            if outage_after != outage_body or observer_after != observer_body:
+            if (
+                outage_after != outage_body
+                or observer_after != observer_body
+                or observer_signature_after != observer_signature_body
+            ):
                 raise ValueError("OpenMAIC dedicated outage release binding changed")
             try:
-                parse_openmaic_shared_ingress_observer_attestation(
+                verify_openmaic_shared_ingress_observer_attestation(
                     observer_after,
                     release_run=bound_run,
+                    signature=observer_signature_after,
+                    public_key_path=observer_attestation_public_key_path,
+                    candidate_root=candidate_path,
+                    expected_public_key_spki_sha256=(
+                        expected_observer_attestation_public_key_spki_sha256
+                    ),
+                    trusted_now=_current_trusted_now(),
                 )
                 replayed_outage = _parse_bound_openmaic_dedicated_outage_attestation(
                     outage_after,
@@ -4237,6 +5703,9 @@ def _write_openmaic_plane_receipt(
                     expected_tenant_id=dedicated_tenant_id,
                     expected_docker_host_identity_sha256=(
                         expected_outage_docker_host_identity_sha256
+                    ),
+                    expected_observer_public_key_spki_sha256=(
+                        expected_observer_attestation_public_key_spki_sha256
                     ),
                 )
             except ValueError as exc:
@@ -4308,6 +5777,8 @@ def _write_openmaic_plane_receipt(
         if outage_path is not None:
             assert outage_sha256 is not None
             assert observer_sha256 is not None
+            assert observer_signature_sha256 is not None
+            assert expected_observer_attestation_public_key_spki_sha256 is not None
             provenance["openmaicDedicatedOutageAttestation"] = {
                 "artifact": "runtime/openmaic-dedicated-outage-attestation.json",
                 "sha256": outage_sha256,
@@ -4315,6 +5786,11 @@ def _write_openmaic_plane_receipt(
             provenance["openmaicSharedIngressObserverAttestation"] = {
                 "artifact": "runtime/openmaic-shared-ingress-observer-attestation.json",
                 "sha256": observer_sha256,
+                "signatureArtifact": {
+                    "artifact": "runtime/openmaic-shared-ingress-observer-attestation.sig",
+                    "sha256": observer_signature_sha256,
+                },
+                "publicKeySpkiSha256": (expected_observer_attestation_public_key_spki_sha256),
             }
         receipt = _pass_receipt_from_candidate(
             candidate=candidate,
@@ -4367,6 +5843,7 @@ def _write_openmaic_plane_receipt(
             ),
         ):
             boundary.assert_unchanged()
+            candidate_artifact.check_unchanged()
             assert source_handle is not None
             assert expected_identity is not None
             published[f"published-{name}"] = (target, expected_identity)
@@ -4387,6 +5864,8 @@ def _write_openmaic_plane_receipt(
             assert_release_binding()
         boundary.assert_unchanged()
         assert_release_binding()
+        # Candidate exit validation must remain inside the two-file rollback.
+        candidate_stack.close()
         return receipt
     except BaseException as original_error:
         if proof_handle is not None:
@@ -4456,6 +5935,7 @@ def _write_openmaic_plane_receipt(
             raise staging_cleanup_error
 
 
+@_receipt_producer
 def write_openmaic_shared_plane_receipt(
     *,
     candidate_root: Path,
@@ -4496,6 +5976,7 @@ def _publish_backup_restore_receipt(
             document=document,
         )
         boundary.assert_unchanged()
+        published[target] = staged_identity
         try:
             _publish_classroom_no_replace(
                 boundary,
@@ -4511,7 +5992,6 @@ def _publish_backup_restore_receipt(
             ):
                 raise FileExistsError("backup restore receipt already exists") from exc
             raise
-        published[target] = staged_identity
         _assert_published_classroom_receipt_relative(
             boundary,
             target,
@@ -4569,6 +6049,7 @@ def _publish_backup_restore_receipt(
                 raise cleanup_errors[0]
 
 
+@_receipt_producer
 def write_backup_restore_receipt(
     *,
     candidate_root: Path,
@@ -4635,6 +6116,7 @@ def write_backup_restore_receipt(
                 raise
 
 
+@_receipt_producer
 def write_openmaic_dedicated_plane_receipt(
     *,
     candidate_root: Path,
@@ -4642,6 +6124,8 @@ def write_openmaic_dedicated_plane_receipt(
     release_run: Mapping[str, object],
     timeout_seconds: int,
     expected_outage_docker_host_identity_sha256: str,
+    observer_attestation_public_key_path: Path,
+    expected_observer_attestation_public_key_spki_sha256: str,
     runner: CommandRunner = _run_openmaic_smoke,
 ) -> dict[str, object]:
     """Run the fixed dedicated-plane smoke and publish its proof marker last."""
@@ -4654,9 +6138,14 @@ def write_openmaic_dedicated_plane_receipt(
         timeout_seconds=timeout_seconds,
         runner=runner,
         expected_outage_docker_host_identity_sha256=(expected_outage_docker_host_identity_sha256),
+        observer_attestation_public_key_path=(observer_attestation_public_key_path),
+        expected_observer_attestation_public_key_spki_sha256=(
+            expected_observer_attestation_public_key_spki_sha256
+        ),
     )
 
 
+@_receipt_producer
 def write_gateway_only_public_receipt(
     *,
     candidate_root: Path,
@@ -4693,27 +6182,36 @@ def write_gateway_only_public_receipt(
     root = Path(os.path.abspath(bundle_root))
     candidate_path = Path(os.path.abspath(candidate_root))
     with _GatewayPublicationBoundary.open(root, candidate_path) as boundary:
-        return _write_gateway_only_public_receipt_bound(
-            root=root,
-            candidate_path=candidate_path,
-            release_run=release_run,
-            deadline_monotonic=deadline_monotonic,
-            expected_host_identity_sha256=expected_host_identity_sha256,
-            trusted_keyring_path=normalized_trusted_keyring_path,
-            expected_trusted_keyring_sha256=expected_trusted_keyring_sha256,
-            expected_observer_challenge=expected_observer_challenge,
-            expected_host_challenge=expected_host_challenge,
-            trusted_now=trusted_now,
-            boundary=boundary,
-            runner=runner,
-            docker_resolver=docker_resolver,
-        )
+        boundary.ensure_publication_parents()
+        with ExitStack() as candidate_stack:
+            candidate_artifact = candidate_stack.enter_context(
+                validated_candidate_artifact_lease(candidate_path)
+            )
+            return _write_gateway_only_public_receipt_bound(
+                root=root,
+                candidate_path=candidate_path,
+                candidate_artifact=candidate_artifact,
+                candidate_stack=candidate_stack,
+                release_run=release_run,
+                deadline_monotonic=deadline_monotonic,
+                expected_host_identity_sha256=expected_host_identity_sha256,
+                trusted_keyring_path=normalized_trusted_keyring_path,
+                expected_trusted_keyring_sha256=expected_trusted_keyring_sha256,
+                expected_observer_challenge=expected_observer_challenge,
+                expected_host_challenge=expected_host_challenge,
+                trusted_now=trusted_now,
+                boundary=boundary,
+                runner=runner,
+                docker_resolver=docker_resolver,
+            )
 
 
 def _write_gateway_only_public_receipt_bound(
     *,
     root: Path,
     candidate_path: Path,
+    candidate_artifact: ValidatedCandidateArtifact,
+    candidate_stack: ExitStack,
     release_run: Mapping[str, object],
     deadline_monotonic: float,
     expected_host_identity_sha256: str,
@@ -4739,6 +6237,7 @@ def _write_gateway_only_public_receipt_bound(
         candidate_path / "deploy" / "image-lock.json",
         candidate_path / "docker-compose.platform.yml",
         candidate_path / "docker-compose.data-plane.yml",
+        candidate_path / "deploy" / "docker-compose.openmaic-shared-ingress-observer.yml",
     )
     if any(os.path.lexists(path) for path in (proof_path, receipt_path)):
         raise ValueError("gateway-only-public evidence already exists")
@@ -4780,9 +6279,13 @@ def _write_gateway_only_public_receipt_bound(
             candidate_inputs[2],
             label="candidate data-plane Compose",
         ),
+        "candidate observer Compose": _read_gateway_input(
+            candidate_inputs[3],
+            label="candidate observer Compose",
+        ),
     }
     boundary.assert_unchanged()
-    candidate = _candidate(candidate_path)
+    candidate = candidate_artifact.candidate_copy()
     verified_trust = verify_gateway_trust_pair(
         observer_envelope_body=pinned_inputs["trust observer envelope"].body,
         host_envelope_body=pinned_inputs["trust host-provisioner envelope"].body,
@@ -4791,7 +6294,6 @@ def _write_gateway_only_public_receipt_bound(
         trusted_keyring_path=trusted_keyring_path,
         expected_trusted_keyring_sha256=expected_trusted_keyring_sha256,
         candidate_root=candidate_path,
-        candidate=candidate,
         release_run=bound_run,
         expected_environment_id=bound_run["environmentId"],
         expected_observer_challenge=expected_observer_challenge,
@@ -4873,11 +6375,13 @@ def _write_gateway_only_public_receipt_bound(
         pinned_inputs["candidate platform Compose"].body,
         docker_project=_GATEWAY_DOCKER_PROJECT,
         expected_services=tuple(runtime_containers.values()),
+        overlay_bodies=(pinned_inputs["candidate observer Compose"].body,),
     )
     docker = Path(docker_resolver())
     if not docker.is_absolute():
         raise ValueError("gateway trusted Docker CLI is invalid")
 
+    candidate_artifact.check_unchanged()
     with tempfile.TemporaryDirectory(prefix="yfeistai-gateway-docker-") as raw_config:
         docker_config = Path(raw_config)
         before_daemon, before_snapshot, before_commands = _gateway_observation_round(
@@ -5063,6 +6567,7 @@ def _write_gateway_only_public_receipt_bound(
                 (staged_proof, proof_path, proof_body, proof_identity),
             ):
                 boundary.assert_unchanged()
+                candidate_artifact.check_unchanged()
                 if os.path.lexists(target):
                     raise ValueError("gateway-only-public publication target appeared concurrently")
                 published[target] = identity
@@ -5079,6 +6584,8 @@ def _write_gateway_only_public_receipt_bound(
         finally:
             _GATEWAY_PUBLICATION_CONTEXT.reset(publication_context)
         boundary.assert_unchanged()
+        # Final verification and descriptor close must still be inside rollback.
+        candidate_stack.close()
         boundary.mark_committed()
         committed = True
         return receipt
@@ -5140,6 +6647,7 @@ def _write_gateway_only_public_receipt_bound(
                 raise staging_cleanup_errors[0]
 
 
+@_receipt_producer
 def write_tenant_isolation_receipt(
     *,
     candidate_root: Path,
@@ -5201,6 +6709,7 @@ def write_tenant_isolation_receipt(
         candidate_root=candidate_path,
         candidate=candidate,
         release_run=bound_run,
+        observer_signer_image=_operator_observer_signer_image(),
     )
     if len(capacity_tenant_ids) < 2:
         raise ValueError("tenant isolation capacity tenant pair is unavailable")
@@ -5331,6 +6840,7 @@ def write_tenant_isolation_receipt(
             candidate_root=candidate_path,
             candidate=candidate,
             release_run=bound_run,
+            observer_signer_image=_operator_observer_signer_image(),
         )
         if replayed_tenant_ids[:2] != selected_tenant_ids:
             raise ValueError("tenant isolation capacity tenant pair changed")
@@ -5387,6 +6897,7 @@ def write_tenant_isolation_receipt(
             candidate_root=candidate_path,
             candidate=candidate,
             release_run=bound_run,
+            observer_signer_image=_operator_observer_signer_image(),
         )
         if replayed_checks != checks or replayed_observed_at != observed_at:
             raise ValueError("tenant isolation proof replay changed")
@@ -5526,6 +7037,7 @@ def write_tenant_isolation_receipt(
             raise staging_cleanup_error
 
 
+@_receipt_producer
 def write_classroom_exports_receipt(
     *,
     candidate_root: Path,
@@ -5585,6 +7097,7 @@ def write_classroom_exports_receipt(
         candidate_root=candidate_path,
         candidate=candidate,
         release_run=bound_run,
+        observer_signer_image=_operator_observer_signer_image(),
     )
 
     attempt_id = uuid.uuid4().hex
@@ -5639,6 +7152,7 @@ def write_classroom_exports_receipt(
     staged_proof = proof_path.with_name(f".{proof_path.name}.{attempt_id}.staging")
     staged_receipt = receipt_path.with_name(f".{receipt_path.name}.{attempt_id}.staging")
     leases: dict[str, _ClassroomArtifactLease] = {}
+    staging_identities: dict[str, tuple[int, int]] = {}
     proof_handle: BinaryIO | None = None
     receipt_handle: BinaryIO | None = None
     proof_identity: tuple[int, int] | None = None
@@ -5679,6 +7193,7 @@ def write_classroom_exports_receipt(
             raise ValueError("classroom exports probe output is invalid or contains a secret")
 
         leases = _open_classroom_artifact_leases(boundary)
+        staging_identities = {kind: lease.identity for kind, lease in leases.items()}
         artifact_handles = {kind: lease.handle for kind, lease in leases.items()}
         if any(_classroom_artifact_contains_secret(lease, secrets) for lease in leases.values()):
             raise ValueError("classroom exports raw artifact contains a live fixture token")
@@ -5740,6 +7255,7 @@ def write_classroom_exports_receipt(
                     candidate_root=candidate_path,
                     candidate=candidate,
                     release_run=bound_run,
+                    observer_signer_image=_operator_observer_signer_image(),
                 )
                 != tenant_id
             ):
@@ -5883,6 +7399,7 @@ def write_classroom_exports_receipt(
             candidate_root=candidate_path,
             candidate=candidate,
             release_run=bound_run,
+            observer_signer_image=_operator_observer_signer_image(),
         )
         if derived_checks != checks or replayed_observed_at != observed_at:
             raise ValueError("classroom exports proof replay changed")
@@ -5976,7 +7493,7 @@ def write_classroom_exports_receipt(
         if receipt_handle is not None:
             receipt_handle.close()
         staging_entries: dict[Path, tuple[int, int] | None] = {
-            staging / name: leases.get(kind).identity if kind in leases else None
+            staging / name: staging_identities.get(kind)
             for kind, name in CLASSROOM_EXPORT_PATHS.items()
         }
         staging_entries[staged_proof] = proof_identity
@@ -6067,6 +7584,9 @@ def _publish_manifest_no_replace(
             target.name,
         )
     else:
+        _require_receipt_attempt().bind(
+            target, source_handle.fileno(), parent_fd=int(boundary.leases["bundle"].handle)
+        )
         _link_posix_file_descriptor(
             source_handle.fileno(),
             int(boundary.leases["bundle"].handle),
@@ -6111,7 +7631,6 @@ def _assert_manifest_published(
                 os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
                 dir_fd=int(boundary.leases["bundle"].handle),
             )
-            handle = descriptor
             details = os.fstat(descriptor)
             identity = _file_identity(details)
             with os.fdopen(descriptor, "rb", closefd=False) as opened:
@@ -6138,6 +7657,9 @@ def _remove_manifest_staging(
 ) -> None:
     if path.parent != boundary.root or Path(path.name).name != path.name or not path.name:
         raise ValueError("release manifest staging path is invalid")
+    if os.name != "nt":
+        _require_receipt_attempt().remove(path, expected_identity)
+        return
     if os.name == "nt":
         import msvcrt
 
@@ -6165,14 +7687,6 @@ def _remove_manifest_staging(
             if handle is not None:
                 _close_windows_handle(handle)
         return
-    details = os.stat(
-        path.name,
-        dir_fd=int(boundary.leases["bundle"].handle),
-        follow_symlinks=False,
-    )
-    if not stat.S_ISREG(details.st_mode) or _file_identity(details) != expected_identity:
-        raise ValueError("release manifest staging file changed")
-    os.unlink(path.name, dir_fd=int(boundary.leases["bundle"].handle))
 
 
 def _validated_receipt(
@@ -6194,6 +7708,10 @@ def _validated_receipt(
     expected_openmaic_observer_id: str | None = None,
     expected_openmaic_observer_origin: str | None = None,
     expected_openmaic_shared_ingress_control_origin: str | None = None,
+    openmaic_observer_public_key_path: Path | None = None,
+    expected_openmaic_observer_public_key_spki_sha256: str | None = None,
+    expected_supervisor_public_key_spki_sha256: str | None = None,
+    require_final_commit: bool = True,
 ) -> tuple[dict[str, object], bytes, str]:
     try:
         body = path.read_bytes()
@@ -6255,6 +7773,12 @@ def _validated_receipt(
         expected_openmaic_shared_ingress_control_origin=(
             expected_openmaic_shared_ingress_control_origin
         ),
+        openmaic_observer_public_key_path=openmaic_observer_public_key_path,
+        expected_openmaic_observer_public_key_spki_sha256=(
+            expected_openmaic_observer_public_key_spki_sha256
+        ),
+        expected_supervisor_public_key_spki_sha256=(expected_supervisor_public_key_spki_sha256),
+        require_final_commit=require_final_commit,
         **gateway_trust_arguments,
     )
     if provenance_error is not None:
@@ -6262,12 +7786,410 @@ def _validated_receipt(
     return document, body, producer
 
 
+def _read_bounded_release_supervisor_handle(
+    handle: object | int,
+    *,
+    windows: bool,
+    maximum_bytes: int,
+) -> bytes:
+    if windows:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        get_size = kernel32.GetFileSizeEx
+        get_size.argtypes = (wintypes.HANDLE, ctypes.POINTER(ctypes.c_longlong))
+        get_size.restype = wintypes.BOOL
+        set_pointer = kernel32.SetFilePointerEx
+        set_pointer.argtypes = (
+            wintypes.HANDLE,
+            ctypes.c_longlong,
+            ctypes.POINTER(ctypes.c_longlong),
+            wintypes.DWORD,
+        )
+        set_pointer.restype = wintypes.BOOL
+        read_file = kernel32.ReadFile
+        read_file.argtypes = (
+            wintypes.HANDLE,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+            wintypes.LPVOID,
+        )
+        read_file.restype = wintypes.BOOL
+        size = ctypes.c_longlong()
+        if not get_size(handle, ctypes.byref(size)):
+            error = ctypes.get_last_error()
+            raise OSError(error, "cannot inspect release supervisor input size")
+        if size.value <= 0 or size.value > maximum_bytes:
+            raise ValueError("release supervisor input size is invalid")
+        position = ctypes.c_longlong()
+        if not set_pointer(handle, 0, ctypes.byref(position), 0):
+            error = ctypes.get_last_error()
+            raise OSError(error, "cannot rewind release supervisor input")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            requested = min(64 * 1024, maximum_bytes - total + 1)
+            buffer = ctypes.create_string_buffer(requested)
+            read = wintypes.DWORD()
+            if not read_file(
+                handle,
+                buffer,
+                requested,
+                ctypes.byref(read),
+                None,
+            ):
+                error = ctypes.get_last_error()
+                raise OSError(error, "cannot read release supervisor input")
+            if read.value == 0:
+                break
+            total += read.value
+            if total > maximum_bytes:
+                raise ValueError("release supervisor input size is invalid")
+            chunks.append(buffer.raw[: read.value])
+        body = b"".join(chunks)
+        if len(body) != size.value:
+            raise ValueError("release supervisor input changed while it was read")
+        return body
+
+    descriptor = int(handle)
+    details = os.fstat(descriptor)
+    if not stat.S_ISREG(details.st_mode) or details.st_size <= 0 or details.st_size > maximum_bytes:
+        raise ValueError("release supervisor input size or type is invalid")
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    chunks = []
+    total = 0
+    while True:
+        requested = min(64 * 1024, maximum_bytes - total + 1)
+        chunk = os.read(descriptor, requested)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > maximum_bytes:
+            raise ValueError("release supervisor input size is invalid")
+        chunks.append(chunk)
+    body = b"".join(chunks)
+    if len(body) != details.st_size:
+        raise ValueError("release supervisor input changed while it was read")
+    return body
+
+
+def _read_release_supervisor_file(path: Path, *, label: str, maximum_bytes: int) -> bytes:
+    target = Path(os.path.abspath(path))
+    if Path(target.name).name != target.name or not target.name or maximum_bytes <= 0:
+        raise ValueError(f"{label} is invalid")
+    windows = os.name == "nt"
+    parent: _ClassroomDirectoryLease | None = None
+    file_handle: object | int | None = None
+    reopened_parent: _ClassroomDirectoryLease | None = None
+    reopened_file: object | int | None = None
+    try:
+        parent = _GatewayPublicationBoundary._open_root(target.parent)
+        if windows:
+            file_handle, identity = _open_windows_regular_file_relative(
+                parent.handle,
+                target.name,
+                share_access=0x00000001 | 0x00000002 | 0x00000004,
+            )
+        else:
+            file_handle = os.open(
+                target.name,
+                os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=int(parent.handle),
+            )
+            details = os.fstat(file_handle)
+            if not stat.S_ISREG(details.st_mode):
+                raise ValueError("release supervisor input is not a regular file")
+            identity = _file_identity(details)
+        body = _read_bounded_release_supervisor_handle(
+            file_handle,
+            windows=windows,
+            maximum_bytes=maximum_bytes,
+        )
+        held_parent_identity = (
+            _windows_handle_identity(parent.handle, directory=True)
+            if windows
+            else _file_identity(os.fstat(int(parent.handle)))
+        )
+        held_file_identity = (
+            _windows_handle_identity(file_handle, directory=False)
+            if windows
+            else _file_identity(os.fstat(int(file_handle)))
+        )
+        reopened_parent = _GatewayPublicationBoundary._open_root(target.parent)
+        if windows:
+            reopened_file, reopened_identity = _open_windows_regular_file_relative(
+                reopened_parent.handle,
+                target.name,
+                share_access=0x00000001 | 0x00000002 | 0x00000004,
+            )
+        else:
+            reopened_file = os.open(
+                target.name,
+                os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=int(reopened_parent.handle),
+            )
+            reopened_details = os.fstat(reopened_file)
+            if not stat.S_ISREG(reopened_details.st_mode):
+                raise ValueError("release supervisor input is not a regular file")
+            reopened_identity = _file_identity(reopened_details)
+        replayed = _read_bounded_release_supervisor_handle(
+            reopened_file,
+            windows=windows,
+            maximum_bytes=maximum_bytes,
+        )
+        if (
+            held_parent_identity != parent.identity
+            or held_file_identity != identity
+            or reopened_parent.identity != parent.identity
+            or reopened_identity != identity
+            or replayed != body
+        ):
+            raise ValueError("release supervisor input boundary changed")
+        return body
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"{label} is invalid") from exc
+    finally:
+        close_errors: list[OSError] = []
+        for handle in (
+            reopened_file,
+            reopened_parent.handle if reopened_parent is not None else None,
+            file_handle,
+            parent.handle if parent is not None else None,
+        ):
+            if handle is None:
+                continue
+            try:
+                if windows:
+                    _close_windows_handle(handle)
+                else:
+                    os.close(int(handle))
+            except OSError as exc:
+                close_errors.append(exc)
+        if close_errors:
+            active_error = sys.exception()
+            if active_error is None:
+                raise close_errors[0]
+            if hasattr(active_error, "add_note"):
+                active_error.add_note(
+                    f"release supervisor input handle cleanup failed: {close_errors[0]}"
+                )
+
+
+def _publish_release_supervisor_public_key(
+    target: Path,
+    body: bytes,
+    *,
+    owned_publications: dict[Path, tuple[int, int]],
+) -> None:
+    if os.path.lexists(target):
+        if (
+            _read_release_supervisor_file(
+                target,
+                label="release supervisor public key",
+                maximum_bytes=16 * 1024,
+            )
+            != body
+        ):
+            raise ValueError("release supervisor public key changed")
+        return
+    staged: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            dir=target.parent,
+            delete=False,
+        ) as handle:
+            staged = Path(handle.name)
+            _pin_receipt(staged, handle.fileno())
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _publish_staged_file_no_replace(
+            staged,
+            target,
+            owned_publications=owned_publications,
+        )
+        staged = None
+    finally:
+        if staged is not None:
+            _finish_receipt_staging(staged)
+
+
+@_receipt_producer
+def write_probe_final_commit_marker(
+    *,
+    candidate_root: Path,
+    bundle_root: Path,
+    release_run: Mapping[str, object],
+    evidence: str,
+    receipt_path: Path,
+    supervisor_signature_path: Path,
+    supervisor_public_key_path: Path,
+    expected_supervisor_public_key_spki_sha256: str,
+) -> Path:
+    """Commit one complete probe trio from a distinct supervisor invocation."""
+
+    if evidence not in PROBE_RECIPES:
+        raise ValueError("probe final commit evidence is invalid")
+    root = Path(bundle_root).resolve()
+    runtime = root / "runtime"
+    if not root.is_dir() or not runtime.is_dir():
+        raise ValueError("probe final commit boundary is invalid")
+    _assert_no_link_ancestors(runtime)
+    resolved_receipt, receipt_artifact = _bundle_artifact(
+        receipt_path,
+        bundle_root=root,
+        label="probe final commit receipt",
+    )
+    candidate_path = Path(candidate_root).resolve()
+    owned_publications: dict[Path, tuple[int, int]] = {}
+    boundary: _ManifestPublicationBoundary | None = None
+    try:
+        with validated_candidate_artifact_lease(candidate_path) as candidate_artifact:
+            candidate = candidate_artifact.candidate_copy()
+            bound_run = _release_run(release_run)
+            document, receipt_body, _producer = _validated_receipt(
+                resolved_receipt,
+                evidence=evidence,
+                candidate=candidate,
+                release_run=bound_run,
+                bundle_root=root,
+                candidate_root=candidate_path,
+                require_final_commit=False,
+            )
+            provenance = document.get("provenance")
+            if not isinstance(provenance, dict):
+                raise ValueError("probe final commit receipt provenance is invalid")
+            raw_report = provenance.get("rawReport")
+            execution = provenance.get("execution")
+            if not isinstance(raw_report, dict) or not isinstance(execution, dict):
+                raise ValueError("probe final commit receipt provenance is invalid")
+            claim = {
+                "schemaVersion": 2,
+                "authority": "external-supervisor-ed25519",
+                "candidate": candidate,
+                "releaseRun": bound_run,
+                "evidence": evidence,
+                "artifacts": {
+                    "receipt": {
+                        "artifact": receipt_artifact,
+                        "sha256": hashlib.sha256(receipt_body).hexdigest(),
+                    },
+                    "rawReport": json.loads(json.dumps(raw_report)),
+                    "execution": json.loads(json.dumps(execution)),
+                },
+            }
+            commit_root = runtime / "probe-commits"
+            try:
+                commit_root.mkdir(mode=0o700)
+            except FileExistsError:
+                if not commit_root.is_dir() or _is_link_or_reparse(commit_root):
+                    raise ValueError("probe final commit boundary is invalid") from None
+            _assert_no_link_ancestors(commit_root)
+            boundary = _ManifestPublicationBoundary.open(commit_root)
+            marker_path = commit_root / f"{evidence}.json"
+            if os.path.lexists(marker_path):
+                raise FileExistsError("probe final commit marker already exists")
+            signature_path = commit_root / f"{evidence}.sig"
+            if Path(os.path.abspath(supervisor_signature_path)) != signature_path:
+                raise ValueError("release supervisor signature path is invalid")
+            signature_body = _read_release_supervisor_file(
+                signature_path,
+                label="release supervisor signature",
+                maximum_bytes=1024,
+            )
+            public_key_body = _read_release_supervisor_file(
+                supervisor_public_key_path,
+                label="release supervisor public key",
+                maximum_bytes=16 * 1024,
+            )
+            verify_release_supervisor_signature(
+                claim,
+                signature=signature_body,
+                public_key=public_key_body,
+                expected_public_key_spki_sha256=expected_supervisor_public_key_spki_sha256,
+            )
+            candidate_artifact.check_unchanged()
+            boundary.assert_unchanged()
+            public_key_path = commit_root / "release-supervisor-public-key.pem"
+            _publish_release_supervisor_public_key(
+                public_key_path,
+                public_key_body,
+                owned_publications=owned_publications,
+            )
+            candidate_artifact.check_unchanged()
+            boundary.assert_unchanged()
+            marker = {
+                **claim,
+                "supervisorSignature": {
+                    "artifact": signature_path.relative_to(root).as_posix(),
+                    "sha256": hashlib.sha256(signature_body).hexdigest(),
+                    "publicKeyArtifact": public_key_path.relative_to(root).as_posix(),
+                    "publicKeySha256": hashlib.sha256(public_key_body).hexdigest(),
+                    "publicKeySpkiSha256": expected_supervisor_public_key_spki_sha256,
+                },
+            }
+            try:
+                _atomic_write_json_no_replace(
+                    marker_path,
+                    marker,
+                    owned_publications=owned_publications,
+                )
+            except FileExistsError as exc:
+                raise FileExistsError("probe final commit marker already exists") from exc
+            candidate_artifact.check_unchanged()
+            boundary.assert_unchanged()
+            expected_identity = owned_publications.get(marker_path)
+            try:
+                details = marker_path.stat(follow_symlinks=False)
+                body = marker_path.read_bytes()
+            except OSError as exc:
+                raise ValueError("probe final commit marker publication failed") from exc
+            if (
+                expected_identity is None
+                or not stat.S_ISREG(details.st_mode)
+                or _file_identity(details) != expected_identity
+                or body != _json_bytes(marker)
+            ):
+                raise ValueError("probe final commit marker publication failed")
+            _fsync_directory(commit_root)
+            boundary.assert_unchanged()
+            candidate_artifact.check_unchanged()
+        # Lease exit revalidates and closes descriptors before publication succeeds.
+        return marker_path
+    except BaseException as original_error:
+        if boundary is not None:
+            for path, identity in reversed(tuple(owned_publications.items())):
+                try:
+                    _remove_manifest_staging(boundary, path, expected_identity=identity)
+                except FileNotFoundError:
+                    pass
+                except BaseException as cleanup_error:
+                    original_error.add_note(f"probe final commit cleanup failed: {cleanup_error}")
+        raise
+    finally:
+        if boundary is not None:
+            active_error = sys.exception()
+            try:
+                boundary.close()
+            except BaseException as close_error:
+                if active_error is None:
+                    raise
+                active_error.add_note(f"probe final commit boundary close failed: {close_error}")
+
+
+@_receipt_producer
 def assemble_manifest(
     output_path: Path,
     *,
     candidate_root: Path,
     release_run: Mapping[str, object],
     receipt_paths: Mapping[str, Path],
+    expected_supervisor_public_key_spki_sha256: str,
     expected_outage_docker_host_identity_sha256: str | None = None,
     expected_gateway_docker_host_identity_sha256: str | None = None,
     trusted_keyring_path: Path | None = None,
@@ -6279,8 +8201,16 @@ def assemble_manifest(
     expected_openmaic_observer_id: str | None = None,
     expected_openmaic_observer_origin: str | None = None,
     expected_openmaic_shared_ingress_control_origin: str | None = None,
+    openmaic_observer_public_key_path: Path | None = None,
+    expected_openmaic_observer_public_key_spki_sha256: str | None = None,
 ) -> dict[str, object]:
     """Validate receipt bytes and publish their schema-v3 manifest last."""
+    if (
+        not isinstance(expected_supervisor_public_key_spki_sha256, str)
+        or _SHA256.fullmatch(expected_supervisor_public_key_spki_sha256) is None
+        or expected_supervisor_public_key_spki_sha256 == "0" * 64
+    ):
+        raise ValueError("release supervisor public-key fingerprint is unavailable or invalid")
     target = Path(os.path.abspath(output_path))
     if Path(target.name).name != target.name or not target.name:
         raise ValueError("release manifest output path is invalid")
@@ -6290,6 +8220,9 @@ def assemble_manifest(
     staged: Path | None = None
     staged_handle: BinaryIO | None = None
     staged_identity: tuple[int, int] | None = None
+    candidate_lease: _CandidateContractLease | None = None
+    candidate_close_attempted = False
+    publication_attempted = False
     committed = False
     primary_error: BaseException | None = None
     try:
@@ -6298,7 +8231,23 @@ def assemble_manifest(
             raise ValueError("receipt path must not be the manifest output path")
         if os.path.lexists(target):
             raise FileExistsError("release manifest already exists")
-        candidate = _candidate(candidate_path)
+        _reject_in_progress_publish_journal(candidate_path / "deploy" / "image-lock.json")
+        candidate_lease = _CandidateContractLease.open(candidate_path)
+        contents = candidate_lease.contents
+
+        def assert_candidate_unchanged() -> None:
+            _reject_in_progress_publish_journal(contents[0][0])
+            try:
+                candidate_lease.assert_unchanged()
+            except OSError as error:
+                raise ValueError("release candidate directory boundary changed") from error
+            _reject_in_progress_publish_journal(contents[0][0])
+
+        assert_candidate_unchanged()
+        lock = load_image_lock_bytes(contents[0][1], require_candidate=True)
+        _validate_image_lock_binding_bytes(lock, contents[1:])
+        candidate = json.loads(json.dumps(lock["candidate"]))
+        assert_candidate_unchanged()
         boundary.assert_unchanged()
         bound_run = _release_run(release_run)
         expected_gateway_identity = expected_gateway_docker_host_identity_sha256
@@ -6309,6 +8258,7 @@ def assemble_manifest(
         evidence_entries: dict[str, object] = {}
         for evidence, raw_path in receipt_paths.items():
             boundary.assert_unchanged()
+            assert_candidate_unchanged()
             receipt_path = Path(os.path.abspath(raw_path))
             if receipt_path == target:
                 raise ValueError("receipt path must not be the manifest output path")
@@ -6340,7 +8290,15 @@ def assemble_manifest(
                 expected_openmaic_shared_ingress_control_origin=(
                     expected_openmaic_shared_ingress_control_origin
                 ),
+                openmaic_observer_public_key_path=(openmaic_observer_public_key_path),
+                expected_openmaic_observer_public_key_spki_sha256=(
+                    expected_openmaic_observer_public_key_spki_sha256
+                ),
+                expected_supervisor_public_key_spki_sha256=(
+                    expected_supervisor_public_key_spki_sha256
+                ),
             )
+            assert_candidate_unchanged()
             boundary.assert_unchanged()
             evidence_entries[evidence] = {
                 "status": "pass",
@@ -6355,6 +8313,7 @@ def assemble_manifest(
             "evidence": evidence_entries,
         }
         boundary.assert_unchanged()
+        assert_candidate_unchanged()
         staged = bundle_root / f".{target.name}.{uuid.uuid4().hex}.tmp"
         staged_handle, staged_identity, staged_body = _create_classroom_json_staging(
             boundary,
@@ -6398,10 +8357,11 @@ def assemble_manifest(
             )
         )
         try:
+            assert_candidate_unchanged()
             if os.path.lexists(target):
                 raise FileExistsError("release manifest already exists")
+            publication_attempted = True
             _publish_no_replace(staged, target)
-            committed = True
             _assert_manifest_published(
                 boundary,
                 target,
@@ -6409,7 +8369,13 @@ def assemble_manifest(
                 expected_identity=staged_identity,
             )
             boundary.assert_unchanged()
+            assert_candidate_unchanged()
             _fsync_directory(bundle_root)
+            boundary.assert_unchanged()
+            assert_candidate_unchanged()
+            candidate_close_attempted = True
+            candidate_lease.close()
+            committed = True
         finally:
             _MANIFEST_PUBLICATION_CONTEXT.reset(publication_context)
         return manifest
@@ -6423,6 +8389,17 @@ def assemble_manifest(
                 staged_handle.close()
             except BaseException as error:
                 cleanup_errors.append(error)
+        if publication_attempted and not committed and staged_identity is not None:
+            try:
+                _remove_manifest_staging(
+                    boundary,
+                    target,
+                    expected_identity=staged_identity,
+                )
+            except FileNotFoundError:
+                pass
+            except BaseException as error:
+                cleanup_errors.append(error)
         if staged is not None and staged_identity is not None:
             try:
                 _remove_manifest_staging(
@@ -6432,6 +8409,12 @@ def assemble_manifest(
                 )
             except BaseException as error:
                 cleanup_errors.append(error)
+        if candidate_lease is not None and not candidate_close_attempted:
+            candidate_close_attempted = True
+            try:
+                candidate_lease.close()
+            except BaseException as error:
+                cleanup_errors.append(error)
         try:
             boundary.close()
         except BaseException as error:
@@ -6439,9 +8422,7 @@ def assemble_manifest(
         if cleanup_errors:
             if primary_error is not None:
                 for cleanup_error in cleanup_errors:
-                    primary_error.add_note(
-                        f"release manifest staging cleanup failed: {cleanup_error}"
-                    )
+                    primary_error.add_note(f"release manifest cleanup failed: {cleanup_error}")
             elif not committed:
                 raise cleanup_errors[0]
 
@@ -6475,10 +8456,14 @@ def _add_openmaic_observer_trust_arguments(
     parser.add_argument("--openmaic-observer-id", required=required)
     parser.add_argument("--openmaic-observer-origin", required=required)
     parser.add_argument("--openmaic-shared-ingress-control-origin", required=required)
+    parser.add_argument("--openmaic-observer-public-key", type=Path, required=required)
+    parser.add_argument("--openmaic-observer-public-key-spki-sha256", required=required)
 
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
+    parser.add_argument("--receipt-recovery-root", type=Path)
+    parser.add_argument("--receipt-worker-uid", type=int)
     commands = parser.add_subparsers(dest="command", required=True)
 
     source_head = commands.add_parser("source-head")
@@ -6533,6 +8518,15 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         "--outage-docker-host-identity-sha256",
         required=True,
     )
+    openmaic_dedicated_plane.add_argument(
+        "--openmaic-observer-public-key",
+        type=Path,
+        required=True,
+    )
+    openmaic_dedicated_plane.add_argument(
+        "--openmaic-observer-public-key-spki-sha256",
+        required=True,
+    )
 
     gateway_only_public = commands.add_parser("gateway-only-public")
     gateway_only_public.add_argument("--candidate-root", type=Path, required=True)
@@ -6573,9 +8567,22 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     _add_common_receipt_arguments(produce)
     produce.add_argument("--evidence", choices=tuple(sorted(PROBE_RECIPES)), required=True)
     produce.add_argument("--bundle-root", type=Path, required=True)
-    produce.add_argument("--working-directory", type=Path, required=True)
     produce.add_argument("--timeout-seconds", type=int, required=True)
     produce.add_argument("--base-url", required=True)
+
+    commit_probe = commands.add_parser("commit-probe")
+    commit_probe.add_argument("--candidate-root", type=Path, required=True)
+    commit_probe.add_argument("--bundle-root", type=Path, required=True)
+    commit_probe.add_argument("--run-id", required=True)
+    commit_probe.add_argument("--environment-id", required=True)
+    commit_probe.add_argument("--evidence", choices=tuple(sorted(PROBE_RECIPES)), required=True)
+    commit_probe.add_argument("--receipt", type=Path, required=True)
+    commit_probe.add_argument("--supervisor-signature", type=Path, required=True)
+    commit_probe.add_argument("--supervisor-public-key", type=Path, required=True)
+    commit_probe.add_argument(
+        "--supervisor-public-key-spki-sha256",
+        required=True,
+    )
 
     assemble = commands.add_parser("assemble")
     assemble.add_argument("--output", type=Path, required=True)
@@ -6583,6 +8590,10 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     assemble.add_argument("--run-id", required=True)
     assemble.add_argument("--environment-id", required=True)
     assemble.add_argument("--receipt", action="append", required=True)
+    assemble.add_argument(
+        "--supervisor-public-key-spki-sha256",
+        required=True,
+    )
     assemble.add_argument("--outage-docker-host-identity-sha256")
     assemble.add_argument("--gateway-docker-host-identity-sha256")
     _add_gateway_trust_arguments(assemble, required=False)
@@ -6618,6 +8629,10 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
                 "--openmaic-shared-ingress-control-origin": (
                     args.openmaic_shared_ingress_control_origin
                 ),
+                "--openmaic-observer-public-key": args.openmaic_observer_public_key,
+                "--openmaic-observer-public-key-spki-sha256": (
+                    args.openmaic_observer_public_key_spki_sha256
+                ),
             }
             missing = [
                 option for option, value in required_observer_arguments.items() if value is None
@@ -6641,6 +8656,13 @@ def _receipt_paths(values: Sequence[str]) -> dict[str, Path]:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
+    with receipt_publication(
+        recovery_root=args.receipt_recovery_root, worker_uid=args.receipt_worker_uid
+    ):
+        return _dispatch_receipt_command(args)
+
+
+def _dispatch_receipt_command(args: argparse.Namespace) -> int:
     release_run = {
         "runId": args.run_id,
         "environmentId": args.environment_id,
@@ -6710,6 +8732,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             release_run=release_run,
             timeout_seconds=args.timeout_seconds,
             expected_outage_docker_host_identity_sha256=(args.outage_docker_host_identity_sha256),
+            observer_attestation_public_key_path=(args.openmaic_observer_public_key),
+            expected_observer_attestation_public_key_spki_sha256=(
+                args.openmaic_observer_public_key_spki_sha256
+            ),
         )
         print(args.bundle_root / "runtime" / "openmaic-dedicated-plane-attestation.json")
         return 0
@@ -6760,15 +8786,29 @@ def main(argv: Sequence[str] | None = None) -> int:
             raw_report_path=args.bundle_root / "raw" / f"{args.evidence}.json",
             execution_record_path=args.bundle_root / "executions" / f"{args.evidence}.json",
             recipe=recipe,
-            working_directory=args.working_directory,
+            working_directory=PROJECT_ROOT,
             timeout_seconds=args.timeout_seconds,
         )
+    elif args.command == "commit-probe":
+        marker = write_probe_final_commit_marker(
+            candidate_root=args.candidate_root,
+            bundle_root=args.bundle_root,
+            release_run=release_run,
+            evidence=args.evidence,
+            receipt_path=args.receipt,
+            supervisor_signature_path=args.supervisor_signature,
+            supervisor_public_key_path=args.supervisor_public_key,
+            expected_supervisor_public_key_spki_sha256=(args.supervisor_public_key_spki_sha256),
+        )
+        print(marker)
+        return 0
     else:
         receipt_paths = _receipt_paths(args.receipt)
         assemble_arguments: dict[str, object] = {
             "candidate_root": args.candidate_root,
             "release_run": release_run,
             "receipt_paths": receipt_paths,
+            "expected_supervisor_public_key_spki_sha256": (args.supervisor_public_key_spki_sha256),
         }
         if args.outage_docker_host_identity_sha256 is not None:
             assemble_arguments["expected_outage_docker_host_identity_sha256"] = (
@@ -6798,6 +8838,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "expected_openmaic_observer_origin": args.openmaic_observer_origin,
                     "expected_openmaic_shared_ingress_control_origin": (
                         args.openmaic_shared_ingress_control_origin
+                    ),
+                    "openmaic_observer_public_key_path": (args.openmaic_observer_public_key),
+                    "expected_openmaic_observer_public_key_spki_sha256": (
+                        args.openmaic_observer_public_key_spki_sha256
                     ),
                 }
             )

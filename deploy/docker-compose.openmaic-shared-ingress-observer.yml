@@ -1,0 +1,176 @@
+services:
+  deeptutor:
+    environment:
+      YFEISTAI_SHARED_INGRESS_CANDIDATE_HEALTH_TOKEN_FILE: /run/secrets/openmaic-observer-health-token
+      YFEISTAI_CANDIDATE_SHA256: "${YFEISTAI_CANDIDATE_SHA256:?set candidate SHA-256}"
+    secrets:
+      - source: openmaic_observer_health_token
+        target: openmaic-observer-health-token
+        uid: "1000"
+        gid: "1000"
+        mode: 0400
+
+  openmaic-shared-ingress-observer:
+    image: "${YFEISTAI_OBSERVER_SIGNER_IMAGE:?set the immutable observer signer image reference}"
+    restart: "no"
+    scale: 1
+    user: "1000:1000"
+    entrypoint:
+      - /bin/sh
+      - -ec
+    command:
+      - |
+        python scripts/openmaic_observer_service.py \
+          --write-attestation /run/yfeistai-observer/openmaic-shared-ingress-observer-attestation.json
+        exec python -m uvicorn scripts.openmaic_observer_service:create_app \
+          --factory --host 0.0.0.0 --port 8000
+    environment:
+      YFEISTAI_RELEASE_RUN_ID: "${YFEISTAI_RELEASE_RUN_ID:?set release run id}"
+      YFEISTAI_ENVIRONMENT_ID: "${YFEISTAI_ENVIRONMENT_ID:?set environment id}"
+      YFEISTAI_SHARED_INGRESS_OBSERVER_ID: "${YFEISTAI_SHARED_INGRESS_OBSERVER_ID:?set observer id}"
+      YFEISTAI_SHARED_INGRESS_OBSERVER_URL: "${YFEISTAI_SHARED_INGRESS_OBSERVER_URL:?set observer URL}"
+      YFEISTAI_SHARED_INGRESS_CONTROL_URL: "${YFEISTAI_SHARED_INGRESS_CONTROL_URL:?set control URL}"
+      YFEISTAI_SHARED_INGRESS_UPSTREAM_URL: "${YFEISTAI_SHARED_INGRESS_UPSTREAM_URL:?set upstream URL}"
+      YFEISTAI_SHARED_INGRESS_INTERNAL_PROXY_URL: http://openmaic-shared-ingress-observer:8000
+      YFEISTAI_SHARED_INGRESS_CANDIDATE_HEALTH_URL: "${YFEISTAI_SHARED_INGRESS_CANDIDATE_HEALTH_URL:?set candidate health URL}"
+      YFEISTAI_SHARED_INGRESS_AUTH_EXPIRES_AT: "${YFEISTAI_SHARED_INGRESS_AUTH_EXPIRES_AT:?set observer auth expiry}"
+      YFEISTAI_CANDIDATE_SHA256: "${YFEISTAI_CANDIDATE_SHA256:?set candidate SHA-256}"
+      YFEISTAI_IMAGE_LOCK_SHA256: "${YFEISTAI_IMAGE_LOCK_SHA256:?set image-lock SHA-256}"
+      YFEISTAI_OBSERVER_PUBLIC_KEY_SPKI_SHA256: "${YFEISTAI_OBSERVER_PUBLIC_KEY_SPKI_SHA256:?set observer public key SPKI SHA-256}"
+      YFEISTAI_SHARED_INGRESS_AUTH_TOKEN_FILE: /run/secrets/openmaic-observer-auth-token
+      YFEISTAI_SHARED_INGRESS_CANDIDATE_HEALTH_TOKEN_FILE: /run/secrets/openmaic-observer-health-token
+    secrets:
+      - source: openmaic_observer_auth_token
+        target: openmaic-observer-auth-token
+        uid: "1000"
+        gid: "1000"
+        mode: 0400
+      - source: openmaic_observer_health_token
+        target: openmaic-observer-health-token
+        uid: "1000"
+        gid: "1000"
+        mode: 0400
+    volumes:
+      - type: bind
+        source: "${YFEISTAI_OBSERVER_ATTESTATION_DIR:?set observer attestation directory}"
+        target: /run/yfeistai-observer
+    networks:
+      - platform-internal
+      - platform-service-egress
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import http.client;
+          connection = http.client.HTTPConnection(
+          "openmaic-shared-ingress-observer", 8000, timeout=2);
+          connection.request("GET", "/healthz"); response = connection.getresponse();
+          raise SystemExit(0 if response.status == 200 else 1)
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+    depends_on:
+      openmaic:
+        condition: service_healthy
+
+  openmaic-observer-attestation-signer:
+    image: "${YFEISTAI_OBSERVER_SIGNER_IMAGE:?set the immutable observer signer image reference}"
+    restart: "no"
+    user: "1000:1000"
+    network_mode: none
+    entrypoint:
+      - python
+    command:
+      - scripts/openmaic_observer_attestation_signer.py
+      - --attestation
+      - /run/yfeistai-observer/openmaic-shared-ingress-observer-attestation.json
+      - --signature
+      - /run/yfeistai-observer/openmaic-shared-ingress-observer-attestation.sig
+      - --signing-key-file
+      - /run/secrets/openmaic-observer-attestation-signing-key
+      - --wait-timeout-seconds
+      - "120"
+      - --expected-release-run-id
+      - "${YFEISTAI_RELEASE_RUN_ID:?set release run id}"
+      - --expected-environment-id
+      - "${YFEISTAI_ENVIRONMENT_ID:?set environment id}"
+      - --expected-observer-id
+      - "${YFEISTAI_SHARED_INGRESS_OBSERVER_ID:?set observer id}"
+      - --expected-candidate-health-url
+      - "${YFEISTAI_SHARED_INGRESS_CANDIDATE_HEALTH_URL:?set candidate health URL}"
+      - --expected-candidate-sha256
+      - "${YFEISTAI_CANDIDATE_SHA256:?set candidate SHA-256}"
+      - --expected-image-lock-sha256
+      - "${YFEISTAI_IMAGE_LOCK_SHA256:?set image-lock SHA-256}"
+      - --expected-public-key-spki-sha256
+      - "${YFEISTAI_OBSERVER_PUBLIC_KEY_SPKI_SHA256:?set observer public key SPKI SHA-256}"
+    secrets:
+      - source: openmaic_observer_attestation_signing_key
+        target: openmaic-observer-attestation-signing-key
+        uid: "1000"
+        gid: "1000"
+        mode: 0400
+    volumes:
+      - type: bind
+        source: "${YFEISTAI_OBSERVER_ATTESTATION_DIR:?set observer attestation directory}"
+        target: /run/yfeistai-observer
+    depends_on:
+      openmaic-shared-ingress-observer:
+        condition: service_healthy
+
+  shared-data-plane-bootstrap:
+    command:
+      - scripts/bootstrap_shared_data_plane.py
+      - --base-url
+      - http://openmaic-shared-ingress-observer:8000
+      - --observer-attestation
+      - /run/yfeistai-observer/openmaic-shared-ingress-observer-attestation.json
+      - --observer-attestation-signature
+      - /run/yfeistai-observer/openmaic-shared-ingress-observer-attestation.sig
+      - --observer-attestation-public-key
+      - /run/secrets/openmaic-observer-attestation-public-key
+      - --observer-attestation-public-key-spki-sha256
+      - "${YFEISTAI_OBSERVER_PUBLIC_KEY_SPKI_SHA256:?set observer public key SPKI SHA-256}"
+      - --candidate-root
+      - /run/yfeistai-candidate
+      - --release-run-id
+      - "${YFEISTAI_RELEASE_RUN_ID:?set release run id}"
+      - --environment-id
+      - "${YFEISTAI_ENVIRONMENT_ID:?set environment id}"
+    environment:
+      YFEISTAI_SHARED_INGRESS_OBSERVER_ATTESTATION_SIGNATURE_PATH: /run/yfeistai-observer/openmaic-shared-ingress-observer-attestation.sig
+      YFEISTAI_SHARED_INGRESS_OBSERVER_PUBLIC_KEY_PATH: /run/secrets/openmaic-observer-attestation-public-key
+      YFEISTAI_SHARED_INGRESS_OBSERVER_PUBLIC_KEY_SPKI_SHA256: "${YFEISTAI_OBSERVER_PUBLIC_KEY_SPKI_SHA256:?set observer public key SPKI SHA-256}"
+    secrets:
+      - source: openmaic_observer_attestation_public_key
+        target: openmaic-observer-attestation-public-key
+        uid: "1000"
+        gid: "1000"
+        mode: 0400
+    volumes:
+      - type: bind
+        source: "${YFEISTAI_OBSERVER_ATTESTATION_DIR:?set observer attestation directory}"
+        target: /run/yfeistai-observer
+        read_only: true
+      - type: bind
+        source: "${YFEISTAI_CANDIDATE_ROOT:?set candidate root}"
+        target: /run/yfeistai-candidate
+        read_only: true
+    depends_on:
+      openmaic-shared-ingress-observer:
+        condition: service_healthy
+      openmaic-observer-attestation-signer:
+        condition: service_completed_successfully
+
+secrets:
+  openmaic_observer_auth_token:
+    file: "${YFEISTAI_OBSERVER_SECRET_DIR:?set observer secret directory}/${YFEISTAI_RELEASE_RUN_ID:?set release run id}/observer-auth.token"
+  openmaic_observer_health_token:
+    file: "${YFEISTAI_OBSERVER_SECRET_DIR:?set observer secret directory}/${YFEISTAI_RELEASE_RUN_ID:?set release run id}/candidate-health.token"
+  openmaic_observer_attestation_signing_key:
+    file: "${YFEISTAI_OBSERVER_SECRET_DIR:?set observer secret directory}/${YFEISTAI_RELEASE_RUN_ID:?set release run id}/attestation-signing-key.pem"
+  openmaic_observer_attestation_public_key:
+    file: "${YFEISTAI_OBSERVER_TRUST_ROOT:?set observer trust root}/openmaic-observer-attestation-public-key.pem"

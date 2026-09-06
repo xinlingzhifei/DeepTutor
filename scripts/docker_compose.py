@@ -9,6 +9,7 @@ does not read or migrate the project-root ``.env`` file.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import hashlib
 import importlib.util
 import json
@@ -16,6 +17,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import sys
 from typing import Any
@@ -35,6 +37,303 @@ _PRODUCTION_TOPOLOGY_OPTIONS = (
     "--project-directory",
     "--project-name",
 )
+_OBSERVER_RUNTIME_ENVIRONMENT = (
+    "YFEISTAI_OBSERVER_SECRET_DIR",
+    "YFEISTAI_RELEASE_RUN_ID",
+    "YFEISTAI_OBSERVER_ATTESTATION_DIR",
+    "YFEISTAI_OBSERVER_TRUST_ROOT",
+    "YFEISTAI_OBSERVER_PUBLIC_KEY_SPKI_SHA256",
+    "YFEISTAI_CANDIDATE_SHA256",
+    "YFEISTAI_IMAGE_LOCK_SHA256",
+    "YFEISTAI_OBSERVER_SIGNER_IMAGE",
+    "YFEISTAI_ENVIRONMENT_ID",
+    "YFEISTAI_SHARED_INGRESS_OBSERVER_ID",
+    "YFEISTAI_SHARED_INGRESS_OBSERVER_URL",
+    "YFEISTAI_SHARED_INGRESS_CONTROL_URL",
+    "YFEISTAI_SHARED_INGRESS_UPSTREAM_URL",
+    "YFEISTAI_SHARED_INGRESS_CANDIDATE_HEALTH_URL",
+    "YFEISTAI_SHARED_INGRESS_AUTH_EXPIRES_AT",
+)
+
+
+def _assert_no_link_ancestors(path: Path) -> None:
+    absolute_path = Path(os.path.abspath(path))
+    current = Path(absolute_path.anchor)
+    for part in absolute_path.parts[1:]:
+        current /= part
+        try:
+            details = os.lstat(current)
+        except OSError as exc:
+            raise OSError(f"production Compose path could not be inspected: {current}") from exc
+        attributes = int(getattr(details, "st_file_attributes", 0))
+        if stat.S_ISLNK(details.st_mode) or attributes & 0x00000400:
+            raise RuntimeError(
+                f"production Compose path contains a link or reparse point: {current}"
+            )
+
+
+def _windows_file_api() -> tuple[Any, ...]:
+    import ctypes
+    from ctypes import wintypes
+
+    class _ByHandleFileInformation(ctypes.Structure):
+        _fields_ = (
+            ("file_attributes", wintypes.DWORD),
+            ("creation_time", wintypes.FILETIME),
+            ("last_access_time", wintypes.FILETIME),
+            ("last_write_time", wintypes.FILETIME),
+            ("volume_serial_number", wintypes.DWORD),
+            ("file_size_high", wintypes.DWORD),
+            ("file_size_low", wintypes.DWORD),
+            ("number_of_links", wintypes.DWORD),
+            ("file_index_high", wintypes.DWORD),
+            ("file_index_low", wintypes.DWORD),
+        )
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    read_file = kernel32.ReadFile
+    read_file.argtypes = (
+        wintypes.HANDLE,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.LPVOID,
+    )
+    read_file.restype = wintypes.BOOL
+    get_file_information = kernel32.GetFileInformationByHandle
+    get_file_information.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(_ByHandleFileInformation),
+    )
+    get_file_information.restype = wintypes.BOOL
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    return (
+        ctypes,
+        wintypes,
+        _ByHandleFileInformation,
+        create_file,
+        read_file,
+        get_file_information,
+        close_handle,
+    )
+
+
+def _open_windows_read_handle(path: Path) -> Any:
+    ctypes, wintypes, _info, create_file, _read, _get_info, _close = _windows_file_api()
+    handle = create_file(
+        str(path),
+        0x80000000,  # GENERIC_READ
+        0x00000001,  # FILE_SHARE_READ; deny write and delete sharing
+        None,
+        3,  # OPEN_EXISTING
+        0x00000080 | 0x00200000,  # FILE_ATTRIBUTE_NORMAL | OPEN_REPARSE_POINT
+        None,
+    )
+    invalid_handle = wintypes.HANDLE(-1).value
+    if handle in (None, invalid_handle):
+        error = ctypes.get_last_error()
+        raise OSError(error, ctypes.FormatError(error), str(path))
+    return handle
+
+
+def _checked_close_windows_handle(handle: Any, path: Path) -> None:
+    ctypes, _wintypes, _info, _create, _read, _get_info, close_handle = _windows_file_api()
+    if not close_handle(handle):
+        error = ctypes.get_last_error()
+        raise OSError(error, ctypes.FormatError(error), str(path))
+
+
+def _windows_handle_identity(handle: Any, path: Path) -> tuple[int, int, int]:
+    ctypes, _wintypes, information_type, _create, _read, get_info, _close = _windows_file_api()
+    information = information_type()
+    if not get_info(handle, ctypes.byref(information)):
+        error = ctypes.get_last_error()
+        raise OSError(error, ctypes.FormatError(error), str(path))
+    if information.file_attributes & (0x00000010 | 0x00000400):
+        raise RuntimeError(f"production Compose artifact is not a regular file: {path.name}")
+    file_index = (int(information.file_index_high) << 32) | int(information.file_index_low)
+    file_size = (int(information.file_size_high) << 32) | int(information.file_size_low)
+    return int(information.volume_serial_number), file_index, file_size
+
+
+def _read_windows_handle(handle: Any, path: Path) -> bytes:
+    ctypes, wintypes, _info, _create, read_file, _get_info, _close = _windows_file_api()
+    chunks: list[bytes] = []
+    while True:
+        buffer = ctypes.create_string_buffer(1024 * 1024)
+        read_count = wintypes.DWORD()
+        if not read_file(handle, buffer, len(buffer), ctypes.byref(read_count), None):
+            error = ctypes.get_last_error()
+            raise OSError(error, ctypes.FormatError(error), str(path))
+        if read_count.value == 0:
+            return b"".join(chunks)
+        chunks.append(buffer.raw[: read_count.value])
+
+
+def _windows_path_identity(path: Path) -> tuple[int, int, int]:
+    handle = _open_windows_read_handle(path)
+    error: BaseException | None = None
+    identity: tuple[int, int, int] | None = None
+    try:
+        identity = _windows_handle_identity(handle, path)
+    except BaseException as exc:
+        error = exc
+    try:
+        _checked_close_windows_handle(handle, path)
+    except BaseException as close_error:
+        if error is not None:
+            raise BaseExceptionGroup(
+                "Windows Compose identity and handle cleanup both failed",
+                [error, close_error],
+            ) from None
+        raise
+    if error is not None:
+        raise error.with_traceback(error.__traceback__)
+    assert identity is not None
+    return identity
+
+
+class _ComposeArtifactLease:
+    """Keep one verified artifact immutable and readable through Compose execution."""
+
+    def __init__(
+        self,
+        *,
+        original_path: Path,
+        execution_path: Path,
+        content: bytes,
+        close: Any,
+        assert_unchanged: Any | None = None,
+    ) -> None:
+        self.original_path = original_path
+        self.execution_path = execution_path
+        self.content = content
+        self._close = close
+        self._assert_unchanged = assert_unchanged
+
+    @classmethod
+    def acquire(cls, path: Path) -> _ComposeArtifactLease:
+        absolute_path = Path(os.path.abspath(path))
+        _assert_no_link_ancestors(absolute_path)
+        if os.name == "nt":
+            return cls._acquire_windows(absolute_path)
+        if os.name == "posix":
+            return cls._acquire_linux_snapshot(absolute_path)
+        raise RuntimeError("production Compose execution leases are unsupported")
+
+    @classmethod
+    def _acquire_windows(cls, path: Path) -> _ComposeArtifactLease:
+        handle = _open_windows_read_handle(path)
+        try:
+            identity = _windows_handle_identity(handle, path)
+            content = _read_windows_handle(handle, path)
+            if len(content) != identity[2]:
+                raise RuntimeError(
+                    f"production Compose artifact size changed while leased: {path.name}"
+                )
+        except BaseException as exc:
+            try:
+                _checked_close_windows_handle(handle, path)
+            except BaseException as close_error:
+                raise BaseExceptionGroup(
+                    "Windows Compose acquisition and handle cleanup both failed",
+                    [exc, close_error],
+                ) from None
+            raise
+
+        def assert_unchanged() -> None:
+            _assert_no_link_ancestors(path)
+            if _windows_path_identity(path) != identity:
+                raise RuntimeError(
+                    f"production Compose artifact identity changed while leased: {path.name}"
+                )
+
+        return cls(
+            original_path=path,
+            execution_path=path,
+            content=content,
+            close=lambda: _checked_close_windows_handle(handle, path),
+            assert_unchanged=assert_unchanged,
+        )
+
+    @classmethod
+    def _acquire_linux_snapshot(cls, path: Path) -> _ComposeArtifactLease:
+        if not hasattr(os, "memfd_create") or not Path("/proc/self/fd").is_dir():
+            raise RuntimeError("production Compose execution leases require Linux procfs")
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        source_fd = os.open(path, flags)
+        try:
+            if not stat.S_ISREG(os.fstat(source_fd).st_mode):
+                raise RuntimeError(f"production Compose artifact is not a file: {path.name}")
+            chunks: list[bytes] = []
+            while chunk := os.read(source_fd, 1024 * 1024):
+                chunks.append(chunk)
+            content = b"".join(chunks)
+        finally:
+            os.close(source_fd)
+
+        import fcntl
+
+        snapshot_fd = os.memfd_create(
+            f"yfeistai-{path.name}",
+            getattr(os, "MFD_CLOEXEC", 0) | getattr(os, "MFD_ALLOW_SEALING", 0),
+        )
+        try:
+            remaining = memoryview(content)
+            while remaining:
+                written = os.write(snapshot_fd, remaining)
+                if written <= 0:
+                    raise OSError("production Compose snapshot write was incomplete")
+                remaining = remaining[written:]
+            os.lseek(snapshot_fd, 0, os.SEEK_SET)
+            required_seals = (
+                fcntl.F_SEAL_SEAL | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_WRITE
+            )
+            fcntl.fcntl(snapshot_fd, fcntl.F_ADD_SEALS, required_seals)
+            applied_seals = fcntl.fcntl(snapshot_fd, fcntl.F_GET_SEALS)
+            if applied_seals & required_seals != required_seals:
+                raise RuntimeError("production Compose snapshot could not be sealed")
+            execution_path = Path(f"/proc/{os.getpid()}/fd/{snapshot_fd}")
+            if execution_path.read_bytes() != content:
+                raise RuntimeError("production Compose snapshot could not be verified")
+        except BaseException:
+            os.close(snapshot_fd)
+            raise
+
+        def assert_unchanged() -> None:
+            if execution_path.read_bytes() != content:
+                raise RuntimeError(f"production Compose snapshot changed while leased: {path.name}")
+
+        return cls(
+            original_path=path,
+            execution_path=execution_path,
+            content=content,
+            close=lambda: os.close(snapshot_fd),
+            assert_unchanged=assert_unchanged,
+        )
+
+    def assert_unchanged(self) -> None:
+        if self._assert_unchanged is not None:
+            self._assert_unchanged()
+
+    def close(self) -> None:
+        close = self._close
+        if close is not None:
+            close()
+            self._close = None
 
 
 def _load_platform_renderer() -> Any:
@@ -54,9 +353,106 @@ def _load_platform_renderer() -> Any:
     return module
 
 
+def _load_neighbor_script(file_name: str, module_name: str, error_message: str) -> Any:
+    module_path = Path(__file__).resolve().with_name(file_name)
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(error_message)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.modules.pop(spec.name, None)
+    return module
+
+
 def _candidate_paths(candidate_root: Path) -> Any:
     renderer = _load_platform_renderer()
     return renderer.candidate_artifact_paths(candidate_root)
+
+
+def _path_key(path: Path | str) -> str:
+    return os.path.normcase(os.path.abspath(path))
+
+
+def _close_artifact_leases(leases: dict[str, Any]) -> None:
+    errors: list[BaseException] = []
+    for lease in reversed(tuple(leases.values())):
+        try:
+            lease.close()
+        except BaseException as exc:
+            errors.append(exc)
+    if errors:
+        raise BaseExceptionGroup("production Compose lease cleanup failed", errors)
+
+
+@contextmanager
+def _production_artifact_leases(
+    *,
+    platform: bool,
+    data_plane: str | None,
+    candidate_root: Path,
+):
+    if not platform and data_plane is None:
+        yield {}
+        return
+    _assert_no_link_ancestors(candidate_root)
+    renderer = _load_platform_renderer()
+    with renderer.validated_candidate_artifact_lease(candidate_root) as artifact:
+        artifacts = artifact.paths
+        required_paths = [
+            artifacts.image_lock,
+            artifacts.base_compose,
+            artifacts.platform_compose,
+            artifacts.data_plane_compose,
+            artifacts.observer_overlay,
+        ]
+        if platform:
+            required_paths.append(PROJECT_ROOT / "docker-compose.yml")
+        expected_candidate_bytes = {
+            _path_key(artifacts.image_lock): artifact.image_lock_bytes,
+            **{_path_key(path): content for path, content in artifact.compose_bytes},
+        }
+        leases: dict[str, _ComposeArtifactLease] = {}
+        body_error: BaseException | None = None
+        try:
+            for path in required_paths:
+                key = _path_key(path)
+                if key not in leases:
+                    leases[key] = _ComposeArtifactLease.acquire(path)
+            for key, expected in expected_candidate_bytes.items():
+                if key not in leases or leases[key].content != expected:
+                    raise RuntimeError(
+                        "production candidate artifact changed between validation and execution lease"
+                    )
+            yield leases
+        except BaseException as exc:
+            body_error = exc
+        cleanup_error: BaseException | None = None
+        try:
+            _close_artifact_leases(leases)
+        except BaseException as exc:
+            cleanup_error = exc
+        if body_error is not None:
+            if cleanup_error is not None:
+                raise BaseExceptionGroup(
+                    "production Compose execution and lease cleanup both failed",
+                    [body_error, cleanup_error],
+                ) from None
+            raise body_error.with_traceback(body_error.__traceback__)
+        if cleanup_error is not None:
+            raise cleanup_error.with_traceback(cleanup_error.__traceback__)
+
+
+def _lease_for(
+    leases: dict[str, _ComposeArtifactLease],
+    path: Path,
+) -> _ComposeArtifactLease:
+    try:
+        return leases[_path_key(path)]
+    except KeyError as exc:
+        raise RuntimeError(f"production Compose artifact was not leased: {path.name}") from exc
 
 
 def platform_compose_topology_arguments(
@@ -80,20 +476,184 @@ def platform_compose_topology_arguments(
         str(candidate / "docker-compose.yml"),
         "-f",
         str(artifacts.platform_compose),
+        "-f",
+        str(artifacts.observer_overlay),
     ]
 
 
-def _validate_production_image_lock(candidate_root: Path) -> None:
+def _validate_production_image_lock(
+    candidate_root: Path,
+    leases: dict[str, _ComposeArtifactLease] | None = None,
+) -> None:
     renderer = _load_platform_renderer()
     paths = renderer.candidate_artifact_paths(candidate_root)
-    renderer.validate_image_lock_bindings(
-        paths.image_lock,
-        require_candidate=True,
-        compose_paths=(
-            paths.platform_compose,
-            paths.data_plane_compose,
-        ),
+    compose_paths = (
+        paths.base_compose,
+        paths.platform_compose,
+        paths.data_plane_compose,
+        paths.observer_overlay,
     )
+    if leases is None:
+        renderer.validate_image_lock_bindings(
+            paths.image_lock,
+            require_candidate=True,
+            compose_paths=compose_paths,
+        )
+        return
+
+    lock = renderer.load_image_lock_bytes(
+        _lease_for(leases, paths.image_lock).content,
+        require_candidate=True,
+    )
+    images = lock["images"]
+    support_images = lock["supportImages"]
+    for compose_path in compose_paths:
+        template_path = (
+            renderer.PROJECT_ROOT / "deploy" / compose_path.name
+            if compose_path.name == "docker-compose.openmaic-shared-ingress-observer.yml"
+            else renderer.PROJECT_ROOT / compose_path.name
+        )
+        try:
+            current = _lease_for(leases, compose_path).content.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(
+                f"production Compose file could not be read: {compose_path.name}"
+            ) from exc
+        expected = renderer._render_compose_references(
+            template_path,
+            images,
+            support_images,
+        )
+        if current != expected:
+            raise ValueError("production Compose image references do not match image lock")
+
+
+def _observer_release_file_snapshot(admission: dict[str, object]) -> tuple[tuple[str, str], ...]:
+    paths = admission.get("paths")
+    required = (
+        "observerAuthToken",
+        "candidateHealthToken",
+        "attestationSigningKey",
+        "attestationPublicKey",
+    )
+    if not isinstance(paths, dict):
+        raise ValueError("observer release manifest paths are invalid")
+    snapshot: list[tuple[str, str]] = []
+    for name in required:
+        raw_path = paths.get(name)
+        if not isinstance(raw_path, str) or not Path(raw_path).is_absolute():
+            raise ValueError("observer release manifest paths are invalid")
+        lease = _ComposeArtifactLease.acquire(Path(raw_path))
+        try:
+            if not lease.content or len(lease.content) > 1024 * 1024:
+                raise ValueError("observer release file is invalid")
+            snapshot.append((name, hashlib.sha256(lease.content).hexdigest()))
+        finally:
+            lease.close()
+    return tuple(snapshot)
+
+
+def _load_observer_release_admission(
+    *,
+    manifest_path: Path,
+    candidate_root: Path,
+    leases: dict[str, _ComposeArtifactLease],
+) -> dict[str, object]:
+    renderer = _load_platform_renderer()
+    artifact_paths = renderer.candidate_artifact_paths(candidate_root)
+    image_lock_bytes = _lease_for(leases, artifact_paths.image_lock).content
+    try:
+        return load_observer_release_admission(
+            manifest_path=manifest_path,
+            candidate_root=candidate_root,
+            image_lock_bytes=image_lock_bytes,
+        )
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise SystemExit("observer release manifest is unavailable or invalid") from exc
+
+
+def load_observer_release_admission(
+    *,
+    manifest_path: Path,
+    candidate_root: Path,
+    image_lock_bytes: bytes,
+) -> dict[str, object]:
+    """Bind launcher or host preflight admission to already-leased candidate bytes."""
+    renderer = _load_platform_renderer()
+    lock = renderer.load_image_lock_bytes(
+        image_lock_bytes,
+        require_candidate=True,
+    )
+    signer = lock["supportImages"]["observer_signer"]["reference"]
+    if not isinstance(signer, str):
+        raise ValueError("observer signer image is unavailable")
+    provisioner = _load_neighbor_script(
+        "provision_openmaic_observer_secrets.py",
+        "_yfeistai_provision_openmaic_observer_secrets",
+        "observer release manifest consumer could not be loaded",
+    )
+    preflight = _load_neighbor_script(
+        "platform_preflight.py",
+        "_yfeistai_platform_preflight_for_observer_admission",
+        "observer release preflight could not be loaded",
+    )
+
+    def validate_release() -> tuple[dict[str, object], object, tuple[tuple[str, str], ...]]:
+        current_admission = provisioner.load_committed_observer_release_manifest(
+            manifest_path=manifest_path,
+            candidate_root=candidate_root,
+            observer_signer_image=signer,
+            image_lock_bytes=image_lock_bytes,
+        )
+        inputs = current_admission["platformPreflightInputs"]
+        errors, current_proof = preflight._inspect_observer_secret_preflight(
+            Path(inputs["observer_secret_dir"]),
+            inputs["release_run_id"],
+            inputs["observer_signer_image"],
+        )
+        if errors or current_proof is None:
+            raise ValueError("observer release manifest preflight failed")
+        return current_admission, current_proof, _observer_release_file_snapshot(current_admission)
+
+    admission, proof, release_file_snapshot = validate_release()
+
+    baseline_admission = dict(admission)
+    baseline_proof = proof
+    baseline_release_file_snapshot = release_file_snapshot
+
+    def revalidate() -> None:
+        try:
+            current_admission, current_proof, current_release_file_snapshot = validate_release()
+        except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+            raise ValueError("observer release files changed after admission") from None
+        if (
+            current_admission != baseline_admission
+            or current_proof != baseline_proof
+            or current_release_file_snapshot != baseline_release_file_snapshot
+        ):
+            raise ValueError("observer release files changed after admission")
+
+    admission["observerSecretPreflight"] = proof
+    admission["_revalidate"] = revalidate
+    return admission
+
+
+def _bind_compose_command_to_leases(
+    command: list[str],
+    leases: dict[str, _ComposeArtifactLease],
+) -> list[str]:
+    bound_command = list(command)
+    compose_count = 0
+    for index, argument in enumerate(bound_command[:-1]):
+        if argument != "-f":
+            continue
+        compose_path = Path(bound_command[index + 1])
+        lease = _lease_for(leases, compose_path)
+        bound_command[index + 1] = str(lease.execution_path)
+        compose_count += 1
+    if compose_count == 0:
+        raise RuntimeError("production Compose command has no leased files")
+    return bound_command
 
 
 def _read_json_object(path: Path) -> dict[str, Any]:
@@ -310,7 +870,7 @@ def _parse_topology_args(
             candidate_root = Path(args[index + 1])
             if not candidate_root.is_absolute():
                 raise SystemExit("--candidate-root must be an absolute path")
-            candidate_root = candidate_root.resolve()
+            candidate_root = Path(os.path.abspath(candidate_root))
             index += 2
             continue
         compose_args.append(argument)
@@ -326,6 +886,39 @@ def _parse_topology_args(
             compose_args=compose_args,
         )
     return platform, data_plane, candidate_root, compose_args
+
+
+def _extract_observer_release_manifest(
+    args: list[str],
+) -> tuple[Path | None, list[str]]:
+    manifest: Path | None = None
+    compose_args: list[str] = []
+    index = 0
+    while index < len(args):
+        argument = args[index]
+        value: str | None = None
+        if argument == "--observer-release-manifest":
+            if index + 1 >= len(args):
+                raise SystemExit("--observer-release-manifest requires a value")
+            value = args[index + 1]
+            index += 2
+        elif argument.startswith("--observer-release-manifest="):
+            value = argument.partition("=")[2]
+            index += 1
+        else:
+            compose_args.append(argument)
+            index += 1
+            continue
+        if manifest is not None:
+            raise SystemExit("--observer-release-manifest may only be provided once")
+        manifest = Path(value)
+    if manifest is None:
+        environment_value = os.environ.get("YFEISTAI_OBSERVER_RELEASE_MANIFEST")
+        if environment_value:
+            manifest = Path(environment_value)
+    if manifest is not None and not manifest.is_absolute():
+        raise SystemExit("observer release manifest path must be absolute")
+    return manifest, compose_args
 
 
 def _validate_production_compose_args(
@@ -348,6 +941,8 @@ def _validate_production_compose_args(
                 argument == option or argument.startswith(f"{option}=")
                 for option in _PRODUCTION_TOPOLOGY_OPTIONS
             )
+            or argument == "--scale"
+            or argument.startswith("--scale=")
         ):
             raise SystemExit("production Compose topology overrides are not allowed")
         if argument == "--profile":
@@ -403,36 +998,84 @@ def main(argv: list[str] | None = None) -> int:
     if not args:
         args = ["up", "-d"]
 
+    observer_manifest, args = _extract_observer_release_manifest(args)
     platform, data_plane, candidate_root, _ = _parse_topology_args(args)
-    if platform or data_plane is not None:
-        _validate_production_image_lock(candidate_root or PROJECT_ROOT)
-    values = render_docker_env(data_plane=data_plane)
-    print(
-        "Docker settings: "
-        f"backend={values['DEEPTUTOR_DOCKER_BACKEND_PORT']} "
-        f"frontend={values['DEEPTUTOR_DOCKER_FRONTEND_PORT']} "
-        f"pocketbase={values['DEEPTUTOR_DOCKER_POCKETBASE_PORT']}",
-        file=sys.stderr,
-    )
+    if platform and observer_manifest is None:
+        raise SystemExit("a committed observer release manifest is required for platform Compose")
+    if not platform and observer_manifest is not None:
+        raise SystemExit("observer release manifest requires --platform")
+    production_root = candidate_root or PROJECT_ROOT
+    with _production_artifact_leases(
+        platform=platform,
+        data_plane=data_plane,
+        candidate_root=production_root,
+    ) as leases:
+        if platform or data_plane is not None:
+            _validate_production_image_lock(production_root, leases)
+        observer_admission: dict[str, object] | None = None
+        if platform:
+            assert observer_manifest is not None
+            observer_admission = _load_observer_release_admission(
+                manifest_path=observer_manifest,
+                candidate_root=production_root,
+                leases=leases,
+            )
+        values = render_docker_env(data_plane=data_plane)
+        print(
+            "Docker settings: "
+            f"backend={values['DEEPTUTOR_DOCKER_BACKEND_PORT']} "
+            f"frontend={values['DEEPTUTOR_DOCKER_FRONTEND_PORT']} "
+            f"pocketbase={values['DEEPTUTOR_DOCKER_POCKETBASE_PORT']}",
+            file=sys.stderr,
+        )
 
-    env = os.environ.copy()
-    # Keep Docker execution detached from host process overrides.
-    for key in (
-        "BACKEND_PORT",
-        "COMPOSE_FILE",
-        "COMPOSE_PROFILES",
-        "COMPOSE_PROJECT_NAME",
-        "FRONTEND_PORT",
-        "POCKETBASE_PORT",
-        "AUTH_ENABLED",
-        "POCKETBASE_URL",
-        "NEXT_PUBLIC_API_BASE",
-        "NEXT_PUBLIC_API_BASE_EXTERNAL",
-    ):
-        env.pop(key, None)
+        env = os.environ.copy()
+        # Keep Docker execution detached from host process overrides.
+        for key in (
+            "BACKEND_PORT",
+            "COMPOSE_FILE",
+            "COMPOSE_PROFILES",
+            "COMPOSE_PROJECT_NAME",
+            "FRONTEND_PORT",
+            "POCKETBASE_PORT",
+            "AUTH_ENABLED",
+            "POCKETBASE_URL",
+            "NEXT_PUBLIC_API_BASE",
+            "NEXT_PUBLIC_API_BASE_EXTERNAL",
+            "YFEISTAI_CANDIDATE_ROOT",
+            "YFEISTAI_OBSERVER_RELEASE_MANIFEST",
+            *_OBSERVER_RUNTIME_ENVIRONMENT,
+        ):
+            env.pop(key, None)
+        if platform or data_plane is not None:
+            env["YFEISTAI_CANDIDATE_ROOT"] = str(production_root)
+        if observer_admission is not None:
+            environment = observer_admission.get("environment")
+            if not isinstance(environment, dict) or set(environment) != set(
+                _OBSERVER_RUNTIME_ENVIRONMENT
+            ):
+                raise SystemExit("observer release manifest environment is invalid")
+            if any(not isinstance(value, str) or not value for value in environment.values()):
+                raise SystemExit("observer release manifest environment is invalid")
+            env.update(environment)
 
-    result = subprocess.run(_compose_command(args), cwd=str(PROJECT_ROOT), env=env, check=False)
-    return int(result.returncode)
+        command = _compose_command(args)
+        if leases:
+            command = _bind_compose_command_to_leases(command, leases)
+            for lease in leases.values():
+                lease.assert_unchanged()
+        if observer_admission is not None:
+            revalidate = observer_admission.get("_revalidate")
+            if not callable(revalidate):
+                raise SystemExit("observer release manifest revalidation is unavailable")
+            try:
+                revalidate()
+            except (KeyError, TypeError, ValueError) as exc:
+                raise SystemExit("observer release manifest changed before subprocess") from exc
+        result = subprocess.run(command, cwd=str(PROJECT_ROOT), env=env, check=False)
+        for lease in leases.values():
+            lease.assert_unchanged()
+        return int(result.returncode)
 
 
 if __name__ == "__main__":

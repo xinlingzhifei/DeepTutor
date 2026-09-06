@@ -54,6 +54,7 @@ policyVersion = 2
 releaseRunId
 environmentId
 evidenceName
+candidateSha256
 role
 platformAdminToken
 ```
@@ -90,7 +91,7 @@ display name, or an object from another tenant.
 `first-release-live` is a dedicated project with exactly one test file. Selecting
 that project or setting `YFEISTAI_EVIDENCE` makes live mode active. Live mode:
 
-- requires an absolute HTTP(S) `WEB_BASE_URL` with a hostname;
+- requires an absolute HTTPS `WEB_BASE_URL` with a hostname;
 - never falls back to `127.0.0.1`;
 - never starts the managed local mocked server;
 - runs one worker, fully serial, with zero retries;

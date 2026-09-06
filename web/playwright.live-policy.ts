@@ -10,6 +10,8 @@ const REQUIRED_BASE_URL_ERROR =
   "WEB_BASE_URL is required for live release evidence";
 const INVALID_BASE_URL_ERROR =
   "WEB_BASE_URL must identify a non-loopback HTTP(S) host";
+const INSECURE_BASE_URL_ERROR =
+  "WEB_BASE_URL must use HTTPS for live release evidence";
 
 export function isLivePlaywrightSelected(
   argv: readonly string[],
@@ -59,9 +61,14 @@ export function resolveLiveBaseUrl(
   if (
     (baseUrl.protocol !== "http:" && baseUrl.protocol !== "https:") ||
     !baseUrl.hostname ||
+    baseUrl.username !== "" ||
+    baseUrl.password !== "" ||
     isLoopbackHostname(baseUrl.hostname)
   ) {
     throw new Error(INVALID_BASE_URL_ERROR);
   }
-  return baseUrl.toString();
+  if (baseUrl.protocol !== "https:") {
+    throw new Error(INSECURE_BASE_URL_ERROR);
+  }
+  return baseUrl.origin;
 }

@@ -38,7 +38,9 @@ from classroom_export_contract import (  # noqa: E402
     canonical_classroom_export_report,
     derive_classroom_export_checks,
 )
-from render_platform_compose import validate_image_lock_bindings  # noqa: E402
+from render_platform_compose import (  # noqa: E402
+    validated_candidate_artifact_lease,
+)
 
 _PUBLIC_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -168,18 +170,8 @@ CandidateLoader = Any
 
 
 def _default_candidate_loader(candidate_root: Path) -> dict[str, object]:
-    lock = validate_image_lock_bindings(
-        candidate_root / "deploy" / "image-lock.json",
-        compose_paths=(
-            candidate_root / "docker-compose.platform.yml",
-            candidate_root / "docker-compose.data-plane.yml",
-        ),
-        require_candidate=True,
-    )
-    candidate = lock.get("candidate")
-    if not isinstance(candidate, dict):
-        raise ExportProbeError("candidate_invalid")
-    return json.loads(json.dumps(candidate))
+    with validated_candidate_artifact_lease(candidate_root) as artifact:
+        return json.loads(json.dumps(artifact.candidate))
 
 
 def _valid_base_url(value: object) -> bool:
@@ -1750,7 +1742,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         _parse_args(argv)
         config = _load_config(os.environ, cwd=Path.cwd())
-        body = asyncio.run(_run_export_probe(config))
+        operation_failed = False
+        try:
+            with validated_candidate_artifact_lease(
+                config.candidate_root,
+                expected_candidate=config.candidate,
+            ):
+                try:
+                    body = asyncio.run(_run_export_probe(config))
+                except BaseException:
+                    operation_failed = True
+                    raise
+        except ValueError as exc:
+            if operation_failed:
+                raise
+            raise ExportProbeError("candidate_invalid") from exc
         _write_stdout_report(body)
     except ExportProbeError as exc:
         print(str(exc), file=sys.stderr)

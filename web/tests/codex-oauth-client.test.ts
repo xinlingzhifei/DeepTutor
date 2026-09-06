@@ -272,7 +272,9 @@ test("ordinary users send a scoped Codex reasoning effort update", async () => {
   ): Promise<Response> => {
     capturedUrl = String(input);
     capturedInit = init;
-    return Response.json(status({ connection: "connected" }));
+    return new Response(JSON.stringify(status({ connection: "connected" })), {
+      headers: { "content-type": "application/json" },
+    });
   };
 
   await setCodexReasoningEffort("gpt-5.6-sol", "high", fetchImpl);

@@ -201,16 +201,37 @@ test("live URL resolution rejects IPv4-mapped IPv6 127/8 candidates", () => {
   assert.deepEqual(accepted, []);
 });
 
-test("live URL resolution accepts a remote HTTPS URL", () => {
-  assert.equal(
-    resolveLiveBaseUrl(
-      true,
-      "  https://candidate.example.test/release?token=remote-allowed  ",
-    ),
-    "https://candidate.example.test/release?token=remote-allowed",
-  );
-  assert.equal(
-    resolveLiveBaseUrl(true, "https://[2001:db8::1]/release"),
-    "https://[2001:db8::1]/release",
-  );
+test("live URL resolution rejects every plain HTTP candidate", () => {
+  const candidates = [
+    "http://candidate.example.test/release",
+    "http://198.51.100.42/release",
+    "http://[2001:db8::1]/release",
+  ] as const;
+
+  for (const candidate of candidates) {
+    const error = captureError(() => resolveLiveBaseUrl(true, candidate));
+    assert.equal(
+      error.message,
+      "WEB_BASE_URL must use HTTPS for live release evidence",
+    );
+    assert.equal(error.message.includes(candidate), false);
+  }
+});
+
+test("live URL resolution normalizes accepted HTTPS URLs to exact origins", () => {
+  const cases = [
+    {
+      input:
+        "  https://CANDIDATE.EXAMPLE.TEST:443/release?token=remote-allowed  ",
+      expected: "https://candidate.example.test",
+    },
+    {
+      input: "https://[2001:db8::1]/release?token=remote-allowed",
+      expected: "https://[2001:db8::1]",
+    },
+  ] as const;
+
+  for (const scenario of cases) {
+    assert.equal(resolveLiveBaseUrl(true, scenario.input), scenario.expected);
+  }
 });

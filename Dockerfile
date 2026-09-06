@@ -98,6 +98,36 @@ RUN --mount=type=secret,id=pip_config,target=/etc/pip.conf,required=false \
     python -m pip install --no-compile -r requirements.txt
 
 # ============================================
+# Stage 2b: OpenMAIC Observer Attestation Signer
+# ============================================
+FROM python:3.11-slim AS observer-signer
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONIOENCODING=utf-8 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+WORKDIR /app
+
+RUN python -m pip install --no-cache-dir --no-compile \
+        "cryptography==47.0.0" \
+        "httpx==0.28.1" \
+        "pydantic==2.13.3" \
+        "uvicorn==0.44.0" \
+    && groupadd --system --gid 1000 observer-signer \
+    && useradd --system --uid 1000 --gid 1000 --no-create-home \
+        --shell /usr/sbin/nologin observer-signer
+
+COPY --chown=1000:1000 scripts/openmaic_observer_attestation_signer.py \
+    scripts/openmaic_observer_service.py \
+    scripts/openmaic_smoke_contract.py \
+    /app/scripts/
+
+USER 1000:1000
+
+ENTRYPOINT ["python", "/app/scripts/openmaic_observer_attestation_signer.py"]
+
+# ============================================
 # Stage 3: Production Image
 # ============================================
 FROM python:3.11-slim AS production
@@ -184,6 +214,8 @@ COPY --from=frontend-builder /app/web/public/ ./web/public/
 COPY deeptutor/ ./deeptutor/
 COPY deeptutor_cli/ ./deeptutor_cli/
 COPY scripts/ ./scripts/
+COPY docker-compose.yml docker-compose.platform.yml docker-compose.data-plane.yml ./
+COPY deploy/docker-compose.openmaic-shared-ingress-observer.yml ./deploy/
 COPY scripts/deeptutor-migrate /usr/local/bin/deeptutor-migrate
 COPY pyproject.toml ./
 COPY requirements/ ./requirements/

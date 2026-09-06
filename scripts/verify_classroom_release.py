@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -10,7 +11,7 @@ import hashlib
 import json
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import re
 import stat
 import subprocess
@@ -19,6 +20,9 @@ import tempfile
 from typing import BinaryIO, Protocol
 from urllib.parse import urlsplit
 
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 import yaml
 from yaml.nodes import MappingNode, ScalarNode, SequenceNode
 
@@ -111,6 +115,7 @@ from gateway_public_contract import (  # noqa: E402
 from gateway_trust_contract import verify_gateway_trust_pair  # noqa: E402
 from openmaic_smoke_contract import (  # noqa: E402
     MAX_OPENMAIC_SMOKE_REPORT_BYTES,
+    OPENMAIC_SHARED_INGRESS_OBSERVER_BOUND_SCHEMA_VERSION,
     derive_openmaic_dedicated_outage_checks,
     derive_openmaic_dedicated_plane_checks,
     derive_openmaic_shared_plane_checks,
@@ -118,9 +123,9 @@ from openmaic_smoke_contract import (  # noqa: E402
     openmaic_shared_plane_command_record,
     parse_openmaic_dedicated_outage_attempt_marker,
     parse_openmaic_dedicated_outage_attestation,
-    parse_openmaic_shared_ingress_observer_attestation,
     parse_openmaic_smoke_report,
     validate_openmaic_shared_ingress_observer_trust_anchor,
+    verify_archived_openmaic_shared_ingress_observer_attestation,
 )
 from platform_preflight_contract import (
     PHASE_SERVICES as PREFLIGHT_PHASE_SERVICES,
@@ -131,6 +136,12 @@ from platform_preflight_contract import (  # noqa: E402
 from platform_preflight_contract import (
     candidate_network_phase_command,
     parse_candidate_network_report,
+)
+from render_platform_compose import (  # noqa: E402
+    CandidateArtifactError,
+    candidate_artifact_paths,
+    validate_image_lock_bindings,
+    validated_candidate_artifact_lease,
 )
 from tenant_isolation_contract import (  # noqa: E402
     MAX_TENANT_ISOLATION_REPORT_BYTES,
@@ -184,6 +195,9 @@ CUSTOM_IMAGE_SPECS = {
     ),
 }
 CUSTOM_IMAGE_NAMES = tuple(CUSTOM_IMAGE_SPECS)
+OBSERVER_SIGNER_IMAGE_NAME = "observer_signer"
+OBSERVER_SIGNER_REPOSITORY = "ghcr.io/xinlingzhifei/yfeistai-observer-signer"
+OBSERVER_SIGNER_SERVICE = "openmaic-observer-attestation-signer"
 CUSTOM_IMAGE_SERVICE_BINDINGS = {
     "docker-compose.platform.yml": {
         "deeptutor": "deeptutor",
@@ -202,6 +216,7 @@ CUSTOM_IMAGE_SERVICE_BINDINGS = {
         "openmaic": "openmaic",
         "openmaic-render": "openmaic_render",
     },
+    "deploy/docker-compose.openmaic-shared-ingress-observer.yml": {},
 }
 RECEIPT_CONTRACTS = {
     "source_head": ("git-probe", ("headMatches", "worktreeClean")),
@@ -275,10 +290,23 @@ _DIGEST = re.compile(r"^sha256:([0-9a-f]{64})$")
 _RELEASE_TAG = re.compile(r"^yfeistai-first-release-[0-9]{8}-([0-9a-f]{8})$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _RELEASE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_IMMUTABLE_IMAGE_NAME = re.compile(
+    r"^(?=.{1,512}$)"
+    r"(?:[a-z0-9]+(?:[._-][a-z0-9]+)*(?::[0-9]+)?/)*"
+    r"[a-z0-9]+(?:[._-][a-z0-9]+)*"
+    r"(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?$"
+)
 _OBSERVED_AT = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
 _RUNTIME_PROJECT = "yfeistai-platform"
 _RUNTIME_HEALTH_SERVICES = frozenset(
-    ("deeptutor", "postgres", "minio", "openmaic", "openmaic-render")
+    (
+        "deeptutor",
+        "postgres",
+        "minio",
+        "openmaic",
+        "openmaic-render",
+        "openmaic-shared-ingress-observer",
+    )
 )
 _GATEWAY_DOCKER_PROJECT = "yfeistai-platform"
 _GATEWAY_DOCKER_CONTEXT = "default"
@@ -321,6 +349,14 @@ _OPENMAIC_OBSERVER_ATTESTATION_SHA256_ENV = "YFEISTAI_OPENMAIC_EXPECTED_OBSERVER
 _OPENMAIC_OBSERVER_ID_ENV = "YFEISTAI_OPENMAIC_EXPECTED_OBSERVER_ID"
 _OPENMAIC_OBSERVER_ORIGIN_ENV = "YFEISTAI_OPENMAIC_EXPECTED_OBSERVER_ORIGIN"
 _OPENMAIC_CONTROL_ORIGIN_ENV = "YFEISTAI_OPENMAIC_EXPECTED_SHARED_INGRESS_CONTROL_ORIGIN"
+_OPENMAIC_OBSERVER_PUBLIC_KEY_ENV = "YFEISTAI_OPENMAIC_OBSERVER_PUBLIC_KEY_PATH"
+_OPENMAIC_OBSERVER_PUBLIC_KEY_SPKI_SHA256_ENV = (
+    "YFEISTAI_OPENMAIC_EXPECTED_OBSERVER_PUBLIC_KEY_SPKI_SHA256"
+)
+_OBSERVER_SIGNER_IMAGE_ENV = "YFEISTAI_OBSERVER_SIGNER_IMAGE"
+_RELEASE_SUPERVISOR_PUBLIC_KEY_SPKI_SHA256_ENV = (
+    "YFEISTAI_RELEASE_SUPERVISOR_PUBLIC_KEY_SPKI_SHA256"
+)
 _RUNTIME_DOCKER_PREFIX = (
     "docker",
     "--config",
@@ -340,6 +376,8 @@ _RUNTIME_COMPOSE_TOPOLOGY = (
     "<candidate-root>/docker-compose.yml",
     "-f",
     "<candidate-root>/docker-compose.platform.yml",
+    "-f",
+    "<candidate-root>/deploy/docker-compose.openmaic-shared-ingress-observer.yml",
 )
 _RUNTIME_COMPOSE_CONFIG_ARGUMENTS = (*_RUNTIME_COMPOSE_TOPOLOGY, "config", "--format", "json")
 _RUNTIME_COMPOSE_HASH_ARGUMENTS = (*_RUNTIME_COMPOSE_TOPOLOGY, "config", "--hash", "*")
@@ -718,6 +756,176 @@ class _GatewayRawProofLease:
             raise errors[0]
 
 
+def _close_bundle_artifact_handles(
+    directory_handles: list[object | int],
+    artifact_handle: object | int | None,
+    *,
+    windows: bool,
+) -> list[OSError]:
+    errors: list[OSError] = []
+    for handle in (
+        artifact_handle,
+        *reversed(directory_handles),
+    ):
+        if handle is None:
+            continue
+        try:
+            if windows:
+                _close_windows_handle(handle)
+            else:
+                os.close(int(handle))
+        except OSError as exc:
+            errors.append(exc)
+    return errors
+
+
+def _open_bundle_artifact_handles(
+    root: Path,
+    components: tuple[str, ...],
+    *,
+    windows: bool,
+) -> tuple[
+    list[object | int],
+    list[tuple[int, int]],
+    object | int,
+    tuple[int, int],
+]:
+    directory_handles: list[object | int] = []
+    directory_identities: list[tuple[int, int]] = []
+    artifact_handle: object | int | None = None
+    try:
+        if windows:
+            root_handle, root_identity = _open_windows_directory_no_follow(root)
+        else:
+            root_handle = _open_posix_directory_no_follow(root)
+            root_details = os.fstat(root_handle)
+            if not stat.S_ISDIR(root_details.st_mode):
+                raise ValueError("evidence bundle boundary is not a directory")
+            root_identity = _file_identity(root_details)
+        directory_handles.append(root_handle)
+        directory_identities.append(root_identity)
+        for component in components[:-1]:
+            if windows:
+                opened, identity = _open_windows_directory_relative(
+                    directory_handles[-1],
+                    component,
+                )
+                directory_handles.append(opened)
+            else:
+                opened = os.open(
+                    component,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=int(directory_handles[-1]),
+                )
+                directory_handles.append(opened)
+                details = os.fstat(opened)
+                if not stat.S_ISDIR(details.st_mode):
+                    raise ValueError("evidence artifact ancestor is not a directory")
+                identity = _file_identity(details)
+            directory_identities.append(identity)
+        if windows:
+            artifact_handle, artifact_identity = _open_windows_regular_file_relative(
+                directory_handles[-1],
+                components[-1],
+                share_access=0x00000001 | 0x00000002 | 0x00000004,
+            )
+        else:
+            artifact_handle = os.open(
+                components[-1],
+                os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=int(directory_handles[-1]),
+            )
+            details = os.fstat(artifact_handle)
+            if not stat.S_ISREG(details.st_mode):
+                raise ValueError("evidence artifact is not a regular file")
+            artifact_identity = _file_identity(details)
+        return (
+            directory_handles,
+            directory_identities,
+            artifact_handle,
+            artifact_identity,
+        )
+    except BaseException as original_error:
+        close_errors = _close_bundle_artifact_handles(
+            directory_handles,
+            artifact_handle,
+            windows=windows,
+        )
+        if close_errors and hasattr(original_error, "add_note"):
+            original_error.add_note(f"evidence artifact handle cleanup failed: {close_errors[0]}")
+        raise
+
+
+def _read_bundle_artifact_body(
+    bundle_root: Path,
+    components: tuple[str, ...],
+) -> bytes:
+    root = Path(os.path.abspath(bundle_root))
+    windows = os.name == "nt"
+    first_directories: list[object | int] = []
+    first_file: object | int | None = None
+    replay_directories: list[object | int] = []
+    replay_file: object | int | None = None
+    try:
+        (
+            first_directories,
+            directory_identities,
+            first_file,
+            artifact_identity,
+        ) = _open_bundle_artifact_handles(root, components, windows=windows)
+        body = _read_runtime_artifact_handle(first_file, windows=windows)
+        held_directory_identities = [
+            (
+                _windows_handle_identity(handle, directory=True)
+                if windows
+                else _file_identity(os.fstat(int(handle)))
+            )
+            for handle in first_directories
+        ]
+        held_artifact_identity = (
+            _windows_handle_identity(first_file, directory=False)
+            if windows
+            else _file_identity(os.fstat(int(first_file)))
+        )
+        held_body = _read_runtime_artifact_handle(first_file, windows=windows)
+        (
+            replay_directories,
+            replay_directory_identities,
+            replay_file,
+            replay_artifact_identity,
+        ) = _open_bundle_artifact_handles(root, components, windows=windows)
+        replay_body = _read_runtime_artifact_handle(replay_file, windows=windows)
+        if (
+            held_directory_identities != directory_identities
+            or held_artifact_identity != artifact_identity
+            or replay_directory_identities != directory_identities
+            or replay_artifact_identity != artifact_identity
+            or held_body != body
+            or replay_body != body
+        ):
+            raise ValueError("evidence artifact boundary changed while it was read")
+        return body
+    finally:
+        close_errors = _close_bundle_artifact_handles(
+            replay_directories,
+            replay_file,
+            windows=windows,
+        )
+        close_errors.extend(
+            _close_bundle_artifact_handles(
+                first_directories,
+                first_file,
+                windows=windows,
+            )
+        )
+        if close_errors:
+            active_error = sys.exception()
+            if active_error is None:
+                raise close_errors[0]
+            if hasattr(active_error, "add_note"):
+                active_error.add_note(f"evidence artifact handle cleanup failed: {close_errors[0]}")
+
+
 def _proof_bytes(
     bundle_root: Path,
     raw: object,
@@ -728,10 +936,24 @@ def _proof_bytes(
         return f"{label} reference is invalid"
     artifact = raw.get("artifact")
     expected_sha256 = raw.get("sha256")
+    windows_artifact = PureWindowsPath(artifact) if isinstance(artifact, str) else None
+    posix_artifact = PurePosixPath(artifact) if isinstance(artifact, str) else None
     if (
         not isinstance(artifact, str)
         or not artifact.strip()
         or Path(artifact).is_absolute()
+        or windows_artifact is None
+        or windows_artifact.is_absolute()
+        or windows_artifact.drive
+        or posix_artifact is None
+        or posix_artifact.is_absolute()
+        or posix_artifact.as_posix() != artifact
+        or "\\" in artifact
+        or not posix_artifact.parts
+        or any(
+            component in {"", ".", ".."} or ":" in component or component != component.rstrip(" .")
+            for component in posix_artifact.parts
+        )
         or not isinstance(expected_sha256, str)
         or _SHA256.fullmatch(expected_sha256) is None
     ):
@@ -776,22 +998,15 @@ def _proof_bytes(
                 return f"{label} does not exist"
             return f"{label} cannot be read from its fixed boundary"
         return body, artifact
-    root = Path(bundle_root).resolve()
-    unresolved = root / artifact
     try:
-        resolved = unresolved.resolve()
-        resolved.relative_to(root)
+        body = _read_bundle_artifact_body(
+            Path(bundle_root),
+            tuple(posix_artifact.parts),
+        )
     except (OSError, ValueError):
-        return f"{label} is outside the evidence bundle"
-    cursor = unresolved
-    while cursor != root:
-        if _is_link_or_reparse(cursor):
-            return f"{label} must not use a symlink"
-        cursor = cursor.parent
-    try:
-        body = resolved.read_bytes()
-    except OSError:
-        return f"{label} does not exist"
+        if not os.path.lexists(Path(bundle_root) / artifact):
+            return f"{label} does not exist"
+        return f"{label} cannot be read from its fixed boundary"
     if hashlib.sha256(body).hexdigest() != expected_sha256:
         return f"{label} digest does not match"
     return body, artifact
@@ -1305,7 +1520,7 @@ def _runtime_base_url(raw: object) -> str | None:
         return None
     parsed = urlsplit(raw)
     if (
-        parsed.scheme not in {"http", "https"}
+        parsed.scheme != "https"
         or not parsed.netloc
         or parsed.username is not None
         or parsed.password is not None
@@ -1316,10 +1531,93 @@ def _runtime_base_url(raw: object) -> str | None:
     return raw
 
 
+def _runtime_observer_secret_preflight(
+    raw: object,
+    *,
+    release_run_id: str,
+) -> dict[str, object]:
+    required_secret_names = {
+        "openmaic_observer_auth_token",
+        "openmaic_observer_health_token",
+        "openmaic_observer_attestation_signing_key",
+    }
+    if not isinstance(raw, dict) or set(raw) != {
+        "schemaVersion",
+        "releaseRunId",
+        "runDirectory",
+        "ownerOnly",
+        "noLinksOrReparsePoints",
+        "distinctSecrets",
+        "observerSignerImage",
+        "secrets",
+    }:
+        raise ValueError("runtime observer secret preflight is invalid")
+    run_directory = raw.get("runDirectory")
+    secrets = raw.get("secrets")
+    observer_signer_image = raw.get("observerSignerImage")
+    if isinstance(observer_signer_image, str):
+        image_name, separator, image_digest = observer_signer_image.rpartition("@sha256:")
+    else:
+        image_name, separator, image_digest = "", "", ""
+    if (
+        type(raw.get("schemaVersion")) is not int
+        or raw.get("schemaVersion") != 1
+        or raw.get("releaseRunId") != release_run_id
+        or not isinstance(run_directory, str)
+        or not (
+            PurePosixPath(run_directory).is_absolute()
+            or PureWindowsPath(run_directory).is_absolute()
+        )
+        or PurePosixPath(run_directory.replace("\\", "/")).name != release_run_id
+        or raw.get("ownerOnly") is not True
+        or raw.get("noLinksOrReparsePoints") is not True
+        or raw.get("distinctSecrets") is not True
+        or not separator
+        or _IMMUTABLE_IMAGE_NAME.fullmatch(image_name) is None
+        or _SHA256.fullmatch(image_digest) is None
+        or image_digest == "0" * 64
+        or not isinstance(secrets, dict)
+        or set(secrets) != required_secret_names
+    ):
+        raise ValueError("runtime observer secret preflight is invalid")
+    for details in secrets.values():
+        if (
+            not isinstance(details, dict)
+            or set(details) != {"fileName", "mode", "ownerId", "groupId", "size"}
+            or not isinstance(details.get("fileName"), str)
+            or PurePosixPath(details["fileName"]).name != details["fileName"]
+            or PureWindowsPath(details["fileName"]).name != details["fileName"]
+            or not isinstance(details.get("mode"), str)
+            or details["mode"] not in {"0400", "0600"}
+            or details.get("ownerId") != 1000
+            or details.get("groupId") != 1000
+            or type(details.get("size")) is not int
+            or details["size"] <= 0
+        ):
+            raise ValueError("runtime observer secret preflight is invalid")
+    return json.loads(json.dumps(raw))
+
+
+def _runtime_observer_signer_image(raw: object) -> str:
+    if isinstance(raw, str):
+        image_name, separator, image_digest = raw.rpartition("@sha256:")
+    else:
+        image_name, separator, image_digest = "", "", ""
+    if (
+        not separator
+        or _IMMUTABLE_IMAGE_NAME.fullmatch(image_name) is None
+        or _SHA256.fullmatch(image_digest) is None
+        or image_digest == "0" * 64
+    ):
+        raise ValueError("observer signer image reference is invalid")
+    return raw
+
+
 def _runtime_candidate_contract(
     candidate_root: Path,
     *,
     candidate: Mapping[str, object],
+    observer_signer_image: str | None = None,
 ) -> dict[str, dict[str, str]]:
     root = Path(os.path.abspath(candidate_root))
     try:
@@ -1327,6 +1625,7 @@ def _runtime_candidate_contract(
             loaded_candidate, expected = _load_candidate_token(
                 lease.token,
                 expected_candidate=candidate,
+                observer_signer_image=observer_signer_image,
             )
             lease.assert_unchanged()
     except (OSError, ValueError) as exc:
@@ -1334,6 +1633,24 @@ def _runtime_candidate_contract(
     if loaded_candidate != candidate:
         raise ValueError("candidate runtime contract is unavailable or invalid")
     return expected
+
+
+def _runtime_bound_observer_signer_image(
+    candidate_root: Path,
+    *,
+    candidate: Mapping[str, object],
+    expected_observer_signer_image: str | None = None,
+) -> tuple[str, dict[str, dict[str, str]]]:
+    candidate_services = _runtime_candidate_contract(
+        candidate_root,
+        candidate=candidate,
+        observer_signer_image=expected_observer_signer_image,
+    )
+    signer_service = candidate_services.get(OBSERVER_SIGNER_SERVICE)
+    if not isinstance(signer_service, dict):
+        raise ValueError("candidate runtime observer signer image is invalid")
+    bound_observer_signer_image = _runtime_observer_signer_image(signer_service.get("image"))
+    return bound_observer_signer_image, candidate_services
 
 
 def _normalized_runtime_repo_digest(reference: str) -> str:
@@ -1395,16 +1712,11 @@ def _open_posix_directory_no_follow(path: Path) -> int:
 
 def _open_windows_directory_no_follow(
     path: Path,
-    *,
-    deletable: bool = False,
 ) -> tuple[object, tuple[int, int]]:
     candidate = Path(path)
     if not candidate.is_absolute() or not candidate.anchor:
         raise ValueError("runtime evidence bundle path is invalid")
-    current, identity = _open_windows_directory_handle(
-        Path(candidate.anchor),
-        deletable=deletable,
-    )
+    current, identity = _open_windows_directory_handle(Path(candidate.anchor))
     try:
         for component in candidate.relative_to(candidate.anchor).parts:
             opened, opened_identity = _open_windows_directory_relative(current, component)
@@ -1429,7 +1741,7 @@ class _EvidenceBundleBoundary:
         path = Path(os.path.abspath(root))
         try:
             if os.name == "nt":
-                handle, identity = _open_windows_directory_no_follow(path, deletable=True)
+                handle, identity = _open_windows_directory_no_follow(path)
             else:
                 handle = _open_posix_directory_no_follow(path)
                 identity = _file_identity(os.fstat(handle))
@@ -1448,7 +1760,6 @@ class _EvidenceBundleBoundary:
             if self.windows:
                 reopened, reopened_identity = _open_windows_directory_no_follow(
                     self.root,
-                    deletable=True,
                 )
             else:
                 reopened = _open_posix_directory_no_follow(self.root)
@@ -1828,6 +2139,7 @@ def validate_runtime_attestation(
     candidate_root: Path,
     candidate: Mapping[str, object],
     release_run: Mapping[str, str],
+    observer_signer_image: str | None = None,
     expected_base_url: str | None = None,
     expected_sha256: str | None = None,
     expected_docker_host_identity_sha256: str | None = None,
@@ -1842,6 +2154,11 @@ def validate_runtime_attestation(
         document = json.loads(body)
     except (UnicodeError, json.JSONDecodeError) as exc:
         raise ValueError("runtime attestation is not valid JSON") from exc
+    bound_observer_signer_image, candidate_services = _runtime_bound_observer_signer_image(
+        candidate_root,
+        candidate=candidate,
+        expected_observer_signer_image=observer_signer_image,
+    )
     required_keys = {
         "schemaVersion",
         "candidate",
@@ -1863,6 +2180,7 @@ def validate_runtime_attestation(
         required_keys.add("dockerHostIdentity")
     elif "dockerHostIdentity" in document_keys:
         required_keys.add("dockerHostIdentity")
+    required_keys.update(("observerSignerImage", "observerSecretPreflight"))
     bound_base_url = _runtime_base_url(
         document.get("baseUrl") if isinstance(document, dict) else None
     )
@@ -1873,6 +2191,7 @@ def validate_runtime_attestation(
         or document.get("schemaVersion") != 1
         or document.get("candidate") != candidate
         or document.get("releaseRun") != release_run
+        or document.get("observerSignerImage") != bound_observer_signer_image
         or not _valid_observed_at_value(document.get("observedAt"))
         or bound_base_url is None
         or (expected_base_url is not None and bound_base_url != expected_base_url)
@@ -1911,7 +2230,12 @@ def validate_runtime_attestation(
             )
         ):
             raise ValueError("gateway Docker host identity is invalid")
-    candidate_services = _runtime_candidate_contract(candidate_root, candidate=candidate)
+    observer_secret_preflight = _runtime_observer_secret_preflight(
+        document.get("observerSecretPreflight"),
+        release_run_id=release_run["runId"],
+    )
+    if observer_secret_preflight["observerSignerImage"] != bound_observer_signer_image:
+        raise ValueError("observer signer image does not match observer secret preflight")
     commands = document.get("commands")
     if not isinstance(commands, list):
         raise ValueError("runtime attestation command records are invalid")
@@ -2036,6 +2360,7 @@ def derive_platform_preflight_receipt_checks(
     candidate_root: Path,
     candidate: Mapping[str, object],
     release_run: Mapping[str, str],
+    observer_signer_image: str,
 ) -> tuple[dict[str, dict[str, bool]], str]:
     try:
         document = json.loads(body)
@@ -2075,6 +2400,7 @@ def derive_platform_preflight_receipt_checks(
         candidate_root=candidate_root,
         candidate=candidate,
         release_run=release_run,
+        observer_signer_image=observer_signer_image,
         expected_base_url=document["baseUrl"],
         expected_sha256=runtime_proof["sha256"],
     )
@@ -2158,6 +2484,7 @@ def derive_capacity_profile_receipt_checks(
     candidate_root: Path,
     candidate: Mapping[str, object],
     release_run: Mapping[str, str],
+    observer_signer_image: str,
 ) -> tuple[dict[str, bool], str]:
     """Replay one fixed live-capacity attestation into receipt checks."""
 
@@ -2203,6 +2530,7 @@ def derive_capacity_profile_receipt_checks(
             candidate_root=candidate_root,
             candidate=candidate,
             release_run=release_run,
+            observer_signer_image=observer_signer_image,
             expected_base_url=base_url,
             expected_sha256=runtime_proof["sha256"],
         )
@@ -2259,6 +2587,7 @@ def derive_capacity_profile_tenant_id(
     candidate_root: Path,
     candidate: Mapping[str, object],
     release_run: Mapping[str, str],
+    observer_signer_image: str,
 ) -> str:
     """Return the existing tenant bound into one validated capacity proof."""
 
@@ -2268,6 +2597,7 @@ def derive_capacity_profile_tenant_id(
         candidate_root=candidate_root,
         candidate=candidate,
         release_run=release_run,
+        observer_signer_image=observer_signer_image,
     )
     document = json.loads(body)
     execution = document.get("execution") if isinstance(document, dict) else None
@@ -2295,6 +2625,7 @@ def derive_capacity_profile_tenant_ids(
     candidate_root: Path,
     candidate: Mapping[str, object],
     release_run: Mapping[str, str],
+    observer_signer_image: str,
 ) -> tuple[str, ...]:
     """Return every executed tenant from one passing, fully replayed capacity proof."""
 
@@ -2304,6 +2635,7 @@ def derive_capacity_profile_tenant_ids(
         candidate_root=candidate_root,
         candidate=candidate,
         release_run=release_run,
+        observer_signer_image=observer_signer_image,
     )
     if any(value is not True for value in checks.values()):
         raise ValueError("capacity execution proof checks did not all pass")
@@ -2351,6 +2683,7 @@ def derive_tenant_isolation_receipt_checks(
     candidate_root: Path,
     candidate: Mapping[str, object],
     release_run: Mapping[str, str],
+    observer_signer_image: str,
 ) -> tuple[dict[str, bool], str]:
     """Replay one tenant-isolation proof and both of its bound dependencies."""
 
@@ -2398,6 +2731,7 @@ def derive_tenant_isolation_receipt_checks(
             candidate_root=candidate_root,
             candidate=candidate,
             release_run=release_run,
+            observer_signer_image=observer_signer_image,
             expected_base_url=base_url,
             expected_sha256=runtime_proof["sha256"],
         )
@@ -2425,6 +2759,7 @@ def derive_tenant_isolation_receipt_checks(
             candidate_root=candidate_root,
             candidate=candidate,
             release_run=release_run,
+            observer_signer_image=observer_signer_image,
         )
     except ValueError as exc:
         raise ValueError(f"tenant isolation capacity attestation is invalid: {exc}") from exc
@@ -2492,6 +2827,7 @@ def _derive_openmaic_plane_receipt_checks(
     candidate_root: Path,
     candidate: Mapping[str, object],
     release_run: Mapping[str, str],
+    observer_signer_image: str,
 ) -> tuple[dict[str, bool], str]:
     """Replay one fixed OpenMAIC plane smoke proof into receipt checks."""
 
@@ -2552,6 +2888,7 @@ def _derive_openmaic_plane_receipt_checks(
             candidate_root=candidate_root,
             candidate=candidate,
             release_run=release_run,
+            observer_signer_image=observer_signer_image,
             expected_base_url=base_url,
             expected_sha256=runtime_proof["sha256"],
         )
@@ -2620,6 +2957,7 @@ def derive_openmaic_shared_plane_receipt_checks(
     candidate_root: Path,
     candidate: Mapping[str, object],
     release_run: Mapping[str, str],
+    observer_signer_image: str,
 ) -> tuple[dict[str, bool], str]:
     """Replay one fixed shared-plane smoke proof into receipt checks."""
 
@@ -2630,6 +2968,7 @@ def derive_openmaic_shared_plane_receipt_checks(
         candidate_root=candidate_root,
         candidate=candidate,
         release_run=release_run,
+        observer_signer_image=observer_signer_image,
     )
 
 
@@ -2640,6 +2979,7 @@ def derive_openmaic_dedicated_plane_receipt_checks(
     candidate_root: Path,
     candidate: Mapping[str, object],
     release_run: Mapping[str, str],
+    observer_signer_image: str,
 ) -> tuple[dict[str, bool], str]:
     """Replay one fixed dedicated-plane smoke proof into receipt checks."""
 
@@ -2650,6 +2990,7 @@ def derive_openmaic_dedicated_plane_receipt_checks(
         candidate_root=candidate_root,
         candidate=candidate,
         release_run=release_run,
+        observer_signer_image=observer_signer_image,
     )
 
 
@@ -2665,6 +3006,7 @@ def _replay_openmaic_dedicated_outage_attempt_marker(
     expected_shared_ingress_control_origin: str,
     expected_tenant_id: str,
     expected_route_id: str,
+    expected_observer_public_key_spki_sha256: str | None = None,
     return_body: bool = False,
 ) -> dict[str, object] | tuple[dict[str, object], bytes]:
     """Read and replay the archived marker against caller-supplied trust anchors."""
@@ -2687,6 +3029,7 @@ def _replay_openmaic_dedicated_outage_attempt_marker(
         expected_shared_ingress_control_origin=expected_shared_ingress_control_origin,
         expected_tenant_id=expected_tenant_id,
         expected_route_id=expected_route_id,
+        expected_observer_public_key_spki_sha256=(expected_observer_public_key_spki_sha256),
     )
     if return_body:
         return parsed, marker_body
@@ -2700,20 +3043,31 @@ def derive_openmaic_dedicated_outage_receipt_checks(
     candidate_root: Path,
     candidate: Mapping[str, object],
     release_run: Mapping[str, str],
+    observer_signer_image: str,
     expected_tenant_id: str,
     expected_docker_host_identity_sha256: str,
     expected_openmaic_observer_attestation_sha256: str | None = None,
     expected_openmaic_observer_id: str | None = None,
     expected_openmaic_observer_origin: str | None = None,
     expected_openmaic_shared_ingress_control_origin: str | None = None,
+    openmaic_observer_public_key_path: Path | None = None,
+    expected_openmaic_observer_public_key_spki_sha256: str | None = None,
 ) -> tuple[dict[str, bool], str]:
     """Replay the independent dedicated outage attestation."""
 
+    if (
+        openmaic_observer_public_key_path is None
+        or not isinstance(expected_openmaic_observer_public_key_spki_sha256, str)
+        or _SHA256.fullmatch(expected_openmaic_observer_public_key_spki_sha256) is None
+        or expected_openmaic_observer_public_key_spki_sha256 == "0" * 64
+    ):
+        raise ValueError("OpenMAIC observer public-key anchor is unavailable or invalid")
     observer_anchor = validate_openmaic_shared_ingress_observer_trust_anchor(
         expected_observer_attestation_sha256=(expected_openmaic_observer_attestation_sha256),
         expected_observer_id=expected_openmaic_observer_id,
         expected_observer_origin=expected_openmaic_observer_origin,
         expected_shared_ingress_control_origin=(expected_openmaic_shared_ingress_control_origin),
+        expected_public_key_spki_sha256=(expected_openmaic_observer_public_key_spki_sha256),
     )
 
     try:
@@ -2743,6 +3097,8 @@ def derive_openmaic_dedicated_outage_receipt_checks(
             "observerId",
             "observerOrigin",
             "sharedIngressControlOrigin",
+            "signatureArtifact",
+            "publicKeySpkiSha256",
         }
         or observer_proof.get("artifact")
         != "runtime/openmaic-shared-ingress-observer-attestation.json"
@@ -2751,6 +3107,10 @@ def derive_openmaic_dedicated_outage_receipt_checks(
         or observer_proof.get("observerOrigin") != observer_anchor["observerOrigin"]
         or observer_proof.get("sharedIngressControlOrigin")
         != observer_anchor["sharedIngressControlOrigin"]
+        or observer_proof.get("signatureArtifact")
+        != "runtime/openmaic-shared-ingress-observer-attestation.sig"
+        or observer_proof.get("publicKeySpkiSha256") != observer_anchor["publicKeySpkiSha256"]
+        or openmaic_observer_public_key_path is None
     ):
         raise ValueError("OpenMAIC dedicated outage execution proof is invalid")
     try:
@@ -2760,6 +3120,7 @@ def derive_openmaic_dedicated_outage_receipt_checks(
             candidate_root=candidate_root,
             candidate=candidate,
             release_run=release_run,
+            observer_signer_image=observer_signer_image,
             expected_base_url=base_url,
             expected_sha256=runtime_proof["sha256"],
         )
@@ -2772,13 +3133,70 @@ def derive_openmaic_dedicated_outage_receipt_checks(
     )
     if isinstance(observer_body, str):
         raise ValueError(observer_body)
+    signature_artifact = observer_proof["signatureArtifact"]
+    assert isinstance(signature_artifact, str)
+    root = Path(bundle_root).resolve()
+    signature_path = root / signature_artifact
+    cursor = signature_path
+    while cursor != root:
+        if _is_link_or_reparse(cursor):
+            raise ValueError("OpenMAIC shared-ingress observer signature is invalid")
+        cursor = cursor.parent
     try:
-        observer = parse_openmaic_shared_ingress_observer_attestation(
+        signature_before = signature_path.stat(follow_symlinks=False)
+        signature = signature_path.read_bytes()
+        signature_after = signature_path.stat(follow_symlinks=False)
+        signature_replayed = signature_path.read_bytes()
+    except OSError as exc:
+        raise ValueError("OpenMAIC shared-ingress observer signature is invalid") from exc
+    if (
+        not stat.S_ISREG(signature_before.st_mode)
+        or (
+            signature_before.st_dev,
+            signature_before.st_ino,
+            signature_before.st_size,
+            signature_before.st_mtime_ns,
+            signature_before.st_ctime_ns,
+            signature_before.st_mode,
+            signature_before.st_uid,
+        )
+        != (
+            signature_after.st_dev,
+            signature_after.st_ino,
+            signature_after.st_size,
+            signature_after.st_mtime_ns,
+            signature_after.st_ctime_ns,
+            signature_after.st_mode,
+            signature_after.st_uid,
+        )
+        or not signature
+        or len(signature) > 1024
+        or signature_replayed != signature
+    ):
+        raise ValueError("OpenMAIC shared-ingress observer signature is invalid")
+    try:
+        observer = verify_archived_openmaic_shared_ingress_observer_attestation(
             observer_body[0],
             release_run=release_run,
+            signature=signature,
+            public_key_path=openmaic_observer_public_key_path,
+            candidate_root=Path(candidate_root).resolve(),
+            expected_public_key_spki_sha256=(expected_openmaic_observer_public_key_spki_sha256),
         )
     except ValueError as exc:
         raise ValueError("OpenMAIC shared-ingress observer attestation is invalid") from exc
+    try:
+        observer_replayed = (root / str(observer_proof["artifact"])).read_bytes()
+        signature_replayed = signature_path.read_bytes()
+    except OSError as exc:
+        raise ValueError("OpenMAIC shared-ingress observer attestation is invalid") from exc
+    if observer_replayed != observer_body[0] or signature_replayed != signature:
+        raise ValueError("OpenMAIC shared-ingress observer attestation is invalid")
+    if (
+        type(observer.get("schemaVersion")) is not int
+        or observer.get("schemaVersion") != OPENMAIC_SHARED_INGRESS_OBSERVER_BOUND_SCHEMA_VERSION
+    ):
+        raise ValueError("OpenMAIC shared-ingress observer attestation is invalid")
     observer_details = observer.get("observer")
     if not isinstance(observer_details, dict):
         raise ValueError("OpenMAIC shared-ingress observer attestation is invalid")
@@ -2819,6 +3237,9 @@ def derive_openmaic_dedicated_outage_receipt_checks(
         expected_shared_ingress_control_origin=(observer_anchor["sharedIngressControlOrigin"]),
         expected_tenant_id=expected_tenant_id,
         expected_route_id=outage["routeId"],
+        expected_observer_public_key_spki_sha256=(
+            expected_openmaic_observer_public_key_spki_sha256
+        ),
         return_body=True,
     )
     if not isinstance(replayed_marker, tuple):
@@ -2838,6 +3259,9 @@ def derive_openmaic_dedicated_outage_receipt_checks(
             expected_tenant_id=expected_tenant_id,
             attempt_marker_body=marker_body,
             expected_docker_host_identity_sha256=(expected_docker_host_identity_sha256),
+            expected_observer_public_key_spki_sha256=(
+                expected_openmaic_observer_public_key_spki_sha256
+            ),
         )
     except ValueError as exc:
         raise ValueError(f"OpenMAIC dedicated outage strict report is invalid: {exc}") from exc
@@ -3239,6 +3663,7 @@ def derive_classroom_exports_receipt_checks(
     candidate_root: Path,
     candidate: Mapping[str, object],
     release_run: Mapping[str, str],
+    observer_signer_image: str,
 ) -> tuple[dict[str, bool], str]:
     """Replay the fixed classroom export proof and all four raw artifacts."""
 
@@ -3291,6 +3716,7 @@ def derive_classroom_exports_receipt_checks(
         candidate_root=candidate_root,
         candidate=candidate,
         release_run=release_run,
+        observer_signer_image=observer_signer_image,
         expected_base_url=base_url,
         expected_sha256=runtime_proof["sha256"],
     )
@@ -3315,6 +3741,7 @@ def derive_classroom_exports_receipt_checks(
         candidate_root=candidate_root,
         candidate=candidate,
         release_run=release_run,
+        observer_signer_image=observer_signer_image,
     )
     if tenant_id != capacity_tenant:
         raise ValueError("classroom exports tenant does not match capacity proof")
@@ -3413,6 +3840,7 @@ def derive_learning_event_idempotency_receipt_checks(
     candidate_root: Path,
     candidate: Mapping[str, object],
     release_run: Mapping[str, str],
+    observer_signer_image: str,
 ) -> tuple[dict[str, bool], str]:
     """Replay the capacity proof stdout into learning-event checks."""
 
@@ -3422,6 +3850,7 @@ def derive_learning_event_idempotency_receipt_checks(
         candidate_root=candidate_root,
         candidate=candidate,
         release_run=release_run,
+        observer_signer_image=observer_signer_image,
     )
     document = json.loads(body)
     execution = document["execution"]
@@ -3521,6 +3950,7 @@ def _gateway_candidate_service_networks(
                 lease.token[1],
                 docker_project=_GATEWAY_DOCKER_PROJECT,
                 expected_services=tuple(runtime_containers.values()),
+                overlay_bodies=(lease.token[2],),
             )
             lease.assert_unchanged()
     except (OSError, ValueError) as exc:
@@ -3608,7 +4038,7 @@ def _gateway_replayed_ports(value: object) -> list[dict[str, object]]:
 
 
 def _gateway_replayed_networks(value: object) -> list[str]:
-    if not isinstance(value, dict) or not value:
+    if not isinstance(value, dict):
         raise ValueError("gateway Docker network set is invalid")
     if any(
         not isinstance(name, str)
@@ -3699,10 +4129,13 @@ def _replay_gateway_docker_round(
         ):
             raise ValueError("gateway Docker container identity is invalid")
         expected_networks = expected_service_networks.get(service)
-        if not isinstance(expected_networks, tuple) or not expected_networks:
+        if not isinstance(expected_networks, tuple):
             raise ValueError("gateway candidate Compose network set is invalid")
         network_mode = row.get("networkMode")
-        if not isinstance(network_mode, str) or network_mode not in expected_networks:
+        if not isinstance(network_mode, str) or (
+            (expected_networks and network_mode not in expected_networks)
+            or (not expected_networks and network_mode != "none")
+        ):
             raise ValueError("gateway Docker network mode is invalid")
         networks = _gateway_replayed_networks(row.get("networks"))
         if networks != sorted(expected_networks):
@@ -3798,6 +4231,7 @@ def derive_gateway_only_public_receipt_checks(
     candidate_root: Path,
     candidate: Mapping[str, object],
     release_run: Mapping[str, str],
+    observer_signer_image: str,
     expected_docker_host_identity_sha256: str,
     trusted_keyring_path: Path,
     expected_trusted_keyring_sha256: str,
@@ -3916,6 +4350,7 @@ def derive_gateway_only_public_receipt_checks(
             candidate_root=candidate_root,
             candidate=candidate,
             release_run=release_run,
+            observer_signer_image=observer_signer_image,
             expected_host_identity_sha256=expected_host_identity_sha256,
             trusted_keyring_path=trusted_keyring_path,
             expected_trusted_keyring_sha256=expected_trusted_keyring_sha256,
@@ -3940,6 +4375,7 @@ def _derive_gateway_only_public_receipt_checks_bound(
     candidate_root: Path,
     candidate: Mapping[str, object],
     release_run: Mapping[str, str],
+    observer_signer_image: str,
     expected_host_identity_sha256: str,
     trusted_keyring_path: Path,
     expected_trusted_keyring_sha256: str,
@@ -3958,7 +4394,6 @@ def _derive_gateway_only_public_receipt_checks_bound(
         trusted_keyring_path=trusted_keyring_path,
         expected_trusted_keyring_sha256=expected_trusted_keyring_sha256,
         candidate_root=candidate_root,
-        candidate=candidate,
         release_run=release_run,
         expected_environment_id=environment_id,
         expected_observer_challenge=expected_observer_challenge,
@@ -3976,6 +4411,7 @@ def _derive_gateway_only_public_receipt_checks_bound(
         candidate_root=candidate_root,
         candidate=candidate,
         release_run=release_run,
+        observer_signer_image=observer_signer_image,
         expected_base_url=base_url,
         expected_sha256=runtime_reference["sha256"],
         expected_docker_host_identity_sha256=expected_host_identity_sha256,
@@ -4100,6 +4536,193 @@ def _derive_gateway_only_public_receipt_checks_bound(
     return checks, observed_at
 
 
+def release_supervisor_claim_bytes(document: Mapping[str, object]) -> bytes:
+    return (json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode(
+        "utf-8"
+    )
+
+
+def verify_release_supervisor_signature(
+    claim: Mapping[str, object],
+    *,
+    signature: bytes,
+    public_key: bytes,
+    expected_public_key_spki_sha256: str,
+) -> None:
+    if (
+        not isinstance(expected_public_key_spki_sha256, str)
+        or _SHA256.fullmatch(expected_public_key_spki_sha256) is None
+        or expected_public_key_spki_sha256 == "0" * 64
+        or not signature
+        or len(signature) > 1024
+        or not public_key
+        or len(public_key) > 16 * 1024
+    ):
+        raise ValueError("release supervisor signature is invalid")
+    try:
+        loaded_key = serialization.load_pem_public_key(public_key)
+        if not isinstance(loaded_key, Ed25519PublicKey):
+            raise ValueError("release supervisor signature is invalid")
+        public_key_spki = loaded_key.public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        if hashlib.sha256(public_key_spki).hexdigest() != expected_public_key_spki_sha256:
+            raise ValueError("release supervisor public-key fingerprint does not match")
+        encoded_signature = signature.decode("ascii").strip()
+        signature_bytes = base64.b64decode(encoded_signature, validate=True)
+        if len(signature_bytes) != 64 or signature not in {
+            encoded_signature.encode("ascii"),
+            encoded_signature.encode("ascii") + b"\n",
+            encoded_signature.encode("ascii") + b"\r\n",
+        }:
+            raise ValueError("release supervisor signature is invalid")
+        loaded_key.verify(signature_bytes, release_supervisor_claim_bytes(claim))
+    except (InvalidSignature, TypeError, ValueError, UnicodeError) as exc:
+        if isinstance(exc, ValueError) and str(exc).startswith("release supervisor"):
+            raise
+        raise ValueError("release supervisor signature is invalid") from exc
+
+
+def _probe_final_commit_error(
+    document: Mapping[str, object],
+    *,
+    evidence: str,
+    candidate: Mapping[str, object],
+    release_run: Mapping[str, str],
+    bundle_root: Path,
+    expected_supervisor_public_key_spki_sha256: str,
+) -> str | None:
+    provenance = document.get("provenance")
+    artifact = f"runtime/probe-commits/{evidence}.json"
+    if not isinstance(provenance, dict) or provenance.get("finalCommit") != {
+        "artifact": artifact,
+        "authority": "external-supervisor-ed25519",
+    }:
+        return "external supervisor final commit reference is missing or invalid"
+    root = Path(bundle_root).resolve()
+    marker_path = root / artifact
+    cursor = marker_path
+    while cursor != root:
+        if _is_link_or_reparse(cursor):
+            return "external supervisor final commit marker is missing or invalid"
+        cursor = cursor.parent
+    try:
+        before = marker_path.stat(follow_symlinks=False)
+        body = marker_path.read_bytes()
+        after = marker_path.stat(follow_symlinks=False)
+        marker = json.loads(body)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return "external supervisor final commit marker is missing or invalid"
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or _file_identity(before) != _file_identity(after)
+        or before.st_size <= 0
+        or before.st_size > 64 * 1024
+        or len(body) != before.st_size
+        or not isinstance(marker, dict)
+        or set(marker)
+        != {
+            "schemaVersion",
+            "authority",
+            "candidate",
+            "releaseRun",
+            "evidence",
+            "artifacts",
+            "supervisorSignature",
+        }
+        or type(marker.get("schemaVersion")) is not int
+        or marker.get("schemaVersion") != 2
+        or marker.get("authority") != "external-supervisor-ed25519"
+        or marker.get("candidate") != candidate
+        or marker.get("releaseRun") != release_run
+        or marker.get("evidence") != evidence
+    ):
+        return "external supervisor final commit marker is missing or invalid"
+    artifacts = marker.get("artifacts")
+    if not isinstance(artifacts, dict) or set(artifacts) != {
+        "receipt",
+        "rawReport",
+        "execution",
+    }:
+        return "external supervisor final commit marker is missing or invalid"
+    if artifacts.get("rawReport") != provenance.get("rawReport"):
+        return "external supervisor final commit raw report digest does not match"
+    if artifacts.get("execution") != provenance.get("execution"):
+        return "external supervisor final commit execution digest does not match"
+    signature_artifact = f"runtime/probe-commits/{evidence}.sig"
+    public_key_artifact = "runtime/probe-commits/release-supervisor-public-key.pem"
+    signature_reference = marker.get("supervisorSignature")
+    if (
+        not isinstance(signature_reference, dict)
+        or set(signature_reference)
+        != {
+            "artifact",
+            "sha256",
+            "publicKeyArtifact",
+            "publicKeySha256",
+            "publicKeySpkiSha256",
+        }
+        or signature_reference.get("artifact") != signature_artifact
+        or signature_reference.get("publicKeyArtifact") != public_key_artifact
+    ):
+        return "external supervisor final commit signature is missing or invalid"
+    signature_proof = _proof_bytes(
+        root,
+        {
+            "artifact": signature_reference.get("artifact"),
+            "sha256": signature_reference.get("sha256"),
+        },
+        label="external supervisor final commit signature",
+    )
+    if isinstance(signature_proof, str):
+        return signature_proof
+    public_key_proof = _proof_bytes(
+        root,
+        {
+            "artifact": signature_reference.get("publicKeyArtifact"),
+            "sha256": signature_reference.get("publicKeySha256"),
+        },
+        label="external supervisor public key",
+    )
+    if isinstance(public_key_proof, str):
+        return public_key_proof
+    stored_spki_sha256 = signature_reference.get("publicKeySpkiSha256")
+    if stored_spki_sha256 != expected_supervisor_public_key_spki_sha256:
+        return "external supervisor public-key fingerprint does not match"
+    claim = {name: value for name, value in marker.items() if name != "supervisorSignature"}
+    try:
+        verify_release_supervisor_signature(
+            claim,
+            signature=signature_proof[0],
+            public_key=public_key_proof[0],
+            expected_public_key_spki_sha256=(expected_supervisor_public_key_spki_sha256),
+        )
+    except ValueError as exc:
+        return str(exc)
+    receipt_proof = _proof_bytes(
+        root,
+        artifacts.get("receipt"),
+        label="external supervisor final commit receipt",
+    )
+    if isinstance(receipt_proof, str):
+        return receipt_proof
+    try:
+        committed_receipt = json.loads(receipt_proof[0])
+    except (UnicodeError, json.JSONDecodeError):
+        return "external supervisor final commit receipt is invalid"
+    if committed_receipt != document:
+        return "external supervisor final commit receipt does not match"
+    try:
+        current = marker_path.stat(follow_symlinks=False)
+        current_body = marker_path.read_bytes()
+    except OSError:
+        return "external supervisor final commit marker changed during validation"
+    if _file_identity(current) != _file_identity(before) or current_body != body:
+        return "external supervisor final commit marker changed during validation"
+    return None
+
+
 def probe_provenance_error(
     document: Mapping[str, object],
     *,
@@ -4108,6 +4731,7 @@ def probe_provenance_error(
     release_run: Mapping[str, str],
     bundle_root: Path,
     candidate_root: Path,
+    observer_signer_image: str | None = None,
     expected_outage_docker_host_identity_sha256: str | None = None,
     expected_gateway_docker_host_identity_sha256: str | None = None,
     trusted_keyring_path: Path | None = None,
@@ -4119,8 +4743,20 @@ def probe_provenance_error(
     expected_openmaic_observer_id: str | None = None,
     expected_openmaic_observer_origin: str | None = None,
     expected_openmaic_shared_ingress_control_origin: str | None = None,
+    openmaic_observer_public_key_path: Path | None = None,
+    expected_openmaic_observer_public_key_spki_sha256: str | None = None,
+    expected_supervisor_public_key_spki_sha256: str | None = None,
+    require_final_commit: bool = True,
 ) -> str | None:
     """Revalidate raw/execution proof for evidence backed by a fixed probe."""
+    try:
+        observer_signer_image, _candidate_services = _runtime_bound_observer_signer_image(
+            candidate_root,
+            candidate=candidate,
+            expected_observer_signer_image=observer_signer_image,
+        )
+    except ValueError as exc:
+        return str(exc)
     if evidence == "backup_restore":
         provenance = document.get("provenance")
         if not isinstance(provenance, dict) or set(provenance) != {"backupRestoreReport"}:
@@ -4172,6 +4808,7 @@ def probe_provenance_error(
                 candidate_root=candidate_root,
                 candidate=candidate,
                 release_run=release_run,
+                observer_signer_image=observer_signer_image,
                 expected_sha256=attestation_proof["sha256"],
             )
         except ValueError as exc:
@@ -4207,6 +4844,7 @@ def probe_provenance_error(
                 candidate_root=candidate_root,
                 candidate=candidate,
                 release_run=release_run,
+                observer_signer_image=observer_signer_image,
             )
         except ValueError as exc:
             return str(exc)
@@ -4254,6 +4892,7 @@ def probe_provenance_error(
                 candidate_root=candidate_root,
                 candidate=candidate,
                 release_run=release_run,
+                observer_signer_image=observer_signer_image,
                 expected_docker_host_identity_sha256=(expected_gateway_docker_host_identity_sha256),
                 trusted_keyring_path=trusted_keyring_path,
                 expected_trusted_keyring_sha256=expected_trusted_keyring_sha256,
@@ -4309,6 +4948,7 @@ def probe_provenance_error(
                 candidate_root=candidate_root,
                 candidate=candidate,
                 release_run=release_run,
+                observer_signer_image=observer_signer_image,
             )
         except ValueError as exc:
             return str(exc)
@@ -4347,6 +4987,7 @@ def probe_provenance_error(
                 candidate_root=candidate_root,
                 candidate=candidate,
                 release_run=release_run,
+                observer_signer_image=observer_signer_image,
             )
         except ValueError as exc:
             return str(exc)
@@ -4408,6 +5049,7 @@ def probe_provenance_error(
                 candidate_root=candidate_root,
                 candidate=candidate,
                 release_run=release_run,
+                observer_signer_image=observer_signer_image,
             )
         except ValueError as exc:
             return str(exc)
@@ -4445,20 +5087,47 @@ def probe_provenance_error(
             if isinstance(outage_body, str):
                 return outage_body
             observer_proof = provenance.get(observer_provenance_key)
+            observer_signature_proof = (
+                observer_proof.get("signatureArtifact")
+                if isinstance(observer_proof, dict)
+                else None
+            )
             if (
                 not isinstance(observer_proof, dict)
-                or set(observer_proof) != {"artifact", "sha256"}
+                or set(observer_proof)
+                != {
+                    "artifact",
+                    "sha256",
+                    "signatureArtifact",
+                    "publicKeySpkiSha256",
+                }
                 or observer_proof.get("artifact")
                 != "runtime/openmaic-shared-ingress-observer-attestation.json"
+                or observer_proof.get("publicKeySpkiSha256")
+                != expected_openmaic_observer_public_key_spki_sha256
+                or not isinstance(observer_signature_proof, dict)
+                or set(observer_signature_proof) != {"artifact", "sha256"}
+                or observer_signature_proof.get("artifact")
+                != "runtime/openmaic-shared-ingress-observer-attestation.sig"
             ):
                 return "OpenMAIC shared-ingress observer execution proof is missing or invalid"
             observer_body = _proof_bytes(
                 bundle_root,
-                observer_proof,
+                {
+                    "artifact": observer_proof["artifact"],
+                    "sha256": observer_proof["sha256"],
+                },
                 label="OpenMAIC shared-ingress observer attestation",
             )
             if isinstance(observer_body, str):
                 return observer_body
+            signature_body = _proof_bytes(
+                bundle_root,
+                observer_signature_proof,
+                label="OpenMAIC shared-ingress observer signature",
+            )
+            if isinstance(signature_body, str):
+                return signature_body
             try:
                 outage_checks, _outage_observed_at = (
                     derive_openmaic_dedicated_outage_receipt_checks(
@@ -4467,6 +5136,7 @@ def probe_provenance_error(
                         candidate_root=candidate_root,
                         candidate=candidate,
                         release_run=release_run,
+                        observer_signer_image=observer_signer_image,
                         expected_tenant_id=tenant_id,
                         expected_docker_host_identity_sha256=(
                             expected_outage_docker_host_identity_sha256
@@ -4478,6 +5148,10 @@ def probe_provenance_error(
                         expected_openmaic_observer_origin=(expected_openmaic_observer_origin),
                         expected_openmaic_shared_ingress_control_origin=(
                             expected_openmaic_shared_ingress_control_origin
+                        ),
+                        openmaic_observer_public_key_path=(openmaic_observer_public_key_path),
+                        expected_openmaic_observer_public_key_spki_sha256=(
+                            expected_openmaic_observer_public_key_spki_sha256
                         ),
                     )
                 )
@@ -4524,6 +5198,7 @@ def probe_provenance_error(
                 candidate_root=candidate_root,
                 candidate=candidate,
                 release_run=release_run,
+                observer_signer_image=observer_signer_image,
             )
         except ValueError as exc:
             return str(exc)
@@ -4544,11 +5219,35 @@ def probe_provenance_error(
     if not isinstance(provenance, dict) or set(provenance) != {
         "recipe",
         "command",
+        "finalCommit",
         "rawReport",
         "execution",
         "runtimeAttestation",
     }:
         return "evidence execution proof is missing or invalid"
+    final_commit_artifact = f"runtime/probe-commits/{evidence}.json"
+    if provenance.get("finalCommit") != {
+        "artifact": final_commit_artifact,
+        "authority": "external-supervisor-ed25519",
+    }:
+        return "external supervisor final commit reference is missing or invalid"
+    if require_final_commit:
+        if (
+            not isinstance(expected_supervisor_public_key_spki_sha256, str)
+            or _SHA256.fullmatch(expected_supervisor_public_key_spki_sha256) is None
+            or expected_supervisor_public_key_spki_sha256 == "0" * 64
+        ):
+            return "external supervisor public-key fingerprint is unavailable or invalid"
+        final_commit_error = _probe_final_commit_error(
+            document,
+            evidence=evidence,
+            candidate=candidate,
+            release_run=release_run,
+            bundle_root=bundle_root,
+            expected_supervisor_public_key_spki_sha256=(expected_supervisor_public_key_spki_sha256),
+        )
+        if final_commit_error is not None:
+            return final_commit_error
     recipe_id, _expected_count = recipe
     command = provenance.get("command")
     expected_command = probe_command_record(evidence)
@@ -4620,6 +5319,7 @@ def probe_provenance_error(
             candidate_root=candidate_root,
             candidate=candidate,
             release_run=release_run,
+            observer_signer_image=observer_signer_image,
             expected_base_url=execution["baseUrl"],
             expected_sha256=attestation_proof["sha256"],
         )
@@ -4692,6 +5392,15 @@ class ReleaseRuntime(Protocol):
     def result(self, name: str) -> LayerEvidence | None: ...
 
 
+def _valid_release_run(raw: object) -> bool:
+    if not isinstance(raw, dict) or set(raw) != {"runId", "environmentId"}:
+        return False
+    return all(
+        isinstance(raw.get(name), str) and _RELEASE_ID.fullmatch(raw[name]) is not None
+        for name in ("runId", "environmentId")
+    )
+
+
 class FileReleaseRuntime:
     """Read explicit evidence for one immutable source candidate."""
 
@@ -4700,6 +5409,9 @@ class FileReleaseRuntime:
         path: Path,
         *,
         expected_source_head: str,
+        expected_release_run_id: str,
+        expected_environment_id: str,
+        expected_supervisor_public_key_spki_sha256: str,
         candidate_root: Path | None = None,
         expected_outage_docker_host_identity_sha256: str | None = None,
         expected_gateway_docker_host_identity_sha256: str | None = None,
@@ -4712,9 +5424,28 @@ class FileReleaseRuntime:
         expected_openmaic_observer_id: str | None = None,
         expected_openmaic_observer_origin: str | None = None,
         expected_openmaic_shared_ingress_control_origin: str | None = None,
+        openmaic_observer_public_key_path: Path | None = None,
+        expected_openmaic_observer_public_key_spki_sha256: str | None = None,
+        expected_observer_signer_image: str | None = None,
     ) -> None:
         self._path = Path(path)
         self._expected_source_head = expected_source_head
+        expected_release_run = {
+            "runId": expected_release_run_id,
+            "environmentId": expected_environment_id,
+        }
+        if not self._valid_release_run(expected_release_run):
+            raise ValueError("expected release run identity is invalid")
+        self._expected_release_run = expected_release_run
+        if (
+            not isinstance(expected_supervisor_public_key_spki_sha256, str)
+            or _SHA256.fullmatch(expected_supervisor_public_key_spki_sha256) is None
+            or expected_supervisor_public_key_spki_sha256 == "0" * 64
+        ):
+            raise ValueError("expected release supervisor public-key fingerprint is invalid")
+        self._expected_supervisor_public_key_spki_sha256 = (
+            expected_supervisor_public_key_spki_sha256
+        )
         self._candidate_root = Path(candidate_root) if candidate_root is not None else PROJECT_ROOT
         self._expected_outage_docker_host_identity_sha256 = (
             expected_outage_docker_host_identity_sha256
@@ -4739,6 +5470,25 @@ class FileReleaseRuntime:
         self._expected_openmaic_shared_ingress_control_origin = (
             expected_openmaic_shared_ingress_control_origin
         )
+        self._openmaic_observer_public_key_path = (
+            Path(openmaic_observer_public_key_path)
+            if openmaic_observer_public_key_path is not None
+            else None
+        )
+        self._expected_openmaic_observer_public_key_spki_sha256 = (
+            expected_openmaic_observer_public_key_spki_sha256
+        )
+        supplied_observer_signer_image = (
+            expected_observer_signer_image
+            if expected_observer_signer_image is not None
+            else os.environ.get(_OBSERVER_SIGNER_IMAGE_ENV)
+        )
+        self._expected_observer_signer_image = (
+            _runtime_observer_signer_image(supplied_observer_signer_image)
+            if supplied_observer_signer_image is not None
+            else None
+        )
+        self._bound_observer_signer_image: str | None = None
         self._loaded = False
         self._candidate_head = ""
         self._candidate: dict[str, object] = {}
@@ -4747,6 +5497,7 @@ class FileReleaseRuntime:
         self._bundle_sha256 = ""
         self._release_run: dict[str, str] = {}
         self._release_run_is_valid = False
+        self._release_run_error = "evidence release run identity is invalid"
         self._evidence: dict[str, object] = {}
 
     def _load(self) -> None:
@@ -4764,17 +5515,23 @@ class FileReleaseRuntime:
             or document.get("schemaVersion") != EVIDENCE_SCHEMA_VERSION
         ):
             return
+        release_run = document.get("releaseRun")
+        if isinstance(release_run, dict) and self._valid_release_run(release_run):
+            observed_release_run = {
+                "runId": release_run["runId"],
+                "environmentId": release_run["environmentId"],
+            }
+            if observed_release_run == self._expected_release_run:
+                self._release_run = observed_release_run
+                self._release_run_is_valid = True
+            else:
+                self._release_run_error = (
+                    "evidence release run identity does not match the trusted controller"
+                )
         candidate = document.get("candidate")
         evidence = document.get("evidence")
         if not isinstance(candidate, dict) or not isinstance(evidence, dict):
             return
-        release_run = document.get("releaseRun")
-        if isinstance(release_run, dict) and self._valid_release_run(release_run):
-            self._release_run = {
-                "runId": release_run["runId"],
-                "environmentId": release_run["environmentId"],
-            }
-            self._release_run_is_valid = True
         source_head = candidate.get("sourceHead")
         if isinstance(source_head, str) and _COMMIT.fullmatch(source_head):
             self._candidate_head = source_head
@@ -4828,12 +5585,7 @@ class FileReleaseRuntime:
 
     @staticmethod
     def _valid_release_run(raw: object) -> bool:
-        if not isinstance(raw, dict) or set(raw) != {"runId", "environmentId"}:
-            return False
-        return all(
-            isinstance(raw.get(name), str) and _RELEASE_ID.fullmatch(raw[name]) is not None
-            for name in ("runId", "environmentId")
-        )
+        return _valid_release_run(raw)
 
     @staticmethod
     def _valid_receipt(name: str, raw: object) -> bool:
@@ -4886,7 +5638,7 @@ class FileReleaseRuntime:
             lock = json.loads(lock_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError):
             return "candidate image lock is unavailable or invalid"
-        if not isinstance(lock, dict) or lock.get("schemaVersion") != 2:
+        if not isinstance(lock, dict) or lock.get("schemaVersion") != 3:
             return "candidate image lock is unavailable or invalid"
         lock_candidate = lock.get("candidate")
         if self._candidate_metadata_error(lock_candidate) is not None:
@@ -4922,6 +5674,43 @@ class FileReleaseRuntime:
             if record.get("reference") != reference:
                 return "candidate image lock reference is invalid"
             references[name] = reference
+        support_images = lock.get("supportImages")
+        if not isinstance(support_images, dict) or set(support_images) != {
+            OBSERVER_SIGNER_IMAGE_NAME
+        }:
+            return "candidate observer signer support image is unavailable or invalid"
+        signer_record = support_images.get(OBSERVER_SIGNER_IMAGE_NAME)
+        if not isinstance(signer_record, dict) or set(signer_record) != {
+            "repository",
+            "tag",
+            "digest",
+            "reference",
+        }:
+            return "candidate observer signer support image is unavailable or invalid"
+        signer_digest = signer_record.get("digest")
+        signer_digest_match = (
+            _DIGEST.fullmatch(signer_digest) if isinstance(signer_digest, str) else None
+        )
+        bound_observer_signer_image = (
+            f"{OBSERVER_SIGNER_REPOSITORY}:{release_tag}@{signer_digest}"
+            if signer_digest_match is not None
+            else None
+        )
+        if (
+            signer_digest_match is None
+            or signer_digest_match.group(1) == "0" * 64
+            or signer_digest in image_digests.values()
+            or signer_record.get("repository") != OBSERVER_SIGNER_REPOSITORY
+            or signer_record.get("tag") != release_tag
+            or signer_record.get("reference") != bound_observer_signer_image
+        ):
+            return "candidate observer signer support image is unavailable or invalid"
+        assert isinstance(bound_observer_signer_image, str)
+        if (
+            self._expected_observer_signer_image is not None
+            and self._expected_observer_signer_image != bound_observer_signer_image
+        ):
+            return "candidate observer signer image does not match the image lock"
         for relative, bindings in CUSTOM_IMAGE_SERVICE_BINDINGS.items():
             try:
                 compose = yaml.load(
@@ -4940,6 +5729,32 @@ class FileReleaseRuntime:
                         "candidate images are not bound to every required production "
                         "Compose service"
                     )
+        artifact_paths = candidate_artifact_paths(self._candidate_root)
+        try:
+            validate_image_lock_bindings(
+                artifact_paths.image_lock,
+                require_candidate=True,
+                expected_candidate=raw,
+                compose_paths=(
+                    artifact_paths.base_compose,
+                    artifact_paths.platform_compose,
+                    artifact_paths.data_plane_compose,
+                    artifact_paths.observer_overlay,
+                ),
+            )
+        except ValueError as exc:
+            return str(exc)
+        try:
+            contract_signer_image, _candidate_services = _runtime_bound_observer_signer_image(
+                self._candidate_root,
+                candidate=raw,
+                expected_observer_signer_image=bound_observer_signer_image,
+            )
+        except ValueError:
+            return "candidate observer Compose is unavailable or invalid"
+        if contract_signer_image != bound_observer_signer_image:
+            return "candidate observer signer support image is unavailable or invalid"
+        self._bound_observer_signer_image = bound_observer_signer_image
         return None
 
     @property
@@ -4992,10 +5807,10 @@ class FileReleaseRuntime:
             return LayerEvidence("fail", "passing evidence artifact is missing")
         if not isinstance(artifact_sha256, str) or not _SHA256.fullmatch(artifact_sha256):
             return LayerEvidence("fail", "passing evidence artifact digest is invalid")
+        if not self._release_run_is_valid:
+            return LayerEvidence("fail", self._release_run_error)
         if not self._candidate_is_valid:
             return LayerEvidence("fail", self._candidate_error)
-        if not self._release_run_is_valid:
-            return LayerEvidence("fail", "evidence release run identity is invalid")
         artifact_reference = artifact.strip()
         artifact_path = self._artifact_path(artifact_reference)
         if artifact_path is None:
@@ -5045,6 +5860,7 @@ class FileReleaseRuntime:
                 release_run=self._release_run,
                 bundle_root=self._path.parent,
                 candidate_root=self._candidate_root,
+                observer_signer_image=self._bound_observer_signer_image,
                 expected_outage_docker_host_identity_sha256=(
                     self._expected_outage_docker_host_identity_sha256
                 ),
@@ -5063,6 +5879,13 @@ class FileReleaseRuntime:
                 expected_openmaic_observer_origin=self._expected_openmaic_observer_origin,
                 expected_openmaic_shared_ingress_control_origin=(
                     self._expected_openmaic_shared_ingress_control_origin
+                ),
+                openmaic_observer_public_key_path=(self._openmaic_observer_public_key_path),
+                expected_openmaic_observer_public_key_spki_sha256=(
+                    self._expected_openmaic_observer_public_key_spki_sha256
+                ),
+                expected_supervisor_public_key_spki_sha256=(
+                    self._expected_supervisor_public_key_spki_sha256
                 ),
             )
             try:
@@ -5112,7 +5935,7 @@ def _runtime_metadata(runtime: ReleaseRuntime, name: str) -> object:
         return None
 
 
-def verify(runtime: ReleaseRuntime) -> ReleaseVerification:
+def _verify_runtime(runtime: ReleaseRuntime) -> ReleaseVerification:
     layers: dict[str, LayerEvidence] = {}
     missing: list[str] = []
     failed: list[str] = []
@@ -5170,6 +5993,51 @@ def verify(runtime: ReleaseRuntime) -> ReleaseVerification:
     )
 
 
+def _reject_candidate_artifact_drift(
+    result: ReleaseVerification,
+) -> ReleaseVerification:
+    layers = dict(result.layers)
+    layers["image_digests"] = LayerEvidence(
+        "fail",
+        "release candidate artifacts changed during verification",
+    )
+    failed_names = set(result.failed)
+    failed_names.add("image_digests")
+    return replace(
+        result,
+        layers=layers,
+        missing=tuple(name for name in result.missing if name != "image_digests"),
+        failed=tuple(name for name in REQUIRED_LAYERS if name in failed_names),
+        candidate=None,
+    )
+
+
+def verify(runtime: ReleaseRuntime) -> ReleaseVerification:
+    if not isinstance(runtime, FileReleaseRuntime):
+        return _verify_runtime(runtime)
+
+    result: ReleaseVerification | None = None
+    lease_entered = False
+    verification_complete = False
+    try:
+        with validated_candidate_artifact_lease(runtime._candidate_root):
+            lease_entered = True
+            result = _verify_runtime(runtime)
+            verification_complete = True
+    except CandidateArtifactError:
+        if lease_entered and not verification_complete:
+            raise
+        if not lease_entered:
+            result = _verify_runtime(runtime)
+            if result.layers["image_digests"].status != "pass":
+                return replace(result, candidate=None)
+            return _reject_candidate_artifact_drift(result)
+        assert result is not None
+        return _reject_candidate_artifact_drift(result)
+    assert result is not None
+    return result
+
+
 def report_payload(result: ReleaseVerification) -> dict[str, object]:
     return {
         "status": result.status,
@@ -5225,6 +6093,9 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--evidence", type=Path, default=DEFAULT_EVIDENCE_PATH)
     parser.add_argument("--candidate-root", type=Path)
+    parser.add_argument("--expected-release-run-id", required=True)
+    parser.add_argument("--expected-environment-id", required=True)
+    parser.add_argument("--release-supervisor-public-key-spki-sha256")
     parser.add_argument("--outage-docker-host-identity-sha256")
     parser.add_argument("--gateway-docker-host-identity-sha256")
     parser.add_argument("--gateway-trust-keyring", type=Path)
@@ -5236,6 +6107,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--openmaic-observer-id")
     parser.add_argument("--openmaic-observer-origin")
     parser.add_argument("--openmaic-shared-ingress-control-origin")
+    parser.add_argument("--openmaic-observer-public-key", type=Path)
+    parser.add_argument("--openmaic-observer-public-key-spki-sha256")
+    parser.add_argument("--observer-signer-image")
     parser.add_argument("--json", action="store_true")
     return parser
 
@@ -5296,6 +6170,46 @@ def _resolve_gateway_trust_value(
     return supplied[0]
 
 
+def _resolve_optional_observer_signer_image(
+    cli_value: object,
+    environment: Mapping[str, str],
+) -> str | None:
+    by_upper = {name.upper(): value for name, value in environment.items()}
+    environment_value = by_upper.get(_OBSERVER_SIGNER_IMAGE_ENV)
+    supplied = [value for value in (cli_value, environment_value) if value is not None]
+    if not supplied:
+        return None
+    validated = [_runtime_observer_signer_image(value) for value in supplied]
+    if len(set(validated)) != 1:
+        raise ValueError("observer signer image inputs do not match")
+    return validated[0]
+
+
+def _resolve_external_path(
+    cli_value: object,
+    environment: Mapping[str, str],
+    *,
+    environment_name: str,
+    label: str,
+) -> Path:
+    by_upper = {name.upper(): value for name, value in environment.items()}
+    environment_value = by_upper.get(environment_name)
+    supplied = [value for value in (cli_value, environment_value) if value is not None]
+    if not supplied:
+        raise ValueError(f"{label} is unavailable or invalid")
+    paths: list[Path] = []
+    for value in supplied:
+        if not isinstance(value, (str, os.PathLike)):
+            raise ValueError(f"{label} is unavailable or invalid")
+        raw = os.fspath(value)
+        if not isinstance(raw, str) or not raw or raw != raw.strip():
+            raise ValueError(f"{label} is unavailable or invalid")
+        paths.append(Path(os.path.abspath(raw)))
+    if len(set(paths)) != 1:
+        raise ValueError(f"{label} inputs do not match")
+    return paths[0]
+
+
 def _reject_source_tree_change(result: ReleaseVerification) -> ReleaseVerification:
     current = result.layers["source_head"]
     if current.status != "pass":
@@ -5317,6 +6231,24 @@ def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
     try:
+        if not _valid_release_run(
+            {
+                "runId": args.expected_release_run_id,
+                "environmentId": args.expected_environment_id,
+            }
+        ):
+            raise ValueError("expected release run identity is invalid")
+        expected_supervisor_public_key_spki_sha256 = _resolve_gateway_trust_value(
+            args.release_supervisor_public_key_spki_sha256,
+            os.environ,
+            environment_name=_RELEASE_SUPERVISOR_PUBLIC_KEY_SPKI_SHA256_ENV,
+            label="release supervisor public-key SPKI SHA-256",
+        )
+        if (
+            _SHA256.fullmatch(expected_supervisor_public_key_spki_sha256) is None
+            or expected_supervisor_public_key_spki_sha256 == "0" * 64
+        ):
+            raise ValueError("release supervisor public-key fingerprint is invalid")
         expected_gateway_docker_host_identity_sha256 = _resolve_gateway_docker_host_identity_sha256(
             args.gateway_docker_host_identity_sha256,
             os.environ,
@@ -5373,6 +6305,22 @@ def main(argv: list[str] | None = None) -> int:
             environment_name=_OPENMAIC_CONTROL_ORIGIN_ENV,
             label="OpenMAIC shared-ingress control origin",
         )
+        openmaic_observer_public_key_path = _resolve_external_path(
+            args.openmaic_observer_public_key,
+            os.environ,
+            environment_name=_OPENMAIC_OBSERVER_PUBLIC_KEY_ENV,
+            label="OpenMAIC observer public key",
+        )
+        expected_openmaic_observer_public_key_spki_sha256 = _resolve_gateway_trust_value(
+            args.openmaic_observer_public_key_spki_sha256,
+            os.environ,
+            environment_name=(_OPENMAIC_OBSERVER_PUBLIC_KEY_SPKI_SHA256_ENV),
+            label="OpenMAIC observer public-key SPKI SHA-256",
+        )
+        expected_observer_signer_image = _resolve_optional_observer_signer_image(
+            args.observer_signer_image,
+            os.environ,
+        )
         validate_openmaic_shared_ingress_observer_trust_anchor(
             expected_observer_attestation_sha256=(expected_openmaic_observer_attestation_sha256),
             expected_observer_id=expected_openmaic_observer_id,
@@ -5380,6 +6328,7 @@ def main(argv: list[str] | None = None) -> int:
             expected_shared_ingress_control_origin=(
                 expected_openmaic_shared_ingress_control_origin
             ),
+            expected_public_key_spki_sha256=(expected_openmaic_observer_public_key_spki_sha256),
         )
     except ValueError as exc:
         parser.error(str(exc))
@@ -5388,6 +6337,9 @@ def main(argv: list[str] | None = None) -> int:
         FileReleaseRuntime(
             args.evidence,
             expected_source_head=expected_source_head,
+            expected_release_run_id=args.expected_release_run_id,
+            expected_environment_id=args.expected_environment_id,
+            expected_supervisor_public_key_spki_sha256=(expected_supervisor_public_key_spki_sha256),
             candidate_root=args.candidate_root,
             expected_outage_docker_host_identity_sha256=(args.outage_docker_host_identity_sha256),
             expected_gateway_docker_host_identity_sha256=(
@@ -5406,6 +6358,11 @@ def main(argv: list[str] | None = None) -> int:
             expected_openmaic_shared_ingress_control_origin=(
                 expected_openmaic_shared_ingress_control_origin
             ),
+            openmaic_observer_public_key_path=(openmaic_observer_public_key_path),
+            expected_openmaic_observer_public_key_spki_sha256=(
+                expected_openmaic_observer_public_key_spki_sha256
+            ),
+            expected_observer_signer_image=expected_observer_signer_image,
         )
     )
     if not expected_source_head or _git_head() != expected_source_head:
