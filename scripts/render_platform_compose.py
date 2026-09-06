@@ -2781,9 +2781,7 @@ def validate_downloaded_promotion_artifact(
         release_tag=release_tag,
         openmaic_head=OPENMAIC_HEAD,
     )
-    if actions_run.get("path") != (
-        f".github/workflows/private-platform-images.yml@{trusted_candidate['releaseTag']}"
-    ):
+    if actions_run.get("path") != ".github/workflows/private-platform-images.yml":
         raise ValueError("GitHub Actions workflow path is invalid")
 
     if not isinstance(actions_artifact, Mapping):

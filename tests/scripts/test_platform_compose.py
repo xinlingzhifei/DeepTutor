@@ -52,7 +52,8 @@ GITHUB_WORKFLOW_REF = (
     f"{SOURCE_REPOSITORY}/.github/workflows/private-platform-images.yml@refs/tags/{RELEASE_TAG}"
 )
 GITHUB_WORKFLOW_PATH = ".github/workflows/private-platform-images.yml"
-GITHUB_WORKFLOW_RUN_PATH = f"{GITHUB_WORKFLOW_PATH}@{RELEASE_TAG}"
+# REST workflow-run `path` is not the ref-qualified GITHUB_WORKFLOW_REF.
+GITHUB_WORKFLOW_RUN_PATH = GITHUB_WORKFLOW_PATH
 PROMOTION_ARTIFACT_NAME = f"private-platform-image-lock-{RELEASE_TAG}-{SOURCE_HEAD}"
 PROMOTION_ARCHIVE_MEMBERS = (
     "deploy/image-lock.json",
@@ -2004,6 +2005,7 @@ def test_downloaded_promotion_artifact_binds_compose_templates_to_actions_source
         "head-branch",
         "head-sha",
         "workflow-path",
+        "workflow-path-tag-suffix",
         "run-attempt",
         "run-conclusion",
         "expired",
@@ -2056,7 +2058,9 @@ def test_downloaded_promotion_artifact_rejects_archive_digest_or_actions_identit
     elif drift == "head-sha":
         actions_run["head_sha"] = "b" * 40
     elif drift == "workflow-path":
-        actions_run["path"] = f".github/workflows/other.yml@{RELEASE_TAG}"
+        actions_run["path"] = ".github/workflows/other.yml"
+    elif drift == "workflow-path-tag-suffix":
+        actions_run["path"] = f"{GITHUB_WORKFLOW_PATH}@{RELEASE_TAG}"
     elif drift == "run-attempt":
         actions_run["run_attempt"] = 2
     elif drift == "run-conclusion":

@@ -23,6 +23,23 @@ configuration text.
 
 ## Execution Status — 2026-09-06
 
+**Real Actions API compatibility correction:** the first frozen candidate
+`34007a4826c25771a28c15c0fa24e19fb8ba4be8` was tagged and pushed as
+`yfeistai-first-release-20260906-34007a48`. Run `34032340707` reached the
+OpenMAIC build after completing the deeptutor staging build, then was explicitly
+cancelled after an independent API check exposed a local verifier defect.
+Both that run and completed historical run `33325874655` return REST `path` as
+`.github/workflows/private-platform-images.yml`, not the ref-qualified workflow
+identity. The verifier now checks that exact path; `head_branch`, `head_sha`,
+repository, run/attempt, artifact digest and receipt `githubWorkflowRef` bindings
+remain unchanged. Correct API metadata and a fabricated suffix produced two
+effective REDs before the one-line fix; the complete affected test file then
+passed **173/173**, native0, pytest110.82s / wall115.157s, unchanged source.
+Independent diff review found no remaining issue. The cancelled run is not a
+successful publication; its original tag/logs and any staging image are retained.
+No same-tag rerun, tag movement or image cleanup is performed. The correction
+must be committed and published as a new immutable candidate.
+
 **Subsequent release-closure approval:** the user approved the versioned Observer
 manifest as the authoritative source for all seven deployment inputs, explicit
 per-run authorization expiry, and a new run/credential batch on retry (no implicit
