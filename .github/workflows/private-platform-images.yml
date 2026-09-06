@@ -530,7 +530,7 @@ jobs:
             --receipt-recovery-root "$receipt_recovery_root" \
             --receipt-worker-uid "$receipt_worker_uid" source-head \
             --output release-candidate/artifacts/source_head.json \
-            --candidate-root release-candidate \
+            --candidate-root "$GITHUB_WORKSPACE/release-candidate" \
             --source-root . \
             --run-id "$release_run" \
             --environment-id ghcr-production \
@@ -539,7 +539,7 @@ jobs:
             --receipt-recovery-root "$receipt_recovery_root" \
             --receipt-worker-uid "$receipt_worker_uid" image-digests \
             --output release-candidate/artifacts/image_digests.json \
-            --candidate-root release-candidate \
+            --candidate-root "$GITHUB_WORKSPACE/release-candidate" \
             --run-id "$release_run" \
             --environment-id ghcr-production \
             --observed-at "$observed_at"

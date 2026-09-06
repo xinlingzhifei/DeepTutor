@@ -23,6 +23,30 @@ configuration text.
 
 ## Execution Status — 2026-09-06
 
+**Actual Task1 receipt-step correction:** candidate `38c8e1de` was published under
+`yfeistai-first-release-20260906-38c8e1de` in first-attempt run `34032988226`.
+All four staging builds, final tag promotions, remote digest comparisons and
+promotion receipt verification succeeded. The run nevertheless ended **failure**:
+`Record Task1 release evidence` passed its POSIX recovery-policy admission, then
+`source-head` failed with `ValueError: candidate root must be an absolute path`.
+Both receipt commands still supplied relative `release-candidate`; artifact upload
+was skipped. This is an input-wiring defect, not an unsafe-ancestor failure.
+Keep that immutable tag and its images; do not reuse it or call this Task1 complete.
+The two arguments now use `"$GITHUB_WORKSPACE/release-candidate"`; the strict
+candidate admission and recovery implementation remain unchanged. The updated
+workflow regression failed first (native1, 1/1), then the complete affected file
+passed **173/173**, native0, pytest105.19s / wall109.235s, unchanged source.
+The new Linux regression executes the complete YAML Task1 bash step with the real
+CLI and Git against an isolated clean fixture commit, and verifies both receipts,
+all five unchanged candidate inputs and unchanged Git HEAD/status. The native CI
+and downloaded-artifact slice passed **82/82**, 92 deselected, native0,
+pytest72.64s / wall75.342s, with all 942 source hashes unchanged and process
+residuals empty. Snapshot SHA256:
+`78bb68a4fa654e3c0ffe4a651eca04f3810e67a3b767848faa30fc0b4994ee65`.
+Its image digest inputs are synthetic fixtures, not publication evidence. Actual
+diff review passed; the next immutable run must still complete and yield a
+verified raw nine-member artifact before deployment can proceed.
+
 **Real Actions API compatibility correction:** the first frozen candidate
 `34007a4826c25771a28c15c0fa24e19fb8ba4be8` was tagged and pushed as
 `yfeistai-first-release-20260906-34007a48`. Run `34032340707` reached the

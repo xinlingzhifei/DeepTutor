@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import shlex
 import stat
+import subprocess
 import sys
 from types import SimpleNamespace
 from typing import Any
@@ -2676,7 +2677,7 @@ def test_private_platform_workflow_emits_task1_receipts_from_clean_source() -> N
     logical_command = re.sub(r"\\\r?\n\s*", " ", receipt_command)
     assert re.search(r"classroom_release_evidence\.py [^\n]*\bsource-head\b", logical_command)
     assert re.search(r"classroom_release_evidence\.py [^\n]*\bimage-digests\b", logical_command)
-    assert "--candidate-root release-candidate" in receipt_command
+    assert receipt_command.count('--candidate-root "$GITHUB_WORKSPACE/release-candidate"') == 2
     assert "--source-root ." in receipt_command
     assert "release-candidate/artifacts/source_head.json" in receipt_command
     assert "release-candidate/artifacts/image_digests.json" in receipt_command
@@ -2760,6 +2761,134 @@ def test_private_platform_workflow_requires_explicit_private_task1_receipt_polic
         assert forbidden not in preparation, (
             "receipt policy must not fall back or provision accounts"
         )
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires the native Linux workflow shell")
+def test_private_platform_workflow_executes_task1_receipts_with_real_git(
+    tmp_path: Path,
+) -> None:
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows/private-platform-images.yml").read_text(encoding="utf-8")
+    )
+    steps = next(iter(workflow["jobs"].values()))["steps"]
+    receipt_step = next(
+        step for step in steps if step.get("name") == "Record Task1 release evidence"
+    )
+    workspace = tmp_path / "workspace"
+    scripts = workspace / "scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "classroom_release_evidence.py").write_bytes(
+        (ROOT / "scripts/classroom_release_evidence.py").read_bytes()
+    )
+    template = tmp_path / "empty-git-template"
+    template.mkdir()
+    environment = {name: value for name, value in os.environ.items() if not name.startswith("GIT_")}
+    environment.update(
+        {
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_COUNT": "0",
+            "GIT_TERMINAL_PROMPT": "0",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPATH": os.pathsep.join((str(ROOT), str(ROOT / "scripts"))),
+            "PATH": os.pathsep.join((str(Path(sys.executable).parent), os.environ["PATH"])),
+            "GITHUB_WORKSPACE": str(workspace),
+            "GITHUB_RUN_ID": GITHUB_RUN_ID,
+            "GITHUB_RUN_ATTEMPT": "1",
+        }
+    )
+
+    def git(*arguments: str) -> str:
+        completed = subprocess.run(
+            ["git", *arguments],
+            cwd=workspace,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
+        return completed.stdout.strip()
+
+    git("init", "--quiet", f"--template={template}")
+    (workspace / ".git/info").mkdir(exist_ok=True)
+    (workspace / ".git/info/exclude").write_text("/release-candidate/\n", encoding="utf-8")
+    git("add", "scripts/classroom_release_evidence.py")
+    git(
+        "-c",
+        "user.name=Receipt fixture",
+        "-c",
+        "user.email=fixture@example.invalid",
+        "commit",
+        "--no-gpg-sign",
+        "--quiet",
+        "-m",
+        "isolated workflow receipt fixture",
+    )
+    git("remote", "add", "origin", f"https://github.com/{SOURCE_REPOSITORY}.git")
+    source_head = git("rev-parse", "HEAD")
+    candidate_root = workspace / "release-candidate"
+    for relative in PROMOTION_ARCHIVE_MEMBERS[1:5]:
+        target = candidate_root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes((ROOT / relative).read_bytes())
+    lock = _load_renderer().write_image_lock(
+        candidate_root / "deploy/image-lock.json",
+        digest_resolver=lambda reference: (
+            "sha256:" + hashlib.sha256(reference.encode("utf-8")).hexdigest()
+        ),
+        compose_paths=tuple(
+            candidate_root / relative for relative in PROMOTION_ARCHIVE_MEMBERS[1:5]
+        ),
+        source_repository=SOURCE_REPOSITORY,
+        source_head=source_head,
+        release_tag=f"yfeistai-first-release-20260906-{source_head[:8]}",
+        openmaic_head=OPENMAIC_HEAD,
+    )
+    candidate_bytes = {
+        relative: (candidate_root / relative).read_bytes()
+        for relative in PROMOTION_ARCHIVE_MEMBERS[:5]
+    }
+    assert git("status", "--porcelain=v1", "--untracked-files=all") == ""
+
+    completed = subprocess.run(
+        ["bash", "--noprofile", "--norc", "-c", str(receipt_step["run"])],
+        cwd=workspace,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    for evidence, checks in (
+        ("source_head", {"headMatches": True, "worktreeClean": True}),
+        ("image_digests", {"lockMatches": True, "composeMatches": True}),
+    ):
+        receipt = json.loads((candidate_root / f"artifacts/{evidence}.json").read_bytes())
+        assert receipt["candidate"] == lock["candidate"]
+        assert receipt["candidate"]["sourceHead"] == source_head
+        assert receipt["evidence"] == evidence
+        assert receipt["releaseRun"] == {
+            "runId": f"github-{GITHUB_RUN_ID}-1",
+            "environmentId": "ghcr-production",
+        }
+        assert receipt["receipt"]["result"] == {
+            "outcome": "pass",
+            "nativeExit": 0,
+            "checks": checks,
+        }
+    assert {path.name for path in (candidate_root / "artifacts").iterdir()} == {
+        "source_head.json",
+        "image_digests.json",
+    }
+    assert {
+        relative: (candidate_root / relative).read_bytes() for relative in candidate_bytes
+    } == candidate_bytes
+    assert git("rev-parse", "HEAD") == source_head
+    assert git("status", "--porcelain=v1", "--untracked-files=all") == ""
 
 
 def test_private_platform_workflow_installs_receipt_dependencies_before_recording() -> None:
