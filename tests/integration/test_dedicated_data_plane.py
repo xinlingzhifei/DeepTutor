@@ -4,6 +4,8 @@ import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import importlib.util
+import json
+import os
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -21,6 +23,7 @@ from deeptutor.teaching.openmaic.data_planes import (
     DataPlaneUnavailable,
     ProviderProfileRecord,
 )
+from deeptutor.teaching.secret_permissions import restrict_secret_file
 
 
 def _load_registration_module():
@@ -92,6 +95,156 @@ def _healthy() -> VerifiedDataPlaneHealth:
         contract_versions=("1.0",),
         capabilities=("outline", "content", "micro", "export", "cancel", "artifact-manifest"),
         export_formats=("classroom_zip", "pptx", "offline_html", "mp4"),
+    )
+
+
+def test_repository_injected_sessions_stay_in_the_selected_database(tmp_path, monkeypatch):
+    import inspect
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    import deeptutor.teaching.repositories.data_planes as module
+
+    assert "session_factory" in inspect.signature(module.SqlAlchemyDataPlaneRepository).parameters
+
+    def forbidden_default():
+        raise AssertionError("the default database must not be opened")
+
+    monkeypatch.setattr(module, "platform_session", forbidden_default)
+
+    async def scenario():
+        engines = [
+            create_async_engine(
+                f"sqlite+aiosqlite:///{tmp_path / (name + '.db')}",
+                execution_options={"schema_translate_map": {"platform": None}},
+            )
+            for name in ("selected", "other")
+        ]
+        try:
+            repositories = []
+            for index, engine in enumerate(engines):
+                async with engine.begin() as connection:
+                    for table in (
+                        Tenant.__table__,
+                        ProviderProfile.__table__,
+                        DataPlaneRoute.__table__,
+                    ):
+                        await connection.run_sync(table.create)
+                factory = async_sessionmaker(engine, expire_on_commit=False)
+                async with factory.begin() as session:
+                    session.add(
+                        Tenant(
+                            id="tenant-selected",
+                            name=str(index),
+                            status="active",
+                            data_plane_mode="shared" if index == 0 else "dedicated",
+                        )
+                    )
+                    if index == 0:
+                        session.add(
+                            ProviderProfile(
+                                id="platform-default",
+                                scope="shared",
+                                tenant_id=None,
+                                owner_key="shared",
+                                provider_type="openai",
+                                model_name="configured-model",
+                                api_base_url="https://llm.example.test/v1",
+                                secret_ref="shared/providers/platform-default",
+                                status="active",
+                            )
+                        )
+                        session.add(
+                            DataPlaneRoute(
+                                id="shared",
+                                mode="shared",
+                                tenant_id=None,
+                                owner_key="shared",
+                                base_url="http://openmaic:3000",
+                                worker_pool="shared",
+                                queue_name="shared",
+                                provider_profile_id="platform-default",
+                                status="active",
+                                health_status="healthy",
+                            )
+                        )
+                repositories.append(module.SqlAlchemyDataPlaneRepository(session_factory=factory))
+            assert (await repositories[0].resolve("tenant-selected")).tenant_mode == "shared"
+            assert (await repositories[1].resolve("tenant-selected")).tenant_mode == "dedicated"
+            assert (
+                await repositories[0].resolve_shared_health_route()
+            ).provider_profile_id == "platform-default"
+            assert (await repositories[1].resolve_dedicated_health_inventory()).active_tenants == 1
+            selection = await repositories[0].resolve_worker_selection(
+                tenant_id="tenant-selected",
+                route_id="shared",
+                provider_profile_id="platform-default",
+                worker_pool_ref="shared",
+                queue_ref="shared",
+            )
+            assert selection is not None
+            assert await repositories[0].resolve_bound_route(selection) is not None
+            assert await repositories[0].resolve_bound_profile(selection) is not None
+            assert await repositories[1].resolve_bound_profile(selection) is None
+            assert await repositories[0].set_health("shared", "unhealthy")
+            assert await repositories[0].resolve_bound_profile(selection) is None
+        finally:
+            for engine in engines:
+                await engine.dispose()
+
+    asyncio.run(scenario())
+
+
+def test_dedicated_registration_checks_the_same_json_provider_descriptor(tmp_path, monkeypatch):
+    from dataclasses import replace
+    import json
+
+    from deeptutor.teaching.openmaic.provider_config import parse_provider_configuration
+
+    assert hasattr(_REGISTER, "dedicated_provider_configuration_matches"), (
+        "JSON registration binding is missing"
+    )
+    registration = replace(
+        _registration(), provider_type="openai", model_name="vendor/model:version"
+    )
+    document = {
+        "scope": "dedicated",
+        "tenantId": registration.tenant_id,
+        "profileId": registration.provider_profile_id,
+        "defaultModel": "openai:vendor/model:version",
+        "providers": {
+            "openai": {
+                "apiKey": "scoped-registration-test-canary",
+                "baseUrl": registration.provider_api_base_url,
+            }
+        },
+    }
+    configuration = parse_provider_configuration(
+        json.dumps(document).encode(),
+        scope="dedicated",
+        tenant_id=registration.tenant_id,
+        profile_id=registration.provider_profile_id,
+    )
+    calls = []
+
+    def read(root, **identity):
+        calls.append((root, identity))
+        return configuration
+
+    monkeypatch.setattr(_REGISTER, "read_provider_configuration", read)
+    assert _REGISTER.dedicated_provider_configuration_matches(registration, tmp_path)
+    assert calls == [
+        (
+            tmp_path,
+            {
+                "scope": "dedicated",
+                "tenant_id": registration.tenant_id,
+                "profile_id": registration.provider_profile_id,
+            },
+        )
+    ]
+    assert not _REGISTER.dedicated_provider_configuration_matches(
+        replace(registration, model_name="wrong-model"), tmp_path
     )
 
 
@@ -470,7 +623,7 @@ def _operator_arguments(
         "--provider-profile-id",
         "provider-tenant-private",
         "--provider-type",
-        "openai-compatible",
+        "openai",
         "--model-name",
         "private-model",
         "--provider-api-base-url",
@@ -496,7 +649,29 @@ def test_operator_cli_uses_explicit_inputs_signs_health_and_closes_resources(
         / "provider-tenant-private"
     )
     provider_secret.parent.mkdir(parents=True)
-    provider_secret.write_text("PROVIDER_SECRET_SENTINEL", encoding="utf-8")
+    provider_secret.write_text(
+        json.dumps(
+            {
+                "scope": "dedicated",
+                "tenantId": "tenant-private",
+                "profileId": "provider-tenant-private",
+                "defaultModel": "openai:private-model",
+                "providers": {
+                    "openai": {
+                        "apiKey": "PROVIDER_SECRET_SENTINEL",
+                        "baseUrl": "https://provider.internal/v1",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    if os.name == "posix":
+        if os.geteuid() == 0:
+            os.chown(provider_secret, 1000, 1000)
+        elif os.geteuid() != 1000 or os.getegid() != 1000:
+            pytest.skip("requires root to provision UID1000 file, or UID/GID1000 runtime")
+    restrict_secret_file(provider_secret)
     service_secret_file = tmp_path / "openmaic_service_secret"
     service_secret_file.write_text("SERVICE_SECRET_SENTINEL_0123456789", encoding="utf-8")
     arguments = _operator_arguments(
@@ -533,16 +708,21 @@ def test_operator_cli_uses_explicit_inputs_signs_health_and_closes_resources(
             events.append(f"active:{tenant_id}")
 
         async def persist(self, registration: DedicatedDataPlaneRegistration) -> None:
+            assert registration.provider_type == "openai"
+            assert registration.model_name == "private-model"
+            assert registration.provider_api_base_url == "https://provider.internal/v1"
             events.append(f"persist:{registration.secret_ref}")
 
     monkeypatch.setattr(_REGISTER, "SqlAlchemyDedicatedDataPlaneWriter", Writer)
-    original_provider_check = _REGISTER.provider_secret_reference_exists
+    original_provider_check = _REGISTER.dedicated_provider_configuration_matches
 
-    def provider_check(*args) -> bool:
+    def provider_check(registration, root) -> bool:
         events.append("provider-secret")
-        return original_provider_check(*args)
+        assert root == provider_secrets_root
+        assert registration.secret_ref == "tenants/tenant-private/providers/provider-tenant-private"
+        return original_provider_check(registration, root)
 
-    monkeypatch.setattr(_REGISTER, "provider_secret_reference_exists", provider_check)
+    monkeypatch.setattr(_REGISTER, "dedicated_provider_configuration_matches", provider_check)
     original_read_service_secret = _REGISTER.read_service_secret
 
     def read_secret(path: Path):
@@ -555,6 +735,8 @@ def test_operator_cli_uses_explicit_inputs_signs_health_and_closes_resources(
 
     def handle_health(request: httpx.Request) -> httpx.Response:
         events.append("signed-health")
+        assert "PROVIDER_SECRET_SENTINEL" not in repr(request.headers)
+        assert b"PROVIDER_SECRET_SENTINEL" not in request.content
         assert request.url.path == "/api/yfeistai/v1/health"
         assert request.headers["x-yfeistai-tenant-id"] == "tenant-private"
         assert request.headers["x-yfeistai-job-id"] == "health"

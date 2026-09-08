@@ -148,6 +148,7 @@ def _data_plane_compose() -> dict[str, Any]:
         profiles=("mp4-export",),
         environment={
             "YFEISTAI_DATA_PLANE_ID": "tenant-acme",
+            "YFEISTAI_OPENMAIC_PROVIDER_PROFILE_ID": "provider-acme",
             "YFEISTAI_DATA_PLANE_SECRET_DIR": (
                 f"./data/system/secrets/data-planes/tenant_{tenant_hash}"
             ),
@@ -4854,4 +4855,34 @@ def test_data_plane_is_project_scoped_private_and_uses_dedicated_secrets() -> No
     secret = compose["secrets"]["openmaic_service_secret"]
     tenant_hash = hashlib.sha256(b"tenant-acme").hexdigest()[:16]
     assert f"tenant_{tenant_hash}" in secret["file"]
-    assert _service_secret_sources(compose["services"]["openmaic"]) == {"openmaic_service_secret"}
+    assert _service_secret_sources(compose["services"]["openmaic"]) == {
+        "openmaic_service_secret",
+        "openmaic_provider_configuration",
+    }
+
+
+def test_provider_configuration_mount_is_one_canonical_file_per_scope() -> None:
+    platform = yaml.load((ROOT / "docker-compose.platform.yml").read_text(), Loader=yaml.BaseLoader)
+    dedicated = yaml.load(
+        (ROOT / "docker-compose.data-plane.yml").read_text(), Loader=yaml.BaseLoader
+    )
+    for compose, scope in ((platform, "shared"), (dedicated, "dedicated")):
+        service = compose["services"]["openmaic"]
+        mounts = [
+            entry
+            for entry in service["secrets"]
+            if isinstance(entry, dict) and entry.get("target") == "/app/server-providers.yml"
+        ]
+        assert mounts == [
+            {"source": "openmaic_provider_configuration", "target": "/app/server-providers.yml"}
+        ]
+        assert service["environment"]["YFEISTAI_OPENMAIC_MODE"] == scope
+        assert "API_KEY" not in str(service["environment"])
+    assert (
+        platform["secrets"]["openmaic_provider_configuration"]["file"]
+        == "./data/system/secrets/openmaic-providers/shared/providers/platform-default"
+    )
+    assert (
+        dedicated["secrets"]["openmaic_provider_configuration"]["file"]
+        == "./data/system/secrets/openmaic-providers/tenants/${YFEISTAI_DATA_PLANE_ID:?set data-plane id}/providers/${YFEISTAI_OPENMAIC_PROVIDER_PROFILE_ID:-}"
+    )

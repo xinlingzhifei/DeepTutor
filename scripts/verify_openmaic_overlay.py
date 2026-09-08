@@ -204,6 +204,16 @@ def _verify_dockerfile(integration_root: Path) -> None:
     if runner_marker not in source:
         raise OverlayVerificationError("Dockerfile must contain a final runner stage")
     runner = source[source.index(runner_marker) :]
+    required_provider_runtime = (
+        "COPY integrations/openmaic/runtime/provider-bootstrap.cjs ./yfeistai-provider-bootstrap.cjs",
+        'RUN test "$(id -u node)" = "1000" && test "$(id -g node)" = "1000"',
+        "USER node:node",
+        'CMD ["node", "--require", "./yfeistai-provider-bootstrap.cjs", "server.js"]',
+    )
+    if any(token not in runner for token in required_provider_runtime):
+        raise OverlayVerificationError(
+            "final image must start the scoped provider preload as UID/GID1000"
+        )
     if "git clone" in runner or re.search(r"\bapk add\b[^\n]*\bgit\b", runner):
         raise OverlayVerificationError("final image must not clone Git or install Git")
 

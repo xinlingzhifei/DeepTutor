@@ -49,6 +49,101 @@ def _module():
     return module
 
 
+def test_preflight_provider_descriptor_must_match_canonical_file_and_bootstrap_command(tmp_path):
+    from deeptutor.teaching.openmaic.provider_config import parse_provider_configuration
+
+    module = _module()
+    assert hasattr(module, "_inspect_provider_compose_bindings"), (
+        "provider Compose preflight is missing"
+    )
+    configuration = parse_provider_configuration(
+        json.dumps(
+            {
+                "scope": "shared",
+                "tenantId": None,
+                "profileId": "platform-default",
+                "defaultModel": "openai:configured-model",
+                "providers": {
+                    "openai": {
+                        "apiKey": "preflight-provider-canary",
+                        "baseUrl": "https://llm.example.test/v1",
+                    }
+                },
+            }
+        ).encode(),
+        scope="shared",
+        tenant_id=None,
+        profile_id="platform-default",
+    )
+    payload = {
+        "services": {
+            "openmaic": {
+                "environment": {
+                    "YFEISTAI_OPENMAIC_MODE": "shared",
+                    "YFEISTAI_OPENMAIC_PROVIDER_PROFILE_ID": "platform-default",
+                },
+                "secrets": [
+                    {
+                        "source": "openmaic_provider_configuration",
+                        "target": "/app/server-providers.yml",
+                    }
+                ],
+            },
+            "shared-data-plane-bootstrap": {
+                "command": [
+                    "scripts/bootstrap_shared_data_plane.py",
+                    "--provider-id",
+                    "openai",
+                    "--provider-model-name",
+                    "configured-model",
+                    "--provider-api-base-url",
+                    "https://llm.example.test/v1",
+                ]
+            },
+        },
+        "secrets": {
+            "openmaic_provider_configuration": {
+                "file": str(tmp_path / "shared/providers/platform-default")
+            }
+        },
+    }
+    assert module._inspect_provider_compose_bindings(payload, configuration, tmp_path) == ()
+    payload["services"]["shared-data-plane-bootstrap"]["command"][4] = "wrong-model"
+    assert module._inspect_provider_compose_bindings(payload, configuration, tmp_path)
+    payload["services"]["shared-data-plane-bootstrap"]["command"][4] = "configured-model"
+    payload["secrets"]["openmaic_provider_configuration"]["file"] = str(
+        tmp_path / "tenants/private/providers/private"
+    )
+    assert module._inspect_provider_compose_bindings(payload, configuration, tmp_path)
+
+
+def test_formal_runtime_preflight_requires_provider_configuration_before_database(
+    tmp_path, monkeypatch
+):
+    module = _module()
+    monkeypatch.setattr(module, "_validated_observer_environment", lambda _: {})
+    calls = []
+
+    async def database(_settings):
+        calls.append("database")
+        raise AssertionError(
+            "invalid provider cold-start configuration must fail before DB inspection"
+        )
+
+    monkeypatch.setattr(module, "_inspect_database_runtime", database)
+    errors = asyncio.run(
+        module.DefaultRuntimePreflightProbe().inspect(
+            settings=SimpleNamespace(),
+            secret_dir=tmp_path,
+            image_lock_path=tmp_path / "lock.json",
+            project_root=tmp_path,
+            candidate_root=tmp_path,
+        )
+    )
+    assert errors == ("OpenMAIC provider configuration",)
+    assert calls == []
+
+
 def _write_tls_pair(
     root: Path,
     *,
@@ -517,6 +612,58 @@ def test_host_preflight_binds_committed_observer_manifest_through_compose(
     services["openmaic-shared-ingress-observer"]["environment"] = _observer_compose_environment(
         admission
     )
+    from deeptutor.teaching.openmaic.provider_config import parse_provider_configuration
+
+    provider = parse_provider_configuration(
+        json.dumps(
+            {
+                "scope": "shared",
+                "tenantId": None,
+                "profileId": "platform-default",
+                "defaultModel": "openai:configured-model",
+                "providers": {
+                    "openai": {
+                        "apiKey": "host-test-only-canary",
+                        "baseUrl": "https://llm.example.test/v1",
+                    }
+                },
+            }
+        ).encode(),
+        scope="shared",
+        tenant_id=None,
+        profile_id="platform-default",
+    )
+    monkeypatch.setattr(module, "read_provider_configuration", lambda *_args, **_kwargs: provider)
+    services["openmaic"].update(
+        {
+            "environment": {
+                "YFEISTAI_OPENMAIC_MODE": "shared",
+                "YFEISTAI_OPENMAIC_PROVIDER_PROFILE_ID": "platform-default",
+            },
+            "secrets": [
+                {"source": "openmaic_provider_configuration", "target": "/app/server-providers.yml"}
+            ],
+        }
+    )
+    services["shared-data-plane-bootstrap"] = {
+        "command": [
+            "scripts/bootstrap_shared_data_plane.py",
+            "--provider-id",
+            "openai",
+            "--provider-model-name",
+            "configured-model",
+            "--provider-api-base-url",
+            "https://llm.example.test/v1",
+        ]
+    }
+    compose_secrets = {
+        "openmaic_provider_configuration": {
+            "file": str(
+                deployment_root
+                / "data/system/secrets/openmaic-providers/shared/providers/platform-default"
+            )
+        }
+    }
 
     def mark_event(name):
         events.append(name)
@@ -547,7 +694,12 @@ def test_host_preflight_binds_committed_observer_manifest_through_compose(
         version = command[-2:] == ["version", "--short"]
         mark_event("version" if version else "config")
         return subprocess.CompletedProcess(
-            command, 0, "2.24.4\n" if version else json.dumps({"services": services}), ""
+            command,
+            0,
+            "2.24.4\n"
+            if version
+            else json.dumps({"services": services, "secrets": compose_secrets}),
+            "",
         )
 
     compose_probe = module._inspect_compose_runtime
@@ -555,6 +707,7 @@ def test_host_preflight_binds_committed_observer_manifest_through_compose(
     monkeypatch.setattr(module, "_inspect_database_runtime", database)
     monkeypatch.setattr(module, "_inspect_object_store_runtime", successful_dependency)
     monkeypatch.setattr(module, "_inspect_openmaic_runtime", successful_dependency)
+    monkeypatch.setattr(module, "_inspect_registered_provider_runtime", successful_dependency)
     monkeypatch.setattr(
         module,
         "_inspect_compose_runtime",

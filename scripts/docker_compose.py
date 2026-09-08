@@ -24,6 +24,16 @@ from typing import Any
 from urllib.parse import urlsplit
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from deeptutor.teaching.openmaic.provider_config import (
+    PROVIDER_CONFIGURATION_DIRECTORY,
+    provider_configuration_path,
+    provider_secret_ref,
+    read_provider_configuration,
+)
+
 SETTINGS_DIR = PROJECT_ROOT / "data" / "user" / "settings"
 DOCKER_ENV_PATH = SETTINGS_DIR / "docker.env"
 
@@ -53,6 +63,18 @@ _OBSERVER_RUNTIME_ENVIRONMENT = (
     "YFEISTAI_SHARED_INGRESS_UPSTREAM_URL",
     "YFEISTAI_SHARED_INGRESS_CANDIDATE_HEALTH_URL",
     "YFEISTAI_SHARED_INGRESS_AUTH_EXPIRES_AT",
+)
+_PROVIDER_DESCRIPTOR_ENVIRONMENT = (
+    "YFEISTAI_OPENMAIC_PROVIDER_ID",
+    "YFEISTAI_OPENMAIC_MODEL_NAME",
+    "YFEISTAI_OPENMAIC_PROVIDER_ENDPOINT",
+)
+_PROVIDER_RUNTIME_ENVIRONMENT = (
+    "YFEISTAI_OPENMAIC_MODE",
+    "YFEISTAI_OPENMAIC_PROVIDER_PROFILE_ID",
+    "YFEISTAI_DATA_PLANE_ID",
+    "YFEISTAI_DATA_PLANE_SECRET_DIR",
+    *_PROVIDER_DESCRIPTOR_ENVIRONMENT,
 )
 
 
@@ -746,11 +768,49 @@ def _validate_data_plane_id(value: str) -> str:
     return value
 
 
+def provider_configuration_environment(
+    secrets_root: Path,
+    *,
+    scope: str,
+    tenant_id: str | None,
+    profile_id: str,
+) -> dict[str, str]:
+    """Cold-start identity and key-free descriptor; absence is not active registration."""
+    values = {
+        "YFEISTAI_OPENMAIC_MODE": scope,
+        "YFEISTAI_OPENMAIC_PROVIDER_PROFILE_ID": profile_id,
+        **dict.fromkeys(_PROVIDER_DESCRIPTOR_ENVIRONMENT, ""),
+    }
+    if not profile_id:
+        return values
+    path = provider_configuration_path(
+        secrets_root, scope=scope, tenant_id=tenant_id, profile_id=profile_id
+    )
+    if not path.exists() and not path.is_symlink():
+        # Docker/Node reject a missing Secret when this OpenMAIC actually starts.
+        # PostgreSQL/migrations and config inspection must not require an LLM key.
+        return values
+    configuration = read_provider_configuration(
+        secrets_root, scope=scope, tenant_id=tenant_id, profile_id=profile_id
+    )
+    values.update(
+        {
+            "YFEISTAI_OPENMAIC_PROVIDER_ID": configuration.provider_id,
+            "YFEISTAI_OPENMAIC_MODEL_NAME": configuration.model_name,
+            "YFEISTAI_OPENMAIC_PROVIDER_ENDPOINT": configuration.base_url,
+        }
+    )
+    return values
+
+
 def render_docker_env(
     settings_dir: Path = SETTINGS_DIR,
     output_path: Path = DOCKER_ENV_PATH,
     *,
     data_plane: str | None = None,
+    platform: bool = False,
+    provider_profile_id: str | None = None,
+    provider_secrets_root: Path | None = None,
 ) -> dict[str, str]:
     """Render compose interpolation vars from JSON settings only."""
     system = _read_json_object(settings_dir / "system.json")
@@ -766,54 +826,54 @@ def render_docker_env(
             _coerce_port(integrations.get("pocketbase_port"), DEFAULT_POCKETBASE_PORT)
         ),
     }
-    platform = _read_platform_object(settings_dir / "platform.json")
-    if platform is not None:
+    platform_config = _read_platform_object(settings_dir / "platform.json")
+    if platform_config is not None:
         values.update(
             {
                 "YFEISTAI_PLATFORM_DATABASE_HOST": _safe_compose_string(
-                    platform.get("database_host"),
+                    platform_config.get("database_host"),
                     name="database_host",
                     default="postgres",
                 ),
                 "YFEISTAI_PLATFORM_DATABASE_PORT": _safe_compose_integer(
-                    platform.get("database_port"),
+                    platform_config.get("database_port"),
                     name="database_port",
                     default=5432,
                     minimum=1,
                     maximum=65535,
                 ),
                 "YFEISTAI_PLATFORM_DATABASE_NAME": _safe_compose_string(
-                    platform.get("database_name"),
+                    platform_config.get("database_name"),
                     name="database_name",
                     default="yfeistai",
                 ),
                 "YFEISTAI_PLATFORM_DATABASE_USER": _safe_compose_string(
-                    platform.get("database_user"),
+                    platform_config.get("database_user"),
                     name="database_user",
                     default="yfeistai_app",
                 ),
                 "YFEISTAI_OBJECT_STORE_ENDPOINT": _safe_object_store_endpoint(
-                    platform.get("object_store_endpoint")
+                    platform_config.get("object_store_endpoint")
                 ),
                 "YFEISTAI_OBJECT_STORE_BUCKET": _safe_compose_string(
-                    platform.get("object_store_bucket"),
+                    platform_config.get("object_store_bucket"),
                     name="object_store_bucket",
                     default="yfeistai-classrooms",
                 ),
                 "YFEISTAI_OBJECT_STORE_REGION": _safe_compose_string(
-                    platform.get("object_store_region"),
+                    platform_config.get("object_store_region"),
                     name="object_store_region",
                     default="us-east-1",
                 ),
                 "YFEISTAI_SHARED_GENERATION_LIMIT": _safe_compose_integer(
-                    platform.get("shared_generation_limit"),
+                    platform_config.get("shared_generation_limit"),
                     name="shared_generation_limit",
                     default=20,
                     minimum=1,
                     maximum=10000,
                 ),
                 "YFEISTAI_DEFAULT_TENANT_GENERATION_LIMIT": _safe_compose_integer(
-                    platform.get("default_tenant_generation_limit"),
+                    platform_config.get("default_tenant_generation_limit"),
                     name="default_tenant_generation_limit",
                     default=2,
                     minimum=1,
@@ -832,19 +892,62 @@ def render_docker_env(
                 ),
             }
         )
+    if platform or data_plane is not None:
+        values.update(
+            provider_configuration_environment(
+                provider_secrets_root
+                or PROJECT_ROOT / "data" / "system" / "secrets" / PROVIDER_CONFIGURATION_DIRECTORY,
+                scope="shared" if platform else "dedicated",
+                tenant_id=data_plane,
+                profile_id="platform-default" if platform else provider_profile_id or "",
+            )
+        )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     lines = [
         "# Auto-generated by scripts/docker_compose.py from data/user/settings/*.json.",
         "# Contains non-sensitive Compose interpolation only; secret values stay in files.",
     ]
-    lines.extend(f"{key}={value}" for key, value in values.items())
+    lines.extend(
+        f"{key}={value}"
+        for key, value in values.items()
+        if key not in _PROVIDER_DESCRIPTOR_ENVIRONMENT
+    )
     output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return values
+
+
+def _extract_provider_profile(args: list[str]) -> tuple[str | None, list[str]]:
+    profile_id: str | None = None
+    remaining: list[str] = []
+    index = 0
+    while index < len(args):
+        argument = args[index]
+        if argument == "--provider-profile-id":
+            if index + 1 >= len(args):
+                raise SystemExit("--provider-profile-id requires an identifier")
+            value = args[index + 1]
+            index += 2
+        elif argument.startswith("--provider-profile-id="):
+            value = argument.partition("=")[2]
+            index += 1
+        else:
+            remaining.append(argument)
+            index += 1
+            continue
+        if profile_id is not None:
+            raise SystemExit("--provider-profile-id may only be provided once")
+        try:
+            provider_secret_ref(scope="dedicated", tenant_id="validated-tenant", profile_id=value)
+        except ValueError:
+            raise SystemExit("--provider-profile-id is invalid") from None
+        profile_id = value
+    return profile_id, remaining
 
 
 def _parse_topology_args(
     args: list[str],
 ) -> tuple[bool, str | None, Path | None, list[str]]:
+    provider_profile_id, args = _extract_provider_profile(args)
     platform = False
     data_plane: str | None = None
     candidate_root: Path | None = None
@@ -877,6 +980,8 @@ def _parse_topology_args(
         index += 1
     if platform and data_plane is not None:
         raise SystemExit("--platform and --data-plane are mutually exclusive")
+    if provider_profile_id is not None and data_plane is None:
+        raise SystemExit("--provider-profile-id requires --data-plane")
     if candidate_root is not None and not (platform or data_plane is not None):
         raise SystemExit("--candidate-root requires --platform or --data-plane")
     if platform or data_plane is not None:
@@ -998,8 +1103,11 @@ def main(argv: list[str] | None = None) -> int:
     if not args:
         args = ["up", "-d"]
 
+    provider_profile_id, args = _extract_provider_profile(args)
     observer_manifest, args = _extract_observer_release_manifest(args)
     platform, data_plane, candidate_root, _ = _parse_topology_args(args)
+    if provider_profile_id is not None and data_plane is None:
+        raise SystemExit("--provider-profile-id requires --data-plane")
     if platform and observer_manifest is None:
         raise SystemExit("a committed observer release manifest is required for platform Compose")
     if not platform and observer_manifest is not None:
@@ -1020,7 +1128,9 @@ def main(argv: list[str] | None = None) -> int:
                 candidate_root=production_root,
                 leases=leases,
             )
-        values = render_docker_env(data_plane=data_plane)
+        values = render_docker_env(
+            data_plane=data_plane, platform=platform, provider_profile_id=provider_profile_id
+        )
         print(
             "Docker settings: "
             f"backend={values['DEEPTUTOR_DOCKER_BACKEND_PORT']} "
@@ -1045,8 +1155,10 @@ def main(argv: list[str] | None = None) -> int:
             "YFEISTAI_CANDIDATE_ROOT",
             "YFEISTAI_OBSERVER_RELEASE_MANIFEST",
             *_OBSERVER_RUNTIME_ENVIRONMENT,
+            *_PROVIDER_RUNTIME_ENVIRONMENT,
         ):
             env.pop(key, None)
+        env.update({name: values[name] for name in _PROVIDER_RUNTIME_ENVIRONMENT if name in values})
         if platform or data_plane is not None:
             env["YFEISTAI_CANDIDATE_ROOT"] = str(production_root)
         if observer_admission is not None:

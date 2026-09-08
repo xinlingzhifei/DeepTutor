@@ -38,6 +38,12 @@ from deeptutor.teaching.openmaic.client import (
     ClientTimeouts,
     OpenMAICClient,
 )
+from deeptutor.teaching.openmaic.provider_config import (
+    ProviderConfigurationError,
+    read_provider_configuration,
+    valid_provider_model_name,
+    validate_provider_endpoint,
+)
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
 
@@ -124,18 +130,36 @@ class DedicatedDataPlaneRegistration:
             "queue_name",
             "provider_profile_id",
             "provider_type",
-            "model_name",
         ):
             _identifier(getattr(self, field), field)
+        if not valid_provider_model_name(self.model_name):
+            raise ValueError("model_name is invalid")
         _endpoint(self.base_url, "base_url")
-        _endpoint(
-            self.provider_api_base_url,
-            "provider_api_base_url",
-            allow_path=True,
-        )
+        validate_provider_endpoint(self.provider_api_base_url)
         expected = f"tenants/{self.tenant_id}/providers/{self.provider_profile_id}"
         if self.secret_ref != expected:
             raise ValueError("secret_ref is outside the dedicated tenant boundary")
+
+
+def dedicated_provider_configuration_matches(
+    registration: DedicatedDataPlaneRegistration, secrets_root: Path
+) -> bool:
+    """Match registration metadata to the same protected file consumed by Node."""
+    try:
+        configuration = read_provider_configuration(
+            secrets_root,
+            scope="dedicated",
+            tenant_id=registration.tenant_id,
+            profile_id=registration.provider_profile_id,
+        )
+    except ProviderConfigurationError:
+        return False
+    return (
+        configuration.provider_id == registration.provider_type
+        and configuration.model_name == registration.model_name
+        and configuration.base_url == registration.provider_api_base_url
+        and configuration.secret_ref == registration.secret_ref
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -365,12 +389,7 @@ async def _run(
             registration,
             verify_tenant=writer.require_active_tenant,
             verify_secret=lambda tenant_id, profile_id, secret_ref: (
-                provider_secret_reference_exists(
-                    provider_secrets_root,
-                    tenant_id,
-                    profile_id,
-                    secret_ref,
-                )
+                dedicated_provider_configuration_matches(registration, provider_secrets_root)
             ),
             verify_health=lambda value: _verify_runtime(value, service_secret_file),
             persist=writer.persist,

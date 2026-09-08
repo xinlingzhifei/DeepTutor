@@ -68,15 +68,15 @@ ENV HOSTNAME=0.0.0.0
 ENV PORT=3000
 
 RUN apk add --no-cache libc6-compat cairo pango jpeg giflib librsvg
-RUN addgroup --system --gid 1001 nodejs && \
-    adduser --system --uid 1001 nextjs
+RUN test "$(id -u node)" = "1000" && test "$(id -g node)" = "1000"
 
 COPY --from=builder /app/public ./public
-COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
-COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
+COPY --from=builder --chown=node:node /app/.next/standalone ./
+COPY --from=builder --chown=node:node /app/.next/static ./.next/static
+COPY integrations/openmaic/runtime/provider-bootstrap.cjs ./yfeistai-provider-bootstrap.cjs
 
-USER nextjs
+USER node:node
 
 EXPOSE 3000
 
-CMD ["node", "server.js"]
+CMD ["node", "--require", "./yfeistai-provider-bootstrap.cjs", "server.js"]

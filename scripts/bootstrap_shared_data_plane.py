@@ -41,6 +41,11 @@ from deeptutor.teaching.openmaic.client import (  # noqa: E402
     SUPPORTED_CONTRACT_VERSION,
     OpenMAICClient,
 )
+from deeptutor.teaching.openmaic.provider_config import (  # noqa: E402
+    PROVIDER_IDS,
+    valid_provider_model_name,
+    validate_provider_endpoint,
+)
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
@@ -55,6 +60,7 @@ class SharedDataPlaneRegistration:
     provider_type: str = "openmaic-server-configured"
     model_name: str = "server-selected-model"
     secret_ref: str = "shared/providers/platform-default"
+    provider_api_base_url: str | None = None
 
     def __post_init__(self) -> None:
         for name in (
@@ -63,10 +69,13 @@ class SharedDataPlaneRegistration:
             "queue_name",
             "provider_profile_id",
             "provider_type",
-            "model_name",
         ):
             if _IDENTIFIER.fullmatch(getattr(self, name)) is None:
                 raise ValueError(f"{name} is invalid")
+        if not valid_provider_model_name(self.model_name):
+            raise ValueError("model_name is invalid")
+        if self.provider_api_base_url is not None:
+            validate_provider_endpoint(self.provider_api_base_url)
         endpoint = urlsplit(self.base_url)
         if (
             endpoint.scheme not in {"http", "https"}
@@ -104,7 +113,7 @@ def _profile_matches(
         and profile.owner_key == "shared"
         and profile.provider_type == registration.provider_type
         and profile.model_name == registration.model_name
-        and profile.api_base_url is None
+        and profile.api_base_url == registration.provider_api_base_url
         and profile.secret_ref == registration.secret_ref
         and profile.status == "active"
     )
@@ -183,7 +192,7 @@ async def persist_shared_data_plane(
                 owner_key="shared",
                 provider_type=registration.provider_type,
                 model_name=registration.model_name,
-                api_base_url=None,
+                api_base_url=registration.provider_api_base_url,
                 secret_ref=registration.secret_ref,
                 status="active",
             )
@@ -327,6 +336,9 @@ def verify_shared_data_plane_observer_binding(
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://openmaic:3000")
+    parser.add_argument("--provider-id", required=True, choices=sorted(PROVIDER_IDS))
+    parser.add_argument("--provider-model-name", required=True)
+    parser.add_argument("--provider-api-base-url", required=True)
     parser.add_argument("--observer-attestation", type=Path, required=True)
     parser.add_argument("--observer-attestation-signature", type=Path, required=True)
     parser.add_argument("--observer-attestation-public-key", type=Path, required=True)
@@ -357,7 +369,12 @@ async def _run(
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
-    registration = SharedDataPlaneRegistration(base_url=arguments.base_url.rstrip("/"))
+    registration = SharedDataPlaneRegistration(
+        base_url=arguments.base_url.rstrip("/"),
+        provider_type=arguments.provider_id,
+        model_name=arguments.provider_model_name,
+        provider_api_base_url=arguments.provider_api_base_url,
+    )
     candidate_root = Path(arguments.candidate_root).absolute()
     with validated_candidate_artifact_lease(candidate_root) as candidate_lease:
         candidate_lease.check_unchanged()

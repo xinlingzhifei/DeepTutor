@@ -63,6 +63,30 @@ def _module():
     return module
 
 
+def test_shared_registration_uses_real_provider_descriptor_and_preserves_old_conflict():
+    module = _module()
+    registration = module.SharedDataPlaneRegistration(
+        provider_type="openai",
+        model_name="vendor/model:version",
+        provider_api_base_url="https://llm.example.test/v1",
+    )
+    assert registration.model_name == "vendor/model:version"
+    assert registration.provider_api_base_url == "https://llm.example.test/v1"
+    profile = module.ProviderProfile(
+        id="platform-default",
+        scope="shared",
+        tenant_id=None,
+        owner_key="shared",
+        provider_type="openmaic-server-configured",
+        model_name="server-selected-model",
+        api_base_url=None,
+        secret_ref="shared/providers/platform-default",
+        status="active",
+    )
+    assert module._profile_matches(profile, registration) is False
+    assert profile.model_name == "server-selected-model"
+
+
 def _contract_module():
     name = "openmaic_smoke_contract_for_bootstrap_test"
     spec = importlib.util.spec_from_file_location(name, CONTRACT_PATH)
@@ -82,6 +106,12 @@ def _arguments(tmp_path: Path) -> tuple[list[str], Path, Path, Path, Path]:
     signature.write_bytes(b"signed-observer-signature\n")
     return (
         [
+            "--provider-id",
+            "openai",
+            "--provider-model-name",
+            "configured-model",
+            "--provider-api-base-url",
+            "https://llm.example.test/v1",
             "--base-url",
             "http://openmaic-shared-ingress-observer:8000",
             "--observer-attestation",

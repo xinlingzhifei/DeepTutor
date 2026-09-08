@@ -144,23 +144,6 @@ jobs:
               raise SystemExit("Pinned base does not contain the independently verified linux/amd64 image")
           PY
 
-      - name: Reject existing final engine tag before build
-        shell: bash
-        run: |
-          set -euo pipefail
-          FINAL_REF="$IMAGE_REPOSITORY:$GITHUB_REF_NAME"
-          if docker buildx imagetools inspect --raw "$FINAL_REF" > "$RUNNER_TEMP/ragflow-final-prebuild.raw" 2> "$RUNNER_TEMP/ragflow-final-prebuild.err"; then
-            echo "::error::candidate tag already exists; refusing once-only publication"
-            exit 1
-          fi
-          python - "$RUNNER_TEMP/ragflow-final-prebuild.err" "$FINAL_REF" <<'PY'
-          from pathlib import Path
-          import sys
-
-          if Path(sys.argv[1]).read_text(encoding="utf-8").strip() != f"ERROR: {sys.argv[2]}: manifest unknown":
-              raise SystemExit("Final tag absence is unproven; registry/authentication/network errors fail closed")
-          PY
-
       - name: Build and push staging engine
         id: build_engine
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
@@ -215,21 +198,17 @@ jobs:
       - name: Promote verified staging manifest once
         env:
           BUILD_DIGEST: ${{ steps.build_engine.outputs.digest }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_ACTOR: ${{ github.actor }}
         shell: bash
         run: |
           set -euo pipefail
           FINAL_REF="$IMAGE_REPOSITORY:$GITHUB_REF_NAME"
-          if docker buildx imagetools inspect --raw "$FINAL_REF" > "$RUNNER_TEMP/ragflow-final-prepromotion.raw" 2> "$RUNNER_TEMP/ragflow-final-prepromotion.err"; then
-            echo "::error::candidate tag already exists; refusing once-only publication"
-            exit 1
-          fi
-          python - "$RUNNER_TEMP/ragflow-final-prepromotion.err" "$FINAL_REF" <<'PY'
-          from pathlib import Path
-          import sys
-
-          if Path(sys.argv[1]).read_text(encoding="utf-8").strip() != f"ERROR: {sys.argv[2]}: manifest unknown":
-              raise SystemExit("Final tag absence is unproven; registry/authentication/network errors fail closed")
-          PY
+          # Staging initializes a first-publish namespace; only typed authenticated
+          # manifest absence permits final publication. GET -> PUT is not atomic.
+          python scripts/ghcr_tag_guard.py \
+            --image-repository "$IMAGE_REPOSITORY" \
+            --release-tag "$GITHUB_REF_NAME"
           docker buildx imagetools create --prefer-index=false \
             --tag "$FINAL_REF" "$IMAGE_REPOSITORY@$BUILD_DIGEST"
 

@@ -200,21 +200,29 @@ def test_engine_is_one_independent_filesystem_build_not_a_fifth_platform_image()
     assert "secrets." not in source.replace("secrets.GITHUB_TOKEN", "")
 
 
-def test_final_tag_absence_is_checked_twice_and_accepts_only_exact_manifest_unknown():
-    _, _, _, steps = _workflow()
-    before = _step(steps, "Reject existing final engine tag before build")
+def test_typed_final_guard_runs_only_after_verified_staging_with_env_only_credentials():
+    source, _, _, steps = _workflow()
+    assert "Reject existing final engine tag before build" not in source
     promote = _step(steps, "Promote verified staging manifest once")
-    for step in (before, promote):
-        run = step["run"]
-        assert 'docker buildx imagetools inspect --raw "$FINAL_REF"' in run
-        assert '!= f"ERROR: {sys.argv[2]}: manifest unknown"' in run
-        assert "raise SystemExit" in run
-        assert "candidate tag already exists" in run
-        assert "not found" not in run
-        assert "name unknown" not in run
-    assert steps.index(before) < steps.index(_step(steps, "Build and push staging engine"))
+    assert promote["env"] == {
+        "BUILD_DIGEST": "${{ steps.build_engine.outputs.digest }}",
+        "GITHUB_TOKEN": "${{ secrets.GITHUB_TOKEN }}",
+        "GITHUB_ACTOR": "${{ github.actor }}",
+    }
+    assert source.count("python scripts/ghcr_tag_guard.py") == 1
+    assert "python scripts/ghcr_tag_guard.py" in promote["run"]
+    assert '--image-repository "$IMAGE_REPOSITORY"' in promote["run"]
+    assert '--release-tag "$GITHUB_REF_NAME"' in promote["run"]
+    assert "GITHUB_TOKEN" not in promote["run"]
+    assert "GITHUB_ACTOR" not in promote["run"]
+    assert "imagetools inspect" not in promote["run"]
+    assert "manifest unknown" not in promote["run"]
+    assert "prebuild.err" not in source and "prepromotion.err" not in source
+    assert steps.index(_step(steps, "Build and push staging engine")) < steps.index(
+        _step(steps, "Verify staging digest and platform")
+    )
     assert steps.index(_step(steps, "Verify staging digest and platform")) < steps.index(promote)
-    assert promote["run"].index("manifest unknown") < promote["run"].index("imagetools create")
+    assert promote["run"].index("ghcr_tag_guard.py") < promote["run"].index("imagetools create")
     assert "docker buildx imagetools create --prefer-index=false" in promote["run"]
     assert '--tag "$FINAL_REF" "$IMAGE_REPOSITORY@$BUILD_DIGEST"' in promote["run"]
 
@@ -292,7 +300,7 @@ def test_inline_python_parses_and_shell_never_interpolates_actions_expressions()
         for snippet in re.findall(r"<<'PY'\n(.*?)\nPY(?:\n|$)", run, re.DOTALL):
             ast.parse(snippet)
             snippets.append(snippet)
-    assert len(snippets) >= 8
+    assert len(snippets) >= 6
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Requires native Linux Bash (including WSL)")
@@ -316,79 +324,54 @@ def test_all_engine_workflow_run_steps_pass_native_bash_syntax_check():
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Requires native Linux Bash (including WSL)")
-@pytest.mark.parametrize(
-    "step_name",
-    [
-        "Reject existing final engine tag before build",
-        "Promote verified staging manifest once",
-    ],
-)
-@pytest.mark.parametrize(
-    "scenario",
-    [
-        "absent",
-        "existing",
-        "authentication",
-        "network",
-        "not_found",
-        "name_unknown",
-        "mixed_error",
-        "wrong_reference",
-        "empty_error",
-    ],
-)
-def test_native_final_tag_admission_only_accepts_exact_absence(tmp_path, step_name, scenario):
+@pytest.mark.parametrize("guard_status", [0, 1, 2, 127])
+def test_native_promotion_never_runs_after_guard_failure(tmp_path, guard_status):
     bash = shutil.which("bash")
     assert bash, "Native Linux workflow checks require Bash"
     _, _, _, steps = _workflow()
     release_tag = "yfeistai-first-release-20260907-aaaaaaaa"
     final_ref = f"{IMAGE}:{release_tag}"
     build_digest = "sha256:" + "b" * 64
-    errors = {
-        "absent": f"ERROR: {final_ref}: manifest unknown",
-        "existing": "",
-        "authentication": f"ERROR: {final_ref}: unauthorized: authentication required",
-        "network": f"ERROR: {final_ref}: dial tcp: connection timed out",
-        "not_found": f"ERROR: {final_ref}: not found",
-        "name_unknown": f"ERROR: {final_ref}: name unknown",
-        "mixed_error": f"ERROR: {final_ref}: manifest unknown\nERROR: authentication required",
-        "wrong_reference": "ERROR: ghcr.io/example/another-image:tag: manifest unknown",
-        "empty_error": "",
-    }
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
-    (fake_bin / "python").symlink_to(sys.executable)
+    python = fake_bin / "python"
+    python.write_text(
+        "#!/bin/sh\n"
+        'test "$GITHUB_TOKEN" = "fixture-token" || exit 98\n'
+        'test "$GITHUB_ACTOR" = "fixture-actor" || exit 98\n'
+        'printf \'python %s\\n\' "$*" >> "$FAKE_CALLS"\n'
+        'exit "$FAKE_GUARD_STATUS"\n',
+        encoding="utf-8",
+    )
+    python.chmod(0o755)
     docker = fake_bin / "docker"
     docker.write_text(
         "#!/bin/sh\n"
-        'printf \'%s\\n\' "$*" >> "$FAKE_DOCKER_CALLS"\n'
+        'printf \'docker %s\\n\' "$*" >> "$FAKE_CALLS"\n'
         'case "$1 $2 $3" in\n'
-        '  "buildx imagetools inspect")\n'
-        "    printf '%s\\n' '{}'\n"
-        "    printf '%s\\n' \"$FAKE_DOCKER_ERROR\" >&2\n"
-        '    exit "$FAKE_DOCKER_INSPECT_STATUS" ;;\n'
         '  "buildx imagetools create") exit 0 ;;\n'
         "  *) exit 99 ;;\n"
         "esac\n",
         encoding="utf-8",
     )
     docker.chmod(0o755)
-    calls_path = tmp_path / "docker-calls.txt"
-    # Only fake Docker and this test interpreter are on PATH; no host credentials,
-    # startup hooks, real Docker executable, or network client are inherited.
+    calls_path = tmp_path / "calls.txt"
+    # Only fake executables and fixture credentials are available. The helper's
+    # HTTP/parser behavior is covered independently without a real registry.
     environment = {
         "PATH": str(fake_bin),
         "RUNNER_TEMP": str(tmp_path),
         "IMAGE_REPOSITORY": IMAGE,
         "GITHUB_REF_NAME": release_tag,
+        "GITHUB_TOKEN": "fixture-token",
+        "GITHUB_ACTOR": "fixture-actor",
         "BUILD_DIGEST": build_digest,
-        "FAKE_DOCKER_CALLS": str(calls_path),
-        "FAKE_DOCKER_ERROR": errors[scenario],
-        "FAKE_DOCKER_INSPECT_STATUS": "0" if scenario == "existing" else "1",
+        "FAKE_CALLS": str(calls_path),
+        "FAKE_GUARD_STATUS": str(guard_status),
     }
     result = subprocess.run(
         [bash, "--noprofile", "--norc", "-e", "-o", "pipefail", "-s"],
-        input=_step(steps, step_name)["run"],
+        input=_step(steps, "Promote verified staging manifest once")["run"],
         cwd=tmp_path,
         env=environment,
         text=True,
@@ -396,11 +379,12 @@ def test_native_final_tag_admission_only_accepts_exact_absence(tmp_path, step_na
         timeout=10,
         check=False,
     )
-    allowed = scenario == "absent"
-    assert result.returncode == (0 if allowed else 1), result.stdout + result.stderr
-    expected_calls = [f"buildx imagetools inspect --raw {final_ref}"]
-    if allowed and step_name == "Promote verified staging manifest once":
+    assert result.returncode == guard_status, result.stdout + result.stderr
+    expected_calls = [
+        f"python scripts/ghcr_tag_guard.py --image-repository {IMAGE} --release-tag {release_tag}"
+    ]
+    if guard_status == 0:
         expected_calls.append(
-            f"buildx imagetools create --prefer-index=false --tag {final_ref} {IMAGE}@{build_digest}"
+            f"docker buildx imagetools create --prefer-index=false --tag {final_ref} {IMAGE}@{build_digest}"
         )
     assert calls_path.read_text(encoding="utf-8").splitlines() == expected_calls

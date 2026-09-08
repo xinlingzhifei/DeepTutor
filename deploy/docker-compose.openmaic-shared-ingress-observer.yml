@@ -124,6 +124,12 @@ services:
   shared-data-plane-bootstrap:
     command:
       - scripts/bootstrap_shared_data_plane.py
+      - --provider-id
+      - "${YFEISTAI_OPENMAIC_PROVIDER_ID:-}"
+      - --provider-model-name
+      - "${YFEISTAI_OPENMAIC_MODEL_NAME:-}"
+      - --provider-api-base-url
+      - "${YFEISTAI_OPENMAIC_PROVIDER_ENDPOINT:-}"
       - --base-url
       - http://openmaic-shared-ingress-observer:8000
       - --observer-attestation

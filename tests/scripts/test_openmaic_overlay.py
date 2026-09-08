@@ -43,6 +43,31 @@ def test_upstream_manifest_pins_verified_repository_commit_and_version() -> None
     assert manifest == EXPECTED_UPSTREAM
 
 
+def test_production_provider_process_has_explicit_uid_and_gid() -> None:
+    dockerfile = (INTEGRATION_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    runner = dockerfile[dockerfile.index(" AS runner") :]
+    # The same owner-only service secret is read by the UID1000 Python callers.
+    assert "USER node:node" in runner
+    assert 'test "$(id -u node)" = "1000"' in runner
+    assert 'test "$(id -g node)" = "1000"' in runner
+    assert "--chown=node:node /app/.next/standalone" in runner
+    assert "--chown=node:node /app/.next/static" in runner
+
+
+def test_dockerfile_verifier_rejects_skipping_provider_preload(tmp_path):
+    verifier = _load_verifier()
+    source = (INTEGRATION_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    (tmp_path / "Dockerfile").write_text(
+        source.replace(
+            '["node", "--require", "./yfeistai-provider-bootstrap.cjs", "server.js"]',
+            '["node", "server.js"]',
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(verifier.OverlayVerificationError):
+        verifier._verify_dockerfile(tmp_path)
+
+
 def test_dockerfile_checks_out_and_verifies_the_pin_before_overlay_copy() -> None:
     dockerfile = (INTEGRATION_ROOT / "Dockerfile").read_text(encoding="utf-8")
 
@@ -89,6 +114,17 @@ def test_static_verifier_accepts_the_committed_overlay() -> None:
     verifier = _load_verifier()
 
     verifier.verify_overlay(INTEGRATION_ROOT)
+
+
+def test_production_node_command_requires_the_scoped_provider_preload() -> None:
+    dockerfile = (INTEGRATION_ROOT / "Dockerfile").read_text(encoding="utf-8")
+    runner = dockerfile[dockerfile.index(" AS runner") :]
+    assert (
+        "COPY integrations/openmaic/runtime/provider-bootstrap.cjs ./yfeistai-provider-bootstrap.cjs"
+        in runner
+    )
+    assert 'CMD ["node", "--require", "./yfeistai-provider-bootstrap.cjs", "server.js"]' in runner
+    assert "server-providers.yml" not in runner
 
 
 @pytest.mark.parametrize(
@@ -192,9 +228,9 @@ def test_verifier_rejects_production_imports_from_overlay_tests(
 
 def test_verifier_requires_security_critical_service_auth_primitives() -> None:
     verifier = _load_verifier()
-    source = (INTEGRATION_ROOT / "overlay" / "lib" / "yfeistai" / "service-auth.ts").read_text(
-        encoding="utf-8"
-    )
+    source = (
+        INTEGRATION_ROOT / "overlay" / "lib" / "yfeistai" / "service-auth.ts"
+    ).read_text(encoding="utf-8")
 
     verifier.verify_service_auth_source(source)
 
@@ -246,9 +282,9 @@ def test_service_auth_verifier_requires_canonical_field_order() -> None:
 
 
 def test_service_auth_normalizes_only_fields_shared_by_body_and_digest_requests() -> None:
-    source = (
-        INTEGRATION_ROOT / "overlay" / "lib" / "yfeistai" / "service-auth.ts"
-    ).read_text(encoding="utf-8")
+    source = (INTEGRATION_ROOT / "overlay" / "lib" / "yfeistai" / "service-auth.ts").read_text(
+        encoding="utf-8"
+    )
     compact_source = "".join(source.split())
 
     assert (

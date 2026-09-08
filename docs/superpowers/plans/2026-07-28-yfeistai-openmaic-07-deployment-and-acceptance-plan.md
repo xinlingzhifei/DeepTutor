@@ -31,8 +31,17 @@
   （pytest426.20s/wall436.031s）。最终证据在
   `E:\CodexTemp\yfeistai-release-20260908`，早期证据在20260907目录。
   这些本地结果不证明 Actions、远端镜像发布或部署成功。
-- 新候选尚待最终源码冻结与真实发布。G3 运行证据、R1真实生命周期、原十二项 live
-  仍未完成；域名/TLS、真实 Provider/Embedding 和新鲜容量检查只阻塞相关部署。
+- `347f20e6` 平台 Actions/原始九成员制品已真实通过；独立 R1 在首次命名空间的
+  正式标签检查处失败。后续补丁改为先发布唯一 staging，再以显式认证和结构化
+  `404/MANIFEST_UNKNOWN` 判断正式标签不存在，其他错误一律拒绝；不复用旧标签。
+- 新增 Task2 Provider 启动接线与服务密钥读取身份修复：单一受保护 JSON、真实上游
+  模型选择、指定数据库登记核验；OpenMAIC 与 Python 统一 UID/GID1000，权限不放宽。
+  最终冻结前受影响14文件原生 exit0：597 passed、13按环境 skipped，pytest181.70s；
+  真实Linux Node22的58条直接断言及固定上游 shared/dedicated 两条配置链均 exit0，
+  两份实际 Compose 展开后的 Provider 绑定通过。这些不证明容器或真实推理成功。
+- 上述补丁现待新不可变候选真实发布。G3 运行证据、R1真实生命周期、原十二项 live
+  仍未完成。生产域名已确定为 `yifeiai.com`，当前A尚指向旧地址；DNS/TLS、真实
+  Provider/Embedding 和执行前的新鲜容量检查只阻塞各自相关部署。
 
 ## 2026-09-06 目标对齐与执行顺序（优先于下方历史步骤）
 
@@ -210,6 +219,55 @@ git commit -m "feat(deploy): add private teaching platform topology"
 ```
 
 ## Task 2: 建立 Secret、迁移和启动前检查
+
+### OpenMAIC Provider 启动输入与两阶段登记（2026-09-08）
+
+Provider 使用一份受保护的 UTF-8 JSON 文件（也是上游 YAML 输入），不使用模型 key 环境变量、
+请求级 provider 参数或第二份凭据副本。部署根目录下唯一来源为：
+
+- shared：`data/system/secrets/openmaic-providers/shared/providers/platform-default`；
+- dedicated：`data/system/secrets/openmaic-providers/tenants/<tenant-id>/providers/<profile-id>`。
+
+文件顶层只能包含 `scope`、`tenantId`、`profileId`、`defaultModel`、`providers`。
+shared 固定 `scope=shared`、`tenantId=null`、`profileId=platform-default`；dedicated 必须与
+包装器 `--data-plane <tenant-id> --provider-profile-id <profile-id>` 完全相同。
+`defaultModel` 使用真实上游首冒号格式 `provider-id:model-id`；`providers` 只能有该 provider
+一个成员，成员只含真实 `apiKey` 和明确 `baseUrl`。没有默认或示例 key；仅上游已有的
+`ollama`/`lemonade` 允许空 key。模型名最长 128、端点最长 512；端点不允许用户信息、
+查询、fragment、尾斜线或歧义路径。重复 JSON 键、非 JSON YAML、额外字段均拒绝。
+
+源文件应由服务器上的受信任操作员创建，实际 UID/GID 必须为 `1000:1000`，mode 为
+`0400` 或 `0600`，所有祖先目录不得是符号链接且须让运行 UID1000 可遍历。**Compose
+bind-backed Secret 的 uid/gid 声明不能修改宿主源文件所有权**；必须在宿主完成真实权限设置。
+`init_platform_secrets.py` 只负责首次生成并设置 mode，不执行 chown；root 运行后不能把
+生成成功当成容器可读。首次部署须逐个核验该脚本列出的七个服务 Secret 源文件及上述
+Provider canonical 文件，设置实际 `1000:1000` 与 `0600`/`0400`；不递归修改其他目录，
+不依赖 Compose 的 uid/gid 声明。`openmaic_service_secret` 的同一文件供 Python 与
+OpenMAIC 的 UID1000 进程读取，不创建第二份 service key。
+OpenMAIC 镜像显式以官方 Node 基础镜像的 `node:node`（1000:1000）启动，与 Python 服务
+保持一致；renderer 不改。只有对应 OpenMAIC 容器将单文件只读挂载到
+`/app/server-providers.yml`，不把整个 Provider 目录或租户私有 key 挂给 shared/worker/bootstrap。
+Node preload 校验文件、身份和默认模型后设置 `DEFAULT_MODEL`，原上游从同文件读取 providers。
+冲突 `DEFAULT_MODEL`、`MODEL_ROUTES` 或 Provider 环境覆盖都会拒绝启动，错误不回显文件内容。
+本次目标已核验为无 Docker、无既有部署的新服务器，首次部署使用新建并核验所有权的数据卷。
+历史 UID1001 的 OpenMAIC 数据卷不自动迁移，不递归修改旧卷所有权；若改为复用旧卷，须先
+单独核验并取得迁移授权。共享 service key 不复制，owner-only 权限不放宽。
+
+冷启动阶段只核对明确身份与上述文件，不要求数据库已有 active route/profile；因此可先启动
+PostgreSQL、迁移等无外部模型依赖服务。缺配置时包装器不会制造默认 Provider，OpenMAIC 自身
+拒绝启动，其健康依赖阻止共享登记继续。包装器仅在内存派生 provider/model/endpoint 三个
+非敏感描述符，经候选绑定的 Compose 传给共享 bootstrap；它们及 key 均不写入 `docker.env`。
+
+数据库与健康就绪后的登记/正式 host preflight 才核对 active 租户、route/profile、scope、owner、
+canonical secret_ref 和真实模型/端点。preflight 对同一个 canonical 文件、最终 Compose 挂载与
+bootstrap 描述符进行交叉核验；指定 `--config` 的数据库不会回落到默认全局数据库。
+独立登记的 `--provider-secrets-root` 指向该部署的 `data/system/secrets/openmaic-providers`，
+登记参数必须逐项匹配独立配置。现有 shared 的 `openmaic-server-configured` /
+`server-selected-model` sentinel 记录会产生明确冲突，**不自动迁移、不覆盖现有 DB**。
+须由受信任维护流程明确处理后重新执行正式登记与验收。
+
+上述代码/离线测试不证明外部凭据有效、模型可达、Docker 启动、TLS 或 live 验收成功；生产镜像
+和候选必须从包含此接线的最终源码重新构建，保持原镜像锁与发布成员格式，不以 override 拼接。
 
 **Files:**
 

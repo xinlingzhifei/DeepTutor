@@ -265,6 +265,101 @@ def test_data_plane_env_uses_a_hashed_dedicated_secret_directory(tmp_path: Path)
     )
 
 
+def test_provider_cold_start_env_does_not_require_database_or_external_key(tmp_path: Path) -> None:
+    module = _load_module()
+    settings_dir = tmp_path / "settings"
+    settings_dir.mkdir()
+    values = module.render_docker_env(
+        settings_dir,
+        tmp_path / "docker.env",
+        data_plane="tenant-acme",
+        provider_profile_id="provider-acme",
+        provider_secrets_root=tmp_path / "absent-provider-secrets",
+    )
+    assert values["YFEISTAI_OPENMAIC_MODE"] == "dedicated"
+    assert values["YFEISTAI_OPENMAIC_PROVIDER_PROFILE_ID"] == "provider-acme"
+    assert values["YFEISTAI_OPENMAIC_PROVIDER_ID"] == ""
+    assert "API_KEY" not in (tmp_path / "docker.env").read_text()
+
+
+@pytest.mark.parametrize("platform_document", (None, {"enabled": True}))
+def test_provider_shared_scope_is_selected_by_topology_not_platform_json(
+    tmp_path, platform_document
+):
+    module = _load_module()
+    settings = tmp_path / "settings"
+    settings.mkdir()
+    if platform_document is not None:
+        (settings / "platform.json").write_text(json.dumps(platform_document), encoding="utf-8")
+    root = tmp_path / "provider-secrets"
+    shared = module.render_docker_env(
+        settings, tmp_path / "shared.env", platform=True, provider_secrets_root=root
+    )
+    development = module.render_docker_env(
+        settings, tmp_path / "development.env", provider_secrets_root=root
+    )
+    assert shared["YFEISTAI_OPENMAIC_MODE"] == "shared"
+    assert shared["YFEISTAI_OPENMAIC_PROVIDER_PROFILE_ID"] == "platform-default"
+    assert "YFEISTAI_OPENMAIC_MODE" not in development
+
+
+def test_provider_descriptor_comes_from_one_file_and_is_not_persisted(tmp_path, monkeypatch):
+    from deeptutor.teaching.openmaic.provider_config import parse_provider_configuration
+
+    module = _load_module()
+    root = tmp_path / "provider-secrets"
+    path = root / "shared/providers/platform-default"
+    path.parent.mkdir(parents=True)
+    body = json.dumps(
+        {
+            "scope": "shared",
+            "tenantId": None,
+            "profileId": "platform-default",
+            "defaultModel": "openai:configured-model",
+            "providers": {
+                "openai": {
+                    "apiKey": "wrapper-secret-canary",
+                    "baseUrl": "https://llm.example.test/v1",
+                }
+            },
+        }
+    ).encode()
+    path.write_bytes(body)
+    configuration = parse_provider_configuration(
+        body, scope="shared", tenant_id=None, profile_id="platform-default"
+    )
+    calls = []
+
+    def read(source_root, **identity):
+        calls.append((source_root, identity))
+        return configuration
+
+    monkeypatch.setattr(module, "read_provider_configuration", read)
+    values = module.render_docker_env(
+        tmp_path / "settings", tmp_path / "docker.env", platform=True, provider_secrets_root=root
+    )
+    assert calls == [
+        (root, {"scope": "shared", "tenant_id": None, "profile_id": "platform-default"})
+    ]
+    assert values["YFEISTAI_OPENMAIC_PROVIDER_ID"] == "openai"
+    assert values["YFEISTAI_OPENMAIC_PROVIDER_ENDPOINT"] == configuration.base_url
+    assert "wrapper-secret-canary" not in repr(values)
+    saved = (tmp_path / "docker.env").read_text(encoding="utf-8")
+    assert "wrapper-secret-canary" not in saved
+    assert not any(name in saved for name in module._PROVIDER_DESCRIPTOR_ENVIRONMENT)
+
+
+def test_provider_profile_selection_is_removed_from_compose_arguments(monkeypatch) -> None:
+    module = _load_module()
+    monkeypatch.setattr(module.shutil, "which", lambda _name: "docker.exe")
+    command = module._compose_command(
+        ["--data-plane", "tenant-acme", "--provider-profile-id", "provider-acme", "config"]
+    )
+    assert "--provider-profile-id" not in command
+    assert "provider-acme" not in command
+    assert command[-1] == "config"
+
+
 def test_compose_command_rejects_ambiguous_or_unsafe_topology(monkeypatch) -> None:
     module = _load_module()
     monkeypatch.setattr(module.shutil, "which", lambda executable: "docker.exe")

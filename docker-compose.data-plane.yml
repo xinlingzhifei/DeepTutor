@@ -7,12 +7,16 @@ services:
     image: *openmaic-image
     restart: unless-stopped
     environment:
+      YFEISTAI_OPENMAIC_MODE: dedicated
+      YFEISTAI_OPENMAIC_PROVIDER_PROFILE_ID: "${YFEISTAI_OPENMAIC_PROVIDER_PROFILE_ID:-}"
       YFEISTAI_OPENMAIC_STATE_ROOT: /tmp/yfeistai-openmaic-state
       YFEISTAI_OPENMAIC_ARTIFACT_ROOT: /tmp/yfeistai-openmaic-artifacts
       YFEISTAI_OPENMAIC_RENDER_ENDPOINT: http://openmaic-render:9000
       YFEISTAI_DATA_PLANE_ID: "${YFEISTAI_DATA_PLANE_ID:?set data-plane id}"
     secrets:
       - openmaic_service_secret
+      - source: openmaic_provider_configuration
+        target: /app/server-providers.yml
     volumes:
       - openmaic-data:/tmp
     networks:
@@ -58,5 +62,7 @@ volumes:
   openmaic-data:
 
 secrets:
+  openmaic_provider_configuration:
+    file: "./data/system/secrets/openmaic-providers/tenants/${YFEISTAI_DATA_PLANE_ID:?set data-plane id}/providers/${YFEISTAI_OPENMAIC_PROVIDER_PROFILE_ID:-}"
   openmaic_service_secret:
     file: "${YFEISTAI_DATA_PLANE_SECRET_DIR:?set data-plane secret directory}/openmaic_service_secret"

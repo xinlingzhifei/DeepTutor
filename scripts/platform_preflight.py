@@ -25,6 +25,7 @@ if str(SCRIPTS_ROOT) not in sys.path:
 
 from docker_compose import (
     _OBSERVER_RUNTIME_ENVIRONMENT,
+    _PROVIDER_RUNTIME_ENVIRONMENT,
     load_observer_release_admission,
     platform_compose_topology_arguments,
 )
@@ -47,6 +48,14 @@ from render_platform_compose import (
     validated_candidate_artifact_lease,
 )
 
+from deeptutor.teaching.openmaic.provider_config import (
+    PROVIDER_CONFIGURATION_DIRECTORY,
+    ProviderConfiguration,
+    ProviderConfigurationError,
+    provider_configuration_path,
+    read_provider_configuration,
+    validate_registered_provider_configuration,
+)
 from deeptutor.teaching.secret_permissions import secret_file_is_restricted
 
 _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -445,6 +454,68 @@ async def inspect_candidate_network_phase(
     }
 
 
+async def _inspect_registered_provider_runtime(
+    settings: Any, configuration: ProviderConfiguration, active_tenants: Sequence[_ActiveTenant]
+) -> tuple[str, ...]:
+    """Read the configured database; reuse the repository's complete active bindings."""
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    from deeptutor.teaching.models import ProviderProfile
+    from deeptutor.teaching.repositories.data_planes import (
+        SqlAlchemyDataPlaneRepository,
+        _profile_record,
+    )
+
+    engine = None
+    try:
+        if not settings.enabled or settings.database_url is None:
+            raise ProviderConfigurationError()
+        engine = create_async_engine(settings.database_url.get_secret_value(), poolclass=NullPool)
+        factory = async_sessionmaker(engine, expire_on_commit=False)
+        repository = SqlAlchemyDataPlaneRepository(session_factory=factory)
+        async with factory() as session:
+            profile = await session.scalar(
+                select(ProviderProfile).where(ProviderProfile.id == configuration.profile_id)
+            )
+        if profile is None:
+            raise ProviderConfigurationError()
+        validate_registered_provider_configuration(configuration, _profile_record(profile))
+        route = await repository.resolve_shared_health_route()
+        if (
+            route is None
+            or route.provider_profile_id != configuration.profile_id
+            or route.health_status != "healthy"
+        ):
+            raise ProviderConfigurationError()
+        for tenant in active_tenants:
+            resolution = await repository.resolve(tenant.tenant_id)
+            if resolution is None:
+                raise ProviderConfigurationError()
+            if resolution.tenant_mode != "shared":
+                continue  # Dedicated processes have their own canonical configuration and registration.
+            selection = await repository.resolve_worker_selection(
+                tenant_id=tenant.tenant_id,
+                route_id=route.route_id,
+                provider_profile_id=configuration.profile_id,
+                worker_pool_ref=route.worker_pool,
+                queue_ref=route.queue_name,
+            )
+            if selection is None or await repository.resolve_bound_route(selection) is None:
+                raise ProviderConfigurationError()
+            bound_profile = await repository.resolve_bound_profile(selection)
+            if bound_profile is None:
+                raise ProviderConfigurationError()
+            validate_registered_provider_configuration(configuration, bound_profile)
+    except Exception:
+        return ("OpenMAIC registered provider binding",)
+    finally:
+        if engine is not None:
+            await engine.dispose()
+    return ()
+
+
 class DefaultRuntimePreflightProbe:
     async def inspect(
         self,
@@ -460,8 +531,20 @@ class DefaultRuntimePreflightProbe:
             _validated_observer_environment(observer_admission)
         except (KeyError, OSError, RuntimeError, TypeError, ValueError):
             return ("observer release manifest unavailable or changed",)
+        provider_root = (
+            project_root / "data" / "system" / "secrets" / PROVIDER_CONFIGURATION_DIRECTORY
+        )
+        try:
+            provider = read_provider_configuration(
+                provider_root, scope="shared", tenant_id=None, profile_id="platform-default"
+            )
+        except ProviderConfigurationError:
+            return ("OpenMAIC provider configuration",)
         database = await _inspect_database_runtime(settings)
         errors = list(database.errors)
+        errors.extend(
+            await _inspect_registered_provider_runtime(settings, provider, database.active_tenants)
+        )
         errors.extend(
             await _inspect_object_store_runtime(
                 settings,
@@ -476,6 +559,8 @@ class DefaultRuntimePreflightProbe:
                 candidate_root=candidate_root,
                 image_lock_path=image_lock_path,
                 observer_admission=observer_admission,
+                provider_configuration=provider,
+                provider_secrets_root=provider_root,
             )
         )
         return tuple(dict.fromkeys(errors))
@@ -542,12 +627,60 @@ def _inspect_observer_compose_environment(
     return ()
 
 
+def _inspect_provider_compose_bindings(
+    payload: dict[str, object], configuration: ProviderConfiguration, secrets_root: Path
+) -> tuple[str, ...]:
+    try:
+        services = payload["services"]
+        service = services["openmaic"]
+        environment = service["environment"]
+        if (
+            environment.get("YFEISTAI_OPENMAIC_MODE") != configuration.scope
+            or environment.get("YFEISTAI_OPENMAIC_PROVIDER_PROFILE_ID") != configuration.profile_id
+            or environment.get("YFEISTAI_DATA_PLANE_ID", "") != (configuration.tenant_id or "")
+        ):
+            raise ValueError
+        mounts = [
+            entry
+            for entry in service["secrets"]
+            if isinstance(entry, dict) and entry.get("target") == "/app/server-providers.yml"
+        ]
+        if mounts != [
+            {"source": "openmaic_provider_configuration", "target": "/app/server-providers.yml"}
+        ]:
+            raise ValueError
+        expected_path = provider_configuration_path(
+            secrets_root,
+            scope=configuration.scope,
+            tenant_id=configuration.tenant_id,
+            profile_id=configuration.profile_id,
+        )
+        if Path(payload["secrets"]["openmaic_provider_configuration"]["file"]) != expected_path:
+            raise ValueError
+        if configuration.scope == "shared":
+            command = services["shared-data-plane-bootstrap"]["command"]
+            if not isinstance(command, list) or any(not isinstance(item, str) for item in command):
+                raise ValueError
+            for flag, expected in (
+                ("--provider-id", configuration.provider_id),
+                ("--provider-model-name", configuration.model_name),
+                ("--provider-api-base-url", configuration.base_url),
+            ):
+                if command.count(flag) != 1 or command[command.index(flag) + 1] != expected:
+                    raise ValueError
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+        return ("OpenMAIC provider deployment configuration",)
+    return ()
+
+
 def _inspect_compose_runtime(
     project_root: Path,
     *,
     candidate_root: Path | None = None,
     image_lock_path: Path | None = None,
     observer_admission: dict[str, object] | None = None,
+    provider_configuration: ProviderConfiguration | None = None,
+    provider_secrets_root: Path | None = None,
     runner=subprocess.run,
 ) -> tuple[str, ...]:
     root = Path(project_root)
@@ -567,6 +700,7 @@ def _inspect_compose_runtime(
         "YFEISTAI_CANDIDATE_ROOT",
         "YFEISTAI_OBSERVER_RELEASE_MANIFEST",
         *_OBSERVER_RUNTIME_ENVIRONMENT,
+        *_PROVIDER_RUNTIME_ENVIRONMENT,
     ):
         environment.pop(name, None)
     try:
@@ -574,6 +708,14 @@ def _inspect_compose_runtime(
     except (KeyError, OSError, RuntimeError, TypeError, ValueError):
         return ("observer release manifest unavailable or changed",)
     environment["YFEISTAI_CANDIDATE_ROOT"] = str(artifact_paths.root)
+    if provider_configuration is not None:
+        environment.update(
+            {
+                "YFEISTAI_OPENMAIC_PROVIDER_ID": provider_configuration.provider_id,
+                "YFEISTAI_OPENMAIC_MODEL_NAME": provider_configuration.model_name,
+                "YFEISTAI_OPENMAIC_PROVIDER_ENDPOINT": provider_configuration.base_url,
+            }
+        )
     errors: list[str] = []
     shared_gateway = False
     try:
@@ -625,6 +767,14 @@ def _inspect_compose_runtime(
         )
         payload = json.loads(config_result.stdout)
         services = payload["services"]
+        if provider_configuration is not None:
+            if provider_secrets_root is None:
+                raise ValueError("provider root required")
+            errors.extend(
+                _inspect_provider_compose_bindings(
+                    payload, provider_configuration, provider_secrets_root
+                )
+            )
         errors.extend(
             _inspect_observer_compose_environment(
                 services.get("openmaic-shared-ingress-observer"),
@@ -701,6 +851,15 @@ def _inspect_compose_runtime(
             _validated_observer_environment(observer_admission)
         except (KeyError, OSError, RuntimeError, TypeError, ValueError):
             errors.append("observer release manifest unavailable or changed")
+    if provider_configuration is not None:
+        try:
+            current_provider = read_provider_configuration(
+                provider_secrets_root, scope="shared", tenant_id=None, profile_id="platform-default"
+            )
+            if current_provider != provider_configuration:
+                raise ProviderConfigurationError()
+        except ProviderConfigurationError:
+            errors.append("OpenMAIC provider configuration changed")
     return tuple(dict.fromkeys(errors))
 
 

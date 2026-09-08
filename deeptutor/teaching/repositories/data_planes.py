@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from contextlib import AbstractAsyncContextManager
 from typing import Literal, cast
 
 from sqlalchemy import and_, func, or_, select, text, update
 from sqlalchemy.exc import DBAPIError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from deeptutor.teaching.database import platform_session
 from deeptutor.teaching.models import (
@@ -273,8 +275,19 @@ def _audit_resource_id(decision: DataPlaneDecision) -> str | None:
 class SqlAlchemyDataPlaneRepository:
     """Read the exact tenant route and persist secret-free decisions."""
 
+    def __init__(
+        self,
+        *,
+        session_factory: Callable[[], AbstractAsyncContextManager[AsyncSession]] | None = None,
+    ) -> None:
+        self._session_factory = session_factory
+
+    def _session(self) -> AbstractAsyncContextManager[AsyncSession]:
+        # Resolve the default at call time, preserving existing runtime/test injection.
+        return (self._session_factory or platform_session)()
+
     async def resolve(self, tenant_id: str) -> DataPlaneResolution | None:
-        async with platform_session() as session:
+        async with self._session() as session:
             result = await session.execute(
                 select(Tenant, DataPlaneRoute, ProviderProfile)
                 .outerjoin(
@@ -319,14 +332,14 @@ class SqlAlchemyDataPlaneRepository:
             )
 
     async def resolve_shared_health_route(self) -> DataPlaneRouteRecord | None:
-        async with platform_session() as session:
+        async with self._session() as session:
             route = await session.scalar(build_shared_health_route_statement())
         return _route_record(route) if route is not None else None
 
     async def resolve_dedicated_health_inventory(
         self,
     ) -> DedicatedDataPlaneHealthInventory:
-        async with platform_session() as session:
+        async with self._session() as session:
             rows = (await session.execute(build_dedicated_health_inventory_statement())).all()
         routes: list[DataPlaneRouteRecord] = []
         unavailable = 0
@@ -350,7 +363,7 @@ class SqlAlchemyDataPlaneRepository:
         )
 
     async def record_decision(self, decision: DataPlaneDecision) -> None:
-        async with platform_session() as session:
+        async with self._session() as session:
             async with session.begin():
                 tenant_exists = await session.scalar(
                     select(Tenant.id).where(Tenant.id == decision.tenant_id)
@@ -446,7 +459,7 @@ class SqlAlchemyDataPlaneRepository:
             "provider_config_digest": provider_config_digest,
         }
         try:
-            async with platform_session() as session:
+            async with self._session() as session:
                 async with session.begin():
                     recorded = await session.scalar(_RECORD_ROUTE_ATTEMPT, parameters)
                     if recorded is not True:
@@ -485,7 +498,7 @@ class SqlAlchemyDataPlaneRepository:
         if expected_data_plane_mode not in {"shared", "dedicated"}:
             return None
 
-        async with platform_session() as session:
+        async with self._session() as session:
             result = await session.execute(
                 _READ_ROUTE_ATTEMPTS,
                 {
@@ -543,7 +556,7 @@ class SqlAlchemyDataPlaneRepository:
     ) -> ProviderProfileRecord | None:
         expected_tenant_id = None if selection.mode == "shared" else selection.tenant_id
         expected_owner_key = "shared" if selection.mode == "shared" else selection.tenant_id
-        async with platform_session() as session:
+        async with self._session() as session:
             profile = await session.scalar(
                 select(ProviderProfile)
                 .join(
@@ -661,7 +674,7 @@ class SqlAlchemyDataPlaneRepository:
     async def set_health(self, route_id: str, health_status: str) -> bool:
         if health_status not in {"healthy", "unhealthy"}:
             raise ValueError("health_status must be healthy or unhealthy")
-        async with platform_session() as session:
+        async with self._session() as session:
             async with session.begin():
                 result = await session.execute(
                     update(DataPlaneRoute)

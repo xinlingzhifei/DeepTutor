@@ -251,11 +251,15 @@ services:
     image: *openmaic-image
     restart: unless-stopped
     environment:
+      YFEISTAI_OPENMAIC_MODE: shared
+      YFEISTAI_OPENMAIC_PROVIDER_PROFILE_ID: platform-default
       YFEISTAI_OPENMAIC_STATE_ROOT: /tmp/yfeistai-openmaic-state
       YFEISTAI_OPENMAIC_ARTIFACT_ROOT: /tmp/yfeistai-openmaic-artifacts
       YFEISTAI_OPENMAIC_RENDER_ENDPOINT: http://openmaic-render:9000
     secrets:
       - openmaic_service_secret
+      - source: openmaic_provider_configuration
+        target: /app/server-providers.yml
     volumes:
       - openmaic-shared-data:/tmp
     networks:
@@ -372,6 +376,8 @@ volumes:
   platform-secret-mask:
 
 secrets:
+  openmaic_provider_configuration:
+    file: ./data/system/secrets/openmaic-providers/shared/providers/platform-default
   platform_database_password:
     file: ./data/system/secrets/platform_database_password
   platform_database_app_password:

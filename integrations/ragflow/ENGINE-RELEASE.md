@@ -48,8 +48,20 @@ Dockerfile、已应用品牌的固定检出作为 context，并显式选择 linu
 它响应同一不可变发布标签，但不把引擎加入原平台四镜像或九成员 artifact。
 两个工作流使用同一并发组并明确 queue: max，避免等待中的候选被另一个运行替换。
 CI 先验证身份、固定检出、应用并验证品牌、检查原始 base manifest，然后构建
-linux/amd64 production。staging 和正式标签都复核原始 manifest；最后输出独立收据。
-不允许重跑已有候选或覆盖正式标签；registry 错误不能当作“标签不存在”。
+linux/amd64 production 并仅推送 runId/runAttempt 唯一 staging，允许首次推送初始化
+包命名空间；staging 的原始摘要和平台验证通过后，才检查正式标签并发布。
+不允许重跑已有候选或覆盖正式标签；最后复核正式标签原始 manifest 并输出独立收据。
+
+scripts/ghcr_tag_guard.py 是唯一的正式标签准入检查，凭据只从该步骤显式设置的
+GITHUB_TOKEN/GITHUB_ACTOR 环境读取。它仅向固定 ghcr.io 的 token endpoint 和
+精确候选 manifest endpoint 发起认证 GET；只有 manifest 的 HTTP 404 且所有
+结构化错误码均为 MANIFEST_UNKNOWN 才放行。已存在标签（即使摘要相同）、
+NAME_UNKNOWN、401/403、网络错误、重定向、非 JSON、畸形或重复 JSON 均拒绝；
+token endpoint 的任何错误都不是标签缺失证据。日志仅包含阶段、状态码和允许列表
+错误码，不输出凭据、原始响应或完整异常。成功 artifact 仍严格为原有六个成员。
+
+该 GET 检查不是 GET→PUT 原子操作。共享发布队列及没有队列外其他写入者是安全
+前提；正式发布后仍必须检查原始摘要，部署权威仍是验证过的 digest 而不是标签。
 
 标准 runner 必须具备至少4核、16 GB RAM及50 GB可用磁盘。不足只终止独立引擎
 构建，不删除 runner 工具，不自动购买更大 runner，也不阻塞无关本地开发。
