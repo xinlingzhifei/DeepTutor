@@ -548,8 +548,8 @@ def write_inputs(
 def _published_ports(service: str, *, drift: str | None = None) -> dict[str, object]:
     if service == "gateway":
         ports: dict[str, object] = {
-            "80/tcp": [{"HostIp": "0.0.0.0", "HostPort": "80"}],
-            "443/tcp": [{"HostIp": "0.0.0.0", "HostPort": "443"}],
+            "80/tcp": [{"HostIp": "127.0.0.1", "HostPort": "13780"}],
+            "443/tcp": [{"HostIp": "127.0.0.1", "HostPort": "13783"}],
         }
         if drift == "gateway-extra-port":
             ports["8001/tcp"] = [{"HostIp": "0.0.0.0", "HostPort": "8001"}]

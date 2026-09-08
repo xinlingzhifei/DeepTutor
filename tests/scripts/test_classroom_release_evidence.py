@@ -9571,6 +9571,11 @@ def test_gateway_only_public_receipt_replays_external_and_docker_proof_last(
         "runtime/gateway-only-public-attestation.json",
     ]
     assert proof["docker"]["beforeSnapshot"] == proof["docker"]["afterSnapshot"]
+    gateway = next(row for row in proof["docker"]["beforeSnapshot"] if row["service"] == "gateway")
+    assert gateway["publishedPorts"] == [
+        {"containerPort": 80, "hostIp": "127.0.0.1", "hostPort": 13780, "protocol": "tcp"},
+        {"containerPort": 443, "hostIp": "127.0.0.1", "hostPort": 13783, "protocol": "tcp"},
+    ]
     assert proof["docker"]["daemon"] == {
         "context": support.DOCKER_CONTEXT,
         "endpoint": support.DOCKER_ENDPOINT,
@@ -9625,14 +9630,14 @@ def test_gateway_only_public_receipt_replays_external_and_docker_proof_last(
             "publishedPorts": [
                 {
                     "containerPort": 80,
-                    "hostIp": "0.0.0.0",
-                    "hostPort": 80,
+                    "hostIp": "127.0.0.1",
+                    "hostPort": 13780,
                     "protocol": "tcp",
                 },
                 {
                     "containerPort": 443,
-                    "hostIp": "0.0.0.0",
-                    "hostPort": 443,
+                    "hostIp": "127.0.0.1",
+                    "hostPort": 13783,
                     "protocol": "tcp",
                 },
             ],

@@ -288,6 +288,37 @@ def test_gateway_public_contract_binds_external_observation_and_attestation() ->
     }
 
 
+def test_shared_host_external_policy_probes_both_loopback_backend_ports() -> None:
+    module = _load_module()
+    assert module.GATEWAY_PUBLIC_SCHEMA_VERSION == 2
+    assert module.GATEWAY_DENIED_PORTS[-2:] == (13780, 13783)
+    report = _report(module)
+    assert module.derive_gateway_public_checks(report)["internalPortsClosed"] is True
+    report["observations"] = [row for row in report["observations"] if row["port"] != 13783]
+    assert module.derive_gateway_public_checks(report)["internalPortsClosed"] is False
+
+
+def test_legacy_port_report_is_not_accepted_for_a_shared_host_candidate() -> None:
+    module = _load_module()
+    report = _report(module)
+    report["schemaVersion"] = 1
+    report["policy"]["deniedTcpPorts"] = [3000, 3782, 5432, 8001, 8090, 9000, 9001]
+    report["observations"] = [
+        row for row in report["observations"] if row["port"] not in (13780, 13783)
+    ]
+    kwargs = {
+        "candidate": CANDIDATE,
+        "release_run": RELEASE_RUN,
+        "expected_base_url": BASE_URL,
+        "expected_runtime_attestation_sha256": RUNTIME_SHA256,
+        "expected_observer_id": OBSERVER_ID,
+        "expected_observer_origin": OBSERVER_ORIGIN,
+    }
+    assert module.validate_gateway_public_report(report, **kwargs) == report
+    with pytest.raises(ValueError, match="schema"):
+        module.validate_gateway_public_report(report, minimum_schema_version=2, **kwargs)
+
+
 def test_gateway_public_contract_accepts_attested_canonical_remote_address_set() -> None:
     module = _load_module()
     report, report_body, _attestation, attestation_body = _address_bound_documents(module)

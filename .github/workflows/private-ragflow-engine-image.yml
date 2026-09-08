@@ -1,0 +1,298 @@
+name: Private RAGFlow Engine Image
+
+on:
+  push:
+    tags:
+      - "yfeistai-first-release-*"
+
+permissions:
+  contents: read
+  packages: write
+
+# Serialize with the four-image platform workflow without adding a fifth image.
+concurrency:
+  group: private-platform-images
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  build-ragflow-engine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      IMAGE_REPOSITORY: ghcr.io/xinlingzhifei/yfeistai-ragflow
+      DOCKER_BUILD_RECORD_UPLOAD: "false"
+    steps:
+      - name: Checkout yFeiSTAI
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate immutable release candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_EVENT_NAME" = "push"
+          test "$GITHUB_RUN_ATTEMPT" = "1"
+          test "$GITHUB_REPOSITORY" = "xinlingzhifei/DeepTutor"
+          test "$GITHUB_REF_TYPE" = "tag"
+          printf '%s\n' "$GITHUB_REF_NAME" | grep -Eq '^yfeistai-first-release-[0-9]{8}-[0-9a-f]{8}$'
+          printf '%s\n' "$GITHUB_SHA" | grep -Eq '^[0-9a-f]{40}$'
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "${GITHUB_REF_NAME##*-}" = "${GITHUB_SHA:0:8}"
+          test "$(git rev-list -n 1 "$GITHUB_REF_NAME")" = "$GITHUB_SHA"
+
+      - name: Check standard runner resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          import shutil
+
+          cores = os.cpu_count() or 0
+          memory_bytes = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+          disk_free = shutil.disk_usage(os.environ["GITHUB_WORKSPACE"]).free
+          print(f"Runner: {cores} cores, {memory_bytes} RAM bytes, {disk_free} free disk bytes")
+          # Decimal GB; no cleanup, paid runner fallback, or resource allocation.
+          if cores < 4 or memory_bytes < 16_000_000_000 or disk_free < 50_000_000_000:
+              raise SystemExit("Standard runner requires >=4 cores, >=16 GB RAM and >=50 GB free disk")
+          PY
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+
+      - name: Checkout pinned RAGFlow
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: infiniflow/ragflow
+          ref: b9df87c4c75a5b0d35c90d15329fc0f6f91cb73e
+          path: integrations/ragflow/upstream
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Replay and verify yFei branding
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d integrations/ragflow/upstream/.git
+          node integrations/ragflow/branding/apply-branding.mjs integrations/ragflow/upstream
+          node integrations/ragflow/branding/apply-branding.mjs integrations/ragflow/upstream --check
+
+      - name: Prepare pinned engine build inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE_IMAGE="$(python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          config = json.loads(Path("integrations/ragflow/ENGINE-BUILD.json").read_bytes())
+          expected = {
+              "schemaVersion": 1,
+              "baseImage": "infiniflow/ragflow-base:v2.1@sha256:21b5afcfb32f57f2cb38d197254fcac8be5a81d7dd80adeac8523d277cb83e80",
+              "platform": "linux/amd64",
+              "backendMode": "python",
+              "upstreamRecipe": "Dockerfile_ci",
+              "upstreamRecipeSha256": "ae86c755169894288eb235e0fba82643bb3550dc93a2b8073e7cbd532102c33e",
+          }
+          if config != expected or type(config["schemaVersion"]) is not int:
+              raise SystemExit("Engine build configuration differs from the pinned contract")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as handle:
+              handle.write(f"BASE_IMAGE={config['baseImage']}\n")
+          print(config["baseImage"])
+          PY
+          )"
+          python scripts/ragflow_engine_release.py prepare \
+            --repository-root . \
+            --upstream-recipe integrations/ragflow/upstream/Dockerfile_ci \
+            --base-image "$BASE_IMAGE" \
+            --output-dir ragflow-engine-release
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify pinned base manifest and platform
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx imagetools inspect --raw "$BASE_IMAGE" > "$RUNNER_TEMP/ragflow-base-manifest.raw.json"
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          body = (Path(os.environ["RUNNER_TEMP"]) / "ragflow-base-manifest.raw.json").read_bytes()
+          if "sha256:" + hashlib.sha256(body).hexdigest() != os.environ["BASE_IMAGE"].split("@", 1)[1]:
+              raise SystemExit("Pinned base raw manifest digest differs")
+          manifest = json.loads(body)
+          amd64 = [item for item in manifest.get("manifests", [])
+                   if item.get("platform") == {"architecture": "amd64", "os": "linux"}]
+          if len(amd64) != 1 or amd64[0].get("digest") != "sha256:5f67514110dfce2e9a57e86f68d3d5fbaa7dd757e4fd84a99e1517d6d3faf6a5":
+              raise SystemExit("Pinned base does not contain the independently verified linux/amd64 image")
+          PY
+
+      - name: Reject existing final engine tag before build
+        shell: bash
+        run: |
+          set -euo pipefail
+          FINAL_REF="$IMAGE_REPOSITORY:$GITHUB_REF_NAME"
+          if docker buildx imagetools inspect --raw "$FINAL_REF" > "$RUNNER_TEMP/ragflow-final-prebuild.raw" 2> "$RUNNER_TEMP/ragflow-final-prebuild.err"; then
+            echo "::error::candidate tag already exists; refusing once-only publication"
+            exit 1
+          fi
+          python - "$RUNNER_TEMP/ragflow-final-prebuild.err" "$FINAL_REF" <<'PY'
+          from pathlib import Path
+          import sys
+
+          if Path(sys.argv[1]).read_text(encoding="utf-8").strip() != f"ERROR: {sys.argv[2]}: manifest unknown":
+              raise SystemExit("Final tag absence is unproven; registry/authentication/network errors fail closed")
+          PY
+
+      - name: Build and push staging engine
+        id: build_engine
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          # A filesystem context includes applied branding and the versioning .git mount.
+          context: ./integrations/ragflow/upstream
+          file: ./ragflow-engine-release/Dockerfile
+          target: production
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: ghcr.io/xinlingzhifei/yfeistai-ragflow:staging-${{ github.run_id }}-${{ github.run_attempt }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/xinlingzhifei/DeepTutor
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+            io.yfeistai.ragflow.upstream.revision=b9df87c4c75a5b0d35c90d15329fc0f6f91cb73e
+
+      - name: Verify staging digest and platform
+        env:
+          BUILD_DIGEST: ${{ steps.build_engine.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGING_REF="$IMAGE_REPOSITORY:staging-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          docker buildx imagetools inspect --raw "$STAGING_REF" > ragflow-engine-release/staging-manifest.raw.json
+          docker buildx imagetools inspect --format '{{json .Image}}' "$STAGING_REF" > "$RUNNER_TEMP/ragflow-staging-image.json"
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+
+          digest = os.environ["BUILD_DIGEST"]
+          if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest) or digest == "sha256:" + "0" * 64:
+              raise SystemExit("Build output did not return a nonzero sha256 digest")
+          body = Path("ragflow-engine-release/staging-manifest.raw.json").read_bytes()
+          if "sha256:" + hashlib.sha256(body).hexdigest() != os.environ["BUILD_DIGEST"]:
+              raise SystemExit("Raw staging manifest differs from the build output digest")
+          manifest = json.loads(body)
+          if manifest.get("mediaType") not in {
+              "application/vnd.oci.image.manifest.v1+json",
+              "application/vnd.docker.distribution.manifest.v2+json",
+          }:
+              raise SystemExit("Expected a single-platform staging image manifest")
+          image = json.loads((Path(os.environ["RUNNER_TEMP"]) / "ragflow-staging-image.json").read_bytes())
+          if image.get("architecture") != "amd64" or image.get("os") != "linux":
+              raise SystemExit("Staging image is not linux/amd64")
+          PY
+
+      - name: Promote verified staging manifest once
+        env:
+          BUILD_DIGEST: ${{ steps.build_engine.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          FINAL_REF="$IMAGE_REPOSITORY:$GITHUB_REF_NAME"
+          if docker buildx imagetools inspect --raw "$FINAL_REF" > "$RUNNER_TEMP/ragflow-final-prepromotion.raw" 2> "$RUNNER_TEMP/ragflow-final-prepromotion.err"; then
+            echo "::error::candidate tag already exists; refusing once-only publication"
+            exit 1
+          fi
+          python - "$RUNNER_TEMP/ragflow-final-prepromotion.err" "$FINAL_REF" <<'PY'
+          from pathlib import Path
+          import sys
+
+          if Path(sys.argv[1]).read_text(encoding="utf-8").strip() != f"ERROR: {sys.argv[2]}: manifest unknown":
+              raise SystemExit("Final tag absence is unproven; registry/authentication/network errors fail closed")
+          PY
+          docker buildx imagetools create --prefer-index=false \
+            --tag "$FINAL_REF" "$IMAGE_REPOSITORY@$BUILD_DIGEST"
+
+      - name: Verify final engine publication
+        env:
+          BUILD_DIGEST: ${{ steps.build_engine.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker buildx imagetools inspect --raw "$IMAGE_REPOSITORY:$GITHUB_REF_NAME" > ragflow-engine-release/final-manifest.raw.json
+          python - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+
+          body = Path("ragflow-engine-release/final-manifest.raw.json").read_bytes()
+          if "sha256:" + hashlib.sha256(body).hexdigest() != os.environ["BUILD_DIGEST"]:
+              raise SystemExit("Raw final manifest differs from the verified build output digest")
+          PY
+
+      - name: Write independent engine receipt
+        env:
+          BUILD_DIGEST: ${{ steps.build_engine.outputs.digest }}
+          BUILD_METADATA: ${{ steps.build_engine.outputs.metadata }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/ragflow_engine_release.py write-receipt \
+            --repository-root . \
+            --upstream-recipe integrations/ragflow/upstream/Dockerfile_ci \
+            --base-image "$BASE_IMAGE" \
+            --prepared-dir ragflow-engine-release \
+            --source-repository "$GITHUB_REPOSITORY" \
+            --source-head "$GITHUB_SHA" \
+            --release-tag "$GITHUB_REF_NAME" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --image "$IMAGE_REPOSITORY:$GITHUB_REF_NAME@$BUILD_DIGEST" \
+            --build-digest "$BUILD_DIGEST" \
+            --remote-manifest ragflow-engine-release/final-manifest.raw.json \
+            --output ragflow-engine-release/engine-receipt.json
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          metadata = json.loads(os.environ["BUILD_METADATA"])
+          if not isinstance(metadata, dict) or metadata.get("containerimage.digest") != os.environ["BUILD_DIGEST"]:
+              raise SystemExit("Action build metadata differs from the verified digest")
+          with Path("ragflow-engine-release/build-metadata.json").open("x", encoding="utf-8") as handle:
+              json.dump(metadata, handle, sort_keys=True, separators=(",", ":"))
+              handle.write("\n")
+          PY
+
+      - name: Upload independent engine evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: private-ragflow-engine-${{ github.ref_name }}-${{ github.sha }}
+          path: |
+            ragflow-engine-release/Dockerfile
+            ragflow-engine-release/build-inputs.json
+            ragflow-engine-release/engine-receipt.json
+            ragflow-engine-release/staging-manifest.raw.json
+            ragflow-engine-release/final-manifest.raw.json
+            ragflow-engine-release/build-metadata.json
+          if-no-files-found: error

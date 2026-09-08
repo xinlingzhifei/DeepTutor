@@ -87,3 +87,23 @@ def test_nginx_check_image_has_no_floating_default() -> None:
     assert "'/ssl_certificate /d'" in dockerfile
     assert "'/ssl_certificate_key /d'" in dockerfile
     assert "&& nginx -t" in dockerfile
+
+
+def test_shared_host_proxy_preserves_tls_and_exposes_no_internal_service() -> None:
+    config = (ROOT / "deploy/nginx/yfeistai-shared-host.conf.example").read_text(encoding="utf-8")
+    assert "server_name yfeistai.example.invalid;" in config
+    assert "default_server" not in config
+    assert "return 308 https://$host$request_uri;" in config
+    assert "proxy_pass https://127.0.0.1:13783;" in config
+    assert "proxy_ssl_server_name on;" in config
+    assert "proxy_ssl_name yfeistai.example.invalid;" in config
+    assert "proxy_ssl_verify on;" in config
+    assert "proxy_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;" in config
+    assert "proxy_set_header Host $host;" in config
+    assert "proxy_set_header X-Forwarded-Proto $scheme;" in config
+    assert "proxy_set_header X-Forwarded-For $remote_addr;" in config
+    assert "proxy_set_header Upgrade $http_upgrade;" in config
+    assert "proxy_request_buffering off;" in config
+    assert "proxy_buffering off;" in config
+    for internal in ("openmaic", "8001", "3782", "5432", "9000", "8090"):
+        assert internal not in config

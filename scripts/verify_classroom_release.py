@@ -109,6 +109,7 @@ from gateway_public_contract import (  # noqa: E402
     GATEWAY_PUBLIC_PRODUCER,
     derive_gateway_public_checks,
     parse_gateway_candidate_networks,
+    parse_gateway_candidate_ports,
     parse_gateway_public_report,
     signed_gateway_observer_policy,
 )
@@ -3933,12 +3934,12 @@ def _gateway_runtime_container_map(runtime: Mapping[str, object]) -> dict[str, s
     return containers
 
 
-def _gateway_candidate_service_networks(
+def _gateway_candidate_topology(
     candidate_root: Path,
     *,
     candidate: Mapping[str, object],
     runtime_containers: Mapping[str, str],
-) -> dict[str, tuple[str, ...]]:
+) -> tuple[dict[str, tuple[str, ...]], list[dict[str, object]]]:
     root = Path(os.path.abspath(candidate_root))
     try:
         with _CandidateContractLease.open(root) as lease:
@@ -3952,12 +3953,15 @@ def _gateway_candidate_service_networks(
                 expected_services=tuple(runtime_containers.values()),
                 overlay_bodies=(lease.token[2],),
             )
+            expected_ports = parse_gateway_candidate_ports(
+                lease.token[1], overlay_bodies=(lease.token[2],)
+            )
             lease.assert_unchanged()
     except (OSError, ValueError) as exc:
         raise ValueError("gateway candidate Compose network set is invalid") from exc
     if loaded_candidate != candidate:
         raise ValueError("gateway candidate Compose network set is invalid")
-    return expected_networks
+    return expected_networks, expected_ports
 
 
 def _gateway_replayed_command(
@@ -4056,6 +4060,7 @@ def _replay_gateway_docker_round(
     *,
     runtime_containers: Mapping[str, str],
     expected_service_networks: Mapping[str, tuple[str, ...]],
+    expected_gateway_ports: list[dict[str, object]],
 ) -> tuple[dict[str, str], list[dict[str, object]]]:
     cursor = 0
     try:
@@ -4141,19 +4146,7 @@ def _replay_gateway_docker_round(
         if networks != sorted(expected_networks):
             raise ValueError("gateway Docker network set is invalid")
         ports = _gateway_replayed_ports(row.get("publishedPorts"))
-        expected_ports = (
-            [
-                {
-                    "containerPort": port,
-                    "hostIp": "0.0.0.0",
-                    "hostPort": port,
-                    "protocol": "tcp",
-                }
-                for port in (80, 443)
-            ]
-            if service == "gateway"
-            else []
-        )
+        expected_ports = expected_gateway_ports if service == "gateway" else []
         if ports != expected_ports:
             raise ValueError("gateway Docker published ports are invalid")
         snapshot.append(
@@ -4426,6 +4419,12 @@ def _derive_gateway_only_public_receipt_checks_bound(
         observer_body,
         trust_pair["observer"],
     )
+    runtime_containers = _gateway_runtime_container_map(runtime)
+    expected_service_networks, expected_gateway_ports = _gateway_candidate_topology(
+        candidate_root,
+        candidate=candidate,
+        runtime_containers=runtime_containers,
+    )
     report = parse_gateway_public_report(
         external_lease.body,
         observer_attestation_body=observer_body,
@@ -4439,6 +4438,7 @@ def _derive_gateway_only_public_receipt_checks_bound(
         trusted_now=trusted_now,
         run_started_at=observer_policy["run_started_at"],
         run_ended_at=observer_policy["run_ended_at"],
+        minimum_schema_version=2 if expected_gateway_ports[0]["hostIp"] == "127.0.0.1" else 1,
     )
     external_lease.assert_unchanged()
     if report.get("observedAt") != observed_at:
@@ -4458,12 +4458,6 @@ def _derive_gateway_only_public_receipt_checks_bound(
         raise ValueError("gateway Docker observation proof is invalid")
     if docker.get("project") != _GATEWAY_DOCKER_PROJECT:
         raise ValueError("gateway Docker container identity is invalid")
-    runtime_containers = _gateway_runtime_container_map(runtime)
-    expected_service_networks = _gateway_candidate_service_networks(
-        candidate_root,
-        candidate=candidate,
-        runtime_containers=runtime_containers,
-    )
     commands = docker.get("commands")
     round_size = len(runtime_containers) + 5
     if not isinstance(commands, list) or len(commands) != round_size * 2:
@@ -4472,11 +4466,13 @@ def _derive_gateway_only_public_receipt_checks_bound(
         commands[:round_size],
         runtime_containers=runtime_containers,
         expected_service_networks=expected_service_networks,
+        expected_gateway_ports=expected_gateway_ports,
     )
     after_daemon, after_snapshot = _replay_gateway_docker_round(
         commands[round_size:],
         runtime_containers=runtime_containers,
         expected_service_networks=expected_service_networks,
+        expected_gateway_ports=expected_gateway_ports,
     )
     if (
         host.get("dockerContext") != runtime_host_identity["context"]

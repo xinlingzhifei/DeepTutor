@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "baseImage": "infiniflow/ragflow-base:v2.1@sha256:21b5afcfb32f57f2cb38d197254fcac8be5a81d7dd80adeac8523d277cb83e80",
+  "platform": "linux/amd64",
+  "backendMode": "python",
+  "upstreamRecipe": "Dockerfile_ci",
+  "upstreamRecipeSha256": "ae86c755169894288eb235e0fba82643bb3550dc93a2b8073e7cbd532102c33e"
+}

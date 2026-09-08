@@ -28,6 +28,7 @@ from docker_compose import (
     load_observer_release_admission,
     platform_compose_topology_arguments,
 )
+from gateway_public_contract import gateway_service_ports, parse_gateway_candidate_ports
 from openmaic_observer_service import (
     OpenMAICObserverServiceError,
     parse_observer_auth_expiry,
@@ -574,6 +575,7 @@ def _inspect_compose_runtime(
         return ("observer release manifest unavailable or changed",)
     environment["YFEISTAI_CANDIDATE_ROOT"] = str(artifact_paths.root)
     errors: list[str] = []
+    shared_gateway = False
     try:
         version_result = runner(
             ["docker", "compose", "version", "--short"],
@@ -629,20 +631,14 @@ def _inspect_compose_runtime(
                 admitted_environment=environment,
             )
         )
-        published_services = {
-            service_name for service_name, service in services.items() if service.get("ports")
-        }
-        gateway_ports = {
-            str(port.get("published"))
-            for port in services.get("gateway", {}).get("ports", ())
-            if isinstance(port, dict) and port.get("published") is not None
-        }
-        if (
-            config_result.returncode != 0
-            or published_services != {"gateway"}
-            or gateway_ports != {"80", "443"}
-        ):
+        expected_ports = parse_gateway_candidate_ports(
+            artifact_paths.platform_compose.read_bytes(),
+            overlay_bodies=(artifact_paths.observer_overlay.read_bytes(),),
+        )
+        if config_result.returncode != 0 or gateway_service_ports(services) != expected_ports:
             errors.append("gateway-only public ports")
+        else:
+            shared_gateway = expected_ports[0]["hostIp"] == "127.0.0.1"
         if effective_image_lock_path is not None:
             lock = json.loads(effective_image_lock_path.read_text(encoding="utf-8"))
             images = lock["images"]
@@ -677,6 +673,34 @@ def _inspect_compose_runtime(
         _validated_observer_environment(observer_admission)
     except (KeyError, OSError, RuntimeError, TypeError, ValueError):
         errors.append("observer release manifest unavailable or changed")
+    if shared_gateway and not errors:
+        # Docker <28 can expose localhost-published ports to peers on the same L2 network.
+        engine_error = "Docker Engine localhost isolation requires 28.0.0"
+        try:
+            engine = runner(
+                ["docker", "version", "--format", "{{.Server.Version}}"],
+                cwd=root,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+            version = re.fullmatch(
+                r"(\d+)\.(\d+)\.(\d+)(?:\+[A-Za-z0-9.-]+)?", engine.stdout.strip()
+            )
+            if (
+                engine.returncode != 0
+                or version is None
+                or tuple(int(part) for part in version.groups()) < (28, 0, 0)
+            ):
+                errors.append(engine_error)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            errors.append(engine_error)
+        try:
+            _validated_observer_environment(observer_admission)
+        except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+            errors.append("observer release manifest unavailable or changed")
     return tuple(dict.fromkeys(errors))
 
 

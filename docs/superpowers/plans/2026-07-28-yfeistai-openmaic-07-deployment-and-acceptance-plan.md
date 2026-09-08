@@ -2,13 +2,75 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 把 yFeiSTAI、PostgreSQL、MinIO、持久化任务进程和锁版 OpenMAIC 部署在同一私有环境，以统一域名对外服务，并用安全、容量、故障和恢复证据完成首期发布。
+**Goal:** 从合并后的 main 发布 yFeiSTAI、PostgreSQL、MinIO、持久化任务进程和锁版 OpenMAIC，在不影响其他项目的共享宿主入口下统一对外服务；完成安全、容量、故障、恢复和十二项真实课堂验收，并完成新增 R1 固定版本带品牌 RAGFlow 独立引擎的真实部署联调后，判定首期完成。
 
 **Architecture:** 生产 Compose 只暴露统一反向代理；PostgreSQL、MinIO、共享 OpenMAIC、Dispatcher、Worker、Reaper 和 Projector 仅在私有网络。独立数据面使用同一 OpenMAIC 镜像和契约、独立 Secret/Provider/存储网络，由平台数据面路由登记。所有镜像在 CI 构建并记录摘要，目标服务器不下载源码。
 
 **Tech Stack:** Docker Compose、Nginx、PostgreSQL 16、MinIO/S3、OpenMAIC 0.3.1、Prometheus client、pytest、Playwright、Python async load harness
 
 ---
+
+## 2026-09-08 无外部配置依赖的执行进展
+
+按用户最新指令，本任务直接执行本地代码与测试，复用 GHCR 发布授权；已取消的
+跨项目槽协调不再作为前置。仅缺输入的具体部署步骤暂停，不暂停无依赖工作。
+
+- G2 代码已接入：候选固定 gateway `127.0.0.1:13780/13783`，宿主入口模板保留
+  80/443 的共享网关所有权及上游 TLS 验证；preflight 要求 Docker Engine 稳定版
+  28.0.0+，运行配置与候选字节严格一致。公网观察 schema2 须证明13780/13783关闭。
+  写入端和回放验证端均从同一候选读取端口，不将旧候选与新源码模板混接。
+- R1 独立 Python 引擎构建输入、收据和发布工作流已补齐；固定上游、品牌补丁、
+  Dockerfile_ci 原始摘要与实际核验的 base manifest。保留平台四镜像/九成员合同，
+  两个工作流以显式队列串行。独立引擎不等于适配端镜像，也不代表真实模型联调通过。
+- 独立引擎/平台companion绑定已补齐，仅生成规范字节；七个原始输入句柄覆盖
+  序列化及最终不变性检查，持久化交由既有发布事务，不新增平台归档成员。
+- 最终冻结前本地原生exit0：入口/引擎/companion组合260 passed、19 Linux专用项
+  在Windows skipped；原生Linux工作流合同30 passed；网关写入/回放106 passed、
+  482 deselected；平台Compose/包装器全文件236 passed、2环境skipped。
+  网关首次300s外层超时仍为INCOMPLETE，随后同源码600s窗口取得完整终态
+  （pytest426.20s/wall436.031s）。最终证据在
+  `E:\CodexTemp\yfeistai-release-20260908`，早期证据在20260907目录。
+  这些本地结果不证明 Actions、远端镜像发布或部署成功。
+- 新候选尚待最终源码冻结与真实发布。G3 运行证据、R1真实生命周期、原十二项 live
+  仍未完成；域名/TLS、真实 Provider/Embedding 和新鲜容量检查只阻塞相关部署。
+
+## 2026-09-06 目标对齐与执行顺序（优先于下方历史步骤）
+
+本节对应用户新增确认的五项剩余目标；当前起点为 `main@b543e872`。完整状态表和
+输入边界以 [首期重新评估计划](./2026-07-30-yfeistai-openmaic-first-release-reassessment.md)
+的“0.000 目标范围更新”为准。本轮只更新计划，没有执行构建、推送或服务器操作。
+
+- [x] 合并全部本地分支源码与本地 RAGFlow/品牌/UI 改动到 main；历史工作树保留。
+- [ ] G1 / Task1：完成新 main 生产构建与不可变制品发布。旧 `93844791` 的成功证据保留，
+  不能代表新代码已发布；入口或发布接线若还需改动，完成并提交后才冻结最终 HEAD。
+- [ ] G2 / Task3（关联 Task2/6）：完成共享宿主入口适配、TLS与真实公网边界验证。
+- [ ] G3 / Task2—6：在同一最终候选上取得真实 Secret/迁移/preflight、健康/指标/脱敏、
+  备份恢复/独立数据面、安全及容量证据，不能重标本地合同为线上通过。
+- [ ] G4 / 新增 R1：完成带品牌 RAGFlow 独立引擎的制品发布、部署及真实模型/生命周期联调。
+- [ ] G5 / Task7—8：原十二项 live 全部有效，加上 R1独立验收，再作最终发布判定。
+
+依赖顺序：可先做生产构建预检，同时补齐 G2/R1 所需的源码与发布接线 → 提交并冻结
+最终 clean HEAD → G1 新制品与R1独立摘要绑定 → 真实部署/G3/R1 → G5。
+`b543e872` 是起点，不是要求之后仍复用的不可变标签。若后续源码变化，须重新绑定候选。
+现有 main 合并已经完成，不将“等验收后才合并旧分支”继续作为前置阻塞。
+
+### R1 扩展目标及完成边界
+
+RAGFlow 不属于现有 `deeptutor`、`openmaic`、`openmaic-render`、observer signer 四镜像
+发布链中的独立引擎；deeptutor 内的 HTTP 适配端不等于引擎。使用
+`integrations/ragflow/UPSTREAM.json` 的 `v0.27.1 / b9df87c4c75a5b0d35c90d15329fc0f6f91cb73e`
+及 `integrations/ragflow/branding/manifest.json` 锁定源码和品牌补丁，独立构建并取得镜像摘要，
+补齐它与平台候选、连接配置和部署 run 的可追溯绑定。现有锁/收据 schema 若需扩展，
+先设计和回归，不在本轮直接修改验证器或虚构新的合法字段。
+
+- [ ] 用真实实例、受保护 API 凭据和 Embedding 服务完成上传、解析终态与非空分块验证。
+- [ ] 草稿不进入普通检索；发布后返回正确来源；停用后不再命中；验证真实权限隔离。
+- [ ] 实测管理界面品牌与生命周期操作，记录上游固定版本、镜像摘要、平台候选和部署身份。
+- [ ] 通过资源预检和独立存储/凭据/网络检查，不占用其他项目的数据或公开内部服务。
+
+R1 验收是总体目标新增条件，不替换原十二项，也不顺带纳入未批准的网页抓取、父子 Chunk、
+不可变审批或物理删除恢复。已有 GHCR 授权和 platform-admin 验收账号方案继续有效；
+真实模型、安全凭据、域名/TLS和容量缺项只阻塞依赖它们的步骤，不阻塞静态开发。
 
 ## Task 1: 建立平台 Compose 拓扑与锁版镜像
 
@@ -289,6 +351,14 @@ git commit -m "feat(deploy): validate teaching secrets and migrations"
 ```
 
 ## Task 3: 配置统一域名反向代理
+
+**G2 共享宿主增量：** 下方80/443由平台直接独占发布的实现属于原标准拓扑，不能直接
+套用到已有共用入口的服务器。先明确宿主代理到本项目网关的受控链路、域名/TLS和监听边界，
+再为 `scripts/docker_compose.py`、`scripts/platform_preflight.py`、运行证明及公网探针补充
+对应失败/通过合同；相关测试起点为 `tests/scripts/test_docker_compose.py`、
+`tests/scripts/test_platform_preflight.py` 和 `tests/deploy/test_nginx_classroom_routes.py`。
+不能仅加临时 Compose override、开放内部端口或跳过现有检查。`gateway_only_public`
+证明的是本项目只有可信网关入口，不是授权本项目接管宿主所有80/443流量。
 
 **Files:**
 
@@ -794,6 +864,11 @@ git commit -m "test(release): verify all classroom first-release flows"
 ```
 
 ## Task 8: 首期发布判定
+
+**更新后的判定：** 原十二项课堂 live 和所有必要运行证据仍须全部通过；还须完成
+R1独立引擎验收及其与平台候选/部署批次的绑定。现有 verifier 的通过只证明它实现的
+既有合同，不自动证明 R1；最终报告须同时核对两组证据，不降低旧门禁、不伪造第十三项
+既有 verifier 输出。整体保持 `not_ready`，直到上述条件全部满足。
 
 - [ ] Step 1: 记录实际版本
 

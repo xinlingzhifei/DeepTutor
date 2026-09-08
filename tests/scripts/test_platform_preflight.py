@@ -31,6 +31,13 @@ from tests.scripts.platform_candidate_test_support import (
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def _shared_gateway_ports() -> list[dict[str, object]]:
+    return [
+        {"target": target, "published": str(host), "host_ip": "127.0.0.1", "protocol": "tcp"}
+        for target, host in ((80, 13780), (443, 13783))
+    ]
+
+
 @cache
 def _module():
     path = ROOT / "scripts" / "platform_preflight.py"
@@ -504,7 +511,7 @@ def test_host_preflight_binds_committed_observer_manifest_through_compose(
             ("postgres", "postgres"),
         )
     }
-    services["gateway"]["ports"] = [{"published": "80"}, {"published": "443"}]
+    services["gateway"]["ports"] = _shared_gateway_ports()
     for name in ("openmaic-observer-attestation-signer", "openmaic-shared-ingress-observer"):
         services[name] = {"image": lock["supportImages"]["observer_signer"]["reference"]}
     services["openmaic-shared-ingress-observer"]["environment"] = _observer_compose_environment(
@@ -535,6 +542,8 @@ def test_host_preflight_binds_committed_observer_manifest_through_compose(
         } == expected_environment
         assert kwargs["env"]["YFEISTAI_CANDIDATE_ROOT"] == str(candidate_root)
         assert "YFEISTAI_OBSERVER_RELEASE_MANIFEST" not in kwargs["env"]
+        if command == ["docker", "version", "--format", "{{.Server.Version}}"]:
+            return subprocess.CompletedProcess(command, 0, "28.0.0\n", "")
         version = command[-2:] == ["version", "--short"]
         mark_event("version" if version else "config")
         return subprocess.CompletedProcess(
@@ -577,7 +586,7 @@ def test_host_preflight_binds_committed_observer_manifest_through_compose(
     }
     assert (
         len(commands)
-        == {None: 2, "static": 0, "database": 0, "version": 1, "config": 2}[change_after]
+        == {None: 3, "static": 0, "database": 0, "version": 1, "config": 2}[change_after]
     )
     if change_after is not None:
         assert "observer release" in capsys.readouterr().out
@@ -965,12 +974,14 @@ def test_runtime_compose_probe_uses_schema3_observer_signer_from_external_candid
 
     def runner(command, **_kwargs):
         commands.append(command)
+        if command == ["docker", "version", "--format", "{{.Server.Version}}"]:
+            return subprocess.CompletedProcess(command, 0, "28.0.0\n", "")
         if command[-2:] == ["version", "--short"]:
             return subprocess.CompletedProcess(command, 0, "2.24.4\n", "")
         services = {
             "gateway": {
                 "image": images["nginx"]["reference"],
-                "ports": [{"published": "80"}, {"published": "443"}],
+                "ports": _shared_gateway_ports(),
             },
             "deeptutor": {"image": images["deeptutor"]["reference"]},
             "minio": {"image": images["minio"]["reference"]},
@@ -1020,6 +1031,7 @@ def test_runtime_compose_probe_uses_schema3_observer_signer_from_external_candid
             "--format",
             "json",
         ],
+        ["docker", "version", "--format", "{{.Server.Version}}"],
     ]
     assert {path: path.read_bytes() for path in original_inputs} == original_inputs
 
@@ -1049,7 +1061,7 @@ def test_runtime_compose_probe_reports_locked_service_drift_with_matching_observ
         services = {
             "gateway": {
                 "image": images["nginx"]["reference"],
-                "ports": [{"published": "80"}, {"published": "443"}],
+                "ports": _shared_gateway_ports(),
             },
             "deeptutor": {"image": images["deeptutor"]["reference"]},
             "minio": {"image": images["minio"]["reference"]},
@@ -1519,6 +1531,8 @@ def test_runtime_compose_probe_does_not_require_packaging_dependency(
 
     def runner(command, **kwargs):
         del kwargs
+        if command == ["docker", "version", "--format", "{{.Server.Version}}"]:
+            return subprocess.CompletedProcess(command, 0, "28.0.0\n", "")
         if command[-2:] == ["version", "--short"]:
             return subprocess.CompletedProcess(command, 0, "v2.24.4\n", "")
         return subprocess.CompletedProcess(
@@ -1527,12 +1541,7 @@ def test_runtime_compose_probe_does_not_require_packaging_dependency(
             json.dumps(
                 {
                     "services": {
-                        "gateway": {
-                            "ports": [
-                                {"published": "80"},
-                                {"published": "443"},
-                            ]
-                        },
+                        "gateway": {"ports": _shared_gateway_ports()},
                         "openmaic-shared-ingress-observer": {
                             "environment": _observer_compose_environment(),
                         },
@@ -1548,3 +1557,45 @@ def test_runtime_compose_probe_does_not_require_packaging_dependency(
         )
         == ()
     )
+
+
+@pytest.mark.parametrize(
+    ("host_ip", "server_version", "expected"),
+    [
+        ("127.0.0.1", "28.0.0", ()),
+        ("0.0.0.0", "28.0.0", ("gateway-only public ports",)),
+        ("127.0.0.1", "27.5.1", ("Docker Engine localhost isolation requires 28.0.0",)),
+        ("127.0.0.1", "28.0.0-rc.1", ("Docker Engine localhost isolation requires 28.0.0",)),
+        ("127.0.0.1", "", ("Docker Engine localhost isolation requires 28.0.0",)),
+    ],
+)
+def test_runtime_compose_probe_checks_shared_host_candidate_bindings(
+    host_ip: str, server_version: str, expected: tuple[str, ...]
+) -> None:
+    module = _module()
+
+    def runner(command, **_kwargs):
+        if command == ["docker", "version", "--format", "{{.Server.Version}}"]:
+            return subprocess.CompletedProcess(command, 0, server_version, "")
+        if command[-2:] == ["version", "--short"]:
+            return subprocess.CompletedProcess(command, 0, "2.24.4\n", "")
+        services = {
+            "gateway": {
+                "ports": [
+                    {
+                        "target": target,
+                        "published": str(host),
+                        "host_ip": host_ip,
+                        "protocol": "tcp",
+                    }
+                    for target, host in ((80, 13780), (443, 13783))
+                ]
+            },
+            "openmaic-shared-ingress-observer": {"environment": _observer_compose_environment()},
+        }
+        return subprocess.CompletedProcess(command, 0, json.dumps({"services": services}), "")
+
+    errors = module._inspect_compose_runtime(
+        ROOT, runner=runner, observer_admission=_stub_admitted_observer_for_compose_unit_probe()
+    )
+    assert errors == expected

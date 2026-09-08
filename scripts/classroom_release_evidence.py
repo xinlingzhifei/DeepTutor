@@ -70,6 +70,7 @@ from classroom_runtime_attestation import (  # noqa: E402
 from gateway_public_contract import (  # noqa: E402
     derive_gateway_public_checks,
     parse_gateway_candidate_networks,
+    parse_gateway_candidate_ports,
     parse_gateway_public_report,
     signed_gateway_observer_policy,
 )
@@ -974,6 +975,7 @@ def _gateway_observation_round(
     runner: CommandRunner,
     runtime_containers: Mapping[str, str],
     expected_service_networks: Mapping[str, Sequence[str]],
+    expected_gateway_ports: list[dict[str, object]],
 ) -> tuple[dict[str, str], list[dict[str, object]], list[dict[str, object]]]:
     prefix = [
         str(docker),
@@ -1083,19 +1085,7 @@ def _gateway_observation_round(
         if networks != sorted(expected_networks):
             raise ValueError("gateway Docker network set is invalid")
         published_ports = _gateway_published_ports(row.get("publishedPorts"))
-        expected_ports = (
-            [
-                {
-                    "containerPort": port,
-                    "hostIp": "0.0.0.0",
-                    "hostPort": port,
-                    "protocol": "tcp",
-                }
-                for port in (80, 443)
-            ]
-            if expected_service == "gateway"
-            else []
-        )
+        expected_ports = expected_gateway_ports if expected_service == "gateway" else []
         if published_ports != expected_ports:
             raise ValueError("gateway Docker published ports are invalid")
         snapshot.append(
@@ -6353,6 +6343,11 @@ def _write_gateway_only_public_receipt_bound(
     base_url = runtime.get("baseUrl") if isinstance(runtime, dict) else None
     if not isinstance(base_url, str):
         raise ValueError("gateway runtime base URL is invalid")
+    expected_gateway_ports = parse_gateway_candidate_ports(
+        pinned_inputs["candidate platform Compose"].body,
+        overlay_bodies=(pinned_inputs["candidate observer Compose"].body,),
+    )
+    minimum_gateway_schema = 2 if expected_gateway_ports[0]["hostIp"] == "127.0.0.1" else 1
     report = parse_gateway_public_report(
         pinned_inputs["external observation"].body,
         observer_attestation_body=pinned_inputs["observer attestation"].body,
@@ -6366,6 +6361,7 @@ def _write_gateway_only_public_receipt_bound(
         trusted_now=trusted_now,
         run_started_at=observer_policy["run_started_at"],
         run_ended_at=observer_policy["run_ended_at"],
+        minimum_schema_version=minimum_gateway_schema,
     )
     checks = derive_gateway_public_checks(report)
     if checks != {"gatewayPublic": True, "internalPortsClosed": True}:
@@ -6392,6 +6388,7 @@ def _write_gateway_only_public_receipt_bound(
             runner=runner,
             runtime_containers=runtime_containers,
             expected_service_networks=expected_service_networks,
+            expected_gateway_ports=expected_gateway_ports,
         )
         after_daemon, after_snapshot, after_commands = _gateway_observation_round(
             docker=docker,
@@ -6401,6 +6398,7 @@ def _write_gateway_only_public_receipt_bound(
             runner=runner,
             runtime_containers=runtime_containers,
             expected_service_networks=expected_service_networks,
+            expected_gateway_ports=expected_gateway_ports,
         )
     if before_daemon["endpoint"] != after_daemon["endpoint"]:
         raise ValueError("gateway Docker daemon endpoint changed")
@@ -6449,6 +6447,7 @@ def _write_gateway_only_public_receipt_bound(
         trusted_now=trusted_now,
         run_started_at=observer_policy["run_started_at"],
         run_ended_at=observer_policy["run_ended_at"],
+        minimum_schema_version=minimum_gateway_schema,
     )
     if replayed != report or derive_gateway_public_checks(replayed) != checks:
         raise ValueError("gateway external observation replay changed")

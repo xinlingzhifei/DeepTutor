@@ -13,12 +13,13 @@ from urllib.parse import urlsplit
 import yaml
 from yaml.nodes import MappingNode, ScalarNode, SequenceNode
 
-GATEWAY_PUBLIC_SCHEMA_VERSION = 1
+GATEWAY_PUBLIC_SCHEMA_VERSION = 2
 GATEWAY_OBSERVER_ATTESTATION_SCHEMA_VERSION = 1
 GATEWAY_PUBLIC_PRODUCER = "gateway-external-probe"
 GATEWAY_OBSERVER_ATTESTATION_PRODUCER = "gateway-external-observer-attestation"
 GATEWAY_ALLOWED_PORTS = (80, 443)
-GATEWAY_DENIED_PORTS = (3000, 3782, 5432, 8001, 8090, 9000, 9001)
+LEGACY_GATEWAY_DENIED_PORTS = (3000, 3782, 5432, 8001, 8090, 9000, 9001)
+GATEWAY_DENIED_PORTS = (*LEGACY_GATEWAY_DENIED_PORTS, 13780, 13783)
 MAX_GATEWAY_PUBLIC_ADDRESSES = 16
 MAX_GATEWAY_PUBLIC_REPORT_BYTES = 128 * 1024
 MAX_GATEWAY_OBSERVER_ATTESTATION_BYTES = 64 * 1024
@@ -117,6 +118,85 @@ def _construct_compose_value(
 
 for _compose_tag in ("!reset", "!override"):
     _ComposeLoader.add_constructor(_compose_tag, _construct_compose_value)
+
+
+def gateway_service_ports(services: object) -> list[dict[str, object]]:
+    """Accept only the fixed direct or loopback gateway topology, never arbitrary ports."""
+
+    error = "gateway candidate published ports are invalid"
+    if not isinstance(services, dict) or "gateway" not in services:
+        raise ValueError(error)
+    for name, service in services.items():
+        if (
+            not isinstance(service, dict)
+            or service.get("network_mode") == "host"
+            or (name != "gateway" and service.get("ports"))
+        ):
+            raise ValueError(error)
+    ports = services["gateway"].get("ports")
+    if not isinstance(ports, list) or len(ports) != 2:
+        raise ValueError(error)
+    normalized: list[dict[str, object]] = []
+    for port in ports:
+        if not isinstance(port, dict):
+            raise ValueError(error)
+        target = port.get("target")
+        published = port.get("published")
+        if (
+            type(target) is not int
+            or target not in (80, 443)
+            or type(published) not in (str, int)
+            or not re.fullmatch(r"[1-9][0-9]{0,4}", str(published))
+            or port.get("protocol", "tcp") != "tcp"
+            or port.get("mode", "ingress") != "ingress"
+        ):
+            raise ValueError(error)
+        normalized.append(
+            {
+                "containerPort": target,
+                "hostIp": port.get("host_ip", "0.0.0.0"),
+                "hostPort": int(published),
+                "protocol": "tcp",
+            }
+        )
+    normalized.sort(key=lambda row: row["containerPort"])
+    direct = [
+        {"containerPort": port, "hostIp": "0.0.0.0", "hostPort": port, "protocol": "tcp"}
+        for port in (80, 443)
+    ]
+    shared = [
+        {"containerPort": target, "hostIp": "127.0.0.1", "hostPort": host, "protocol": "tcp"}
+        for target, host in ((80, 13780), (443, 13783))
+    ]
+    if normalized not in (direct, shared):
+        raise ValueError(error)
+    return normalized
+
+
+def parse_gateway_candidate_ports(
+    compose_body: bytes,
+    *,
+    overlay_bodies: Sequence[bytes] = (),
+) -> list[dict[str, object]]:
+    """Derive host bindings from leased candidate bytes, not host environment or runtime claims."""
+
+    error = "gateway candidate published ports are invalid"
+    services: dict[str, object] = {}
+    for body in (compose_body, *overlay_bodies):
+        if not isinstance(body, bytes):
+            raise ValueError(error)
+        try:
+            document = yaml.load(body.decode("utf-8"), Loader=_ComposeLoader)
+        except (UnicodeError, yaml.YAMLError) as exc:
+            raise ValueError(error) from exc
+        raw_services = document.get("services") if isinstance(document, dict) else None
+        if not isinstance(raw_services, dict):
+            raise ValueError(error)
+        for name, service in raw_services.items():
+            if not isinstance(name, str) or not isinstance(service, dict):
+                raise ValueError(error)
+            services[name] = {**services.get(name, {}), **service}
+    return gateway_service_ports(services)
 
 
 def parse_gateway_candidate_networks(
@@ -577,6 +657,7 @@ def validate_gateway_public_report(
     expected_runtime_attestation_sha256: str,
     expected_observer_id: str,
     expected_observer_origin: str,
+    minimum_schema_version: int = 1,
 ) -> dict[str, object]:
     """Validate one already-decoded fixed external observation."""
 
@@ -584,11 +665,16 @@ def validate_gateway_public_report(
         not isinstance(report, dict)
         or set(report) != _REPORT_FIELDS
         or type(report.get("schemaVersion")) is not int
-        or report.get("schemaVersion") != GATEWAY_PUBLIC_SCHEMA_VERSION
+        or report.get("schemaVersion") not in (1, GATEWAY_PUBLIC_SCHEMA_VERSION)
         or report.get("producer") != GATEWAY_PUBLIC_PRODUCER
         or not _valid_observed_at(report.get("observedAt"))
     ):
         raise ValueError("gateway public report is invalid")
+    if minimum_schema_version not in (1, 2) or report["schemaVersion"] < minimum_schema_version:
+        raise ValueError("gateway public report schema does not cover candidate ports")
+    denied_ports = (
+        LEGACY_GATEWAY_DENIED_PORTS if report["schemaVersion"] == 1 else GATEWAY_DENIED_PORTS
+    )
     _validate_candidate(report.get("candidate"))
     if not _exact_json_equal(report.get("candidate"), dict(candidate)):
         raise ValueError("gateway public candidate binding is invalid")
@@ -639,11 +725,11 @@ def validate_gateway_public_report(
         not isinstance(policy, dict)
         or set(policy) != {"allowedTcpPorts", "deniedTcpPorts"}
         or policy.get("allowedTcpPorts") != list(GATEWAY_ALLOWED_PORTS)
-        or policy.get("deniedTcpPorts") != list(GATEWAY_DENIED_PORTS)
+        or policy.get("deniedTcpPorts") != list(denied_ports)
     ):
         raise ValueError("gateway public fixed port policy is invalid")
     observations = report.get("observations")
-    expected_ports = (*GATEWAY_ALLOWED_PORTS, *GATEWAY_DENIED_PORTS)
+    expected_ports = (*GATEWAY_ALLOWED_PORTS, *denied_ports)
     if (
         not isinstance(observations, list)
         or len(observations) != len(expected_ports)
@@ -720,6 +806,7 @@ def parse_gateway_public_report(
     trusted_now: str,
     run_started_at: str,
     run_ended_at: str,
+    minimum_schema_version: int = 1,
 ) -> dict[str, object]:
     """Parse a canonical report bound by the external observer attestation."""
 
@@ -747,6 +834,7 @@ def parse_gateway_public_report(
         expected_runtime_attestation_sha256=expected_runtime_attestation_sha256,
         expected_observer_id=expected_observer_id,
         expected_observer_origin=expected_observer_origin,
+        minimum_schema_version=minimum_schema_version,
     )
     report_target = parsed.get("target")
     attestation_target = observer_attestation.get("target")
@@ -831,6 +919,10 @@ def derive_gateway_public_checks(report: Mapping[str, object]) -> dict[str, bool
     """Derive the two release checks from a validated fixed observation matrix."""
 
     failed = {"gatewayPublic": False, "internalPortsClosed": False}
+    schema = report.get("schemaVersion") if isinstance(report, Mapping) else None
+    if type(schema) is not int or schema not in (1, 2):
+        return failed
+    denied_ports = LEGACY_GATEWAY_DENIED_PORTS if schema == 1 else GATEWAY_DENIED_PORTS
     observations = report.get("observations") if isinstance(report, Mapping) else None
     if not isinstance(observations, Sequence) or isinstance(observations, (str, bytes)):
         return failed
@@ -877,7 +969,7 @@ def derive_gateway_public_checks(report: Mapping[str, object]) -> dict[str, bool
             break
 
     internal_closed = True
-    for port in GATEWAY_DENIED_PORTS:
+    for port in denied_ports:
         rows = address_rows(port)
         if rows is None or not all(
             isinstance(row, Mapping)
@@ -911,7 +1003,9 @@ __all__ = [
     "canonical_gateway_public_document",
     "derive_gateway_public_checks",
     "gateway_public_command_record",
+    "gateway_service_ports",
     "parse_gateway_candidate_networks",
+    "parse_gateway_candidate_ports",
     "parse_gateway_observer_attestation",
     "parse_gateway_public_report",
     "signed_gateway_observer_policy",

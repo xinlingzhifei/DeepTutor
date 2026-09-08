@@ -23,6 +23,35 @@ configuration text.
 
 ## Execution Status — 2026-09-06
 
+**Current goal alignment after local-main integration:** all local application code
+was merged into `main@b543e872f71126ed11690925f6466d3d6e56bba6`. The current goal
+now includes a new-main publication, shared-host ingress adaptation, Plan07 live
+operational/acceptance evidence, and the independent branded RAGFlow deployment
+and lifecycle validation. See the authoritative `0.000` goal update in
+`2026-07-30-yfeistai-openmaic-first-release-reassessment.md` and the G1–G5/R1
+mapping in Plan07. This entry is a documentation update, not an executed release.
+
+The successful historical candidate `93844791` / run `34034924980` / artifact
+`9990178253` remains valid for its exact source. It is not the final candidate
+for the newly merged RAGFlow/branding work. Complete any necessary ingress and
+publication wiring changes before freezing the next clean HEAD, then publish a
+new immutable tag and independently verify that run's raw artifact and digests.
+Do not move old tags, reuse old receipts for new code, or repeat already-completed
+branch consolidation as a release prerequisite.
+
+The existing four custom-image contract covers the platform workloads and
+independent observer signer, not a RAGFlow engine image. R1 must lock its upstream
+source, branding patch, separately produced engine digest and deployment/connection
+identity to the same release batch. Design and test any schema/interface changes
+before implementing them; this goal update neither changes schema3 nor inserts
+unrecognized image-lock fields. R1 evidence is additional to, not a replacement
+for, the original twelve live categories. Existing registry authorization stands;
+real Provider, TLS and fresh capacity inputs are still required for dependent steps.
+
+The earlier entries below are historical execution evidence; statements about a
+then-pending publication or a merge-after-acceptance sequence do not override this
+current goal alignment.
+
 **Actual Task1 receipt-step correction:** candidate `38c8e1de` was published under
 `yfeistai-first-release-20260906-38c8e1de` in first-attempt run `34032988226`.
 All four staging builds, final tag promotions, remote digest comparisons and

@@ -636,7 +636,8 @@ def test_platform_merge_exposes_only_gateway_ports() -> None:
             assert not service.get("ports"), name
 
     published = {str(port["published"]) for port in compose["services"]["gateway"]["ports"]}
-    assert published == {"80", "443"}
+    assert published == {"13780", "13783"}
+    assert {port["host_ip"] for port in compose["services"]["gateway"]["ports"]} == {"127.0.0.1"}
 
 
 def test_gateway_publishes_through_a_non_internal_edge_network() -> None:

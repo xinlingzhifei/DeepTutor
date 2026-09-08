@@ -12,6 +12,7 @@ permissions:
 concurrency:
   group: private-platform-images
   cancel-in-progress: false
+  queue: max
 
 jobs:
   build-platform-images:

@@ -88,10 +88,12 @@ services:
     restart: unless-stopped
     ports:
       - target: 80
-        published: "80"
+        published: "13780"
+        host_ip: 127.0.0.1
         protocol: tcp
       - target: 443
-        published: "443"
+        published: "13783"
+        host_ip: 127.0.0.1
         protocol: tcp
     volumes:
       - type: bind
