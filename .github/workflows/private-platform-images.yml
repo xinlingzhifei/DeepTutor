@@ -491,6 +491,7 @@ jobs:
       - name: Install release receipt dependencies
         shell: bash
         run: |
+          set -euo pipefail
           python -m pip install \
             --disable-pip-version-check \
             --no-input \
@@ -498,7 +499,10 @@ jobs:
             "PyYAML==6.0.3" \
             "cryptography==47.0.0" \
             "pydantic==2.13.3" \
-            "python-pptx==1.0.2"
+            "python-pptx==1.0.2" \
+            "httpx==0.28.1"
+          python scripts/classroom_release_evidence.py source-head --help
+          python scripts/classroom_release_evidence.py image-digests --help
 
       - name: Record Task1 release evidence
         shell: bash
