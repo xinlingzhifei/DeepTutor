@@ -36,6 +36,7 @@ from deeptutor.teaching.openmaic.data_planes import (
     DataPlaneSelection,
     DataPlaneSelector,
     DataPlaneUnavailable,
+    SharedModelNotConfigured,
 )
 from deeptutor.teaching.permissions import ResourceScope
 from deeptutor.teaching.quota import InsufficientQuota
@@ -225,9 +226,12 @@ def get_data_plane_repository() -> SqlAlchemyDataPlaneRepository:
 
 
 def get_data_plane_selector() -> DataPlaneSelector:
+    from deeptutor.teaching.openmaic.catalog_sync import require_shared_course_model
+
     return DataPlaneSelector(
         settings=load_platform_settings(),
         repository=get_data_plane_repository(),
+        require_shared_model=require_shared_course_model,
     )
 
 
@@ -674,6 +678,11 @@ async def create_classroom_job(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Invalid generation request",
+        ) from None
+    except SharedModelNotConfigured:
+        raise HTTPException(
+            status_code=409,
+            detail="Course model is not configured. Ask an administrator to select a model in Settings.",
         ) from None
     except (DataPlaneBindingUnavailable, DataPlaneUnavailable):
         raise HTTPException(

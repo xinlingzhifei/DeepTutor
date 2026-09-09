@@ -355,3 +355,35 @@ def test_disabled_teaching_preserves_legacy_mode_without_repository_access() -> 
     assert asyncio.run(selector.resolve("legacy-tenant")) is None
     assert repository.calls == []
     assert repository.decisions == []
+
+
+def test_only_shared_generation_requires_admin_model():
+    from deeptutor.teaching.openmaic.data_planes import SharedModelNotConfigured
+
+    def missing():
+        raise SharedModelNotConfigured()
+
+    settings = SimpleNamespace(enabled=True)
+    shared = RecordingRepository(_shared_resolution("tenant-standard"))
+    with pytest.raises(SharedModelNotConfigured):
+        asyncio.run(
+            DataPlaneSelector(
+                settings=settings, repository=shared, require_shared_model=missing
+            ).resolve("tenant-standard")
+        )
+    # Export selectors have no model guard; dedicated tenants use their own model.
+    assert (
+        asyncio.run(
+            DataPlaneSelector(settings=settings, repository=shared).resolve("tenant-standard")
+        ).mode
+        == "shared"
+    )
+    dedicated = RecordingRepository(_dedicated_resolution("tenant-private"))
+    assert (
+        asyncio.run(
+            DataPlaneSelector(
+                settings=settings, repository=dedicated, require_shared_model=missing
+            ).resolve("tenant-private")
+        ).mode
+        == "dedicated"
+    )

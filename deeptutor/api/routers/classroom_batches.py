@@ -24,7 +24,7 @@ from deeptutor.api.routers.teaching_catalog import (
 from deeptutor.teaching.brief_builder import TeachingBriefBuilder
 from deeptutor.teaching.database import get_platform_engine
 from deeptutor.teaching.job_route_binding import DataPlaneBindingUnavailable
-from deeptutor.teaching.openmaic.data_planes import DataPlaneUnavailable
+from deeptutor.teaching.openmaic.data_planes import DataPlaneUnavailable, SharedModelNotConfigured
 from deeptutor.teaching.quota import InsufficientQuota
 from deeptutor.teaching.repositories.classrooms import ClassroomPersistenceError
 from deeptutor.teaching.services.batches import (
@@ -203,6 +203,11 @@ async def _call(operation):
         raise HTTPException(
             status_code=422,
             detail="Batch request is invalid",
+        ) from None
+    except SharedModelNotConfigured:
+        raise HTTPException(
+            status_code=409,
+            detail="Course model is not configured. Ask an administrator to select a model in Settings.",
         ) from None
     except (
         BatchPersistenceError,

@@ -3,7 +3,7 @@ import {
   generateSceneActions,
   generateSceneContent,
 } from "@/lib/generation/scene-generator";
-import { resolveModel } from "@/lib/server/resolve-model";
+import { resolveCourseModel } from "../../../../../lib/yfeistai/course-model";
 
 import { artifactStore } from "../../../../../lib/yfeistai/artifact-manifest";
 import {
@@ -105,7 +105,7 @@ const postClassroom = createClassroomPostHandler({
   store: contentJobStore,
   artifactStore,
   generateScenes: async (scene, context) => {
-    const resolved = await resolveModel({ stage: "generate-classroom" });
+    const resolved = await resolveCourseModel();
     const aiCall = async (systemPrompt: string, userPrompt: string) => {
       const response = await callLLM(
         {

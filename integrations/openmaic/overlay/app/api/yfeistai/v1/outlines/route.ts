@@ -1,6 +1,6 @@
 import { callLLM } from "@/lib/ai/llm";
 import { generateSceneOutlinesFromRequirements } from "@/lib/generation/outline-generator";
-import { resolveModel } from "@/lib/server/resolve-model";
+import { resolveCourseModel } from "../../../../../lib/yfeistai/course-model";
 import { resolveClassroomWebSearchConfig } from "@/lib/server/web-search-config";
 import { formatSearchResultsAsContext, searchWeb } from "@/lib/web-search";
 
@@ -72,7 +72,7 @@ const postOutline = createOutlinePostHandler({
   readSecret: readServiceSecret,
   store: outlineJobStore,
   generateOutlines: async (request) => {
-    const resolved = await resolveModel({ stage: "generate-classroom" });
+    const resolved = await resolveCourseModel();
     const aiCall = async (systemPrompt: string, userPrompt: string) => {
       const result = await callLLM(
         {

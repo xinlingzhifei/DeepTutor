@@ -43,6 +43,8 @@ from deeptutor.teaching.openmaic.client import (  # noqa: E402
 )
 from deeptutor.teaching.openmaic.provider_config import (  # noqa: E402
     PROVIDER_IDS,
+    ProviderNotConfigured,
+    read_provider_configuration,
     valid_provider_model_name,
     validate_provider_endpoint,
 )
@@ -111,9 +113,14 @@ def _profile_matches(
         and profile.scope == "shared"
         and profile.tenant_id is None
         and profile.owner_key == "shared"
-        and profile.provider_type == registration.provider_type
-        and profile.model_name == registration.model_name
-        and profile.api_base_url == registration.provider_api_base_url
+        and (
+            registration.provider_type == "openmaic-server-configured"
+            or (
+                profile.provider_type == registration.provider_type
+                and profile.model_name == registration.model_name
+                and profile.api_base_url == registration.provider_api_base_url
+            )
+        )
         and profile.secret_ref == registration.secret_ref
         and profile.status == "active"
     )
@@ -336,9 +343,10 @@ def verify_shared_data_plane_observer_binding(
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://openmaic:3000")
-    parser.add_argument("--provider-id", required=True, choices=sorted(PROVIDER_IDS))
-    parser.add_argument("--provider-model-name", required=True)
-    parser.add_argument("--provider-api-base-url", required=True)
+    parser.add_argument("--provider-id", default="")
+    parser.add_argument("--provider-model-name", default="")
+    parser.add_argument("--provider-api-base-url", default="")
+    parser.add_argument("--provider-config-root", type=Path)
     parser.add_argument("--observer-attestation", type=Path, required=True)
     parser.add_argument("--observer-attestation-signature", type=Path, required=True)
     parser.add_argument("--observer-attestation-public-key", type=Path, required=True)
@@ -369,11 +377,36 @@ async def _run(
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
+    if arguments.provider_config_root is not None:
+        if any(
+            (arguments.provider_id, arguments.provider_model_name, arguments.provider_api_base_url)
+        ):
+            raise ValueError("provider file cannot be combined with provider descriptor arguments")
+        try:
+            provider = read_provider_configuration(
+                arguments.provider_config_root,
+                scope="shared",
+                tenant_id=None,
+                profile_id="platform-default",
+            )
+        except ProviderNotConfigured:
+            provider = None
+        if provider is not None:
+            arguments.provider_id = provider.provider_id
+            arguments.provider_model_name = provider.model_name
+            arguments.provider_api_base_url = provider.base_url
+    descriptors = (
+        arguments.provider_id,
+        arguments.provider_model_name,
+        arguments.provider_api_base_url,
+    )
+    if any(descriptors) and (not all(descriptors) or arguments.provider_id not in PROVIDER_IDS):
+        raise ValueError("provider descriptor is incomplete or unsupported")
     registration = SharedDataPlaneRegistration(
         base_url=arguments.base_url.rstrip("/"),
-        provider_type=arguments.provider_id,
-        model_name=arguments.provider_model_name,
-        provider_api_base_url=arguments.provider_api_base_url,
+        provider_type=arguments.provider_id or "openmaic-server-configured",
+        model_name=arguments.provider_model_name or "server-selected-model",
+        provider_api_base_url=arguments.provider_api_base_url or None,
     )
     candidate_root = Path(arguments.candidate_root).absolute()
     with validated_candidate_artifact_lease(candidate_root) as candidate_lease:

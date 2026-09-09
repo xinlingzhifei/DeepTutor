@@ -4869,7 +4869,7 @@ def test_provider_configuration_mount_is_one_canonical_file_per_scope() -> None:
     dedicated = yaml.load(
         (ROOT / "docker-compose.data-plane.yml").read_text(), Loader=yaml.BaseLoader
     )
-    for compose, scope in ((platform, "shared"), (dedicated, "dedicated")):
+    for compose, scope in ((dedicated, "dedicated"),):
         service = compose["services"]["openmaic"]
         mounts = [
             entry
@@ -4881,10 +4881,21 @@ def test_provider_configuration_mount_is_one_canonical_file_per_scope() -> None:
         ]
         assert service["environment"]["YFEISTAI_OPENMAIC_MODE"] == scope
         assert "API_KEY" not in str(service["environment"])
+    shared = platform["services"]["openmaic"]
+    assert "openmaic_provider_configuration" not in platform["secrets"]
     assert (
-        platform["secrets"]["openmaic_provider_configuration"]["file"]
-        == "./data/system/secrets/openmaic-providers/shared/providers/platform-default"
+        shared["environment"]["YFEISTAI_OPENMAIC_PROVIDER_CONFIG_FILE"]
+        == "/run/yfeistai-provider/platform-default"
     )
+    mounts = [
+        m
+        for m in shared["volumes"]
+        if isinstance(m, dict) and m.get("target") == "/run/yfeistai-provider"
+    ]
+    assert len(mounts) == 1
+    assert mounts[0]["source"] == "./data/system/secrets/openmaic-providers/shared/providers"
+    assert mounts[0]["read_only"] == "true"
+    assert mounts[0]["bind"]["create_host_path"] == "false"
     assert (
         dedicated["secrets"]["openmaic_provider_configuration"]["file"]
         == "./data/system/secrets/openmaic-providers/tenants/${YFEISTAI_DATA_PLANE_ID:?set data-plane id}/providers/${YFEISTAI_OPENMAIC_PROVIDER_PROFILE_ID:-}"

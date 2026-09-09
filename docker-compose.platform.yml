@@ -72,6 +72,11 @@ services:
       - classroom_ticket_secret
       - openmaic_service_secret
     volumes:
+      - type: bind
+        source: ./data/system/secrets/openmaic-providers/shared/providers
+        target: /app/data/system/secrets/openmaic-providers/shared/providers
+        bind:
+          create_host_path: false
       - type: volume
         source: platform-secret-mask
         target: /app/data/system/secrets
@@ -253,15 +258,20 @@ services:
     environment:
       YFEISTAI_OPENMAIC_MODE: shared
       YFEISTAI_OPENMAIC_PROVIDER_PROFILE_ID: platform-default
+      YFEISTAI_OPENMAIC_PROVIDER_CONFIG_FILE: /run/yfeistai-provider/platform-default
       YFEISTAI_OPENMAIC_STATE_ROOT: /tmp/yfeistai-openmaic-state
       YFEISTAI_OPENMAIC_ARTIFACT_ROOT: /tmp/yfeistai-openmaic-artifacts
       YFEISTAI_OPENMAIC_RENDER_ENDPOINT: http://openmaic-render:9000
     secrets:
       - openmaic_service_secret
-      - source: openmaic_provider_configuration
-        target: /app/server-providers.yml
     volumes:
       - openmaic-shared-data:/tmp
+      - type: bind
+        source: ./data/system/secrets/openmaic-providers/shared/providers
+        target: /run/yfeistai-provider
+        read_only: true
+        bind:
+          create_host_path: false
     networks:
       - platform-internal
       - shared-provider-egress
@@ -289,6 +299,12 @@ services:
       - platform_database_app_password
       - openmaic_service_secret
     volumes:
+      - type: bind
+        source: ./data/system/secrets/openmaic-providers/shared/providers
+        target: /run/yfeistai-provider-root/shared/providers
+        read_only: true
+        bind:
+          create_host_path: false
       - ./data:/app/data
       - type: volume
         source: platform-secret-mask
@@ -376,8 +392,6 @@ volumes:
   platform-secret-mask:
 
 secrets:
-  openmaic_provider_configuration:
-    file: ./data/system/secrets/openmaic-providers/shared/providers/platform-default
   platform_database_password:
     file: ./data/system/secrets/platform_database_password
   platform_database_app_password:

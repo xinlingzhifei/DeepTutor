@@ -1018,11 +1018,18 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
         body: JSON.stringify({ catalog: draft }),
       });
       const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail || "Model configuration save failed");
       setCatalog(payload.catalog);
       setDraft(cloneCatalog(payload.catalog));
       // The model list the chat composer shows is derived from this catalog.
       invalidateLLMOptionsCache();
-      setToast(t("Draft saved"));
+      setToast(payload.openmaic?.state === "error"
+        ? t("Model saved; course model synchronization failed. Check provider compatibility and configuration, then apply again.")
+        : payload.openmaic?.state === "not_configured"
+          ? t("Model saved. Select a default model before generating courses.")
+          : payload.openmaic?.state === "synced"
+            ? t("Model saved and synchronized to course generation")
+            : t("Draft saved"));
     } finally {
       setSaving(false);
     }
@@ -1047,11 +1054,20 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
           body: JSON.stringify({ catalog: draft }),
         });
         const payload = await response.json();
+        if (!response.ok) throw new Error(payload.detail || "Model configuration save failed");
         setCatalog(payload.catalog);
         setDraft(cloneCatalog(payload.catalog));
         invalidateLLMOptionsCache();
         const statusResponse = await apiFetch(apiUrl("/api/v1/system/status"));
         setStatus((await statusResponse.json()) as SystemStatus);
+        if (payload.openmaic?.state === "error") {
+          setToast(t("Model saved; course model synchronization failed. Check provider compatibility and configuration, then apply again."));
+          return;
+        }
+        if (payload.openmaic?.state === "not_configured") {
+          setToast(t("Model saved. Select a default model before generating courses."));
+          return;
+        }
       }
       setToast(t("All changes saved"));
     } finally {

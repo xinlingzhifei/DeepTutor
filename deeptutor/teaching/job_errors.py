@@ -32,6 +32,7 @@ NON_RETRYABLE_ERROR_CATEGORIES = {
     "contract_invalid",
     "confirmed_outline_hash_mismatch",
     "data_plane_unavailable",
+    "model_not_configured",
 }
 MAX_RETRY_DELAY_SECONDS = 5 * 60
 MAX_DSL_REPAIR_ATTEMPTS = 2
@@ -114,6 +115,7 @@ def classify_engine_error_code(code: object) -> JobFailure:
 
     normalized = str(code).strip().lower() if isinstance(code, str) else ""
     mapping = {
+        "model_not_configured": "model_not_configured",
         "connect_timeout": "connect_timeout",
         "read_timeout": "read_timeout",
         "mp4_render_timeout": "read_timeout",

@@ -1087,6 +1087,7 @@ async def test_generation_cancels_the_deterministic_job_when_details_are_lost(
         async def resolve(self, tenant_id: str):
             assert tenant_id == "tenant-a"
             return SimpleNamespace(
+                mode="shared",
                 route_ref="route-a",
                 provider_profile_ref="provider-a",
                 worker_pool_ref="workers-a",
@@ -1218,6 +1219,7 @@ async def test_generation_rechecks_stable_pins_after_weak_idempotent_create(
                 "resource_class_id": request.resource_class_id,
                 "public_request_sha256": request.public_request_sha256,
                 "request_sha256": request.request_sha256,
+                "data_plane_mode": request.data_plane_mode,
                 "data_plane_route_id": request.data_plane_route_id,
                 "provider_profile_id": request.provider_profile_id,
                 "worker_pool_ref": request.worker_pool_ref,
@@ -1247,6 +1249,7 @@ async def test_generation_rechecks_stable_pins_after_weak_idempotent_create(
     class Selector:
         async def resolve(self, _tenant_id: str):
             return SimpleNamespace(
+                mode="shared",
                 route_ref="route-a",
                 provider_profile_ref="provider-a",
                 worker_pool_ref="workers-a",
@@ -1760,3 +1763,17 @@ def test_api_factory_delegates_to_shared_student_classroom_builder(monkeypatch) 
 
     assert result is expected
     assert captured == {"context": context, "dependencies": dependencies}
+
+
+@pytest.mark.asyncio
+async def test_missing_course_model_has_actionable_student_error():
+    from fastapi import HTTPException
+
+    from deeptutor.api.routers.student_classrooms import _call
+    from deeptutor.teaching.openmaic.data_planes import SharedModelNotConfigured
+    async def missing():
+        raise SharedModelNotConfigured()
+    with pytest.raises(HTTPException) as error:
+        await _call(missing())
+    assert error.value.status_code == 409
+    assert "select a model in Settings" in error.value.detail

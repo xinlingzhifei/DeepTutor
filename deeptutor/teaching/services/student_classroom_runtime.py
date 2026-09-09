@@ -197,9 +197,12 @@ def build_student_classroom_service(
     if job_repository is None:
         job_repository = SqlAlchemyGenerationJobRepository(runtime_engine())
     if data_plane_selector is None:
+        from deeptutor.teaching.openmaic.catalog_sync import require_shared_course_model
+
         data_plane_selector = DataPlaneSelector(
             settings=runtime_settings(),
             repository=SqlAlchemyDataPlaneRepository(),
+            require_shared_model=require_shared_course_model,
         )
     if cancellation_gateway is None:
         cancellation_gateway = RuntimeCancellationGateway(runtime_settings())

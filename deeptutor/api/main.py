@@ -113,6 +113,23 @@ async def lifespan(app: FastAPI):
     # Validate configuration consistency
     validate_tool_consistency()
 
+    # Recover a saved administrator selection after a crash or container restart.
+    # An empty model catalog is a valid first-boot state, not a startup failure.
+    try:
+        from deeptutor.runtime.home import get_runtime_data_root
+        from deeptutor.services.config.model_catalog import ModelCatalogService
+        from deeptutor.teaching.openmaic.catalog_sync import synchronize_shared_catalog
+
+        course_model = await synchronize_shared_catalog(
+            ModelCatalogService.get_instance(
+                get_runtime_data_root() / "user/settings/model_catalog.json"
+            )
+        )
+        if course_model["state"] == "error":
+            logger.warning("Course model synchronization is pending; retry from Settings")
+    except Exception:
+        logger.warning("Course model synchronization unavailable; retry from Settings")
+
     # Initialize LLM client early so OPENAI_* env vars are available before
     # any downstream provider integrations start.
     try:

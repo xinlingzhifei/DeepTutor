@@ -1223,7 +1223,10 @@ async def update_catalog(payload: CatalogPayload):
     proposed = reconcile_codex_catalog_update(current, restored)
     catalog = service.save(proposed)
     _invalidate_runtime_caches()
-    return {"catalog": redact_catalog_secrets(catalog)}
+    from deeptutor.teaching.openmaic.catalog_sync import synchronize_shared_catalog
+
+    course_model = await synchronize_shared_catalog(service)
+    return {"catalog": redact_catalog_secrets(catalog), "openmaic": course_model}
 
 
 @router.post("/apply")
@@ -1241,10 +1244,14 @@ async def apply_catalog(payload: CatalogPayload | None = None):
     )
     applied = service.apply(catalog)
     _invalidate_runtime_caches()
+    from deeptutor.teaching.openmaic.catalog_sync import synchronize_shared_catalog
+
+    course_model = await synchronize_shared_catalog(service)
     return {
         "message": "Catalog applied to runtime settings.",
         "catalog": redact_catalog_secrets(service.load()),
         "runtime": applied,
+        "openmaic": course_model,
     }
 
 
@@ -1505,6 +1512,9 @@ async def complete_tour(payload: TourCompletePayload | None = None):
     )
     applied = service.apply(catalog)
     _invalidate_runtime_caches()
+    from deeptutor.teaching.openmaic.catalog_sync import synchronize_shared_catalog
+
+    course_model = await synchronize_shared_catalog(service)
     now = int(time.time())
     launch_at = now + 3
     redirect_at = now + 5
@@ -1524,6 +1534,7 @@ async def complete_tour(payload: TourCompletePayload | None = None):
 
     return {
         "status": "completed",
+        "openmaic": course_model,
         "message": "Configuration saved. yFeiSTAI will restart shortly.",
         "launch_at": launch_at,
         "redirect_at": redirect_at,

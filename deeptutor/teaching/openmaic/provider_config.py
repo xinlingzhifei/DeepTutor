@@ -50,6 +50,20 @@ class ProviderConfigurationError(ValueError):
         super().__init__("openmaic_provider_configuration_invalid")
 
 
+class ProviderNotConfigured(ProviderConfigurationError):
+    """The shared runtime is healthy but no course model has been selected."""
+
+
+def unconfigured_provider_document() -> dict[str, object]:
+    return {
+        "scope": "shared",
+        "tenantId": None,
+        "profileId": "platform-default",
+        "defaultModel": None,
+        "providers": {},
+    }
+
+
 def provider_secret_ref(*, scope: str, tenant_id: str | None, profile_id: str) -> str:
     if not isinstance(profile_id, str) or _IDENTIFIER.fullmatch(profile_id) is None:
         raise ProviderConfigurationError()
@@ -170,6 +184,9 @@ def parse_provider_configuration(
             object_pairs_hook=_unique_object,
             parse_constant=_reject_json_constant,
         )
+        if scope == "shared" and tenant_id is None and profile_id == "platform-default":
+            if document == unconfigured_provider_document():
+                raise ProviderNotConfigured()
         if (
             not isinstance(document, dict)
             or set(document) != {"scope", "tenantId", "profileId", "defaultModel", "providers"}
@@ -212,6 +229,8 @@ def parse_provider_configuration(
             base_url=entry["baseUrl"],
             api_key=SecretStr(api_key),
         )
+    except ProviderNotConfigured:
+        raise
     except (KeyError, TypeError, UnicodeError, ValueError, RecursionError):
         raise ProviderConfigurationError() from None
 
@@ -236,7 +255,12 @@ def read_provider_configuration(
     descriptor = None
     try:
         for current in (*reversed(path.parents), path):
-            details = current.lstat()
+            try:
+                details = current.lstat()
+            except FileNotFoundError:
+                if scope == "shared" and tenant_id is None and profile_id == "platform-default":
+                    raise ProviderNotConfigured() from None
+                raise
             if stat.S_ISLNK(details.st_mode) or (
                 getattr(details, "st_file_attributes", 0)
                 & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
@@ -284,6 +308,8 @@ def read_provider_configuration(
         return parse_provider_configuration(
             body, scope=scope, tenant_id=tenant_id, profile_id=profile_id
         )
+    except ProviderNotConfigured:
+        raise
     except (OSError, ValueError):
         raise ProviderConfigurationError() from None
     finally:

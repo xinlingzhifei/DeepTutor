@@ -96,6 +96,17 @@ def initialize_platform_secrets(secret_dir: Path) -> tuple[Path, ...]:
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     if root.is_symlink() or not root.is_dir():
         raise ValueError("platform secret directory is unsafe")
+    shared_provider_dir = root / "openmaic-providers/shared/providers"
+    for ancestor in (
+        root / "openmaic-providers",
+        root / "openmaic-providers/shared",
+        shared_provider_dir,
+    ):
+        if ancestor.is_symlink():
+            raise ValueError("shared provider directory is unsafe")
+        ancestor.mkdir(exist_ok=True, mode=0o700)
+    if os.name == "posix" and os.geteuid() == 0:
+        os.chown(shared_provider_dir, 1000, 1000)
     created: list[Path] = []
     for name, bytes_count in GENERATED_SECRET_SPECS.items():
         target = root / name

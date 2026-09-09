@@ -19,6 +19,7 @@ from deeptutor.api.routers.teaching_catalog import (
 )
 from deeptutor.teaching.database import get_platform_engine
 from deeptutor.teaching.job_route_binding import DataPlaneBindingUnavailable
+from deeptutor.teaching.openmaic.data_planes import SharedModelNotConfigured
 from deeptutor.teaching.quota import InsufficientQuota
 from deeptutor.teaching.repositories.catalog import SqlAlchemyCatalogRepository
 from deeptutor.teaching.repositories.classrooms import (
@@ -335,6 +336,11 @@ async def _call(operation):
         raise HTTPException(status_code=404, detail="Student classroom not found") from None
     except StudentClassroomDenied:
         raise HTTPException(status_code=403, detail="Student generation is denied") from None
+    except SharedModelNotConfigured:
+        raise HTTPException(
+            status_code=409,
+            detail="Course model is not configured. Ask an administrator to select a model in Settings.",
+        ) from None
     except StudentClassroomUnavailable:
         raise HTTPException(
             status_code=503,

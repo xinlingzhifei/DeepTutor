@@ -519,3 +519,16 @@ def test_persistence_rolls_back_when_candidate_drifts_inside_transaction(
     assert len(session.added) == 2
     assert session.transaction.rolled_back is True
     assert session.transaction.committed is False
+
+
+def test_empty_model_restart_preserves_existing_profile_for_exports():
+    from types import SimpleNamespace
+    module = _module()
+    registration = module.SharedDataPlaneRegistration()
+    profile = SimpleNamespace(id="platform-default", scope="shared", tenant_id=None,
+        owner_key="shared", provider_type="openai", model_name="previous-model",
+        api_base_url="https://provider.invalid/v1",
+        secret_ref="shared/providers/platform-default", status="active")
+    assert module._profile_matches(profile, registration)
+    profile.tenant_id = "private-tenant"
+    assert not module._profile_matches(profile, registration)

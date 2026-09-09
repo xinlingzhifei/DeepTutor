@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
-from typing import Literal, NoReturn, Protocol
+from typing import Callable, Literal, NoReturn, Protocol
 
 DataPlaneMode = Literal["shared", "dedicated"]
 DataPlaneAttemptDecision = Literal["selected", "unavailable"]
@@ -28,6 +28,10 @@ class DataPlaneUnavailable(RuntimeError):
 
     def __init__(self) -> None:
         super().__init__("data plane is unavailable")
+
+
+class SharedModelNotConfigured(DataPlaneUnavailable):
+    """The administrator must select a model before shared generation."""
 
 
 class DataPlaneConfigurationUnavailable(RuntimeError):
@@ -174,9 +178,11 @@ class DataPlaneSelector:
         *,
         settings: _TeachingSettings,
         repository: DataPlaneSelectionRepository,
+        require_shared_model: Callable[[], None] | None = None,
     ) -> None:
         self._settings = settings
         self._repository = repository
+        self._require_shared_model = require_shared_model
 
     async def _reject(
         self,
@@ -278,6 +284,8 @@ class DataPlaneSelector:
                 resolution,
                 reason_code="provider_inactive",
             )
+        if route.mode == "shared" and self._require_shared_model is not None:
+            self._require_shared_model()
         selection = DataPlaneSelection(
             tenant_id=tenant_id,
             route_ref=route.route_id,

@@ -44,6 +44,9 @@ REQUIRED_OVERLAY_FILES = {
     Path("lib/yfeistai/outline-generation.ts"),
     Path("lib/yfeistai/portable-classroom.ts"),
     Path("lib/yfeistai/provider-error.ts"),
+    Path("lib/yfeistai/course-model.ts"),
+    Path("lib/yfeistai/provider-reader.cjs"),
+    Path("lib/yfeistai/provider-reader.d.cts"),
     Path("lib/yfeistai/service-boundary.ts"),
     Path("lib/yfeistai/service-auth.ts"),
     Path("tests/yfeistai/artifact-manifest.test.ts"),
@@ -206,6 +209,7 @@ def _verify_dockerfile(integration_root: Path) -> None:
     runner = source[source.index(runner_marker) :]
     required_provider_runtime = (
         "COPY integrations/openmaic/runtime/provider-bootstrap.cjs ./yfeistai-provider-bootstrap.cjs",
+        "COPY integrations/openmaic/overlay/lib/yfeistai/provider-reader.cjs ./provider-reader.cjs",
         'RUN test "$(id -u node)" = "1000" && test "$(id -g node)" = "1000"',
         "USER node:node",
         'CMD ["node", "--require", "./yfeistai-provider-bootstrap.cjs", "server.js"]',
@@ -238,7 +242,14 @@ def find_forbidden_overlay_surface(overlay_root: Path) -> list[str]:
             match = pattern.search(source)
             if match:
                 violations.append(f"{relative}: forbidden {match.group(0)} surface")
-        for pattern in FORBIDDEN_CLIENT_PARAMETER_PATTERNS:
+        # These server-only modules read the protected file; request contracts
+        # and routes must still reject all client-supplied model credentials.
+        server_provider_module = relative_text in {
+            "lib/yfeistai/course-model.ts",
+            "lib/yfeistai/provider-reader.cjs",
+            "lib/yfeistai/provider-reader.d.cts",
+        }
+        for pattern in () if server_provider_module else FORBIDDEN_CLIENT_PARAMETER_PATTERNS:
             match = pattern.search(source)
             if match:
                 violations.append(f"{relative}: forbidden client parameter {match.group(0)}")
@@ -417,11 +428,11 @@ def _verify_outline_generation(overlay_root: Path) -> None:
 
     required_post_tokens = (
         "@/lib/generation/outline-generator",
-        "@/lib/server/resolve-model",
+        "lib/yfeistai/course-model",
         "@/lib/web-search",
         "generateSceneOutlinesFromRequirements(",
         "runOutlineRouteAdapter(",
-        'resolveModel({ stage: "generate-classroom" })',
+        "resolveCourseModel()",
         "maxRetries: 0",
         "resolveClassroomWebSearchConfig({})",
         'answer: ""',
@@ -591,7 +602,7 @@ def verify_task4_sources(overlay_root: Path) -> None:
             "durableLeaseMatches(",
             "syncParentDirectory(target)",
             "PROCESS_INSTANCE_ID",
-            'record.hostname === hostname()',
+            "record.hostname === hostname()",
         ),
     )
     _require_tokens(
@@ -708,7 +719,7 @@ def verify_task4_sources(overlay_root: Path) -> None:
         "classroom POST route",
         (
             "@/lib/generation/scene-generator",
-            "@/lib/server/resolve-model",
+            "lib/yfeistai/course-model",
             "runSceneRouteAdapter(",
             "generate: generateSceneContent",
             "languageModel: resolved.model",

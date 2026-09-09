@@ -1900,3 +1900,19 @@ def test_export_status_response_has_one_stable_lifecycle_contract(
     assert payload["download_ready"] is expected_download
     assert payload["error_code"] == expected_error
     assert payload["error_category"] == ("engine" if expected_error else None)
+
+
+def test_missing_shared_model_returns_actionable_error_before_quota_reservation(api_harness):
+    from deeptutor.teaching.openmaic.data_planes import SharedModelNotConfigured
+
+    app, repository, *_ = api_harness
+
+    class MissingModelSelector:
+        async def resolve(self, tenant_id):
+            raise SharedModelNotConfigured()
+
+    app.dependency_overrides[jobs_router.get_data_plane_selector] = MissingModelSelector
+    response = TestClient(app).post("/api/v1/classroom-jobs", json=_public_request())
+    assert response.status_code == 409
+    assert "select a model in Settings" in response.json()["detail"]
+    assert repository.created_requests == []

@@ -212,8 +212,69 @@ def test_real_node_bootstrap_rejects_ambiguous_json_before_upstream_yaml_loader(
     _assert_rejected(_run(tmp_path, raw=raw))
 
 
-def test_real_node_bootstrap_requires_the_config_file(tmp_path):
-    _assert_rejected(_run(tmp_path, missing=True))
+def test_real_node_bootstrap_starts_shared_without_a_model(tmp_path):
+    result = _run(tmp_path, missing=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "STARTED:undefined\n"
+
+
+def test_real_node_bootstrap_starts_after_shared_model_is_cleared(tmp_path):
+    document = _configuration()
+    document.update(defaultModel=None, providers={})
+    result = _run(tmp_path, document)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "STARTED:undefined\n"
+
+
+def test_real_node_bootstrap_keeps_dedicated_credentials_required(tmp_path):
+    environment = _environment()
+    environment.update(YFEISTAI_OPENMAIC_MODE="dedicated", YFEISTAI_DATA_PLANE_ID="tenant-a")
+    _assert_rejected(_run(tmp_path, missing=True, env=environment))
+
+
+def test_real_node_reader_observes_atomic_changes_without_restart(tmp_path):
+    reader = ROOT / "integrations/openmaic/overlay/lib/yfeistai/provider-reader.cjs"
+    config = tmp_path / "server-providers.yml"
+    config.write_text(json.dumps(_configuration()))
+    config.chmod(0o600)
+    replacement = _configuration()
+    replacement["defaultModel"] = "openai:new-model"
+    replacement["providers"]["openai"]["apiKey"] = "rotated-fixture-key"
+    cleared = {**replacement, "defaultModel": None, "providers": {}}
+    script = """
+const fs = require('node:fs');
+const {readConfiguration} = require(process.argv[1]);
+const original = readConfiguration();
+function replace(value) {
+  fs.writeFileSync('next.json', value, {mode: 0o600});
+  fs.renameSync('next.json', 'server-providers.yml');
+}
+replace(process.argv[2]);
+const changed = readConfiguration();
+if (changed.defaultModel !== 'openai:new-model' || changed.providers.openai.apiKey !== 'rotated-fixture-key') process.exit(2);
+if (original.defaultModel !== 'openai:fixture-model') process.exit(3);
+replace(process.argv[3]);
+if (readConfiguration() !== null) process.exit(4);
+console.log('ROTATION_AND_CLEAR_OK');
+"""
+    result = subprocess.run(
+        [
+            shutil.which("node"),
+            "-e",
+            script,
+            str(reader),
+            json.dumps(replacement),
+            json.dumps(cleared),
+        ],
+        cwd=tmp_path,
+        env=_environment(),
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "ROTATION_AND_CLEAR_OK\n"
+    assert CANARY not in result.stdout + result.stderr
 
 
 @pytest.mark.parametrize(

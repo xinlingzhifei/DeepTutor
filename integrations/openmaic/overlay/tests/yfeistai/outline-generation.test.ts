@@ -815,12 +815,20 @@ describe("outline service API security and idempotency", () => {
       async () => sharedJob,
     );
 
+    // The store assigns durable timestamps independently of the generator.
+    const persisted = await firstModule.outlineJobStore.read(sharedTenantId, sharedJobId);
+    expect(persisted).toMatchObject({
+      jobId: sharedJobId,
+      status: "succeeded",
+      result: sharedJob.result,
+    });
+
     vi.resetModules();
     const secondModule = await import("../../lib/yfeistai/job-store");
 
     await expect(
       secondModule.outlineJobStore.read(sharedTenantId, sharedJobId),
-    ).resolves.toEqual(sharedJob);
+    ).resolves.toEqual(persisted);
   });
 
   test("authenticates before parsing malformed JSON", async () => {

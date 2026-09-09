@@ -29,6 +29,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from deeptutor.teaching.openmaic.provider_config import (
     PROVIDER_CONFIGURATION_DIRECTORY,
+    ProviderNotConfigured,
     provider_configuration_path,
     provider_secret_ref,
     read_provider_configuration,
@@ -790,9 +791,12 @@ def provider_configuration_environment(
         # Docker/Node reject a missing Secret when this OpenMAIC actually starts.
         # PostgreSQL/migrations and config inspection must not require an LLM key.
         return values
-    configuration = read_provider_configuration(
-        secrets_root, scope=scope, tenant_id=tenant_id, profile_id=profile_id
-    )
+    try:
+        configuration = read_provider_configuration(
+            secrets_root, scope=scope, tenant_id=tenant_id, profile_id=profile_id
+        )
+    except ProviderNotConfigured:
+        return values
     values.update(
         {
             "YFEISTAI_OPENMAIC_PROVIDER_ID": configuration.provider_id,

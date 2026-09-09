@@ -75,44 +75,43 @@ def test_preflight_provider_descriptor_must_match_canonical_file_and_bootstrap_c
         tenant_id=None,
         profile_id="platform-default",
     )
+    directory = str(tmp_path / "shared/providers")
+
+    def mount(target, read_only):
+        return {"type": "bind", "source": directory, "target": target, "read_only": read_only}
+
     payload = {
         "services": {
             "openmaic": {
                 "environment": {
                     "YFEISTAI_OPENMAIC_MODE": "shared",
                     "YFEISTAI_OPENMAIC_PROVIDER_PROFILE_ID": "platform-default",
+                    "YFEISTAI_OPENMAIC_PROVIDER_CONFIG_FILE": "/run/yfeistai-provider/platform-default",
                 },
-                "secrets": [
-                    {
-                        "source": "openmaic_provider_configuration",
-                        "target": "/app/server-providers.yml",
-                    }
-                ],
+                "volumes": [mount("/run/yfeistai-provider", True)],
+            },
+            "deeptutor": {
+                "volumes": [
+                    mount("/app/data/system/secrets/openmaic-providers/shared/providers", False)
+                ]
             },
             "shared-data-plane-bootstrap": {
                 "command": [
                     "scripts/bootstrap_shared_data_plane.py",
-                    "--provider-id",
-                    "openai",
-                    "--provider-model-name",
-                    "configured-model",
-                    "--provider-api-base-url",
-                    "https://llm.example.test/v1",
-                ]
+                    "--provider-config-root",
+                    "/run/yfeistai-provider-root",
+                ],
+                "volumes": [mount("/run/yfeistai-provider-root/shared/providers", True)],
             },
-        },
-        "secrets": {
-            "openmaic_provider_configuration": {
-                "file": str(tmp_path / "shared/providers/platform-default")
-            }
-        },
+        }
     }
     assert module._inspect_provider_compose_bindings(payload, configuration, tmp_path) == ()
-    payload["services"]["shared-data-plane-bootstrap"]["command"][4] = "wrong-model"
+    assert module._inspect_provider_compose_bindings(payload, None, tmp_path) == ()
+    payload["services"]["openmaic"]["volumes"][0]["read_only"] = False
     assert module._inspect_provider_compose_bindings(payload, configuration, tmp_path)
-    payload["services"]["shared-data-plane-bootstrap"]["command"][4] = "configured-model"
-    payload["secrets"]["openmaic_provider_configuration"]["file"] = str(
-        tmp_path / "tenants/private/providers/private"
+    payload["services"]["openmaic"]["volumes"][0]["read_only"] = True
+    payload["services"]["openmaic"]["volumes"][0]["source"] = str(
+        tmp_path / "tenants/private/providers"
     )
     assert module._inspect_provider_compose_bindings(payload, configuration, tmp_path)
 
@@ -123,6 +122,9 @@ def test_formal_runtime_preflight_requires_provider_configuration_before_databas
     module = _module()
     monkeypatch.setattr(module, "_validated_observer_environment", lambda _: {})
     calls = []
+    provider = tmp_path / "data/system/secrets/openmaic-providers/shared/providers/platform-default"
+    provider.parent.mkdir(parents=True)
+    provider.write_text("invalid")
 
     async def database(_settings):
         calls.append("database")
@@ -634,36 +636,28 @@ def test_host_preflight_binds_committed_observer_manifest_through_compose(
         profile_id="platform-default",
     )
     monkeypatch.setattr(module, "read_provider_configuration", lambda *_args, **_kwargs: provider)
-    services["openmaic"].update(
-        {
-            "environment": {
-                "YFEISTAI_OPENMAIC_MODE": "shared",
-                "YFEISTAI_OPENMAIC_PROVIDER_PROFILE_ID": "platform-default",
-            },
-            "secrets": [
-                {"source": "openmaic_provider_configuration", "target": "/app/server-providers.yml"}
-            ],
-        }
-    )
+    directory = str(deployment_root / "data/system/secrets/openmaic-providers/shared/providers")
+    services["openmaic"]["environment"] = {
+        "YFEISTAI_OPENMAIC_MODE": "shared",
+        "YFEISTAI_OPENMAIC_PROVIDER_PROFILE_ID": "platform-default",
+        "YFEISTAI_OPENMAIC_PROVIDER_CONFIG_FILE": "/run/yfeistai-provider/platform-default",
+    }
     services["shared-data-plane-bootstrap"] = {
         "command": [
             "scripts/bootstrap_shared_data_plane.py",
-            "--provider-id",
-            "openai",
-            "--provider-model-name",
-            "configured-model",
-            "--provider-api-base-url",
-            "https://llm.example.test/v1",
+            "--provider-config-root",
+            "/run/yfeistai-provider-root",
         ]
     }
-    compose_secrets = {
-        "openmaic_provider_configuration": {
-            "file": str(
-                deployment_root
-                / "data/system/secrets/openmaic-providers/shared/providers/platform-default"
-            )
-        }
-    }
+    for name, target, read_only in (
+        ("openmaic", "/run/yfeistai-provider", True),
+        ("deeptutor", "/app/data/system/secrets/openmaic-providers/shared/providers", False),
+        ("shared-data-plane-bootstrap", "/run/yfeistai-provider-root/shared/providers", True),
+    ):
+        services[name]["volumes"] = [
+            {"type": "bind", "source": directory, "target": target, "read_only": read_only}
+        ]
+    compose_secrets = {}
 
     def mark_event(name):
         events.append(name)
@@ -1752,3 +1746,32 @@ def test_runtime_compose_probe_checks_shared_host_candidate_bindings(
         ROOT, runner=runner, observer_admission=_stub_admitted_observer_for_compose_unit_probe()
     )
     assert errors == expected
+
+
+def test_unconfigured_shared_model_still_checks_every_runtime_dependency(tmp_path, monkeypatch):
+    module = _module()
+    monkeypatch.setattr(module, "_validated_observer_environment", lambda _: {})
+    calls = []
+    async def database(_):
+        calls.append("database")
+        return module._DatabaseInspection((), (), ("shared", "http://openmaic:3000"))
+    async def storage(*args):
+        calls.append("storage")
+        return ()
+    async def health(*args):
+        calls.append("health")
+        return ()
+    def compose(*args, **kwargs):
+        assert kwargs["provider_configuration"] is None
+        assert kwargs["provider_secrets_root"] is not None
+        calls.append("compose")
+        return ()
+    monkeypatch.setattr(module, "_inspect_database_runtime", database)
+    monkeypatch.setattr(module, "_inspect_object_store_runtime", storage)
+    monkeypatch.setattr(module, "_inspect_openmaic_runtime", health)
+    monkeypatch.setattr(module, "_inspect_compose_runtime", compose)
+    errors = asyncio.run(module.DefaultRuntimePreflightProbe().inspect(settings=object(),
+        secret_dir=tmp_path, image_lock_path=tmp_path/"lock.json", project_root=tmp_path,
+        candidate_root=tmp_path))
+    assert errors == ()
+    assert calls == ["database", "storage", "health", "compose"]

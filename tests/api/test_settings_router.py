@@ -673,7 +673,10 @@ async def test_update_catalog_invalidates_runtime_caches(monkeypatch: pytest.Mon
     new_llm_client = llm_client_module.get_llm_client()
     new_embedding_client = embedding_client_module.get_embedding_client()
 
-    assert response == {"catalog": settings_router.redact_catalog_secrets(updated_catalog)}
+    assert response == {
+        "catalog": settings_router.redact_catalog_secrets(updated_catalog),
+        "openmaic": {"state": "not_enabled"},
+    }
     assert service.load() == updated_catalog
     assert old_llm_config.model == "gpt-old"
     assert new_llm_config.model == "gpt-new"
@@ -1471,3 +1474,54 @@ def test_get_ui_settings_not_registered_on_gated_router() -> None:
     }
     assert "GET" not in gated_methods, f"GET /ui must not be gated: {gated_methods}"
     assert "PUT" in gated_methods
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint", ["update_catalog", "apply_catalog", "complete_tour"])
+async def test_catalog_mutations_sync_only_after_admin_authorization(monkeypatch, endpoint):
+    from fastapi import HTTPException
+
+    from deeptutor.teaching.openmaic import catalog_sync
+
+    calls = []
+
+    async def sync(service):
+        calls.append(service)
+        return {"state": "synced"}
+
+    def denied():
+        raise HTTPException(403, "Admin required")
+
+    monkeypatch.setattr(catalog_sync, "synchronize_shared_catalog", sync)
+    monkeypatch.setattr(settings_router, "_require_settings_admin", denied)
+    payload = (
+        settings_router.TourCompletePayload(catalog={})
+        if endpoint == "complete_tour"
+        else settings_router.CatalogPayload(catalog={})
+    )
+    with pytest.raises(HTTPException) as error:
+        await getattr(settings_router, endpoint)(payload)
+    assert error.value.status_code == 403
+    assert calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint", ["update_catalog", "apply_catalog"])
+async def test_admin_save_synchronizes_persisted_unmasked_catalog(monkeypatch, endpoint):
+    from deeptutor.teaching.openmaic import catalog_sync
+
+    service = _FakeCatalogService({"services": {}})
+    _patch_runtime(monkeypatch, service)
+    calls = []
+
+    async def sync(actual):
+        calls.append(actual.load())
+        return {"state": "synced"}
+
+    monkeypatch.setattr(catalog_sync, "synchronize_shared_catalog", sync)
+    value = {"services": {"llm": {"profiles": []}}}
+    response = await getattr(settings_router, endpoint)(
+        settings_router.CatalogPayload(catalog=value)
+    )
+    assert calls == [service.load()]
+    assert response["openmaic"] == {"state": "synced"}

@@ -52,6 +52,7 @@ from deeptutor.teaching.openmaic.provider_config import (
     PROVIDER_CONFIGURATION_DIRECTORY,
     ProviderConfiguration,
     ProviderConfigurationError,
+    ProviderNotConfigured,
     provider_configuration_path,
     read_provider_configuration,
     validate_registered_provider_configuration,
@@ -538,13 +539,18 @@ class DefaultRuntimePreflightProbe:
             provider = read_provider_configuration(
                 provider_root, scope="shared", tenant_id=None, profile_id="platform-default"
             )
+        except ProviderNotConfigured:
+            provider = None
         except ProviderConfigurationError:
             return ("OpenMAIC provider configuration",)
         database = await _inspect_database_runtime(settings)
         errors = list(database.errors)
-        errors.extend(
-            await _inspect_registered_provider_runtime(settings, provider, database.active_tenants)
-        )
+        if provider is not None:
+            errors.extend(
+                await _inspect_registered_provider_runtime(
+                    settings, provider, database.active_tenants
+                )
+            )
         errors.extend(
             await _inspect_object_store_runtime(
                 settings,
@@ -628,12 +634,65 @@ def _inspect_observer_compose_environment(
 
 
 def _inspect_provider_compose_bindings(
-    payload: dict[str, object], configuration: ProviderConfiguration, secrets_root: Path
+    payload: dict[str, object], configuration: ProviderConfiguration | None, secrets_root: Path
 ) -> tuple[str, ...]:
     try:
         services = payload["services"]
         service = services["openmaic"]
         environment = service["environment"]
+        if configuration is None or configuration.scope == "shared":
+            if (
+                environment.get("YFEISTAI_OPENMAIC_MODE") != "shared"
+                or environment.get("YFEISTAI_OPENMAIC_PROVIDER_PROFILE_ID") != "platform-default"
+                or environment.get("YFEISTAI_DATA_PLANE_ID", "")
+                or environment.get("YFEISTAI_OPENMAIC_PROVIDER_CONFIG_FILE")
+                != "/run/yfeistai-provider/platform-default"
+            ):
+                raise ValueError
+            directory = secrets_root / "shared/providers"
+            for name, target, read_only in (
+                ("openmaic", "/run/yfeistai-provider", True),
+                (
+                    "deeptutor",
+                    "/app/data/system/secrets/openmaic-providers/shared/providers",
+                    False,
+                ),
+                (
+                    "shared-data-plane-bootstrap",
+                    "/run/yfeistai-provider-root/shared/providers",
+                    True,
+                ),
+            ):
+                mounts = [
+                    m
+                    for m in services[name].get("volumes", [])
+                    if isinstance(m, dict) and m.get("target") == target
+                ]
+                if len(mounts) != 1:
+                    raise ValueError
+                mount = mounts[0]
+                if (
+                    mount.get("type") != "bind"
+                    or Path(mount["source"]) != directory
+                    or bool(mount.get("read_only", False)) != read_only
+                ):
+                    raise ValueError
+            command = services["shared-data-plane-bootstrap"]["command"]
+            if (
+                command.count("--provider-config-root") != 1
+                or command[command.index("--provider-config-root") + 1]
+                != "/run/yfeistai-provider-root"
+                or any(
+                    flag in command
+                    for flag in (
+                        "--provider-id",
+                        "--provider-model-name",
+                        "--provider-api-base-url",
+                    )
+                )
+            ):
+                raise ValueError
+            return ()
         if (
             environment.get("YFEISTAI_OPENMAIC_MODE") != configuration.scope
             or environment.get("YFEISTAI_OPENMAIC_PROVIDER_PROFILE_ID") != configuration.profile_id
@@ -767,7 +826,7 @@ def _inspect_compose_runtime(
         )
         payload = json.loads(config_result.stdout)
         services = payload["services"]
-        if provider_configuration is not None:
+        if provider_configuration is not None or provider_secrets_root is not None:
             if provider_secrets_root is None:
                 raise ValueError("provider root required")
             errors.extend(

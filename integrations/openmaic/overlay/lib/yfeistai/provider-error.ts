@@ -1,4 +1,5 @@
 export type StableProviderErrorCode =
+  | "model_not_configured"
   | "provider_429"
   | "provider_5xx"
   | "connect_timeout"
@@ -101,6 +102,12 @@ export function classifyProviderFailure(
   error: unknown,
 ): StableProviderFailure | null {
   const records = errorChain(error);
+  if (records.some((record) => recordValue(record, "code") === "MODEL_NOT_CONFIGURED")) {
+    return {
+      code: "model_not_configured",
+      message: "Configure the course model in Settings first.",
+    };
+  }
   const statuses = providerStatuses(records);
   if (statuses.includes(429)) {
     return {
