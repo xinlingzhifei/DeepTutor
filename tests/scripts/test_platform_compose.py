@@ -679,12 +679,16 @@ def test_minio_bootstrap_enables_and_verifies_bucket_versioning() -> None:
     bucket = 'bucket="platform/${YFEISTAI_OBJECT_STORE_BUCKET:-yfeistai-classrooms}"'
     create = 'mc mb --ignore-existing "$$bucket"'
     enable = 'mc version enable "$$bucket"'
-    verify = 'mc version info "$$bucket" | grep -F "versioning is enabled"'
+    verify = 'version_info="$$(mc version info "$$bucket")"'
 
     assert bucket in script
     assert create in script
     assert enable in script
     assert verify in script
+    assert 'case "$$version_info" in' in script
+    assert '*"versioning is enabled"*) ;;' in script
+    assert 'exit 1 ;;' in script
+    assert 'grep' not in script
     assert script.index(create) < script.index(enable) < script.index(verify)
 
 
