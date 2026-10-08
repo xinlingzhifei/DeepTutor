@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import uuid
 
 from pydantic import SecretStr
 import pytest
@@ -15,6 +16,93 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 
 ROOT = Path(__file__).resolve().parents[3]
+
+
+@pytest.mark.asyncio
+async def test_runtime_tenant_migration_uses_migrator_and_grants_app_access(
+    request: pytest.FixtureRequest, monkeypatch, tmp_path: Path
+) -> None:
+    from deeptutor.services.config import load_platform_settings, platform_settings
+    from deeptutor.teaching import provisioning_worker
+
+    base_url = make_url(_database_url(request))
+    database_name = "tenant_roles_" + uuid.uuid4().hex[:12]
+    admin_engine = create_async_engine(base_url, isolation_level="AUTOCOMMIT")
+    try:
+        async with admin_engine.connect() as connection:
+            await connection.execute(text(f'CREATE DATABASE "{database_name}"'))
+    finally:
+        await admin_engine.dispose()
+
+    base_url = base_url.set(database=database_name)
+    app_password = "RUNTIME_APP_PASSWORD_SENTINEL"
+    migration_password = "RUNTIME_MIGRATION_PASSWORD_SENTINEL"
+    admin_engine = create_async_engine(base_url)
+    try:
+        await _migration_script()._execute_role_bootstrap(
+            admin_engine, app_password=app_password, migration_password=migration_password
+        )
+    finally:
+        await admin_engine.dispose()
+    settings_dir = tmp_path / "data/user/settings"
+    settings_dir.mkdir(parents=True)
+    (settings_dir / "platform.json").write_text('{"enabled":true}', encoding="utf-8")
+    monkeypatch.setattr(platform_settings, "get_runtime_settings_dir", lambda: settings_dir)
+    migration_file = tmp_path / "migration-password"
+    migration_file.write_text(migration_password, encoding="utf-8")
+    app_url = base_url.set(username="yfeistai_app", password=app_password)
+    migration_url = base_url.set(username="yfeistai_migrator", password=migration_password)
+    monkeypatch.setenv("DEEPTUTOR_HOME", str(tmp_path))
+    monkeypatch.setenv(
+        "DEEPTUTOR_PLATFORM_DATABASE_URL", app_url.render_as_string(hide_password=False)
+    )
+    monkeypatch.setenv("YFEISTAI_PLATFORM_MIGRATION_USER", "yfeistai_migrator")
+    monkeypatch.setenv("YFEISTAI_PLATFORM_MIGRATION_PASSWORD_FILE", str(migration_file))
+    migration_engine = create_async_engine(migration_url)
+    try:
+        await _migration_script().migrate_locked_tenant_directory(migration_engine)
+    finally:
+        await migration_engine.dispose()
+    app_engine = create_async_engine(load_platform_settings().database_url.get_secret_value())
+    monkeypatch.setattr(provisioning_worker, "get_platform_engine", lambda: app_engine)
+    try:
+        provisioner = provisioning_worker.AlembicTenantSchemaProvisioner()
+        result = await provisioner.provision("runtime-role-tenant")
+        assert result.revision == provisioning_worker.TENANT_SCHEMA_REVISION
+        assert await provisioner.provision("runtime-role-tenant") == result
+        async with app_engine.connect() as connection:
+            assert await connection.scalar(text("SELECT current_user")) == "yfeistai_app"
+            assert (
+                await connection.scalar(
+                    text(f'SELECT count(*) FROM "{result.schema_name}".generation_jobs')
+                )
+                == 0
+            )
+            assert (
+                await connection.scalar(
+                    text(
+                        "SELECT has_database_privilege(current_user, current_database(), 'CREATE')"
+                    )
+                )
+                is False
+            )
+            assert (
+                await connection.scalar(
+                    text("SELECT has_schema_privilege(current_user, :schema, 'CREATE')"),
+                    {"schema": result.schema_name},
+                )
+                is False
+            )
+            assert (
+                await connection.scalar(
+                    text(
+                        "SELECT has_table_privilege(current_user, 'platform.generation_route_attempts', 'SELECT')"
+                    )
+                )
+                is False
+            )
+    finally:
+        await app_engine.dispose()
 
 
 def _database_url(request: pytest.FixtureRequest) -> str:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from argparse import Namespace
 from importlib import resources
+import os
 from pathlib import Path
 import re
 from typing import Literal, NamedTuple
@@ -13,7 +14,7 @@ from alembic.config import Config
 from alembic.util import CommandError
 from sqlalchemy import exc as sqlalchemy_exc
 from sqlalchemy import text
-from sqlalchemy.engine import Connection
+from sqlalchemy.engine import Connection, make_url
 from sqlalchemy.sql.elements import TextClause
 
 from deeptutor.services.config import load_platform_settings
@@ -45,7 +46,24 @@ def load_migration_database_url() -> str:
         raise CommandError("platform database is disabled")
     if settings.database_url is None:
         raise CommandError("platform database URL is unavailable")
-    return settings.database_url.get_secret_value()
+    database_url = settings.database_url.get_secret_value()
+    migration_user = os.environ.get("YFEISTAI_PLATFORM_MIGRATION_USER")
+    password_file = os.environ.get("YFEISTAI_PLATFORM_MIGRATION_PASSWORD_FILE")
+    if migration_user is None and password_file is None:
+        return database_url
+    if not migration_user or not password_file:
+        raise CommandError("migration database credentials are incomplete")
+    try:
+        password = Path(password_file).read_text(encoding="utf-8").rstrip("\r\n")
+        if not password:
+            raise ValueError("empty migration password")
+        return (
+            make_url(database_url)
+            .set(username=migration_user, password=password)
+            .render_as_string(hide_password=False)
+        )
+    except (OSError, UnicodeError, ValueError):
+        raise CommandError("migration database credentials are invalid") from None
 
 
 def is_transient_database_error(exc: Exception) -> bool:
@@ -173,6 +191,23 @@ def _run_migrations_in_transaction(
     with context.begin_transaction():
         connection.execute(*_migration_timeout_command())
         context.run_migrations()
+        # Runtime provisioning verifies the new schema through the app role.
+        # Publish its DML grants atomically with the tenant migration.
+        if migration_scope.name == "tenant" and connection.scalar(
+            text("SELECT current_user = 'yfeistai_migrator'")
+        ):
+            schema = '"' + migration_scope.schema.replace('"', '""') + '"'
+            for statement in (
+                f"GRANT USAGE ON SCHEMA {schema} TO yfeistai_app",
+                f"GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA "
+                f"{schema} TO yfeistai_app",
+                f"GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA {schema} TO yfeistai_app",
+                f"ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} "
+                "GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO yfeistai_app",
+                f"ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} "
+                "GRANT USAGE, SELECT ON SEQUENCES TO yfeistai_app",
+            ):
+                connection.execute(text(statement))
 
 
 def _migration_timeout_command() -> tuple[TextClause, dict[str, str]]:
