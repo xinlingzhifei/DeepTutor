@@ -3303,8 +3303,8 @@ def test_image_lock_writer_uses_explicit_candidate_digests_without_resolving_can
     assert resolved == [
         "nginx:1.29.8-alpine3.23",
         "postgres:16.14-alpine3.24",
-        "minio/minio:RELEASE.2025-04-22T22-12-26Z",
-        "minio/mc:RELEASE.2025-04-16T18-13-26Z",
+        "ghcr.io/xinlingzhifei/deeptutor:dependency-minio-RELEASE.2025-04-22T22-12-26Z",
+        "ghcr.io/xinlingzhifei/deeptutor:dependency-mc-RELEASE.2025-04-16T18-13-26Z",
         "ghcr.io/muchobien/pocketbase:latest",
     ]
     assert written["candidate"]["imageDigests"] == {

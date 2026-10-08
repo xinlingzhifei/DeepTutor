@@ -38,8 +38,8 @@ IMAGE_SPECS = {
     "openmaic_render": ("ghcr.io/xinlingzhifei/openmaic-render", None, "3"),
     "nginx": ("nginx", "1.29.8-alpine3.23", "4"),
     "postgres": ("postgres", "16.14-alpine3.24", "5"),
-    "minio": ("minio/minio", "RELEASE.2025-04-22T22-12-26Z", "6"),
-    "minio_client": ("minio/mc", "RELEASE.2025-04-16T18-13-26Z", "7"),
+    "minio": ("ghcr.io/xinlingzhifei/deeptutor", "dependency-minio-RELEASE.2025-04-22T22-12-26Z", "6"),
+    "minio_client": ("ghcr.io/xinlingzhifei/deeptutor", "dependency-mc-RELEASE.2025-04-16T18-13-26Z", "7"),
     "pocketbase": ("ghcr.io/muchobien/pocketbase", "latest", "8"),
 }
 MANIFEST_FILE = "observer-release-manifest.json"

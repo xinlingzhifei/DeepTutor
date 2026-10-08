@@ -7,16 +7,16 @@
       "tag": "first-release"
     },
     "minio": {
-      "digest": "sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e",
-      "reference": "minio/minio:RELEASE.2025-04-22T22-12-26Z@sha256:a1ea29fa28355559ef137d71fc570e508a214ec84ff8083e39bc5428980b015e",
-      "repository": "minio/minio",
-      "tag": "RELEASE.2025-04-22T22-12-26Z"
+      "digest": "sha256:3f97c5651cb6662b880c787a232b6b34fec8d8922e08d6617b25d241a21164bb",
+      "reference": "ghcr.io/xinlingzhifei/deeptutor:dependency-minio-RELEASE.2025-04-22T22-12-26Z@sha256:3f97c5651cb6662b880c787a232b6b34fec8d8922e08d6617b25d241a21164bb",
+      "repository": "ghcr.io/xinlingzhifei/deeptutor",
+      "tag": "dependency-minio-RELEASE.2025-04-22T22-12-26Z"
     },
     "minio_client": {
-      "digest": "sha256:aead63c77f9db9107f1696fb08ecb0faeda23729cde94b0f663edf4fe09728e3",
-      "reference": "minio/mc:RELEASE.2025-04-16T18-13-26Z@sha256:aead63c77f9db9107f1696fb08ecb0faeda23729cde94b0f663edf4fe09728e3",
-      "repository": "minio/mc",
-      "tag": "RELEASE.2025-04-16T18-13-26Z"
+      "digest": "sha256:2582c2f48b1e31545143ba5285c67d7b38c8b8f6912142d0630686dc7aaac28b",
+      "reference": "ghcr.io/xinlingzhifei/deeptutor:dependency-mc-RELEASE.2025-04-16T18-13-26Z@sha256:2582c2f48b1e31545143ba5285c67d7b38c8b8f6912142d0630686dc7aaac28b",
+      "repository": "ghcr.io/xinlingzhifei/deeptutor",
+      "tag": "dependency-mc-RELEASE.2025-04-16T18-13-26Z"
     },
     "nginx": {
       "digest": "sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de",

@@ -45,8 +45,8 @@ from deeptutor.teaching.schema_names import tenant_schema_name
 from deeptutor.teaching.storage_credentials import TenantStorageCredentialRecord
 from deeptutor.teaching.tenant_context import TenantContext
 
-_MINIO_IMAGE = "minio/minio:RELEASE.2025-04-22T22-12-26Z"
-_MC_IMAGE = "minio/mc:RELEASE.2025-04-16T18-13-26Z"
+_MINIO_IMAGE = "ghcr.io/xinlingzhifei/deeptutor:dependency-minio-RELEASE.2025-04-22T22-12-26Z"
+_MC_IMAGE = "ghcr.io/xinlingzhifei/deeptutor:dependency-mc-RELEASE.2025-04-16T18-13-26Z"
 _BUCKET = "classroom-artifacts"
 
 

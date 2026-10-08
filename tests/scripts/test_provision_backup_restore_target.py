@@ -502,6 +502,38 @@ def test_provisioner_accepts_only_normalized_image_lock_repositories(tmp_path: P
     assert module.target_resource_names(config).database_name.startswith("br_")
 
 
+def test_provisioner_accepts_verified_minio_archive(tmp_path: Path) -> None:
+    module = _module()
+    config = replace(
+        _config(tmp_path),
+        minio_image=(
+            "ghcr.io/xinlingzhifei/deeptutor:dependency-minio-RELEASE.2025-04-22T22-12-26Z"
+            "@sha256:3f97c5651cb6662b880c787a232b6b34fec8d8922e08d6617b25d241a21164bb"
+        ),
+    )
+
+    assert module.target_resource_names(config).database_name.startswith("br_")
+
+
+@pytest.mark.parametrize(
+    "reference",
+    (
+        "ghcr.io/xinlingzhifei/deeptutor:first-release"
+        "@sha256:3f97c5651cb6662b880c787a232b6b34fec8d8922e08d6617b25d241a21164bb",
+        "ghcr.io/xinlingzhifei/deeptutor:dependency-minio-RELEASE.2025-04-22T22-12-26Z"
+        "@sha256:" + "8" * 64,
+    ),
+)
+def test_provisioner_rejects_other_images_in_archive_repository(
+    tmp_path: Path, reference: str
+) -> None:
+    module = _module()
+    config = replace(_config(tmp_path), minio_image=reference)
+
+    with pytest.raises(ValueError, match="image repository is invalid"):
+        module.target_resource_names(config)
+
+
 @pytest.mark.parametrize(
     ("field", "reference"),
     (

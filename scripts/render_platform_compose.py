@@ -164,12 +164,12 @@ IMAGE_SPECS: dict[str, dict[str, Any]] = {
         "tag": "16.14-alpine3.24",
     },
     "minio": {
-        "repository": "minio/minio",
-        "tag": "RELEASE.2025-04-22T22-12-26Z",
+        "repository": "ghcr.io/xinlingzhifei/deeptutor",
+        "tag": "dependency-minio-RELEASE.2025-04-22T22-12-26Z",
     },
     "minio_client": {
-        "repository": "minio/mc",
-        "tag": "RELEASE.2025-04-16T18-13-26Z",
+        "repository": "ghcr.io/xinlingzhifei/deeptutor",
+        "tag": "dependency-mc-RELEASE.2025-04-16T18-13-26Z",
     },
     "pocketbase": {
         "repository": "ghcr.io/muchobien/pocketbase",

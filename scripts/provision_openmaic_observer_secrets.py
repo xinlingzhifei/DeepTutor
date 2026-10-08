@@ -67,8 +67,8 @@ _IMAGE_SPECS: dict[str, tuple[str, str | None]] = {
     "openmaic_render": ("ghcr.io/xinlingzhifei/openmaic-render", None),
     "nginx": ("nginx", "1.29.8-alpine3.23"),
     "postgres": ("postgres", "16.14-alpine3.24"),
-    "minio": ("minio/minio", "RELEASE.2025-04-22T22-12-26Z"),
-    "minio_client": ("minio/mc", "RELEASE.2025-04-16T18-13-26Z"),
+    "minio": ("ghcr.io/xinlingzhifei/deeptutor", "dependency-minio-RELEASE.2025-04-22T22-12-26Z"),
+    "minio_client": ("ghcr.io/xinlingzhifei/deeptutor", "dependency-mc-RELEASE.2025-04-16T18-13-26Z"),
     "pocketbase": ("ghcr.io/muchobien/pocketbase", "latest"),
 }
 

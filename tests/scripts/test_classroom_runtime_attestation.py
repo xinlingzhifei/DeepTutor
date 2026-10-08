@@ -165,13 +165,13 @@ def _candidate_root(tmp_path: Path) -> tuple[Path, dict[str, str]]:
         "nginx": ("nginx", "1.29.8-alpine3.23", "sha256:" + "4" * 64),
         "postgres": ("postgres", "16.14-alpine3.24", "sha256:" + "5" * 64),
         "minio": (
-            "minio/minio",
-            "RELEASE.2025-04-22T22-12-26Z",
+            "ghcr.io/xinlingzhifei/deeptutor",
+            "dependency-minio-RELEASE.2025-04-22T22-12-26Z",
             "sha256:" + "6" * 64,
         ),
         "minio_client": (
-            "minio/mc",
-            "RELEASE.2025-04-16T18-13-26Z",
+            "ghcr.io/xinlingzhifei/deeptutor",
+            "dependency-mc-RELEASE.2025-04-16T18-13-26Z",
             "sha256:" + "7" * 64,
         ),
         "pocketbase": ("ghcr.io/muchobien/pocketbase", "latest", "sha256:" + "8" * 64),

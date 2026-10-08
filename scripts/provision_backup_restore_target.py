@@ -62,6 +62,10 @@ _APPROVED_IMAGE_REPOSITORIES = {
     "postgres": "docker.io/library/postgres",
     "minio": "docker.io/minio/minio",
 }
+_MINIO_ARCHIVE_REFERENCE = (
+    "ghcr.io/xinlingzhifei/deeptutor:dependency-minio-RELEASE.2025-04-22T22-12-26Z"
+    "@sha256:3f97c5651cb6662b880c787a232b6b34fec8d8922e08d6617b25d241a21164bb"
+)
 _MAX_SECRET_BYTES = 64 * 1024
 _MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024
 _SAFE_ENVIRONMENT_NAMES = (
@@ -171,7 +175,9 @@ def _validate_image(value: object, image_kind: str) -> None:
     if value.endswith("sha256:" + "0" * 64):
         raise ValueError("target provisioning image digest is invalid")
     repository = _normalized_image_repository(value)
-    if repository != _APPROVED_IMAGE_REPOSITORIES[image_kind]:
+    if repository != _APPROVED_IMAGE_REPOSITORIES[image_kind] and not (
+        image_kind == "minio" and value == _MINIO_ARCHIVE_REFERENCE
+    ):
         raise ValueError(f"target provisioning {image_kind} image repository is invalid")
 
 
