@@ -248,8 +248,12 @@ RUN mkdir -p \
 # non-root in either runtime. UID 1000 also matches the host user under
 # keep-id with a bind mount on ./data.
 RUN groupadd --system --gid 1000 deeptutor \
-    && useradd --system --uid 1000 --gid 1000 --no-create-home --shell /usr/sbin/nologin deeptutor \
+    && useradd --system --uid 1000 --gid 1000 --create-home --shell /usr/sbin/nologin deeptutor \
     && chown -R deeptutor:deeptutor /app/data /app/web/.next
+
+# supervisord changes the child UID without changing HOME. Database clients
+# must resolve optional client certificates inside the application user's home.
+ENV HOME=/home/deeptutor
 
 # supervisord config is split into two files so the production and development
 # images share one daemon-level [supervisord] section instead of duplicating it:
