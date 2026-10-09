@@ -52,7 +52,7 @@ export default function RegisterPage() {
   }
 
   return (
-    <div className="w-full max-w-sm">
+    <div className="mx-auto flex min-h-dvh w-full max-w-sm flex-col justify-center px-5 py-8 sm:px-0">
       {/* Logo / Title */}
       <div className="text-center mb-8">
         <h1 className="font-serif text-2xl font-semibold text-[var(--foreground)] tracking-tight">
