@@ -1,17 +1,21 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { FileUp, LoaderCircle, Sparkles } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import {
   classroomNextRoute,
+  getTeachingCatalogPermissions,
+  createTeachingCourse,
+  createTeachingClass,
   createTeachingClassroom,
   listTeachingClasses,
   listTeachingCourses,
   listTeachingSources,
   uploadTeachingPdfSource,
+  TeachingApiError,
   type TeachingClass,
   type TeachingClassroomCreateInput,
   type TeachingContentMode,
@@ -21,6 +25,9 @@ import {
   type TeachingSource,
 } from "@/lib/teaching-api";
 import { createTeachingAttemptRegistry } from "@/lib/teaching-workflow";
+import { CatalogCreatePanel } from "./CatalogCreatePanel";
+import { useCourseModelStatus } from "@/hooks/useCourseModelStatus";
+import { CourseModelStatusNotice } from "@/components/settings/CourseModelStatusCard";
 
 const EXPORTS: TeachingExportFormat[] = [
   "classroom_zip",
@@ -64,6 +71,28 @@ export function TeachingBriefForm() {
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [creationAttempts] = useState(() => createTeachingAttemptRegistry());
+  const courseModel = useCourseModelStatus(true);
+  const [canManage, setCanManage] = useState(false);
+  const [canCreateClass, setCanCreateClass] = useState(false);
+  const [creating, setCreating] = useState<"course" | "class" | null>(null);
+  const [catalogLoading, setCatalogLoading] = useState(true);
+  const [classesLoading, setClassesLoading] = useState(false);
+  const classesRequest = useRef(0);
+  const submission = useRef(false);
+
+  useEffect(() => {
+    let active = true;
+    setCanCreateClass(false);
+    void getTeachingCatalogPermissions(courseId).then(value => {
+      if (active) {
+        setCanManage(value.canCreateCourse);
+        setCanCreateClass(value.canCreateClass);
+      }
+    }).catch(() => {
+      if (active) { setCanManage(false); setCanCreateClass(false); }
+    });
+    return () => { active = false; };
+  }, [courseId]);
 
   useEffect(() => {
     let active = true;
@@ -76,6 +105,9 @@ export function TeachingBriefForm() {
       })
       .catch(reason => {
         if (active) setError(reason instanceof Error ? reason.message : String(reason));
+      })
+      .finally(() => {
+        if (active) setCatalogLoading(false);
       });
     return () => {
       active = false;
@@ -83,27 +115,69 @@ export function TeachingBriefForm() {
   }, []);
 
   useEffect(() => {
+    const requestId = ++classesRequest.current;
+    setClasses([]);
+    setClassId("");
     if (!courseId) {
-      setClasses([]);
-      setClassId("");
+      setClassesLoading(false);
       return;
     }
+    setClassesLoading(true);
     let active = true;
     listTeachingClasses(courseId)
       .then(next => {
-        if (!active) return;
+        if (!active || classesRequest.current !== requestId) return;
         setClasses(next);
         setClassId(current =>
           next.some(item => item.id === current) ? current : next[0]?.id || "",
         );
       })
       .catch(reason => {
-        if (active) setError(reason instanceof Error ? reason.message : String(reason));
+        if (active && classesRequest.current === requestId) {
+          setError(reason instanceof Error ? reason.message : String(reason));
+        }
+      })
+      .finally(() => {
+        if (active && classesRequest.current === requestId) setClassesLoading(false);
       });
     return () => {
       active = false;
     };
   }, [courseId]);
+
+  const createCatalogItem = async (id: string, name: string) => {
+    if (creating === "course") {
+      let course: TeachingCourse;
+      try {
+        course = await createTeachingCourse(id, name);
+      } catch (reason) {
+        // A timed-out response may already have committed. Recover only this
+        // exact creation attempt, never a different item with the same name.
+        if (!(reason instanceof TeachingApiError) || reason.status !== 409) throw reason;
+        const existing = (await listTeachingCourses()).find(item => item.id === id && item.title === name);
+        if (!existing) throw reason;
+        course = existing;
+      }
+      setCourses(current => [...current.filter(item => item.id !== course.id), course]);
+      setCourseId(course.id);
+      setSourceKey("");
+    } else {
+      let classroom: TeachingClass;
+      try {
+        classroom = await createTeachingClass(courseId, id, name);
+      } catch (reason) {
+        if (!(reason instanceof TeachingApiError) || reason.status !== 409) throw reason;
+        const existing = (await listTeachingClasses(courseId)).find(item => item.id === id && item.name === name);
+        if (!existing) throw reason;
+        classroom = existing;
+      }
+      classesRequest.current++;
+      setClassesLoading(false);
+      setClasses(current => [...current.filter(item => item.id !== classroom.id), classroom]);
+      setClassId(classroom.id);
+    }
+    setCreating(null);
+  };
 
   const scopedSources = useMemo(
     () =>
@@ -148,13 +222,20 @@ export function TeachingBriefForm() {
 
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
+    if (submission.current || creating || !courseModel.ready) return;
     if (!courseId || !classId || !title.trim() || !objective.trim()) return;
     if (contentMode === "source_grounded" && !selectedSource) {
       setError(t("teaching.brief.sourceRequired"));
       return;
     }
     setSubmitting(true);
+    submission.current = true;
     setError(null);
+    if (!await courseModel.refresh()) {
+      submission.current = false;
+      setSubmitting(false);
+      return;
+    }
     const pointTitle = knowledgePointTitle.trim() || objective.trim();
     const sourceType = selectedSource?.sourceType ?? null;
     const input: TeachingClassroomCreateInput = {
@@ -211,18 +292,23 @@ export function TeachingBriefForm() {
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
+      submission.current = false;
       setSubmitting(false);
     }
   };
 
   return (
     <form onSubmit={submit} className="space-y-6" data-testid="teaching-brief-form">
+      <CourseModelStatusNotice model={courseModel} />
       <section className="grid gap-4 rounded-2xl border border-[var(--border)] bg-[var(--card)] p-5 md:grid-cols-2">
         <label className="space-y-1.5 text-sm font-medium">
           {t("teaching.brief.course")}
           <select
             value={courseId}
-            onChange={event => setCourseId(event.target.value)}
+            onChange={event => {
+              setCourseId(event.target.value); setSourceKey(""); setCreating(null);
+            }}
+            disabled={catalogLoading || creating !== null}
             required
             className="w-full rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 py-2"
           >
@@ -238,6 +324,7 @@ export function TeachingBriefForm() {
           {t("teaching.brief.class")}
           <select
             value={classId}
+            disabled={classesLoading || !courseId || creating !== null}
             onChange={event => setClassId(event.target.value)}
             required
             className="w-full rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 py-2"
@@ -250,6 +337,21 @@ export function TeachingBriefForm() {
             ))}
           </select>
         </label>
+        {canManage || canCreateClass ? (
+          <div className="flex flex-wrap gap-3 text-sm md:col-span-2">
+            {canManage ? <button type="button" disabled={creating !== null || catalogLoading} onClick={() => setCreating("course")}
+              className="text-[var(--primary)] disabled:opacity-50">{t("Create course")}</button> : null}
+            {canCreateClass ? <button type="button" disabled={!courseId || creating !== null || classesLoading} onClick={() => setCreating("class")}
+              className="text-[var(--primary)] disabled:opacity-50">{t("Create class")}</button> : null}
+          </div>
+        ) : null}
+        {!catalogLoading && (!courses.length || (courseId && !classesLoading && !classes.length)) ? (
+          <p className="text-sm text-[var(--muted-foreground)] md:col-span-2">
+            {t(canManage || canCreateClass ? "Create a course and class here to start preparing your lesson." : "Ask your organization administrator to create a course and class and grant you access.")}
+          </p>
+        ) : null}
+        {creating ? <CatalogCreatePanel key={`${creating}:${courseId}`} kind={creating}
+          onCreate={createCatalogItem} onCancel={() => setCreating(null)} /> : null}
         <label className="space-y-1.5 text-sm font-medium md:col-span-2">
           {t("teaching.brief.title")}
           <input
@@ -481,7 +583,7 @@ export function TeachingBriefForm() {
       ) : null}
       <button
         type="submit"
-        disabled={submitting || uploading}
+        disabled={submitting || uploading || !courseModel.ready || creating !== null || !courseId || !classId || classesLoading}
         className="inline-flex items-center gap-2 rounded-lg bg-[var(--primary)] px-5 py-2.5 text-sm font-semibold text-[var(--primary-foreground)] disabled:opacity-50"
       >
         {submitting ? <LoaderCircle className="h-4 w-4 animate-spin" aria-hidden /> : null}

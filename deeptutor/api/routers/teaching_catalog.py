@@ -395,6 +395,44 @@ async def _generation_administration_result(operation: Awaitable[_T]) -> _T:
         ) from None
 
 
+@router.get("/catalog-permissions")
+async def catalog_permissions(
+    course_id: str | None = None,
+    context: TenantContext = Depends(require_tenant),
+    service: CatalogService = Depends(get_catalog_service),
+) -> dict[str, bool]:
+    return service.creation_permissions(context, course_id)
+
+
+@router.get("/model-readiness")
+async def course_model_readiness(context: TenantContext = Depends(require_tenant)):
+    from deeptutor.api.routers.classroom_jobs import get_data_plane_repository
+    from deeptutor.api.routers.settings import get_openmaic_status
+    from deeptutor.multi_user.context import get_current_user
+    from deeptutor.teaching.openmaic.data_planes import DataPlaneSelector, DataPlaneUnavailable
+
+    try:
+        selector = DataPlaneSelector(
+            settings=load_platform_settings(),
+            repository=get_data_plane_repository(),
+            audit_decisions=False,
+        )
+        selection = await selector.resolve(context.tenant_id)
+        if selection is not None and selection.mode == "shared":
+            return await get_openmaic_status()
+        if selection is not None:
+            return {"state": "synced", "ready": True, "can_configure": False}
+        state = "not_enabled"
+    except (DataPlaneUnavailable, SQLAlchemyError):
+        state = "error"
+    return {
+        "state": state,
+        "ready": False,
+        "reason": "data_plane_unavailable",
+        "can_configure": get_current_user().is_admin,
+    }
+
+
 @router.get("/courses", response_model=CourseListResponse)
 async def list_courses(
     context: TenantContext = Depends(require_tenant),

@@ -26,6 +26,7 @@ import {
 import { useAppShell } from "@/context/AppShellContext";
 import { apiFetch, apiUrl } from "@/lib/api";
 import { invalidateLLMOptionsCache } from "@/lib/llm-options";
+import { COURSE_MODEL_CHANGED } from "@/lib/course-model-status";
 import { setModelReasoningEffort } from "@/lib/reasoning-effort";
 import { setTheme as applyThemePreference } from "@/lib/theme";
 
@@ -1023,6 +1024,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
       setDraft(cloneCatalog(payload.catalog));
       // The model list the chat composer shows is derived from this catalog.
       invalidateLLMOptionsCache();
+      window.dispatchEvent(new Event(COURSE_MODEL_CHANGED));
       setToast(payload.openmaic?.state === "error"
         ? t("Model saved; course model synchronization failed. Check provider compatibility and configuration, then apply again.")
         : payload.openmaic?.state === "not_configured"
@@ -1058,6 +1060,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
         setCatalog(payload.catalog);
         setDraft(cloneCatalog(payload.catalog));
         invalidateLLMOptionsCache();
+        window.dispatchEvent(new Event(COURSE_MODEL_CHANGED));
         const statusResponse = await apiFetch(apiUrl("/api/v1/system/status"));
         setStatus((await statusResponse.json()) as SystemStatus);
         if (payload.openmaic?.state === "error") {

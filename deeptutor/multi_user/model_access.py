@@ -18,6 +18,7 @@ from typing import Any
 
 from deeptutor.services.config.model_catalog import ModelCatalogService
 from deeptutor.services.model_selection import list_llm_options
+from deeptutor.services.model_selection.llm import llm_profile_configured
 
 from .context import get_current_user
 from .grants import load_grant
@@ -103,6 +104,7 @@ def redacted_model_access(user_id: str | None = None) -> dict[str, list[dict[str
                     "model": (model or {}).get("model") or "",
                     "source": "admin",
                     "available": model is not None,
+                    "configured": llm_profile_configured(profile),
                 }
             )
     if user_id == user.id:
@@ -131,6 +133,7 @@ def allowed_llm_options() -> dict[str, Any]:
             "provider": "",
             "source": item.get("source") or "admin",
             "is_active_default": False,
+            "configured": item.get("configured", True),
         }
         for item in redacted_model_access(user.id).get("llm", [])
         if item.get("available")

@@ -185,6 +185,15 @@ async function installTeacherBackend(page: Page) {
     const method = request.method();
     const pathname = new URL(request.url()).pathname;
 
+    if (method === "GET" && pathname === "/api/v1/teaching/model-readiness") {
+      await json(route, { state: "synced", ready: true, can_configure: false });
+      return;
+    }
+    if (method === "GET" && pathname === "/api/v1/teaching/catalog-permissions") {
+      await json(route, { canCreateCourse: false, canCreateClass: false });
+      return;
+    }
+
     if (method === "GET" && pathname === "/api/v1/settings") {
       await json(route, { catalog: {} });
       return;

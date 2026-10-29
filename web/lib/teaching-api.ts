@@ -987,6 +987,33 @@ export async function listTeachingCourses(): Promise<TeachingCourse[]> {
   );
 }
 
+export async function getTeachingCatalogPermissions(courseId = ""): Promise<{ canCreateCourse: boolean; canCreateClass: boolean }> {
+  const result = object(
+    await requestJson(`/api/v1/teaching/catalog-permissions?course_id=${encodeURIComponent(courseId)}`, { cache: "no-store" }),
+    "catalog permissions",
+  );
+  return {
+    canCreateCourse: boolean(result.canCreateCourse, "canCreateCourse"),
+    canCreateClass: boolean(result.canCreateClass, "canCreateClass"),
+  };
+}
+
+export async function createTeachingCourse(id: string, title: string): Promise<TeachingCourse> {
+  return parseCourse(await requestJson("/api/v1/teaching/courses", {
+    method: "POST",
+    ...jsonRequest({ id, title: title.trim() }),
+  }));
+}
+
+export async function createTeachingClass(
+  courseId: string, id: string, name: string,
+): Promise<TeachingClass> {
+  return parseClass(await requestJson(
+    `/api/v1/teaching/courses/${safeSegment(courseId, "course ID")}/classes`,
+    { method: "POST", ...jsonRequest({ id, name: name.trim() }) },
+  ));
+}
+
 export async function listTeachingClasses(courseId: string): Promise<TeachingClass[]> {
   return parseList(
     await requestJson(

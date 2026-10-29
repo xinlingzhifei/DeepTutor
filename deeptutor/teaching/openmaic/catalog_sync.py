@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -18,6 +19,81 @@ from deeptutor.teaching.openmaic.provider_config import (
 
 class CatalogSyncError(ValueError):
     """Public, credential-free synchronization failure."""
+
+
+async def shared_model_status(catalog_service: Any) -> dict[str, Any]:
+    """Read saved selection and its published projection, without calling a model.
+
+    A successful sync is reconstructed from the actual file and registration so
+    it survives restarts and cannot report an older model as ready after a save.
+    """
+    from sqlalchemy import select
+
+    from deeptutor.runtime.home import get_runtime_data_root
+    from deeptutor.services.config import load_platform_settings
+    from deeptutor.teaching.models import ProviderProfile
+    from deeptutor.teaching.openmaic.provider_config import read_provider_configuration
+
+    result: dict[str, Any] = {"state": "not_configured", "ready": False}
+    try:
+        if not load_platform_settings().enabled:
+            return {"state": "not_enabled", "ready": False}
+        document = provider_document_from_catalog(catalog_service.load())
+        if document is None:
+            return result
+        expected = parse_provider_configuration(
+            json.dumps(document).encode(),
+            scope="shared",
+            tenant_id=None,
+            profile_id="platform-default",
+        )
+        result.update(provider=expected.provider_id, model=expected.model_name)
+        root = get_runtime_data_root() / "system/secrets/openmaic-providers"
+        published = read_provider_configuration(
+            root,
+            scope="shared",
+            tenant_id=None,
+            profile_id="platform-default",
+        )
+        if published != expected:
+            raise CatalogSyncError("synchronization_required")
+        async with _shared_update_session() as session:
+            profile = await session.scalar(
+                select(ProviderProfile).where(ProviderProfile.id == "platform-default")
+            )
+            if profile is None:
+                raise CatalogSyncError("platform_not_initialized")
+            if (
+                profile.scope,
+                profile.tenant_id,
+                profile.owner_key,
+                profile.secret_ref,
+                profile.status,
+                profile.provider_type,
+                profile.model_name,
+                profile.api_base_url,
+            ) != (
+                "shared",
+                None,
+                "shared",
+                expected.secret_ref,
+                "active",
+                expected.provider_id,
+                expected.model_name,
+                expected.base_url,
+            ):
+                raise CatalogSyncError("synchronization_required")
+        updated_at = (root / expected.secret_ref).stat().st_mtime
+        return {
+            **result,
+            "state": "synced",
+            "ready": True,
+            "last_synced_at": datetime.fromtimestamp(updated_at, timezone.utc).isoformat(),
+        }
+    except CatalogSyncError as error:
+        return {**result, "state": "error", "reason": str(error)}
+    except Exception:
+        return {**result, "state": "error", "reason": "synchronization_unavailable"}
 
 
 def require_shared_course_model() -> None:

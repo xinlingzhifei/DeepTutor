@@ -245,6 +245,28 @@ def _client(context: TenantContext, repository: object) -> TestClient:
     return TestClient(app)
 
 
+def test_catalog_creation_affordances_follow_scoped_permissions():
+    repository = _CatalogRepository()
+    admin = _client(
+        _context("admin", "org_admin", scope_type="tenant", scope_id="tenant-a"), repository
+    )
+    assert admin.get("/api/v1/teaching/catalog-permissions?course_id=course-a").json() == {
+        "canCreateCourse": True,
+        "canCreateClass": True,
+    }
+    teacher = _client(
+        _context("teacher", "teacher", scope_type="course", scope_id="course-a"), repository
+    )
+    assert teacher.get("/api/v1/teaching/catalog-permissions?course_id=course-a").json() == {
+        "canCreateCourse": False,
+        "canCreateClass": True,
+    }
+    assert teacher.get("/api/v1/teaching/catalog-permissions?course_id=course-b").json() == {
+        "canCreateCourse": False,
+        "canCreateClass": False,
+    }
+
+
 def _course_generation_policy_payload(**changes: object) -> dict[str, object]:
     payload: dict[str, object] = {
         "allowStudentMicro": True,

@@ -98,6 +98,18 @@ class RecordingRepository:
         self.decisions.append(decision)
 
 
+def test_readiness_checks_validate_routes_without_writing_decision_audits():
+    repository = RecordingRepository(_shared_resolution("tenant-standard"))
+    selector = DataPlaneSelector(
+        settings=SimpleNamespace(enabled=True), repository=repository, audit_decisions=False
+    )
+    assert asyncio.run(selector.resolve("tenant-standard")).mode == "shared"
+    repository.resolution = None
+    with pytest.raises(DataPlaneUnavailable):
+        asyncio.run(selector.resolve("tenant-standard"))
+    assert repository.decisions == []
+
+
 def test_standard_tenant_resolves_healthy_shared_data_plane() -> None:
     resolution = _shared_resolution("tenant-standard")
     assert resolution.route is not None

@@ -7,6 +7,7 @@ import { fetchAuthStatus } from "@/lib/auth";
 import {
   listUsers,
   deleteUser,
+  UserIdentityConflictError,
   setUserRole,
   createUser,
   type UserRecord,
@@ -135,8 +136,8 @@ export default function AdminUsersPage() {
     setActionError("");
     try {
       if (kind === "delete") {
-        await deleteUser(user.username);
-        setUsers((prev) => prev.filter((u) => u.username !== user.username));
+        await deleteUser(user.username, user.id);
+        setUsers((prev) => prev.filter((u) => u.id !== user.id));
       } else {
         const newRole = kind === "promote" ? "admin" : "user";
         await setUserRole(user.username, newRole);
@@ -154,6 +155,11 @@ export default function AdminUsersPage() {
       setConfirmTarget(null);
     } catch (e) {
       setConfirmTarget(null);
+      if (e instanceof UserIdentityConflictError) {
+        await load();
+        setActionError(t("The account changed. The list has been refreshed; review it before deleting again."));
+        return;
+      }
       setActionError(
         e instanceof Error
           ? e.message

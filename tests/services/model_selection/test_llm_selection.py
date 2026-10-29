@@ -86,3 +86,13 @@ def test_apply_llm_selection_rejects_model_not_in_profile():
         assert "Invalid LLM selection" in str(exc)
     else:
         raise AssertionError("expected invalid selection to fail")
+
+
+def test_llm_options_report_missing_credentials_without_exposing_them():
+    catalog = _catalog()
+    catalog["services"]["llm"]["profiles"][0]["api_key"] = "  "
+    options = list_llm_options(catalog)["options"]
+    assert options[0]["configured"] is False
+    assert options[2]["configured"] is True  # Local models need no key.
+    catalog["services"]["llm"]["profiles"][0]["binding"] = "openai_codex"
+    assert list_llm_options(catalog)["options"][0]["configured"] is True

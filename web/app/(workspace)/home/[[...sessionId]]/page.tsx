@@ -101,6 +101,7 @@ import {
 import { listKnowledgeBases } from "@/lib/knowledge-api";
 import { getSubagentSettings } from "@/lib/subagents-api";
 import { useLLMOptions } from "@/hooks/useLLMOptions";
+import { chatModelIssue } from "@/lib/llm-options";
 import {
   getEnabledOptionalTools,
   invalidateEnabledOptionalToolsCache,
@@ -418,6 +419,7 @@ export default function ChatPage() {
     error: llmOptionsError,
     refresh: refreshLLMOptions,
   } = useLLMOptions();
+  const chatModelReady = !chatModelIssue(llmOptions, state.llmSelection, activeLLMDefault, llmOptionsLoading, llmOptionsError);
   const [capabilityConfigs, setCapabilityConfigs] =
     useState<CapabilityPlaygroundConfigMap>({});
   // User-toggleable tools the user has enabled in /settings/tools. This is
@@ -1767,7 +1769,7 @@ export default function ChatPage() {
           !selectedHistorySessions.length &&
           !selectedQuestionEntries.length &&
           !selectedMemoryFiles.length) ||
-        state.isStreaming
+        state.isStreaming || !chatModelReady
       )
         return;
 
@@ -1864,6 +1866,7 @@ export default function ChatPage() {
     },
     [
       attachments,
+      chatModelReady,
       bookReferencesPayload,
       historyReferencesPayload,
       isQuizMode,
@@ -2404,7 +2407,7 @@ export default function ChatPage() {
             {!hasMessages ? (
               <StarterSuggestions
                 onPick={(prompt) => void handleSend(prompt)}
-                disabled={state.isStreaming}
+                disabled={state.isStreaming || !chatModelReady}
               />
             ) : null}
             <div

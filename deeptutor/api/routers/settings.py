@@ -709,6 +709,26 @@ async def get_catalog():
     return {"catalog": redact_catalog_secrets(get_model_catalog_service().load())}
 
 
+@router.get("/openmaic-status")
+async def get_openmaic_status():
+    from deeptutor.teaching.openmaic.catalog_sync import shared_model_status
+
+    result = await shared_model_status(get_model_catalog_service())
+    can_configure = get_current_user().is_admin
+    if not can_configure:
+        result = {key: result[key] for key in ("state", "ready")}
+    return {**result, "can_configure": can_configure}
+
+
+@router.post("/openmaic-sync")
+async def resync_openmaic():
+    _require_settings_admin()
+    from deeptutor.teaching.openmaic.catalog_sync import synchronize_shared_catalog
+
+    await synchronize_shared_catalog(get_model_catalog_service())
+    return await get_openmaic_status()
+
+
 @router.get("/network")
 async def get_network_settings():
     _require_settings_admin()

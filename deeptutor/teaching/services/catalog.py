@@ -98,6 +98,18 @@ class CatalogService:
     def __init__(self, repository: CatalogRepository) -> None:
         self._repository = repository
 
+    def creation_permissions(
+        self, context: TenantContext, course_id: str | None = None
+    ) -> dict[str, bool]:
+        return {
+            "canCreateCourse": _is_admin(context),
+            "canCreateClass": bool(course_id)
+            and (
+                _is_admin(context)
+                or _has_permission(context, "classroom.create", course_id=course_id)
+            ),
+        }
+
     async def list_courses(self, context: TenantContext) -> tuple[CourseRecord, ...]:
         if _is_admin(context):
             return await self._repository.list_courses(None)

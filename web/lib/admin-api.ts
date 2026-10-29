@@ -16,14 +16,19 @@ export async function listUsers(): Promise<UserRecord[]> {
   return res.json();
 }
 
-export async function deleteUser(username: string): Promise<void> {
+export class UserIdentityConflictError extends Error {}
+
+export async function deleteUser(username: string, expectedUserId: string): Promise<void> {
   const res = await apiFetch(
     apiUrl(`/api/v1/auth/users/${encodeURIComponent(username)}`),
     {
       method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expected_user_id: expectedUserId }),
     },
   );
   if (!res.ok) {
+    if (res.status === 409) throw new UserIdentityConflictError();
     const data = await res.json().catch(() => ({}));
     throw new Error(data.detail ?? "Failed to delete user");
   }

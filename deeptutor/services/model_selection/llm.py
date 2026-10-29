@@ -56,6 +56,20 @@ def _llm_service(catalog: dict[str, Any]) -> dict[str, Any]:
     return services.get("llm", {}) if isinstance(services, dict) else {}
 
 
+def llm_profile_configured(profile: dict[str, Any]) -> bool:
+    """Report missing static inputs, without testing credentials or connectivity."""
+    spec = find_by_name(str(profile.get("binding") or ""))
+    if spec is None:
+        return False
+    if spec.is_oauth:
+        # OAuth credentials are resolved by the provider, outside this catalog.
+        return True
+    return bool(
+        (str(profile.get("base_url") or "").strip() or spec.default_api_base)
+        and (spec.is_local or str(profile.get("api_key") or "").strip())
+    )
+
+
 def list_llm_options(catalog: dict[str, Any]) -> dict[str, Any]:
     """Return a redacted list of configured chat-selectable LLM models."""
     service = _llm_service(catalog)
@@ -92,6 +106,7 @@ def list_llm_options(catalog: dict[str, Any]) -> dict[str, Any]:
                 "model": model_value,
                 "provider": provider,
                 "provider_label": provider_label,
+                "configured": llm_profile_configured(profile),
                 "is_active_default": (
                     profile_id == active_profile_id and model_id == active_model_id
                 ),

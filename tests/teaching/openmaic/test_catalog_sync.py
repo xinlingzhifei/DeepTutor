@@ -45,6 +45,57 @@ def test_selected_model_round_trips_through_openmaic_contract():
     assert value == before
 
 
+def test_status_reconstructs_saved_sync_and_detects_rotated_key(sync_runtime):
+    module, profile, _events, target = sync_runtime
+    saved = catalog()
+    service = SimpleNamespace(load=lambda: saved)
+    assert not asyncio.run(module.shared_model_status(service))["ready"]
+    asyncio.run(module.synchronize_shared_catalog(service))
+    before = target.read_bytes()
+    status = asyncio.run(module.shared_model_status(service))
+    assert status["state"] == "synced"
+    assert status["ready"] is True
+    assert status["model"] == "course-model"
+    assert status["last_synced_at"]
+    assert "secret-canary" not in json.dumps(status)
+    assert "https://" not in json.dumps(status)
+    assert target.read_bytes() == before  # Status reads never publish credentials.
+    saved["services"]["llm"]["profiles"][0]["api_key"] = "rotated-secret"
+    stale = asyncio.run(module.shared_model_status(service))
+    assert stale["ready"] is False
+    assert stale["reason"] == "synchronization_required"
+    asyncio.run(module.synchronize_shared_catalog(service))
+    assert asyncio.run(module.shared_model_status(service))["ready"] is True
+    profile.status = "disabled"
+    assert asyncio.run(module.shared_model_status(service))["ready"] is False
+
+
+def test_status_clear_and_failed_reads_never_report_old_model_ready(sync_runtime):
+    module, _profile, _events, _target = sync_runtime
+    asyncio.run(module.synchronize_shared_catalog(SimpleNamespace(load=catalog)))
+    assert asyncio.run(module.shared_model_status(SimpleNamespace(load=lambda: {}))) == {
+        "state": "not_configured",
+        "ready": False,
+    }
+
+    def failed_load():
+        raise OSError("secret-canary")
+
+    failure = asyncio.run(module.shared_model_status(SimpleNamespace(load=failed_load)))
+    assert failure == {"state": "error", "ready": False, "reason": "synchronization_unavailable"}
+
+
+def test_status_reports_unsupported_provider_without_secret(sync_runtime):
+    module, _profile, _events, _target = sync_runtime
+    saved = catalog()
+    saved["services"]["llm"]["profiles"][0]["binding"] = "openai_codex"
+    assert asyncio.run(module.shared_model_status(SimpleNamespace(load=lambda: saved))) == {
+        "state": "error",
+        "ready": False,
+        "reason": "unsupported_provider",
+    }
+
+
 def test_empty_or_cleared_selection_is_unconfigured():
     assert provider_document_from_catalog({}) is None
     value = catalog()
@@ -229,6 +280,7 @@ def test_shared_generation_guard_tracks_clear_and_configuration(sync_runtime):
 
 def test_missing_model_terminal_error_is_not_retried():
     from deeptutor.teaching.job_errors import classify_engine_error_code
+
     failure = classify_engine_error_code("model_not_configured")
     assert failure.category == "model_not_configured"
     assert not failure.retryable

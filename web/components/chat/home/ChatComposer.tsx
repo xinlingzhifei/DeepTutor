@@ -41,7 +41,9 @@ import type { SelectedHistorySession } from "@/components/chat/HistorySessionPic
 import type { SelectedQuestionEntry } from "@/components/chat/QuestionBankPicker";
 import type { SelectedRecord } from "@/lib/notebook-selection-types";
 import type { LLMSelection } from "@/lib/unified-ws";
-import type { LLMOption } from "@/lib/llm-options";
+import { chatModelIssue, type LLMOption } from "@/lib/llm-options";
+import Link from "next/link";
+import { useAuthStatus } from "@/hooks/useAuthStatus";
 import ChatSpaceMenu from "@/components/chat/space/ChatSpaceMenu";
 import type { SpaceMemoryFile } from "@/lib/space-items";
 import type { SelectedBookReference } from "@/lib/book-references";
@@ -499,7 +501,9 @@ export default memo(function ChatComposer({
   // (via `onRequestConfigConfirm`) instead of silently doing nothing.
   const isConfigBlocked = capabilityNeedsConfig && !capabilityConfigConfirmed;
   const hasIntent = hasContent || hasReferences;
-  const canSend = hasIntent && !isStreaming && !isConfigBlocked;
+  const modelIssue = chatModelIssue(llmOptions, llmSelection, activeLLMDefault, llmOptionsLoading, llmOptionsError);
+  const { isAdmin, enabled: authEnabled, loading: authLoading } = useAuthStatus();
+  const canSend = hasIntent && !isStreaming && !isConfigBlocked && !modelIssue;
 
   // `blocked` only exists once there is intent: without it the button stays
   // `idle` so an empty composer doesn't present a live send affordance. That
@@ -507,7 +511,7 @@ export default memo(function ChatComposer({
   // the `blocked` state can stay clickable and surface the config card.
   const sendState: SendState = isStreaming
     ? "streaming"
-    : !hasIntent
+    : !hasIntent || modelIssue
       ? "idle"
       : isConfigBlocked
         ? "blocked"
@@ -725,6 +729,15 @@ export default memo(function ChatComposer({
               </div>
             </div>
           )}
+          {modelIssue && !isStreaming ? (
+            <div role="status" data-testid="chat-model-status" className="mx-4 mt-4 space-y-2 rounded-lg bg-[var(--muted)]/50 p-3 text-xs text-[var(--muted-foreground)]">
+              <p>{t(modelIssue)}</p>
+              {!llmOptionsLoading ? <div className="flex gap-3">
+                <button type="button" onClick={onRefreshLLMOptions} className="font-medium text-[var(--primary)]">{t("Refresh models")}</button>
+                {!authLoading && (isAdmin || !authEnabled) ? <Link href="/settings/llm" target="_blank" rel="noopener noreferrer" className="font-medium text-[var(--primary)]">{t("Open model settings")}</Link> : null}
+              </div> : null}
+            </div>
+          ) : null}
           <ComposerInput
             ref={inputHandleRef}
             textareaRef={textareaRef}

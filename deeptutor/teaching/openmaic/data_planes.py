@@ -179,10 +179,16 @@ class DataPlaneSelector:
         settings: _TeachingSettings,
         repository: DataPlaneSelectionRepository,
         require_shared_model: Callable[[], None] | None = None,
+        audit_decisions: bool = True,
     ) -> None:
         self._settings = settings
         self._repository = repository
         self._require_shared_model = require_shared_model
+        self._audit_decisions = audit_decisions
+
+    async def _record_decision(self, decision: DataPlaneDecision) -> None:
+        if self._audit_decisions:
+            await self._repository.record_decision(decision)
 
     async def _reject(
         self,
@@ -193,7 +199,7 @@ class DataPlaneSelector:
     ) -> NoReturn:
         route = resolution.route
         profile = resolution.provider_profile
-        await self._repository.record_decision(
+        await self._record_decision(
             DataPlaneDecision(
                 tenant_id=tenant_id,
                 route_ref=route.route_id if route is not None else None,
@@ -210,7 +216,7 @@ class DataPlaneSelector:
             return None
         resolution = await self._repository.resolve(tenant_id)
         if resolution is None:
-            await self._repository.record_decision(
+            await self._record_decision(
                 DataPlaneDecision(
                     tenant_id=tenant_id,
                     route_ref=None,
@@ -297,7 +303,7 @@ class DataPlaneSelector:
             route_config_digest=route_config_digest(route),
             provider_config_digest=provider_config_digest(profile),
         )
-        await self._repository.record_decision(
+        await self._record_decision(
             DataPlaneDecision(
                 tenant_id=tenant_id,
                 route_ref=route.route_id,

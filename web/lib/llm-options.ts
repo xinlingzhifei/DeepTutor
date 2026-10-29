@@ -14,6 +14,8 @@ export interface LLMOption extends LLMSelection {
   provider_label?: string;
   context_window?: number;
   is_active_default: boolean;
+  /** Static required inputs are present; this does not test provider access. */
+  configured?: boolean;
 }
 
 export interface LLMOptionsResponse {
@@ -31,6 +33,19 @@ export function sameLLMSelection(
   b: LLMSelection | null | undefined,
 ) {
   return llmSelectionKey(a) === llmSelectionKey(b);
+}
+
+export function chatModelIssue(
+  options: LLMOption[], selection: LLMSelection | null,
+  activeDefault: LLMSelection | null, loading: boolean, error: boolean,
+): string | null {
+  if (loading) return "Loading model configuration…";
+  if (error) return "Could not load models. Refresh to try again.";
+  if (!options.length) return "No chat model is available. Configure a model or ask an administrator to grant access.";
+  const selected = options.find(option => sameLLMSelection(option, selection ?? activeDefault));
+  if (!selected) return "Select an available model before sending.";
+  if (selected.configured === false) return "The selected model is missing its API address or credential. Update its settings before sending.";
+  return null;
 }
 
 /** List the configured model profiles.
