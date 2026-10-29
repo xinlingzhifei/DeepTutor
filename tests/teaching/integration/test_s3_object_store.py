@@ -30,6 +30,7 @@ from deeptutor.teaching.artifacts import (
     classroom_artifact_key,
     temporary_artifact_key,
 )
+from deeptutor.teaching.minio_tenant_storage import build_tenant_policy
 from deeptutor.teaching.object_store import (
     ClassroomArtifactPromotionService,
     ClassroomArtifactStoreFactory,
@@ -107,38 +108,7 @@ class MinioHarness:
 
 
 def _policy(tenant_id: str) -> dict[str, object]:
-    prefix = f"tenants/{tenant_id}"
-    return {
-        "Version": "2012-10-17",
-        "Statement": [
-            {
-                "Effect": "Allow",
-                "Action": ["s3:ListBucket"],
-                "Resource": [f"arn:aws:s3:::{_BUCKET}"],
-                "Condition": {
-                    "StringLike": {
-                        "s3:prefix": [prefix, f"{prefix}/*"],
-                    }
-                },
-            },
-            {
-                "Effect": "Allow",
-                "Action": ["s3:GetBucketVersioning"],
-                "Resource": [f"arn:aws:s3:::{_BUCKET}"],
-            },
-            {
-                "Effect": "Allow",
-                "Action": [
-                    "s3:GetObject",
-                    "s3:GetObjectVersion",
-                    "s3:PutObject",
-                    "s3:DeleteObject",
-                    "s3:DeleteObjectVersion",
-                ],
-                "Resource": [f"arn:aws:s3:::{_BUCKET}/{prefix}/*"],
-            },
-        ],
-    }
+    return build_tenant_policy(bucket=_BUCKET, tenant_prefix=f"tenants/{tenant_id}/")
 
 
 def _exec_mc(container: DockerContainer, *arguments: str) -> None:

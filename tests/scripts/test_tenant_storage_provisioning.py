@@ -70,11 +70,19 @@ def test_tenant_policy_allows_only_the_exact_tenant_prefix() -> None:
             "Condition": {"StringLike": {"s3:prefix": ["tenants/tenant-a/*"]}},
         },
         {
+            "Sid": "BucketVersioningRead",
+            "Effect": "Allow",
+            "Action": ["s3:GetBucketVersioning"],
+            "Resource": ["arn:aws:s3:::classrooms"],
+        },
+        {
             "Sid": "TenantObjects",
             "Effect": "Allow",
             "Action": [
                 "s3:DeleteObject",
+                "s3:DeleteObjectVersion",
                 "s3:GetObject",
+                "s3:GetObjectVersion",
                 "s3:ListBucketMultipartUploads",
                 "s3:ListMultipartUploadParts",
                 "s3:PutObject",

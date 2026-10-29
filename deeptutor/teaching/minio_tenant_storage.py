@@ -78,11 +78,19 @@ def build_tenant_policy(*, bucket: str, tenant_prefix: str) -> dict[str, Any]:
                 "Condition": {"StringLike": {"s3:prefix": [f"{tenant_prefix}*"]}},
             },
             {
+                "Sid": "BucketVersioningRead",
+                "Effect": "Allow",
+                "Action": ["s3:GetBucketVersioning"],
+                "Resource": [f"arn:aws:s3:::{bucket}"],
+            },
+            {
                 "Sid": "TenantObjects",
                 "Effect": "Allow",
                 "Action": [
                     "s3:DeleteObject",
+                    "s3:DeleteObjectVersion",
                     "s3:GetObject",
+                    "s3:GetObjectVersion",
                     "s3:ListBucketMultipartUploads",
                     "s3:ListMultipartUploadParts",
                     "s3:PutObject",
