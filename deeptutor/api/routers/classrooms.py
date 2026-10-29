@@ -29,6 +29,7 @@ from deeptutor.api.routers.teaching_catalog import (
 )
 from deeptutor.teaching.brief_builder import TeachingBriefBuilder
 from deeptutor.teaching.database import get_platform_engine
+from deeptutor.teaching.quota import InsufficientQuota
 from deeptutor.teaching.repositories.classrooms import (
     ClassroomPersistenceError,
     SqlAlchemyClassroomRepository,
@@ -276,6 +277,8 @@ async def _call(operation):
         raise HTTPException(
             status_code=422, detail="Teaching source could not be safely read"
         ) from None
+    except InsufficientQuota:
+        raise HTTPException(status_code=409, detail="Insufficient quota") from None
     except InvalidDraftMedia as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None
     except InvalidDraftDocument as exc:

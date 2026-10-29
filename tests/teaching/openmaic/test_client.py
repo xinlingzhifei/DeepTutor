@@ -83,6 +83,22 @@ def _export_request(*, job_id: str = "job-export") -> ExportRequest:
     )
 
 
+def _open_creation_request() -> GenerationRequest:
+    from tests.teaching_contract_fixtures import valid_generation_request
+
+    payload = valid_generation_request()
+    payload["tenant_id"] = "tenant-a"
+    brief = payload["teaching_brief"]
+    brief.update(
+        tenant_id="tenant-a", content_mode="open_creation", source_snapshot=None,
+        source_fragments=[], citations=[], source_refs=[],
+    )
+    brief["permission_summary"].update(
+        allowed_source_ids=[], allowed_fragment_ids=[], attribution_required=False,
+    )
+    return GenerationRequest.model_validate(payload)
+
+
 def _export_input_declaration() -> ExportInputDeclaration:
     document_sha256 = hashlib.sha256(b"{}").hexdigest()
     return ExportInputDeclaration(
@@ -509,6 +525,11 @@ def test_client_rejects_an_incomplete_engine_capability_surface(
             _generation_request,
         ),
         (
+            "submit_outline",
+            "/api/yfeistai/v1/outlines",
+            _open_creation_request,
+        ),
+        (
             "submit_content",
             "/api/yfeistai/v1/classrooms",
             lambda: GenerationRequest.model_construct(
@@ -540,7 +561,7 @@ def test_submit_methods_sign_exact_canonical_json(
         assert json.loads(request.content) == submitted.model_dump(
             mode="json",
             by_alias=True,
-            exclude_none=True,
+            exclude_none=False,
         )
         assert request.extensions["timeout"] == {
             "connect": 1.5,

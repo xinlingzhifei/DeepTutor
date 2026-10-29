@@ -243,6 +243,19 @@ def test_unreadable_pdf_is_an_explicit_422_without_private_details() -> None:
     assert "/private/" not in response.text
 
 
+def test_insufficient_quota_is_an_explicit_409() -> None:
+    from deeptutor.teaching.quota import InsufficientQuota
+
+    class NoQuota(_WorkflowService):
+        async def create(self, _context, request, idempotency_key=None):
+            raise InsufficientQuota("tenant quota is insufficient")
+
+    response = _client(NoQuota()).post("/api/v1/classrooms", json=_full_classroom_request())
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Insufficient quota"
+
+
 def test_create_media_policy_defaults_to_image_audio_and_accepts_text_only() -> None:
     defaulted = classrooms.CreateClassroomRequest.model_validate(
         _full_classroom_request()

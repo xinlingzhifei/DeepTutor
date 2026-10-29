@@ -526,7 +526,8 @@ class OpenMAICClient:
         request_route_id = getattr(request, "data_plane_route_id", None)
         if request_route_id is not None and request_route_id != self._route_id:
             raise ValueError("request route does not match the resolved data plane")
-        body = canonical_json_bytes(request)
+        # Nullable fields such as teachingBrief.sourceSnapshot are required on the wire.
+        body = canonical_json_bytes(request.model_dump(mode="json", by_alias=True))
         response = await self._request(
             "POST",
             path,
