@@ -693,26 +693,11 @@ def _select_pdf_segments(
 def _extract_query_selected_pdf_text(path: str, query: str) -> str:
     """Scan every page but retain only the bounded query-relevant view."""
 
-    try:
-        import fitz
-    except ImportError:  # pragma: no cover - production installs PyMuPDF
-        fitz = None
+    # Reuse the inspection reader; native rendering imports exceed the child budget.
+    from pypdf import PdfReader
 
-    if fitz is not None:
-        with fitz.open(path) as document:
-            if document.is_encrypted and not document.authenticate(""):
-                raise SourceSnapshotUnavailable("PDF is encrypted")
-            selected = _select_pdf_segments(
-                (
-                    (page_number, page.get_text() or "")
-                    for page_number, page in enumerate(document, 1)
-                ),
-                query,
-            )
-    else:  # pragma: no cover - fallback for minimal installations
-        from pypdf import PdfReader
-
-        reader = PdfReader(path)
+    with open(path, "rb") as stream:
+        reader = PdfReader(stream)
         if getattr(reader, "is_encrypted", False):
             raise SourceSnapshotUnavailable("PDF is encrypted")
         selected = _select_pdf_segments(
@@ -722,9 +707,7 @@ def _extract_query_selected_pdf_text(path: str, query: str) -> str:
             ),
             query,
         )
-    return "\n\n".join(
-        f"--- Page {page or 0} ---\n{text}" for page, _position, text in selected
-    )
+    return "\n\n".join(f"--- Page {page or 0} ---\n{text}" for page, _position, text in selected)
 
 
 class SourceSnapshotBuilder:

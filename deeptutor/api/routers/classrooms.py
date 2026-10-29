@@ -48,7 +48,7 @@ from deeptutor.teaching.services.classrooms import (
     SqlAlchemyClassroomGeneration,
     draft_media_relative_path,
 )
-from deeptutor.teaching.source_snapshots import SourceSnapshotBuilder
+from deeptutor.teaching.source_snapshots import SourceSnapshotBuilder, SourceSnapshotUnavailable
 from deeptutor.teaching.tenant_context import TenantContext, require_tenant
 
 router = APIRouter()
@@ -272,6 +272,10 @@ async def _call(operation):
         raise HTTPException(status_code=404, detail="Classroom not found") from None
     except ClassroomAccessDenied:
         raise HTTPException(status_code=403, detail="Classroom access denied") from None
+    except SourceSnapshotUnavailable:
+        raise HTTPException(
+            status_code=422, detail="Teaching source could not be safely read"
+        ) from None
     except InvalidDraftMedia as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None
     except InvalidDraftDocument as exc:

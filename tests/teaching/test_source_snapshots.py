@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import builtins
 from datetime import datetime, timezone
 import hashlib
 import inspect
@@ -838,6 +839,47 @@ async def test_pdf_worker_selects_relevant_pages_after_old_400k_cutoff(
     assert "Photosynthesis uses chlorophyll" in selected
     assert "administrative scheduling" not in selected
     assert len(selected) <= 10_000
+
+
+def test_pdf_text_extraction_does_not_load_native_rendering_libraries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pypdf import PdfWriter
+    from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
+
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=612, height=792)
+    font = DictionaryObject(
+        {
+            NameObject("/Type"): NameObject("/Font"),
+            NameObject("/Subtype"): NameObject("/Type1"),
+            NameObject("/BaseFont"): NameObject("/Helvetica"),
+        }
+    )
+    page[NameObject("/Resources")] = DictionaryObject(
+        {NameObject("/Font"): DictionaryObject({NameObject("/F1"): font})}
+    )
+    content = DecodedStreamObject()
+    content.set_data(
+        b"BT /F1 12 Tf 72 720 Td (Pythagorean theorem: 3 squared plus 4 squared equals 5 squared.) Tj ET"
+    )
+    page[NameObject("/Contents")] = content
+    path = tmp_path / "source.pdf"
+    writer.write(path)
+    original_import = builtins.__import__
+
+    def bounded_import(name, *args, **kwargs):
+        if name.split(".")[0] in {"fitz", "pymupdf", "numpy"}:
+            raise MemoryError("Native rendering exceeds the PDF worker budget")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", bounded_import)
+    text = source_snapshots_module._extract_query_selected_pdf_text(
+        str(path), "Pythagorean theorem"
+    )
+    assert "--- Page 1 ---" in text
+    assert "3 squared plus 4 squared equals 5 squared" in text
 
 
 def test_pdf_fragments_are_query_selected_and_strictly_bounded() -> None:
