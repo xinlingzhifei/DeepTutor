@@ -1,5 +1,7 @@
 import JSZip from "jszip";
 import PptxGenJS from "pptxgenjs";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 
 import {
   artifactStore,
@@ -15,6 +17,8 @@ import {
   canonicalExportJson,
   cancelRemoteRenderIfRequested,
   createOfflineHtmlArtifact,
+  createRenderHtmlArtifact,
+  slideElementText,
   createExportPostHandler,
   exportJobStore,
   inspectZipArchive,
@@ -25,7 +29,6 @@ import {
 } from "../../../../../lib/yfeistai/export-generation";
 import {
   readServiceSecret,
-  signServiceRequest,
 } from "../../../../../lib/yfeistai/service-auth";
 import {
   configuredOpenMaicStateRoot,
@@ -228,13 +231,7 @@ function sceneSummary(scene: Record<string, unknown>): string {
         return "";
       }
       const record = element as Record<string, unknown>;
-      const text = record.content ?? record.text;
-      return typeof text === "string"
-        ? text
-            .replace(/<[^>]+>/g, " ")
-            .replace(/\s+/g, " ")
-            .trim()
-        : "";
+      return slideElementText(record);
     })
     .filter(Boolean)
     .join("\n");
@@ -411,10 +408,10 @@ async function bestEffortCancelRenderJob(
   request: ExportGenerationRequest,
 ): Promise<void> {
   try {
-    await signedRendererFetch(
+    await nativeRendererFetch(
       rendererBase,
-      `/yfeistai/v1/render/${renderJobId}/cancel`,
-      "POST",
+      `/render/${renderJobId}`,
+      "DELETE",
       "",
       request,
       5_000,
@@ -424,36 +421,20 @@ async function bestEffortCancelRenderJob(
   }
 }
 
-async function signedRendererFetch(
+async function nativeRendererFetch(
   rendererBase: string,
   requestPath: string,
-  method: "GET" | "POST",
-  body: string,
+  method: "GET" | "POST" | "DELETE",
+  body: string | FormData,
   request: ExportGenerationRequest,
   timeoutMilliseconds: number,
 ): Promise<Response> {
-  const operationIdempotencyKey = requestPath.endsWith("/cancel")
-    ? `${request.idempotencyKey}:render-cancel`
-    : `${request.idempotencyKey}:render-submit`;
-  const signed = signServiceRequest({
-    secret: readServiceSecret(),
-    method,
-    path: requestPath,
-    tenantId: request.tenantId,
-    jobId: request.jobId,
-    timestamp: Math.floor(Date.now() / 1_000),
-    idempotencyKey: method === "POST" ? operationIdempotencyKey : undefined,
-    body,
-  });
+  // The pinned renderer has a native multipart API on the private network.
+  // Tenant authentication and job ownership are enforced by this signed adapter.
   return rendererFetch(`${rendererBase}${requestPath}`, {
     method,
     headers: {
-      ...(body ? { "content-type": "application/json" } : {}),
-      "x-yfeistai-tenant-id": signed.tenantId,
-      "x-yfeistai-job-id": signed.jobId,
-      "x-yfeistai-timestamp": String(signed.timestamp),
-      "x-yfeistai-idempotency-key": signed.idempotencyKey,
-      "x-yfeistai-signature": signed.signature,
+      "x-openmaic-client": request.tenantId,
     },
     body: method === "POST" ? body : undefined,
     signal: AbortSignal.timeout(Math.max(1, timeoutMilliseconds)),
@@ -553,29 +534,26 @@ async function renderMp4(
   const rendererBase = endpoint.endsWith("/")
     ? endpoint.slice(0, -1)
     : endpoint;
-  const deadline = Date.now() + 120_000;
+  const deadline = Date.now() + 15 * 60_000;
   const remaining = (maximum: number) => Math.min(maximum, deadline - Date.now());
   await assertRenderActive(context);
   const checkpoint = persistedRenderJobId(request, rendererBase);
   let rawRenderJobId = checkpoint.renderJobId;
   if (!rawRenderJobId) {
     const media = await loadMedia(request);
-    const body = canonicalExportJson({
-      tenantId: request.tenantId,
-      engineJobId: request.jobId,
-      idempotencyKey: `${request.idempotencyKey}:render-submit`,
-      classroomDocument: asPortableDocument(request.classroomDocument),
-      mediaManifest: request.mediaManifest,
-      media: media.map((item) => ({
-        relativePath: item.relativePath,
-        mime: item.mime,
-        sha256: item.sha256,
-        bytesBase64: Buffer.from(item.bytes).toString("base64"),
-      })),
-    });
-    const submit = await signedRendererFetch(
+    const gsap = await readFile(path.join(process.cwd(), "public/vendor/gsap.min.js"), "utf8");
+    const project = new JSZip();
+    project.file("index.html", createRenderHtmlArtifact(request.classroomDocument, media, gsap).bytes);
+    const zipBytes = await project.generateAsync({ type: "uint8array", compression: "DEFLATE" });
+    validateArchiveEntries(inspectZipArchive(zipBytes));
+    const body = new FormData();
+    body.set("project", new Blob([Uint8Array.from(zipBytes).buffer], { type: "application/zip" }), "classroom.zip");
+    body.set("fps", "24");
+    body.set("quality", "standard");
+    body.set("format", "mp4");
+    const submit = await nativeRendererFetch(
       rendererBase,
-      "/yfeistai/v1/render",
+      "/render",
       "POST",
       body,
       request,
@@ -623,9 +601,9 @@ async function renderMp4(
         );
       }
       await assertRenderActive(context);
-      const status = await signedRendererFetch(
+      const status = await nativeRendererFetch(
         rendererBase,
-        `/yfeistai/v1/render/${renderJobId}`,
+        `/render/${renderJobId}`,
         "GET",
         "",
         request,
@@ -649,9 +627,9 @@ async function renderMp4(
       }
       if (state.status === "succeeded") {
         await assertRenderActive(context);
-        const download = await signedRendererFetch(
+        const download = await nativeRendererFetch(
           rendererBase,
-          `/yfeistai/v1/render/${renderJobId}/artifact`,
+          `/render/${renderJobId}/download`,
           "GET",
           "",
           request,

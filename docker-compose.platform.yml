@@ -327,6 +327,8 @@ services:
   openmaic-render:
     image: *openmaic-render-image
     restart: unless-stopped
+    environment:
+      HOME: /app
     cap_add:
       - NET_ADMIN
     networks:

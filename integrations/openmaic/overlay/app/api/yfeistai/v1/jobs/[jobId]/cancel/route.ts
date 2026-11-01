@@ -7,7 +7,6 @@ import { isPrivateRenderEndpoint } from "../../../../../../../lib/yfeistai/expor
 import { outlineJobStore } from "../../../../../../../lib/yfeistai/job-store";
 import {
   readServiceSecret,
-  signServiceRequest,
 } from "../../../../../../../lib/yfeistai/service-auth";
 import {
   configuredOpenMaicStateRoot,
@@ -49,27 +48,13 @@ async function cancelPersistedRenderJob(
     throw new Error("render checkpoint binding is invalid");
   }
   const renderId = encodeURIComponent(record.renderJobId);
-  const requestPath = `/yfeistai/v1/render/${renderId}/cancel`;
-  const signed = signServiceRequest({
-    secret: readServiceSecret(),
-    method: "POST",
-    path: requestPath,
-    tenantId,
-    jobId,
-    timestamp: Math.floor(Date.now() / 1_000),
-    idempotencyKey: `${record.idempotencyKey}:render-cancel`,
-    body: "",
-  });
+  const requestPath = `/render/${renderId}`;
   await fetch(`${configured}${requestPath}`, {
-    method: "POST",
+    method: "DELETE",
     redirect: "error",
     signal: AbortSignal.timeout(5_000),
     headers: {
-      "x-yfeistai-tenant-id": signed.tenantId,
-      "x-yfeistai-job-id": signed.jobId,
-      "x-yfeistai-timestamp": String(signed.timestamp),
-      "x-yfeistai-idempotency-key": signed.idempotencyKey,
-      "x-yfeistai-signature": signed.signature,
+      "x-openmaic-client": tenantId,
     },
   });
 }

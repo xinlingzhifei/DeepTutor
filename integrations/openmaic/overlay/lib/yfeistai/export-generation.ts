@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { createInflateRaw } from "node:zlib";
+import { renderToString } from "katex";
 
 import {
   type ArtifactEntry,
@@ -751,6 +752,7 @@ export interface OfflineMediaInput {
 
 function escapeOfflineJson(value: unknown): string {
   return canonicalExportJson(value)
+    .replaceAll("\\\\", "\\u005c")
     .replaceAll("<", "\\u003c")
     .replaceAll(">", "\\u003e")
     .replaceAll("&", "\\u0026");
@@ -871,6 +873,25 @@ function embedOfflineValue(
   return value;
 }
 
+export function slideElementText(element: Record<string, unknown>): string {
+  if (element.type === "latex") {
+    return typeof element.latex === "string" ? element.latex : "";
+  }
+  const text = element.content ?? element.text ?? element.title ?? element.label;
+  if (typeof text !== "string") return "";
+  const entities: Record<string, string> = {
+    amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ",
+  };
+  return text
+    .replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1>/gi, "")
+    .replace(/<br\s*\/?\s*>|<\/(?:p|div|li|h[1-6])>/gi, "\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&(amp|lt|gt|quot|apos|nbsp);/g, (_, name: string) => entities[name])
+    .replace(/[\t ]+/g, " ")
+    .replace(/ *\n */g, "\n")
+    .trim();
+}
+
 export function createOfflineHtmlArtifact(
   classroomDocument: unknown,
   media: readonly OfflineMediaInput[],
@@ -925,6 +946,22 @@ export function createOfflineHtmlArtifact(
       embedded,
     ) as typeof scene.actions;
   }
+  for (const scene of document.openmaic.scenes) {
+    if (scene.content.type !== "slide") continue;
+    const elements = scene.content.canvas.elements;
+    if (!Array.isArray(elements)) continue;
+    for (const element of elements) {
+      if (!element || typeof element !== "object" || Array.isArray(element)) continue;
+      element.offlineText = slideElementText(element);
+      delete element.formulaMarkup;
+      if (element.type === "latex" && typeof element.latex === "string") {
+        element.formulaMarkup = renderToString(element.latex, {
+          output: "mathml", displayMode: true, throwOnError: false, trust: false,
+        }).replace(/\s+xmlns="[^"]*"/g, "")
+          .replaceAll("<mi>", '<mi mathvariant="normal">');
+      }
+    }
+  }
   const documentJson = escapeOfflineJson(document);
   const title = document.openmaic.stage.name.replace(/[<>&"]/g, "");
   const html = `<!doctype html>
@@ -934,21 +971,46 @@ export function createOfflineHtmlArtifact(
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; media-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; frame-src data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
 <title>${title}</title>
-<style>body{font-family:system-ui,sans-serif;margin:0;background:#f7f8fa;color:#172033}main{max-width:960px;margin:auto;padding:40px}.scene{background:#fff;border:1px solid #e4e7ec;border-radius:12px;padding:24px;margin:18px 0}h1,h2,h3{margin-top:0}.media{display:block;max-width:100%;max-height:420px;margin:12px 0}iframe{width:100%;min-height:420px;border:1px solid #ddd}.nav{display:flex;justify-content:space-between;gap:12px}button{padding:10px 18px}fieldset,label,li{margin:.4rem 0}.canvas-element,.actions{padding:.5rem 0}</style>
+<style>body{font-family:system-ui,sans-serif;margin:0;background:#f7f8fa;color:#172033}main{max-width:960px;margin:auto;padding:40px}.scene{background:#fff;border:1px solid #e4e7ec;border-radius:12px;padding:24px;margin:18px 0}h1,h2,h3{margin-top:0}.media{display:block;max-width:100%;max-height:420px;margin:12px 0}iframe{width:100%;min-height:420px;border:1px solid #ddd}.nav{display:flex;justify-content:space-between;gap:12px}button{padding:10px 18px}fieldset,label,li{margin:.4rem 0}.canvas-element,.actions{padding:.5rem 0;white-space:pre-line}</style>
 </head>
 <body><main><h1 id="title"></h1><div id="scene"></div><div class="nav"><button id="previous">Previous</button><span id="position"></span><button id="next">Next</button></div></main>
 <script id="classroom" type="application/json">${documentJson}</script>
 <script>(()=>{
 const d=JSON.parse(document.getElementById("classroom").textContent),scenes=d.openmaic.scenes,root=document.getElementById("scene"),position=document.getElementById("position");let index=0;document.getElementById("title").textContent=d.openmaic.stage.name;
 const appendMedia=(value,parent)=>{if(typeof value!=="string")return false;let tag="";if(value.startsWith("data:image/"))tag="img";else if(value.startsWith("data:audio/"))tag="audio";else if(value.startsWith("data:video/"))tag="video";if(!tag)return false;const node=document.createElement(tag);node.className="media";if(tag!=="img")node.controls=true;node.setAttribute("src",value);parent.append(node);return true};
-const renderSlideScene=(scene,parent)=>{const elements=scene.content.canvas&&Array.isArray(scene.content.canvas.elements)?scene.content.canvas.elements:[];for(const element of elements){const block=document.createElement("div");block.className="canvas-element";if(!appendMedia(element.src??element.url,block)){const text=element.content??element.text??element.title??element.label;if(text!==undefined)block.textContent=String(text);else Object.values(element).forEach(value=>appendMedia(value,block))}parent.append(block)}};
+const renderSlideScene=(scene,parent)=>{const elements=scene.content.canvas&&Array.isArray(scene.content.canvas.elements)?scene.content.canvas.elements:[];for(const element of elements){const block=document.createElement("div");block.className="canvas-element";if(!appendMedia(element.src??element.url,block)){const text=element.offlineText;if(element.type==="latex"&&element.formulaMarkup)block.innerHTML=element.formulaMarkup;else if(text)block.textContent=String(text);else Object.values(element).forEach(value=>appendMedia(value,block))}parent.append(block)}};
 const renderQuizScene=(scene,parent)=>{for(const q of scene.content.questions||[]){const field=document.createElement("fieldset"),legend=document.createElement("legend");legend.textContent=q.prompt;field.append(legend);for(const option of q.options||[]){const label=document.createElement("label"),input=document.createElement("input");input.type=q.questionType==="multiple_choice"?"checkbox":"radio";input.name=q.id;input.value=option.id;label.append(input,document.createTextNode(String(option.label)));field.append(label,document.createElement("br"))}const explanation=document.createElement("details"),summary=document.createElement("summary");summary.textContent="Explanation";explanation.append(summary,document.createTextNode(q.explanation));field.append(explanation);parent.append(field)}};
 const renderPblScene=(scene,parent)=>{const scenario=document.createElement("p");scenario.textContent=scene.content.scenario;parent.append(scenario);const roles=document.createElement("section"),rolesTitle=document.createElement("h3"),roleList=document.createElement("ul");rolesTitle.textContent="Roles";for(const role of scene.content.roles||[]){const item=document.createElement("li");item.textContent=role.name+": "+role.brief;roleList.append(item)}roles.append(rolesTitle,roleList);const milestones=document.createElement("section"),milestonesTitle=document.createElement("h3"),milestoneList=document.createElement("ol");milestonesTitle.textContent="Milestones";for(const milestone of scene.content.milestones||[]){const item=document.createElement("li");item.textContent=milestone.title+": "+milestone.rubric;milestoneList.append(item)}milestones.append(milestonesTitle,milestoneList);parent.append(roles,milestones)};
 const renderActions=(scene,parent)=>{if(!Array.isArray(scene.actions)||scene.actions.length===0)return;const section=document.createElement("section"),title=document.createElement("h3"),list=document.createElement("ol");section.className="actions";title.textContent="Actions";for(const action of scene.actions){const item=document.createElement("li"),text=action.text??action.content??action.label??action.type;item.textContent=String(text??"");Object.values(action).forEach(value=>appendMedia(value,item));list.append(item)}section.append(title,list);parent.append(section)};
-const render=()=>{root.replaceChildren();const scene=scenes[index],article=document.createElement("article"),heading=document.createElement("h2");article.className="scene";heading.textContent=scene.title;article.append(heading);if(scene.type==="interactive"){const frame=document.createElement("iframe");frame.setAttribute("sandbox","allow-scripts");frame.setAttribute("src",scene.content.html);article.append(frame)}else if(scene.type==="quiz")renderQuizScene(scene,article);else if(scene.type==="pbl")renderPblScene(scene,article);else renderSlideScene(scene,article);renderActions(scene,article);root.append(article);position.textContent=(index+1)+" / "+scenes.length;document.getElementById("previous").disabled=index===0;document.getElementById("next").disabled=index===scenes.length-1};
+const render=()=>{root.replaceChildren();const scene=scenes[index],article=document.createElement("article"),heading=document.createElement("h2");article.className="scene";heading.textContent=scene.title;article.append(heading);if(scene.type==="interactive"){const frame=document.createElement("iframe");frame.setAttribute("sandbox","allow-scripts");frame.setAttribute("src",scene.content.html);article.append(frame)}else if(scene.type==="quiz")renderQuizScene(scene,article);else if(scene.type==="pbl")renderPblScene(scene,article);else renderSlideScene(scene,article);renderActions(scene,article);root.append(article);position.textContent=(index+1)+" / "+scenes.length;const previous=document.getElementById("previous"),next=document.getElementById("next");if(previous)previous.disabled=index===0;if(next)next.disabled=index===scenes.length-1};
 document.getElementById("previous").onclick=()=>{if(index>0){index--;render()}};document.getElementById("next").onclick=()=>{if(index+1<scenes.length){index++;render()}};render();
 })();</script>
 </body></html>`;
+  assertOfflineHtmlSelfContained(html);
+  return { bytes: new TextEncoder().encode(html) };
+}
+
+export function createRenderHtmlArtifact(
+  classroomDocument: unknown,
+  media: readonly OfflineMediaInput[],
+  gsapSource: string,
+): ExportArtifactOutput {
+  const document = strictAsPortableDocument(classroomDocument);
+  const duration = document.openmaic.scenes.length * 30;
+  let html = new TextDecoder().decode(createOfflineHtmlArtifact(document, media).bytes);
+  html = html
+    .replace("script-src 'unsafe-inline'", "script-src 'unsafe-inline' data:")
+    .replace("<main>", `<main id="yfeistai" data-composition-id="yfeistai" data-start="0" data-duration="${duration}" data-width="1280" data-height="720">`)
+    .replace(/<div class="nav">[\s\S]*?<\/div>/, '<span id="position" hidden></span>')
+    .replace("</head>", "<style>main{box-sizing:border-box;width:1280px;height:720px;max-width:none;padding:28px;overflow:hidden}h1{font-size:22px}.scene{border:0;margin:0;transform-origin:top left}.actions{display:none}</style></head>")
+    .replace("<script>(()=>{", `<script src="data:text/javascript;base64,${Buffer.from(gsapSource).toString("base64")}"></script><script>(()=>{`)
+    .replace(/document\.getElementById\("previous"\)\.onclick=[\s\S]*?;render\(\);/, `
+const fit=()=>{const scene=root.firstElementChild;scene.style.transform="";const scale=Math.min(1,610/scene.scrollHeight);scene.style.transform="scale("+scale+")"};
+const clips=[],tl=gsap.timeline({paused:true});
+for(index=0;index<scenes.length;index++){render();fit();const clip=root.firstElementChild;clip.classList.add("clip");clip.dataset.start=String(index*30);clip.dataset.duration="30";Object.assign(clip.style,{position:"absolute",inset:"0",opacity:"0"});clips.push(clip);tl.set(clip,{opacity:1},index*30);tl.set(clip,{opacity:0},(index+1)*30)}
+root.replaceChildren(...clips);Object.assign(root.style,{position:"relative",height:"610px"});tl.set({}, {}, ${duration});tl.seek(0);
+window.__timelines={yfeistai:tl};
+`);
   assertOfflineHtmlSelfContained(html);
   return { bytes: new TextEncoder().encode(html) };
 }

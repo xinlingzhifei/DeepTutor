@@ -888,6 +888,7 @@ def test_openmaic_images_and_worker_pools_are_separate_and_pinned() -> None:
         "dockerfile": "render-service/Dockerfile",
     }
     assert "build" not in services["openmaic-render"]
+    assert services["openmaic-render"]["environment"]["HOME"] == "/app"
     assert (
         services["openmaic"]["environment"]["YFEISTAI_OPENMAIC_RENDER_ENDPOINT"]
         == "http://openmaic-render:9000"

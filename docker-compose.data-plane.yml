@@ -35,6 +35,8 @@ services:
   openmaic-render:
     image: *openmaic-render-image
     restart: unless-stopped
+    environment:
+      HOME: /app
     profiles:
       - mp4-export
     cap_add:

@@ -8,6 +8,8 @@ import { describe, expect, test, vi } from "vitest";
 
 import {
   canonicalExportJson,
+  slideElementText,
+  createRenderHtmlArtifact,
   cancelRemoteRenderIfRequested,
   createOfflineHtmlArtifact,
   createExportGetHandler,
@@ -784,6 +786,40 @@ describe("controlled export boundary", () => {
     expect(html).toContain("renderPblScene");
     expect(html).toContain("renderActions");
     expect(html).not.toContain("option.text");
+  });
+
+  test("preserves rich slide text and formulas in portable exports", () => {
+    expect(slideElementText({ type: "text", content: "<p>Area &amp; length</p><p>Second line</p>" })).toBe("Area & length\nSecond line");
+    expect(slideElementText({ type: "latex", latex: "a^2 + b^2 = c^2" })).toBe("a^2 + b^2 = c^2");
+    const classroom = validClassroomDocument({ mediaManifest: [] });
+    const scene = (classroom.openmaic as { scenes: Array<{ content: { canvas: { elements: Array<Record<string, unknown>> } } }> }).scenes[0];
+    scene.content.canvas.elements = [
+      { type: "text", content: "<p>Area &amp; length</p>" },
+      { type: "latex", latex: "c = \\sqrt{a^2 + b^2}" },
+    ];
+    const { fileSha256: _hash, ...body } = classroom;
+    classroom.fileSha256 = sha256(body);
+    const html = new TextDecoder().decode(createOfflineHtmlArtifact(classroom, []).bytes);
+    const embedded = JSON.parse(html.match(/<script id="classroom" type="application\/json">([\s\S]*?)<\/script>/)![1]);
+    expect(embedded.openmaic.scenes[0].content.canvas.elements[0].offlineText).toBe("Area & length");
+    expect(embedded.openmaic.scenes[0].content.canvas.elements[1].formulaMarkup).toContain("<math");
+    expect(embedded.openmaic.scenes[0].content.canvas.elements[1].formulaMarkup).toContain('mathvariant="normal"');
+    expect(embedded.openmaic.scenes[0].content.canvas.elements[1].latex).toBe("c = \\sqrt{a^2 + b^2}");
+    expect(html).not.toContain('xmlns=');
+    expect(() => assertOfflineHtmlSelfContained(html)).not.toThrow();
+  });
+
+  test("builds a self-contained timed composition for the native renderer", () => {
+    const classroom = validClassroomDocument({ mediaManifest: [] });
+    const html = new TextDecoder().decode(createRenderHtmlArtifact(classroom, [], "/* vendored runtime */").bytes);
+    expect(html).toContain('data-composition-id="yfeistai"');
+    expect(html).toContain('data-width="1280"');
+    expect(html).toContain('data-duration="30"');
+    expect(html).toContain("window.__timelines");
+    expect(html).toContain(Buffer.from("/* vendored runtime */").toString("base64"));
+    expect(html).not.toContain('id="previous"');
+    expect(html).not.toContain('id="next"');
+    expect(() => assertOfflineHtmlSelfContained(html)).not.toThrow();
   });
 
   test("rejects unresolved relative resources in interactive HTML", () => {
