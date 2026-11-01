@@ -230,7 +230,17 @@ def get_classroom_service(
 
 
 def _response(record: object) -> ClassroomResponse:
-    return ClassroomResponse.model_validate(record, from_attributes=True)
+    response = ClassroomResponse.model_validate(record, from_attributes=True)
+    if response.document == {} and response.lifecycle_state in {
+        "draft",
+        "generating_outline",
+        "awaiting_outline",
+        "generating_content",
+        "failed",
+        "canceled",
+    }:
+        response.document = None
+    return response
 
 
 def _required_record(record: object | None) -> object:

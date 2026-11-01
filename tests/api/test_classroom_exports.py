@@ -408,6 +408,38 @@ def test_mp4_policy_denial_has_stable_public_reason(api_harness) -> None:
     assert response.json()["detail"] == "MP4_EXPORT_DISABLED_BY_TENANT_POLICY"
 
 
+@pytest.mark.parametrize("allow_mp4", [False, True])
+def test_tenant_reads_export_capabilities_without_policy_management_access(allow_mp4) -> None:
+    app = FastAPI()
+    repository = FakeExportPolicyRepository()
+    repository.allow_mp4 = allow_mp4
+    app.include_router(exports_router.router, prefix="/api/v1")
+    app.dependency_overrides[auth_router.require_platform_enabled] = lambda: None
+    app.dependency_overrides[require_tenant] = _context
+    app.dependency_overrides[exports_router.get_classroom_export_policy_repository] = lambda: repository
+
+    response = TestClient(app).get("/api/v1/classroom-export-capabilities")
+
+    assert response.status_code == 200
+    assert response.json() == {"allow_mp4": allow_mp4}
+    assert repository.replacements == []
+    assert repository.deletions == []
+
+
+def test_export_capabilities_reject_a_policy_from_another_tenant() -> None:
+    app = FastAPI()
+    app.include_router(exports_router.router, prefix="/api/v1")
+    app.dependency_overrides[auth_router.require_platform_enabled] = lambda: None
+    app.dependency_overrides[require_tenant] = lambda: _context(tenant_id="tenant-b")
+    app.dependency_overrides[exports_router.get_classroom_export_policy_repository] = (
+        FakeExportPolicyRepository
+    )
+
+    response = TestClient(app).get("/api/v1/classroom-export-capabilities")
+
+    assert response.status_code == 503
+
+
 def test_platform_admin_reads_and_replaces_active_tenant_mp4_policy() -> None:
     app = FastAPI()
     repository = FakeExportPolicyRepository()

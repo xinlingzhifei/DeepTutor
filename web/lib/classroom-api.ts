@@ -239,6 +239,16 @@ async function requestJson(
   }
 }
 
+export async function getClassroomExportPolicy(
+  signal?: AbortSignal,
+): Promise<ClassroomExportPolicy> {
+  const value = record(
+    await requestJson("/api/v1/classroom-export-capabilities", { signal }),
+    "export capabilities",
+  );
+  return { mp4Enabled: requiredBoolean(value, "allow_mp4", "export capabilities") };
+}
+
 const MEDIA_RESPONSE_KEYS = new Set([
   "id",
   "relativePath",

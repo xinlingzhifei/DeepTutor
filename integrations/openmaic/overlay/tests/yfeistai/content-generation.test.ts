@@ -246,6 +246,38 @@ function signedRequest(input: {
 }
 
 describe("confirmed outline content boundary", () => {
+  test.each([
+    ["2026-07-30T00:00:00.000Z", "2026-07-30T00:00:00Z"],
+    ["2026-07-30T00:00:00.123Z", "2026-07-30T00:00:00.123000Z"],
+  ])("emits the Python contract's canonical timestamps: %s", async (now, expected) => {
+    const result = await generateContentJob(boundRequest(), {
+      now: () => new Date(now),
+      generateScenes: async (scene, context) =>
+        generatedSlide(scene.sceneId, scene.title, context.stageId, context.order),
+    });
+    expect(result.classroomDocument.generationMetadata.generatedAt).toBe(expected);
+    expect(result.classroomDocument.openmaic.stage.createdAt).toBe(expected);
+    expect(result.classroomDocument.validationResult.validatedAt).toBe(expected);
+    expect(result.classroomDocument.auditMetadata).not.toHaveProperty("parentClassroomVersionId");
+    expect(asPortableDocument(result.classroomDocument)).toEqual(result.classroomDocument);
+  });
+
+  test("keeps SVG drawing paths distinct from media file references", async () => {
+    const result = await generateContentJob(boundRequest(), {
+      generateScenes: async (scene, context) => ({
+        ...generatedSlide(scene.sceneId, scene.title, context.stageId, context.order),
+        content: toPortableOpenMaicSceneContent("slide", {
+          elements: [{
+            id: "triangle", type: "shape", path: "M0 0 L100 0 L100 100 Z",
+          }],
+        }),
+        actions: [{ id: "formula", type: "wb_draw_latex", latex: "\\sqrt{25}" }],
+      }),
+    });
+    expect(result.classroomDocument.mediaManifest).toEqual([]);
+    expect(result.classroomDocument.openmaic.scenes).toHaveLength(2);
+  });
+
   test("preserves source fragments and a non-slide scene intent for the production adapter", async () => {
     const request = sourceGroundedRequest();
     const contexts: Array<Record<string, unknown>> = [];
@@ -402,7 +434,7 @@ describe("confirmed outline content boundary", () => {
           mime: "application/json",
           sha256: expect.stringMatching(/^[0-9a-f]{64}$/),
           bytes: expect.any(Number),
-          expiresAt: "2026-07-31T01:00:00.000Z",
+          expiresAt: "2026-07-31T01:00:00Z",
         }),
       ]);
       const forbiddenRuntimeSurface = new RegExp(
@@ -527,7 +559,7 @@ describe("confirmed outline content boundary", () => {
       relativePath: "media/scene-1/asset-1.png",
       bytes: mediaBytes,
       mime: "image/png",
-      expiresAt: "2026-07-31T00:00:00.000Z",
+      expiresAt: "2026-07-31T00:00:00Z",
     });
     const result = await generateContentJob(boundRequest(), {
       now: () => new Date("2026-07-30T00:00:00.000Z"),

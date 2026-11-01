@@ -338,7 +338,6 @@ export default function TeachingClassroomEditPage() {
         </section>
         <ClassroomExportMenu
           target={{ kind: "draft", assetId: classroom.assetId, revision }}
-          policy={{ mp4Enabled: false }}
           disabled={editorDirty || operationLocked}
         />
       </div>

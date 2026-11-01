@@ -122,6 +122,10 @@ class ExportPolicyResponse(BaseModel):
     operation_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
 
 
+class ExportCapabilitiesResponse(BaseModel):
+    allow_mp4: bool
+
+
 class ClassroomExportServiceLike(Protocol):
     async def create_for_draft(
         self,
@@ -231,6 +235,21 @@ def _export_policy_response(
         revision=state.revision,
         operation_id=state.operation_id,
     )
+
+
+@router.get("/classroom-export-capabilities", response_model=ExportCapabilitiesResponse)
+async def get_classroom_export_capabilities(
+    context: TenantContext = Depends(require_tenant),
+    repository: ClassroomExportPolicyRepositoryLike = Depends(
+        get_classroom_export_policy_repository
+    ),
+) -> ExportCapabilitiesResponse:
+    try:
+        policy = await repository.policy_state()
+    except SQLAlchemyError:
+        raise HTTPException(status_code=503, detail="Export policy is unavailable") from None
+    checked = _export_policy_response(policy, tenant_id=context.tenant_id)
+    return ExportCapabilitiesResponse(allow_mp4=checked.allow_mp4)
 
 
 @router.get("/classroom-export-policy", response_model=ExportPolicyResponse)

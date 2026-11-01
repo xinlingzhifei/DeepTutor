@@ -136,6 +136,7 @@ async function installTeacherBackend(page: Page) {
     revision: 1,
     outline: initialOutline as Record<string, unknown>,
     validated: false,
+    allowMp4: false,
     createCalls: [] as ApiCall[],
     outlineCalls: [] as ApiCall[],
     confirmCalls: 0,
@@ -184,6 +185,11 @@ async function installTeacherBackend(page: Page) {
     const request = route.request();
     const method = request.method();
     const pathname = new URL(request.url()).pathname;
+
+    if (method === "GET" && pathname === "/api/v1/classroom-export-capabilities") {
+      await json(route, { allow_mp4: state.allowMp4 });
+      return;
+    }
 
     if (method === "GET" && pathname === "/api/v1/teaching/model-readiness") {
       await json(route, { state: "synced", ready: true, can_configure: false });
@@ -530,6 +536,25 @@ export async function runTeacherClassroomFlow({
   expect(download.suggestedFilename()).toBe("energy-transfer.pptx");
   expect(await download.failure()).toBeNull();
   expect(teachingDownload.downloadCalls).toBe(downloadCallsBefore + 1);
+  expect(state.unexpected).toEqual([]);
+}
+
+export async function runTeacherExportPolicy({ page }: { page: Page }) {
+  await page.addInitScript(() => {
+    localStorage.setItem("deeptutor-language", "en");
+  });
+  const state = await installTeacherBackend(page);
+  state.phase = "editing";
+  state.revision = 3;
+  await page.goto(`/teaching/classrooms/${ASSET_ID}/edit`);
+  const mp4 = page.getByRole("button", { name: /MP4/ });
+  await expect(mp4).toBeDisabled();
+  state.allowMp4 = true;
+  await page.reload();
+  await expect(mp4).toBeEnabled();
+  state.allowMp4 = false;
+  await page.reload();
+  await expect(mp4).toBeDisabled();
   expect(state.unexpected).toEqual([]);
 }
 

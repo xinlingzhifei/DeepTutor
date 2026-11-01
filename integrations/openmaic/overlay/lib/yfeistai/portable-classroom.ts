@@ -116,7 +116,7 @@ export interface PortableClassroomDocument {
     templateVersion: string;
     teachingBriefId: string;
     teachingBriefSha256: string;
-    parentClassroomVersionId: string | null;
+    parentClassroomVersionId?: string | null;
   };
   validationResult: {
     valid: boolean;
@@ -186,8 +186,19 @@ function sha256(value: unknown, label: string): string {
 
 function hasForbiddenLocation(value: string): boolean {
   const text = value.trim();
+  // CSS property names in rich text are declarations, not URI schemes.
+  // Keep every property value intact so resource locations are still checked.
+  const content = text.replace(
+    /\bstyle\s*=\s*(["'])([\s\S]*?)\1/gi,
+    (_attribute, quote: string, css: string) =>
+      `style=${quote}${css.replace(
+        /("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')|(^|;)\s*(?:--)?[a-z][a-z0-9-]*\s*:/gi,
+        (_declaration, quoted: string | undefined, separator: string) =>
+          quoted ?? `${separator} `,
+      )}${quote}`,
+  );
   return (
-    /(?:^|[\s"'(=])(?:[a-z][a-z0-9+.-]*:|\/\/|\\\\)/i.test(text) ||
+    /(?:^|[\s"'(=>])(?:[a-z][a-z0-9+.-]*:|\/\/|\\\\)/i.test(content) ||
     /(?:src|href|srcset|action|poster)\s*=\s*["']?\s*(?:[a-z][a-z0-9+.-]*:|\/\/|\\\\|\/)/i.test(
       text,
     ) ||
@@ -229,6 +240,13 @@ export function assertPortableValue(
   for (const [key, item] of Object.entries(value)) {
     if (FORBIDDEN_RUNTIME_KEYS.has(key)) {
       throw new Error(`${label} contains a forbidden runtime field`);
+    }
+    if (
+      ["latex", "wb_draw_latex"].includes((value as Record<string, unknown>).type as string) &&
+      key === "latex" && typeof item === "string"
+    ) {
+      // Formula source is text; the renderer interprets it with trust disabled.
+      continue;
     }
     assertPortableValue(item, `${label}.${key}`);
   }
@@ -612,22 +630,18 @@ export function asPortableDocument(value: unknown): PortableClassroomDocument {
   sha256(generation.teachingBriefSha256, "generation teaching brief hash");
 
   const audit = asRecord(document.auditMetadata, "audit metadata");
-  if (!("parentClassroomVersionId" in audit)) {
-    audit.parentClassroomVersionId = null;
-  }
   exactKeys(audit, "audit metadata", [
     "templateId",
     "templateVersion",
     "teachingBriefId",
     "teachingBriefSha256",
-    "parentClassroomVersionId",
-  ]);
+  ], ["parentClassroomVersionId"]);
   for (const field of ["templateId", "templateVersion", "teachingBriefId"]) {
     nonEmptyString(audit[field], `audit metadata ${field}`);
   }
   sha256(audit.teachingBriefSha256, "audit teaching brief hash");
   if (
-    audit.parentClassroomVersionId !== null &&
+    audit.parentClassroomVersionId !== undefined && audit.parentClassroomVersionId !== null &&
     (typeof audit.parentClassroomVersionId !== "string" ||
       audit.parentClassroomVersionId.length === 0)
   ) {

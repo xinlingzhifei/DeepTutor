@@ -1,4 +1,5 @@
 import { parseFragment } from 'parse5'
+import { renderToString } from 'katex'
 
 import type {
   ImageElementFilters,
@@ -341,10 +342,15 @@ export function sanitizeRendererElement(element: PPTElement): PPTElement {
     }
   }
   if (element.type === 'latex') {
+    const html = element.latex
+      ? renderToString(element.latex, {
+          throwOnError: false, displayMode: true, output: 'html', trust: false,
+        })
+      : element.html
     return {
       ...element,
       color: safeColor(element.color),
-      html: element.html ? sanitizeRendererHtml(element.html) : undefined,
+      html: html ? sanitizeRendererHtml(html) : undefined,
     }
   }
   if (element.type === 'line') {

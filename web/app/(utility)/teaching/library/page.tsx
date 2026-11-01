@@ -160,7 +160,6 @@ export default function TeachingLibraryPage() {
                 </div>
                 <ClassroomExportMenu
                   target={{ kind: "version", versionId: publication.versionId }}
-                  policy={{ mp4Enabled: false }}
                 />
               </article>
             ))}

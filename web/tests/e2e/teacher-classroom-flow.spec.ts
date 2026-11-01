@@ -1,4 +1,4 @@
-import { runTeacherClassroomFlow } from "./teacher-classroom-flow";
+import { runTeacherClassroomFlow, runTeacherExportPolicy } from "./teacher-classroom-flow";
 import { test } from "./support/teaching-flow-test";
 
 test.use({ locale: "en-US", timezoneId: "UTC" });
@@ -8,3 +8,7 @@ test("teacher creates, confirms, submits a frozen draft, and retries export", as
   page,
   teachingDownload,
 }) => runTeacherClassroomFlow({ page, teachingDownload }));
+
+test("MP4 export follows the current tenant policy", async ({ page }) =>
+  runTeacherExportPolicy({ page }),
+);

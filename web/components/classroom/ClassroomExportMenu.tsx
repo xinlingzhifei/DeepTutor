@@ -1,6 +1,6 @@
 "use client";
 
-import { useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Download, FileArchive, LoaderCircle } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
@@ -10,6 +10,7 @@ import {
   createClassroomExportAttemptRegistry,
   createDraftClassroomExport,
   createVersionClassroomExport,
+  getClassroomExportPolicy,
   listClassroomExportOptions,
   pollClassroomExport,
   shouldRetainClassroomExportAttempt,
@@ -24,7 +25,7 @@ type ClassroomExportTarget =
 
 interface ClassroomExportMenuProps {
   target: ClassroomExportTarget;
-  policy: ClassroomExportPolicy;
+  policy?: ClassroomExportPolicy;
   disabled?: boolean;
   onJobChange?: (job: ClassroomExportJob) => void;
 }
@@ -40,6 +41,9 @@ export function ClassroomExportMenu({
   const [pendingFormat, setPendingFormat] =
     useState<ClassroomExportFormat | null>(null);
   const [error, setError] = useState(false);
+  const [tenantPolicy, setTenantPolicy] = useState<ClassroomExportPolicy>({
+    mp4Enabled: false,
+  });
   const controllerRef = useRef<AbortController | null>(null);
   const createAttemptsRef = useRef(createClassroomExportAttemptRegistry());
   const targetKey =
@@ -48,6 +52,20 @@ export function ClassroomExportMenu({
       : JSON.stringify(["version", target.versionId]);
   const targetBoundary = targetKey;
   const activeTargetBoundaryRef = useRef(targetBoundary);
+
+  useEffect(() => {
+    if (policy) return;
+    const controller = new AbortController();
+    setTenantPolicy({ mp4Enabled: false });
+    getClassroomExportPolicy(controller.signal)
+      .then(next => {
+        if (!controller.signal.aborted) setTenantPolicy(next);
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setError(true);
+      });
+    return () => controller.abort();
+  }, [policy, targetBoundary]);
 
   useLayoutEffect(() => {
     activeTargetBoundaryRef.current = targetBoundary;
@@ -183,7 +201,7 @@ export function ClassroomExportMenu({
         </h3>
       </div>
       <div className="grid gap-2 sm:grid-cols-2">
-        {listClassroomExportOptions(policy).map(option => {
+        {listClassroomExportOptions(policy ?? tenantPolicy).map(option => {
           const pending = pendingFormat === option.format;
           return (
             <div key={option.format}>

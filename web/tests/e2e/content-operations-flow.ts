@@ -288,6 +288,11 @@ async function installContentOperationsBackend(page: Page) {
     const method = request.method();
     const pathname = new URL(request.url()).pathname;
 
+    if (method === "GET" && pathname === "/api/v1/classroom-export-capabilities") {
+      await json(route, { allow_mp4: false });
+      return;
+    }
+
     if (method === "GET" && pathname === "/api/v1/settings") {
       await json(route, { catalog: {} });
       return;

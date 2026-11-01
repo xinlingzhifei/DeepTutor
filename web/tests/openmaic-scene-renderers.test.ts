@@ -333,6 +333,30 @@ test('renderer slide sanitizer rejects CSS URLs in persisted backgrounds', () =>
   assert.equal(slide.background?.gradient?.colors[1]?.color, '#ffffff')
 })
 
+test('renderer rebuilds formula HTML from source instead of a persisted cache', () => {
+  const slide = sanitizeRendererSlide({
+    id: 'slide-formula',
+    viewportSize: 1_000,
+    viewportRatio: 9 / 16,
+    theme: {
+      backgroundColor: '#ffffff', themeColors: ['#2563eb'],
+      fontColor: '#111111', fontName: 'sans-serif',
+    },
+    elements: [{
+      id: 'formula-a', type: 'latex', left: 0, top: 0, width: 300, height: 100,
+      rotate: 0, fixedRatio: true, latex: '\\frac{3}{5} + \\sqrt{25}',
+      html: '<script>untrustedCache()</script>',
+    }],
+  })
+  const formula = slide.elements[0]
+  assert.equal(formula.type, 'latex')
+  if (formula.type === 'latex') {
+    assert.match(formula.html ?? '', /katex/)
+    assert.match(formula.html ?? '', /mfrac/)
+    assert.doesNotMatch(formula.html ?? '', /untrustedCache|<script/i)
+  }
+})
+
 test('renderer slide sanitizer removes URL-bearing image filters and paint fields', () => {
   const slide = sanitizeRendererSlide({
     id: 'slide-filter',

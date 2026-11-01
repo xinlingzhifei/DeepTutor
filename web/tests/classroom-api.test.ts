@@ -11,6 +11,7 @@ import {
   createDraftClassroomExport,
   createVersionClassroomExport,
   getClassroomExport,
+  getClassroomExportPolicy,
   listClassroomExportOptions,
   pollClassroomExport,
   shouldRetainClassroomExportAttempt,
@@ -59,6 +60,25 @@ async function withFetch<T>(
     globalThis.fetch = original;
   }
 }
+
+test("export capability reads use the tenant read-only endpoint", async () => {
+  for (const enabled of [false, true]) {
+    await withFetch(async input => {
+      assert.equal(input, "/api/v1/classroom-export-capabilities");
+      return jsonResponse({ allow_mp4: enabled });
+    }, async () => {
+      const policy = await getClassroomExportPolicy();
+      assert.deepEqual(policy, { mp4Enabled: enabled });
+      assert.equal(listClassroomExportOptions(policy).find(item => item.format === "mp4")?.enabled, enabled);
+    });
+  }
+});
+
+test("export capability reads reject a non-boolean policy", async () => {
+  await withFetch(async () => jsonResponse({ allow_mp4: "true" }), () =>
+    assert.rejects(getClassroomExportPolicy(), /boolean/i),
+  );
+});
 
 test("media URLs are always yFeiSTAI routes", () => {
   const url = classroomMediaUrl("version-1", "asset-2");

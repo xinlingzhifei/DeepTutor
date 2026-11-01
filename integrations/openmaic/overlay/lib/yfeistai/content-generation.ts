@@ -149,8 +149,15 @@ export function toPortableOpenMaicSceneContent(
     if (!Array.isArray(record.elements)) {
       throw new Error("OpenMAIC slide content is invalid");
     }
+    const elements = record.elements.map(value => {
+      const element = asRecord(value, "OpenMAIC slide element");
+      if (element.type !== "latex") return element;
+      const { html: _renderedHtml, ...formula } = element;
+      nonEmptyString(formula.latex, "OpenMAIC formula source");
+      return formula;
+    });
     const canvas: Record<string, JsonValue> = {
-      elements: portableClone(record.elements, "OpenMAIC slide elements"),
+      elements: portableClone(elements, "OpenMAIC slide elements"),
     };
     if (record.background !== undefined) {
       canvas.background = portableClone(
@@ -919,8 +926,21 @@ function collectMediaReferences(
     return;
   }
   for (const [childKey, child] of Object.entries(value)) {
+    if (
+      childKey === "path" &&
+      ["shape", "latex"].includes((value as Record<string, unknown>).type as string) &&
+      typeof child === "string" && /^[Mm][\s\d.,+\-eEMmLlHhVvCcSsQqTtAaZz]+$/.test(child)
+    ) {
+      continue;
+    }
     collectMediaReferences(child, target, childKey);
   }
+}
+
+function canonicalTimestamp(value: Date): string {
+  return value.toISOString().replace(/\.(\d{3})Z$/, (_match, milliseconds: string) =>
+    milliseconds === "000" ? "Z" : `.${milliseconds}000Z`,
+  );
 }
 
 export async function generateContentJob(
@@ -931,11 +951,11 @@ export async function generateContentJob(
   await assertNotCanceled(dependencies.isCanceled);
 
   const now = (dependencies.now ?? (() => new Date()))();
-  const generatedAt = now.toISOString();
-  const expiresAt = new Date(
+  const generatedAt = canonicalTimestamp(now);
+  const expiresAt = canonicalTimestamp(new Date(
     now.getTime() +
       (dependencies.artifactTtlMilliseconds ?? 24 * 60 * 60 * 1_000),
-  ).toISOString();
+  ));
   const outline = resolveContentOutline(request, generatedAt);
   const stageId = `stage-${request.jobId}`;
   const classroomId = `classroom-${request.jobId}`;
@@ -1053,7 +1073,6 @@ export async function generateContentJob(
       templateVersion: request.templateVersion,
       teachingBriefId: request.teachingBriefId,
       teachingBriefSha256: request.teachingBriefSha256,
-      parentClassroomVersionId: null,
     },
     validationResult: {
       valid: true as const,

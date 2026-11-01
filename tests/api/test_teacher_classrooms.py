@@ -215,6 +215,32 @@ def _full_classroom_request() -> dict[str, object]:
     }
 
 
+@pytest.mark.parametrize(
+    "lifecycle_state",
+    ["draft", "generating_outline", "awaiting_outline", "generating_content", "failed", "canceled"],
+)
+def test_unmaterialized_draft_is_null_in_classroom_responses(lifecycle_state) -> None:
+    service = _WorkflowService()
+    service.assets["asset-1"].update(document={}, lifecycle_state=lifecycle_state)
+    client = _client(service)
+
+    for path in ("/api/v1/classrooms/asset-1", "/api/v1/classrooms/asset-1/draft"):
+        response = client.get(path)
+        assert response.status_code == 200
+        assert response.json()["document"] is None
+
+
+def test_materialized_draft_is_not_discarded_from_classroom_responses() -> None:
+    service = _WorkflowService()
+    document = _canonical_document()
+    service.assets["asset-1"].update(document=document, lifecycle_state="editing")
+
+    response = _client(service).get("/api/v1/classrooms/asset-1/draft")
+
+    assert response.status_code == 200
+    assert response.json()["document"] == document
+
+
 def test_teacher_full_classroom_stops_for_outline_confirmation() -> None:
     client = _client(_WorkflowService())
 
