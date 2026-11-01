@@ -2,6 +2,8 @@ import JSZip from "jszip";
 import PptxGenJS from "pptxgenjs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
+import { latexToOmml } from "@/lib/export/latex-to-omml";
+import type { JsonValue } from "../../../../../lib/yfeistai/portable-classroom";
 
 import {
   artifactStore,
@@ -264,10 +266,63 @@ async function exportPptx(
       sceneJson.includes(item.relativePath),
     );
     const images = sceneMedia.filter((item) => item.mime.startsWith("image/"));
-    slide.addText(sceneSummary(scene as unknown as Record<string, unknown>), {
+    const bodyWidth = images.length > 0 ? 7.2 : 11.8;
+    const canvasElements = scene.content.type === "slide" &&
+      Array.isArray(scene.content.canvas.elements)
+      ? scene.content.canvas.elements.filter(
+          (value): value is Record<string, JsonValue> =>
+            value !== null && typeof value === "object" && !Array.isArray(value),
+        )
+      : [];
+    if (canvasElements.some((element) => element.type === "latex")) {
+      // Keep text and equations in their original relative positions. Flattening
+      // the canvas into one text box exposes LaTeX source and loses its layout.
+      const elements = canvasElements.filter((element) => element.type === "text" || element.type === "latex");
+      if (!elements.every((element) =>
+        [element.left, element.top, element.width, element.height].every(
+          (value) => typeof value === "number" && Number.isFinite(value),
+        ) && Number(element.width) > 0 && Number(element.height) > 0,
+      )) {
+        throw new Error("PPTX canvas element geometry is invalid");
+      }
+      const width = Math.max(1000, ...elements.map((element) => Number(element.left) + Number(element.width)));
+      const height = Math.max(562.5, ...elements.map((element) => Number(element.top) + Number(element.height)));
+      const scale = Math.min(bodyWidth / width, 5.4 / height);
+      for (const element of elements) {
+        const box = {
+          x: 0.75 + Number(element.left) * scale,
+          y: 1.2 + Number(element.top) * scale,
+          w: Number(element.width) * scale,
+          h: Number(element.height) * scale,
+        };
+        if (element.type === "latex" && typeof element.latex === "string") {
+          const lines = (element.latex.match(/\\\\/g) || []).length + 1;
+          const fontSize = Math.max(10, Math.round(box.h * 72 / (lines * 2.5)));
+          const omml = latexToOmml(element.latex, fontSize);
+          if (!omml) throw new Error("PPTX formula conversion failed");
+          slide.addFormula({
+            ...box, omml, fontSize,
+            align: element.align === "left" || element.align === "right" ? element.align : "center",
+          });
+        } else {
+          const text = slideElementText(element);
+          if (!text) continue;
+          const html = typeof element.content === "string" ? element.content : "";
+          const fontPixels = Number(html.match(/font-size:\s*([\d.]+)px/i)?.[1] || 18);
+          slide.addText(text, {
+            ...box, fontSize: Math.max(10, fontPixels * scale * 72),
+            fontFace: typeof element.defaultFontName === "string" ? element.defaultFontName : "Microsoft YaHei",
+            color: typeof element.defaultColor === "string" && /^#[a-f\d]{6}$/i.test(element.defaultColor)
+              ? element.defaultColor.slice(1) : "344054",
+            bold: /<(strong|b)\b/i.test(html),
+            valign: "top", margin: 0, fit: "shrink",
+          });
+        }
+      }
+    } else slide.addText(sceneSummary(scene as unknown as Record<string, unknown>), {
       x: 0.75,
       y: 1.35,
-      w: images.length > 0 ? 7.2 : 11.8,
+      w: bodyWidth,
       h: 5.4,
       fontSize: 17,
       color: "344054",
